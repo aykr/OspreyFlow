@@ -1,0 +1,236 @@
+"""What a request may read, and what it writes into (`06_DECISIONS.md` ADR-099 decisions 4 to 6).
+
+**Reads.** `app.get_principal` scopes every request's principal: to the datasets of the case its
+path names (`/v1/investigations/{investigation_id}/...`), and to none for any other path, so a read
+outside a case sees nothing (default-deny). A route that names its case elsewhere (an analytics
+body, an alert's own case) scopes explicitly with `scope_to_case`. Only the Conduit's own
+background work reads unlimited (`Principal.datasets is None`); no request handler is given that
+principal. The limit itself is applied in the graph adapter (`AccessFilter`) and, for bodies the
+working set already holds, by `ontology.handling.principal_may_read`.
+
+**Writes.** Everything the Conduit writes for a case (a marked entity, an accepted finding, a file
+added, a Studio load run from the case) must belong to one of the case's datasets, or it would
+vanish from the case as it is written. Rather than ask every write path to remember, the request's
+case is held in a context variable when its principal is scoped, and `DatasetStampingGraph`, the
+graph the Conduit's services are given, stamps any write that names no dataset with the case's
+first. A write that names its datasets keeps them. Outside a request (a background job, a script)
+nothing is stamped, and those writers name their own.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable, Sequence
+from contextvars import ContextVar
+from typing import Any, Protocol
+
+from ports.graph import BulkGraphLoader, GraphPort
+from schemas.domain import EdgeWrite, NodeId, NodeWrite, Principal
+
+from .datasets import DatasetStore
+
+_CASE_DATASETS: ContextVar[tuple[str, ...] | None] = ContextVar("case_datasets", default=None)
+
+
+def set_case_datasets(datasets: Sequence[str] | None) -> None:
+    """Called once per request, by `app.get_principal`: the datasets of the request's case, or
+    `None` outside a case."""
+    _CASE_DATASETS.set(tuple(datasets) if datasets is not None else None)
+
+
+def case_datasets() -> tuple[str, ...] | None:
+    return _CASE_DATASETS.get()
+
+
+async def scope_to_case(
+    principal: Principal, investigation_id: str, store: DatasetStore
+) -> Principal:
+    """`principal`, reading only the datasets of `investigation_id`. Says nothing about whether the
+    principal may open the case: that is the route's own level check."""
+    datasets = await store.ids_of_case(investigation_id)
+    set_case_datasets(datasets)
+    return principal.model_copy(update={"datasets": datasets})
+
+
+def reach_clause(principal: Principal, position: int) -> tuple[str, list[object]]:
+    """ADR-099 Amendment 3, for a Postgres store of things made in a case (a saved pattern, a
+    watch, an alert): the SQL that keeps a read to the case's datasets, as `AND (...)` with its
+    parameter at `$position`. A record made before the amendment names no dataset and stays in
+    reach until `scripts.stamp_datasets` places it; the Conduit's own unlimited work reads all."""
+    if principal.datasets is None:
+        return "", []
+    return (
+        f" AND (dataset_id = ANY(${position}::text[]) OR dataset_id IS NULL)",
+        [list(principal.datasets)],
+    )
+
+
+def made_in(principal: Principal) -> str | None:
+    """The dataset a record made by `principal` now belongs to: the first of its case's."""
+    return principal.datasets[0] if principal.datasets else None
+
+
+def outside_any_case(principal: Principal) -> Principal:
+    set_case_datasets(None)
+    return principal.model_copy(update={"datasets": []})
+
+
+def _stamp_nodes(nodes: Sequence[NodeWrite], into: str | None) -> list[NodeWrite]:
+    if into is None:
+        return list(nodes)
+    return [n if n.datasets else n.model_copy(update={"datasets": [into]}) for n in nodes]
+
+
+def _stamp_edges(edges: Sequence[EdgeWrite], into: str | None) -> list[EdgeWrite]:
+    if into is None:
+        return list(edges)
+    return [e if e.datasets else e.model_copy(update={"datasets": [into]}) for e in edges]
+
+
+class UnknownDatasetError(Exception):
+    """A write names a dataset the registry does not hold (ADR-099 Amendment 6). Nothing of that
+    write reaches the store: an element in an unregistered dataset is in no case's world, ever."""
+
+    def __init__(self, dataset_ids: Sequence[str]) -> None:
+        self.dataset_ids = sorted(set(dataset_ids))
+        super().__init__("no such dataset: " + ", ".join(self.dataset_ids))
+
+
+class DatasetRegistry(Protocol):
+    """What the stamping graph asks of the dataset store: which of these ids it holds."""
+
+    async def known(self, dataset_ids: Sequence[str]) -> set[str]: ...
+
+
+def _named(writes: Sequence[NodeWrite] | Sequence[EdgeWrite]) -> set[str]:
+    return {d for w in writes for d in w.datasets}
+
+
+class DatasetStampingGraph:
+    """The Conduit's `GraphPort`: the adapter itself, with the request's case stamped on every
+    write that names no dataset. Every other call goes to the adapter unchanged, and a capability
+    the adapter lacks (`BulkGraphLoader`) is lacking here too.
+
+    `dataset`, when given, is stamped instead of the request's case: a seed or a script, which runs
+    outside any request, names the one dataset everything it writes belongs to."""
+
+    def __init__(
+        self,
+        inner: GraphPort,
+        *,
+        dataset: str | None = None,
+        registry: DatasetRegistry | None = None,
+    ) -> None:
+        self._inner = inner
+        self._dataset = dataset
+        self._registry = registry
+        #: Ids the registry has confirmed. A dataset is never deleted, so a confirmation holds.
+        self._confirmed: set[str] = set()
+        #: Called after every write the store accepted (ADR-100 Amendment 3: kept figures cleared).
+        self._after_write: list[Callable[[], Awaitable[None]]] = []
+
+    def after_write(self, hook: Callable[[], Awaitable[None]]) -> None:
+        self._after_write.append(hook)
+
+    async def _written(self) -> None:
+        for hook in self._after_write:
+            await hook()
+
+    def check_against(self, registry: DatasetRegistry) -> None:
+        """Every later write is checked against `registry` (the Conduit's dataset store, which
+        exists only after the graph is built)."""
+        self._registry = registry
+
+    async def _checked(self, writes: Sequence[Any]) -> None:
+        if self._registry is None:
+            return
+        wanted = _named(writes) - self._confirmed
+        if not wanted:
+            return
+        held = await self._registry.known(sorted(wanted))
+        self._confirmed |= held
+        if missing := wanted - held:
+            raise UnknownDatasetError(sorted(missing))
+
+    def _into(self) -> str | None:
+        if self._dataset is not None:
+            return self._dataset
+        held = case_datasets()
+        return held[0] if held else None
+
+    @property
+    def inner(self) -> GraphPort:
+        return self._inner
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "bulk_load_edges":  # only `BulkDatasetStampingGraph` has it: see `stamping`
+            raise AttributeError(name)
+        return getattr(self._inner, name)
+
+    async def upsert_nodes(self, nodes: Sequence[NodeWrite], tx: Any) -> list[NodeId]:
+        stamped = _stamp_nodes(nodes, self._into())
+        await self._checked(stamped)
+        ids = await self._inner.upsert_nodes(stamped, tx)
+        await self._written()
+        return ids
+
+    async def upsert_edges(self, edges: Sequence[EdgeWrite], tx: Any) -> list[str]:
+        stamped = _stamp_edges(edges, self._into())
+        await self._checked(stamped)
+        ids = await self._inner.upsert_edges(stamped, tx)
+        await self._written()
+        return ids
+
+    # A correction or a revert changes what is counted too; each clears what was kept after it.
+    async def supersede_node(self, node_id: NodeId, replacement: NodeWrite, tx: Any) -> NodeId:
+        new_id = await self._inner.supersede_node(node_id, replacement, tx)
+        await self._written()
+        return new_id
+
+    async def supersede_edge(self, edge_id: str, replacement: EdgeWrite, tx: Any) -> str:
+        new_id = await self._inner.supersede_edge(edge_id, replacement, tx)
+        await self._written()
+        return new_id
+
+    async def revert_elements(
+        self, node_ids: Sequence[NodeId], edge_ids: Sequence[str], tx: Any
+    ) -> None:
+        await self._inner.revert_elements(node_ids, edge_ids, tx)
+        await self._written()
+
+
+class BulkDatasetStampingGraph(DatasetStampingGraph):
+    """The same, over an adapter that is a `BulkGraphLoader`, and so one itself. The method is
+    declared here, not passed on by `__getattr__`: Python's runtime protocol check looks attributes
+    up statically, so a passed-on method does not make the wrapper a `BulkGraphLoader`, and the
+    Enron seed, asking that question, refused to write after deleting its links (7 October 2026)."""
+
+    async def bulk_load_edges(self, edges: Sequence[EdgeWrite], **kwargs: Any) -> Any:
+        inner: Any = self.inner
+        stamped = _stamp_edges(edges, self._into())
+        await self._checked(stamped)
+        result = await inner.bulk_load_edges(stamped, **kwargs)
+        await self._written()
+        return result
+
+
+def stamping(
+    inner: GraphPort, *, dataset: str | None = None, registry: DatasetRegistry | None = None
+) -> DatasetStampingGraph:
+    """The stamping graph over `inner`: a `BulkGraphLoader` exactly when `inner` is one. With a
+    `registry`, every write's datasets are checked against it first."""
+    if isinstance(inner, BulkGraphLoader):
+        return BulkDatasetStampingGraph(inner, dataset=dataset, registry=registry)
+    return DatasetStampingGraph(inner, dataset=dataset, registry=registry)
+
+
+__all__: Sequence[str] = (
+    "BulkDatasetStampingGraph",
+    "DatasetRegistry",
+    "UnknownDatasetError",
+    "DatasetStampingGraph",
+    "stamping",
+    "case_datasets",
+    "outside_any_case",
+    "scope_to_case",
+    "set_case_datasets",
+)

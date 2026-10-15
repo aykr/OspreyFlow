@@ -1,0 +1,143 @@
+# The Glass is a single-page application: every unknown path is one of its
+# own routes, so `try_files` falls back to index.html rather than 404ing.
+# Without this, refreshing on a deep link into an investigation breaks.
+#
+# Port 8080, not 80: spec/05_DEPLOYMENT.md §7 requires containers to run
+# as non-root, and a non-root process cannot bind a privileged port.
+#
+# **This image is also the deployment's reverse proxy for the Conduit**
+# (05_DEPLOYMENT.md §2.6 item 1, the owner's decision of 25 September
+# 2026). Before it, the Glass's bundle carried `http://localhost:8000`
+# baked in at image-build time, so a rendered deployment served a
+# workspace that could not reach the Conduit it was rendered alongside —
+# not when the API port was moved, and not from any browser that was not
+# on the Conduit's own host. Serving both from one origin removes the
+# problem rather than making the address configurable: the bundle holds no
+# address at all and is portable across every deployment unchanged, and
+# there is no cross-origin request left to configure CORS for.
+# `Connection: upgrade` only for a request that asked to upgrade, and
+# `Connection: close` otherwise — sending `upgrade` unconditionally breaks
+# ordinary keep-alive requests to the same location. This file is included
+# from nginx's own `http` context (`conf.d/*.conf`), which is the only
+# context where `map` is legal, so it sits here rather than in the server
+# block below.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 8080;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Every route the Glass calls is under /v1 — checked against the whole
+    # of apps/workspace/src, not assumed — so one location block covers
+    # the REST surface and the delta WebSocket alike.
+    #
+    # `api` is the compose service name on the deployment's internal
+    # network; 05_DEPLOYMENT.md §7 keeps it there and this proxy is what
+    # makes publishing its port unnecessary.
+    location /v1/ {
+        # **Resolved per request, not at startup.** With a literal
+        # `proxy_pass http://api:8000`, nginx resolves `api` once while
+        # loading its configuration and refuses to start if it cannot:
+        # `[emerg] host not found in upstream "api"`. Found on the first
+        # golden path after this proxy was added — the workspace starts
+        # before the Conduit, nginx exited, the container restarted, and
+        # `docker compose up --wait` reported the workspace unhealthy.
+        #
+        # Beyond the start-order race, the Glass is a static application
+        # and should serve whether or not the Conduit is reachable: a
+        # deployment whose Conduit is down should show the sign-in screen
+        # or a typed error, not fail to serve any page at all. Naming the
+        # upstream in a variable defers the lookup to request time, so the
+        # worst case becomes a 502 on `/v1` rather than a workspace that
+        # will not start.
+        #
+        # The container's own resolver (`/etc/resolv.conf`, filled in at
+        # start by the nginx image's NGINX_ENTRYPOINT_LOCAL_RESOLVERS):
+        # Docker's embedded DNS on a compose network, the cluster's DNS on
+        # Kubernetes, where `127.0.0.11` does not exist (found installing
+        # the chart: every `/v1` request answered 502). The Conduit's name
+        # is OSPREY_CONDUIT_HOST — `api` on compose; on a cluster the
+        # Service's full name, since nginx's resolver applies no search
+        # domain. A short `valid=` matters because a recreated Conduit gets
+        # a new address and nginx would otherwise hold the old one.
+        resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
+        set $conduit http://${OSPREY_CONDUIT_HOST}:8000;
+        # `$request_uri` is explicit because a `proxy_pass` with a
+        # variable does not substitute the matched location prefix — it
+        # passes the URI unchanged only if told to, and silently drops the
+        # query string otherwise.
+        proxy_pass $conduit$request_uri;
+
+        # The delta stream (`/v1/investigations/{id}/stream`) is a
+        # WebSocket, and an upgrade needs HTTP/1.1 with both headers:
+        # nginx defaults to 1.0 upstream, which cannot upgrade at all.
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # nginx closes an idle upstream connection after 60s by default,
+        # which would drop a delta stream that is behaving exactly as
+        # intended — a quiet investigation produces no messages. The
+        # Conduit, not this proxy, decides when a stream ends.
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+
+        # A working-set response can be large and a tile response is
+        # binary; buffering the whole of either before sending a byte adds
+        # latency for nothing and writes temp files under a read-only root
+        # (§7). The Conduit streams; so does this.
+        proxy_buffering off;
+    }
+
+    # The Conduit's own liveness, proxied so that an operator on the host
+    # can ask whether it is up. Without this, `/healthz` falls through to
+    # the SPA route below and answers 200 with the Glass's own HTML —
+    # which is worse than a 404, because a health check that returns 200
+    # for a dead Conduit reports the opposite of the truth. Found because
+    # `harness.apply` printed this URL and it served index.html.
+    #
+    # Unauthenticated by design (03_CONDUIT_MIDDLEWARE.md §3.0, the
+    # owner's decision of 24 September 2026): it is liveness, not
+    # readiness, it touches no store, and its anonymous and authenticated
+    # responses are asserted identical.
+    location = /healthz {
+        resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
+        set $conduit_health http://${OSPREY_CONDUIT_HOST}:8000;
+        proxy_pass $conduit_health$request_uri;
+        proxy_set_header Host $host;
+    }
+
+    # Hashed asset filenames are immutable; index.html must never be
+    # cached, or a deployed upgrade keeps serving the previous bundle.
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        try_files $uri =404;
+    }
+
+    # The map's place names: glyph files kept with the basemap and mounted read-only here by the
+    # renderer (harness/render.py, GLYPHS_CONTAINER_PATH). A missing range is a 404, never the
+    # Glass's own page, which the SPA fallback below once answered and MapLibre cannot read.
+    location /fonts/ {
+        alias /usr/share/nginx/fonts/;
+        types { application/x-protobuf pbf; }
+        default_type application/x-protobuf;
+        add_header Cache-Control "public, max-age=86400";
+        try_files $uri =404;
+    }
+
+    location / {
+        add_header Cache-Control "no-store";
+        try_files $uri $uri/ /index.html;
+    }
+}

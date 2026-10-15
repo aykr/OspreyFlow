@@ -1,0 +1,108 @@
+import { useState } from "react";
+
+export interface ViewActionsProps {
+  nodeCount: number;
+  onClearAll: () => void;
+  /** A link is selected, so it can be hidden from this view. */
+  selectedLink?: boolean;
+  /** How many links are hidden in this browser tab. */
+  hiddenLinkCount?: number;
+  onHideLink?: () => void;
+  onShowHiddenLinks?: () => void;
+  /** ADR-094: add files to the case, standing alone. Absent: not offered. */
+  onAddFiles?: () => void;
+  /** ADR-098: draw the links among every node in the view. Absent: not offered. */
+  onLinksAmongAll?: () => void;
+}
+
+/**
+ * Tidying the view: hide a selected link, show hidden links again, or clear everything. Clearing
+ * asks first and says what it does and does not do: the records stay in the store and History can
+ * undo it. What is done to selected nodes is on the selection bar (ADR-097 step 1).
+ */
+export function ViewActions({
+  nodeCount,
+  onClearAll,
+  selectedLink = false,
+  hiddenLinkCount = 0,
+  onHideLink,
+  onShowHiddenLinks,
+  onAddFiles,
+  onLinksAmongAll,
+}: ViewActionsProps) {
+  const [confirming, setConfirming] = useState(false);
+  const total = nodeCount.toLocaleString("en-GB");
+  return (
+    // The canvas toolbar's View group (ADR-097 step 2); the confirmation is laid over the canvas below.
+    <span className="canvas-toolbar__status canvas-toolbar__view">
+        {selectedLink && (
+          <button type="button" className="radial-menu__item" onClick={onHideLink}>
+            Hide selected link
+          </button>
+        )}
+        {hiddenLinkCount > 0 && (
+          <button type="button" className="radial-menu__item" onClick={onShowHiddenLinks}>
+            Show hidden links ({hiddenLinkCount})
+          </button>
+        )}
+        {onLinksAmongAll && nodeCount > 1 && (
+          <button type="button" className="radial-menu__item" onClick={onLinksAmongAll}>
+            Show links among all
+          </button>
+        )}
+        <button
+          type="button"
+          className="radial-menu__item"
+          disabled={nodeCount === 0}
+          onClick={() => setConfirming(true)}
+        >
+          Clear view
+        </button>
+      {onAddFiles && (
+        <button type="button" className="radial-menu__item" onClick={onAddFiles}>
+          Add files
+        </button>
+      )}
+      {confirming && nodeCount > 0 && (
+        <div
+          role="alertdialog"
+          aria-label="Clear the view"
+          className="canvas-menu-panel canvas-menu-panel--end"
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: "var(--sp-6)",
+            padding: "var(--sp-8)",
+            maxWidth: 300,
+            background: "var(--surface-raised, var(--surface))",
+            border: "1px solid var(--border)",
+          }}
+        >
+          <strong className="value">
+            Remove all {total} nodes from this view?
+          </strong>
+          <span>
+            The records stay in the store. History can bring them back.
+          </span>
+          <button
+            type="button"
+            className="radial-menu__item"
+            onClick={() => {
+              setConfirming(false);
+              onClearAll();
+            }}
+          >
+            Clear all {total}
+          </button>
+          <button
+            type="button"
+            className="radial-menu__item"
+            onClick={() => setConfirming(false)}
+          >
+            Keep
+          </button>
+        </div>
+      )}
+    </span>
+  );
+}

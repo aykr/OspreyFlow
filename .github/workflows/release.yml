@@ -1,0 +1,169 @@
+# The user repository's release (ADR-114 decision 13, Amendment 6 point 1, Amendment 8).
+#
+# A `vMAJOR.MINOR.PATCH` tag builds, scans, pushes and signs the images this repository owns,
+# then publishes the release: its notes (the tag's CHANGELOG.md section), its `versions.lock`
+# (every image by digest), which `ospreyflow update` reads, the guided install page, and the
+# Enterprise chart (Amendment 17), also pushed to the registry as an OCI artifact. Signing is keyless — GitHub's OIDC
+# identity for this workflow at this tag — so no private key exists anywhere; `ospreyflow update`
+# verifies each image against exactly that identity before it changes anything, and so does the
+# last job here, before the release is published.
+#
+# It lives in Core, which is published alone as the user repository: it uses nothing from the
+# developer repository.
+name: release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: read
+
+env:
+  COSIGN_VERSION: v2.4.1
+
+jobs:
+  # First, so a tag with no changelog section builds nothing.
+  notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag's changelog section is its notes
+        run: python3 -m scripts.changelog_check --tag "$GITHUB_REF_NAME" --notes-out notes.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notes
+          path: notes.md
+
+  images:
+    needs: notes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # keyless signing: this workflow's identity, no key
+    strategy:
+      matrix:
+        include:
+          - { service: workspace, dockerfile: apps/workspace/Dockerfile }
+          - { service: api, dockerfile: services/api/Dockerfile }
+          - { service: ingest, dockerfile: services/ingest/Dockerfile }
+          - { service: ner, dockerfile: services/ner/Dockerfile }
+          # ADR-114 Amendment 10 point 6: the workers as images of their own (Enterprise's chart).
+          - { service: worker, dockerfile: services/worker/Dockerfile }
+          - { service: report-sync, dockerfile: services/report_sync/Dockerfile }
+          # Built from its own folder, not the repository root.
+          - { service: superset, dockerfile: deploy/superset/Dockerfile, context: deploy/superset }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Name the image (the registry wants the owner in lower case)
+        id: name
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${{ matrix.service }}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      # Scanned first, as the amd64 image, before anything is pushed.
+      - name: Build for the scan
+        run: |
+          docker buildx build --platform linux/amd64 --load -f ${{ matrix.dockerfile }} \
+            -t "${{ steps.name.outputs.image }}:scan" "${{ matrix.context || '.' }}"
+      - uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ steps.name.outputs.image }}:scan
+          scan-type: image
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      # Both platforms in one index (found proving `update --from`: a single amd64 image would run
+      # emulated on an Apple-silicon Mac), tagged by commit as `harness.render` names an owned image
+      # in pull mode. The index's digest is what is signed and locked.
+      - name: Build both platforms and push
+        id: push
+        run: |
+          docker buildx build --platform linux/amd64,linux/arm64 --push \
+            -f ${{ matrix.dockerfile }} -t "${{ steps.name.outputs.image }}:$GITHUB_SHA" \
+            --metadata-file meta.json "${{ matrix.context || '.' }}"
+          echo "ref=${{ steps.name.outputs.image }}@$(jq -r '."containerimage.digest"' meta.json)" >> "$GITHUB_OUTPUT"
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+      - name: Sign by digest, keyless
+        run: cosign sign --yes "${{ steps.push.outputs.ref }}"
+
+  release:
+    needs: images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write # the chart is pushed beside the images
+      id-token: write # the lock is signed keyless too
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync
+      - uses: actions/download-artifact@v4
+        with:
+          name: notes
+      # Pull mode (no `source_path`): every image locked by the digest the registry holds — the
+      # owned ones just pushed, by this commit's tag — or the render refuses.
+      - name: The release's versions.lock
+        run: |
+          export OSPREY_IMAGE_REGISTRY="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}"
+          PYTHONPATH=.:packages uv run python -m harness.render --config osprey.yaml --out-root release-render
+          cp release-render/*/versions.lock versions.lock
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+      # The lock names the third-party images' digests, so it is signed too (Amendment 8 point 11).
+      - name: Sign the lock, keyless
+        run: cosign sign-blob --yes --bundle versions.lock.sigstore.json versions.lock
+      # ADR-114 Amendment 11: the guided install page, built here and shipped beside the release —
+      # stamped with the hash of its sources, packed, and signed as the lock is.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build, pack and sign the install page
+        run: |
+          npm ci
+          npm run build -w apps/harness
+          tar -C apps/harness/dist -czf install-page.tar.gz .
+          cosign sign-blob --yes --bundle install-page.tar.gz.sigstore.json install-page.tar.gz
+      # ADR-114 Amendment 17: the Enterprise chart at the tag's version, signed as a file (attached
+      # to the release) and pushed to the registry, where it is signed by digest as an image is.
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+      - name: Package, sign and push the chart
+        run: |
+          helm package deploy/helm/ospreyflow --version "${GITHUB_REF_NAME#v}" --app-version "$GITHUB_REF_NAME"
+          cosign sign-blob --yes --bundle "ospreyflow-${GITHUB_REF_NAME#v}.tgz.sigstore.json" "ospreyflow-${GITHUB_REF_NAME#v}.tgz"
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          helm push "ospreyflow-${GITHUB_REF_NAME#v}.tgz" "oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts" 2>&1 | tee push.log
+          digest=$(sed -n 's/^Digest: //p' push.log)
+          test -n "$digest"
+          CHART_REF="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts/ospreyflow@$digest"
+          echo "CHART_REF=$CHART_REF" >> "$GITHUB_ENV"
+          cosign sign --yes "$CHART_REF"
+      # The checks `ospreyflow update` makes, made here first: a release whose lock or images do not
+      # verify against this workflow's identity is never published.
+      - name: Verify the lock and every owned image as an update will
+        run: |
+          PYTHONPATH=.:packages uv run python -m harness.signatures \
+            --lock versions.lock --lock-signature versions.lock.sigstore.json \
+            --blob install-page.tar.gz --blob-signature install-page.tar.gz.sigstore.json \
+            --blob "ospreyflow-${GITHUB_REF_NAME#v}.tgz" --blob-signature "ospreyflow-${GITHUB_REF_NAME#v}.tgz.sigstore.json" \
+            --artifact "$CHART_REF" \
+            --repository "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --cosign cosign
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "OspreyFlow $GITHUB_REF_NAME" \
+            --notes-file notes.md versions.lock versions.lock.sigstore.json \
+            install-page.tar.gz install-page.tar.gz.sigstore.json \
+            "ospreyflow-${GITHUB_REF_NAME#v}.tgz" "ospreyflow-${GITHUB_REF_NAME#v}.tgz.sigstore.json"

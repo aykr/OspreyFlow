@@ -1,0 +1,96 @@
+# `.dockerignore` — the build context, not the running container.
+#
+# `spec/06_DECISIONS.md` ADR-035 §C2 names this file as the mechanism, in its own words: "if a
+# packaging step copies the repository root, `/demo-data/`'s own gitignore exclusion is irrelevant
+# to what a `docker build` context includes unless the `Dockerfile` also excludes it
+# (`.dockerignore`), the same 'check the build context, not just the running container' finding
+# already made for the private build tree." ADR-034 §B7 makes the same demand from the other side:
+# no private-tree file and no authorship identifier in a built artefact, "invisible at runtime,
+# fully recoverable from the tarball."
+#
+# **What this file is and is not, stated plainly so it is not over-credited.** Checked directly, 24
+# September 2026: the two Dockerfiles that exist today (`services/api`, `services/ingest`) copy
+# selective directories — `pyproject.toml`, `uv.lock`, `packages`, `services` — never `COPY . .`.
+# So there is **no live leak today**, and this file is not a fix for one. It does two things that
+# are still real: it keeps the whole repository from being uploaded to the daemon as build context
+# on every build (`.git`, `.venv`, `node_modules` and `data/` are sent today even though nothing
+# copies them), and it is the standing defence for the images that do not exist yet — the harness's
+# own image above all (`05_DEPLOYMENT.md` §2/§3's `ghcr.io/ospreyflow/harness:latest`), which by
+# construction runs against a mounted `/workspace` and is the most likely future candidate for a
+# broad copy. A defence written before the image that needs it, not after.
+#
+# **`.gitignore` does not do this job.** Docker does not read it. Every rule below that also appears
+# in `.gitignore` is deliberately repeated, not redundant — `config/real_data_exceptions.yaml` in
+# particular is gitignored *and* therefore exactly the file most likely to be present, uncommitted
+# and unnoticed, on the one machine that builds an owner-run demonstration bundle.
+#
+# Proven non-vacuous by `tests/test_dockerignore.py`, which removes a single line and asserts the
+# path it names stops being excluded — `CLAUDE.md` rule 15's second clause: a planted violation that
+# some other pattern would have caught anyway proves nothing about the pattern under test.
+
+# --- Version control, tooling caches, editor and OS noise --------------------
+.git
+.gitignore
+.github
+.DS_Store
+**/.DS_Store
+**/__pycache__
+**/*.pyc
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.venv
+node_modules
+**/node_modules
+
+# --- The private build tree ---------------------------------------------------
+# The developer repository's private-tree markers are the authoritative list, and its own test of
+# this file imports them rather than trusting this comment to stay in step. The images are built from
+# this folder alone, so the developer repository itself is never in their context (ADR-114 Amendment 2).
+#
+# **Round 14a (Trigger A): `docs/` dissolved into `spec/` (product) and `process/` (build-process,
+# private).** `spec/` is not excluded — it is the product's own specification, and
+# `spec/design/tokens.css` moved out of it into `apps/workspace/src/design/tokens.css` at the same
+# time (ADR-034 §B8's own "when the restructure moves tokens.css into the product tree, this COPY
+# and that negation go together" — done here), so the re-include exception that line predicted is
+# gone rather than left matching nothing. `CLAUDE.md` at the root is now a one-line stub; the real
+# file and everything else build-process (`.claude/`, `.graphifyignore`) are listed by name.
+process
+CLAUDE.md
+.claude
+.graphifyignore
+
+# --- A large brand asset no image build reads, excluded for size, not privacy -----------------
+# `spec/` is product spec and not excluded wholesale (unlike `process/` above): nothing there is
+# private. This one file is different only because it is large and nothing code-links it —
+# `tokens.css`, the file that did need reaching, moved out of `spec/design/` and into the product
+# tree entirely at the same time (round 14a), so nothing under `spec/design/` needs to reach a
+# build context any more.
+spec/design/OspreyFlow_Brand_Foundations.html
+
+# --- Real data, demo data, and local operator state ---------------------------
+# `CLAUDE.md` rule 9 / `07_BUILD_PLAN.md` standing rule 3 / ADR-035 §C1 and §C3. The exceptions list
+# names real datasets and lives only on the owner's own device; the two data directories are where
+# anything it admits would actually sit.
+config/real_data_exceptions.yaml
+demo-data
+data
+OspreyFlow_Data
+backups
+
+# --- Tests, fixtures and development-only trees -------------------------------
+tests
+graphify-out
+.graphify
+.playwright-mcp
+.impeccable
+Claude outputs
+apps/workspace/dist
+apps/workspace/test-results
+apps/workspace/playwright-report
+apps/workspace/.env.local
+
+# --- Deployment and harness scaffolding not needed inside a service image ------
+# `deploy/generated/` is rendered deployment output (`python -m harness.render`) and is
+# covered by the `deploy` line below; named here so it is not later assumed absent.
+deploy

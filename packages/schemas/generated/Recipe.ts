@@ -1,0 +1,230 @@
+// AUTO-GENERATED — do not edit by hand.
+// Source: packages/schemas/domain.py, analytics.py, ingest.py, profile.py, model.py and compute.py, via generate_ts.py
+export type Id = string;
+export type Version = number;
+export type Label = string;
+export type Profile = string;
+export type Delimiter = string;
+export type Encoding = string;
+export type HeaderRows = number;
+export type DateOrder = ("dmy" | "mdy") | null;
+export type SourceCrs = string | null;
+export type OntologyVersion = number;
+export type LegalBasis = string | null;
+export type Field = string | null;
+export type Fields = string[] | null;
+export type Transform = string | null;
+export type Map = {
+  [k: string]: string;
+} | null;
+export type Key = FieldBinding[];
+export type Ref = string;
+export type PoleClass = string;
+export type Type = string;
+export type MatchOn = string | null;
+export type OnMatch = "reference" | "create";
+export type Field1 = string;
+export type Is = ("not_null" | "null") | null;
+export type Handling1 = {
+  [k: string]: unknown;
+} | null;
+export type Provenance1 = {
+  [k: string]: unknown;
+} | null;
+export type Kind = "message_text" | "document_text" | "image_file" | "video_file";
+export type Field2 = string;
+export type Entities = RecipeEntity[];
+export type Type1 = string;
+export type From = string;
+export type To = string;
+export type Handling2 = {
+  [k: string]: unknown;
+} | null;
+export type Provenance2 = {
+  [k: string]: unknown;
+} | null;
+export type Edges = RecipeEdge[];
+export type Field3 = string;
+export type Action = "ignore";
+export type Note = string | null;
+export type UnmappedFields = UnmappedField[];
+export type Cron = string | null;
+export type Watch = string | null;
+export type Id1 = string;
+/**
+ * The pipeline graph's closed node vocabulary (`06_DECISIONS.md` ADR-108). Closed on
+ * purpose: rule 8 — no expression or scripting language in the Studio; every node is a declared
+ * stage whose transforms remain Knowledge Adapters with golden files.
+ */
+export type PipelineNodeKind = "domain_model" | "source" | "profile" | "map" | "extract" | "enrich" | "load";
+export type Label1 = string;
+export type Nodes = PipelineNode[];
+export type Source = string;
+export type Target = string;
+export type Edges1 = PipelineEdge[];
+
+export interface Recipe {
+  id: Id;
+  version: Version;
+  label: Label;
+  connector: RecipeConnector;
+  ontology_version: OntologyVersion;
+  defaults?: RecipeDefaults;
+  deduplicate?: DeduplicateConfig | null;
+  row_template: RowTemplate;
+  unmapped_fields?: UnmappedFields;
+  schedule?: ScheduleConfig | null;
+  pipeline?: PipelineGraph | null;
+  [k: string]: unknown;
+}
+export interface RecipeConnector {
+  profile: Profile;
+  delimiter?: Delimiter;
+  encoding?: Encoding;
+  header_rows?: HeaderRows;
+  date_order?: DateOrder;
+  source_crs?: SourceCrs;
+  [k: string]: unknown;
+}
+export interface RecipeDefaults {
+  provenance?: Provenance;
+  handling?: Handling;
+  legal_basis?: LegalBasis;
+  [k: string]: unknown;
+}
+export interface Provenance {
+  [k: string]: unknown;
+}
+export interface Handling {
+  [k: string]: unknown;
+}
+export interface DeduplicateConfig {
+  key: Key;
+  [k: string]: unknown;
+}
+/**
+ * One property's source: a source field (optionally passed through a
+ * Knowledge Adapter `transform`), a `literal`, or a value `map` — never
+ * an expression (`09_INGEST_STUDIO.md` §4: "no expression language").
+ *
+ * `fields` is the multi-column alternative to `field`, for a transform
+ * that genuinely needs more than one source value — a coordinate pair,
+ * or a British National Grid reference split across a letter pair and
+ * two numeric columns. It is still one declared transform over named
+ * source columns, not an expression: nothing computes which fields to
+ * combine, the recipe states them outright. How many columns a given
+ * transform takes is the adapter's own declared arity
+ * (`knowledge_adapters.ARITY`), not a fixed count here — two is not
+ * special, it is just what a coordinate pair happens to need.
+ */
+export interface FieldBinding {
+  field?: Field;
+  fields?: Fields;
+  literal?: unknown;
+  transform?: Transform;
+  map?: Map;
+  [k: string]: unknown;
+}
+export interface RowTemplate {
+  entities: Entities;
+  edges?: Edges;
+  [k: string]: unknown;
+}
+export interface RecipeEntity {
+  ref: Ref;
+  pole_class: PoleClass;
+  type: Type;
+  match_on?: MatchOn;
+  on_match?: OnMatch;
+  when?: RecipeCondition | null;
+  properties?: Properties;
+  handling?: Handling1;
+  provenance?: Provenance1;
+  content?: ContentBinding | null;
+  [k: string]: unknown;
+}
+/**
+ * A `when` clause — `09_INGEST_STUDIO.md` §4's conditional elements.
+ */
+export interface RecipeCondition {
+  field: Field1;
+  is?: Is;
+  equals?: unknown;
+  [k: string]: unknown;
+}
+export interface Properties {
+  [k: string]: FieldBinding;
+}
+/**
+ * ADR-094: a source column whose value the model can read. On a link it is the link's message
+ * or document text, written to the link's event (never the graph link), where the reader and
+ * extraction read it, as they read an Enron email's excerpt. A column named outright, never an
+ * expression (rule 8).
+ */
+export interface ContentBinding {
+  kind: Kind;
+  field: Field2;
+  [k: string]: unknown;
+}
+export interface RecipeEdge {
+  type: Type1;
+  from: From;
+  to: To;
+  when?: RecipeCondition | null;
+  temporal?: TemporalBinding | null;
+  properties?: Properties1;
+  content?: ContentBinding | null;
+  handling?: Handling2;
+  provenance?: Provenance2;
+  [k: string]: unknown;
+}
+export interface TemporalBinding {
+  at: FieldBinding;
+  [k: string]: unknown;
+}
+export interface Properties1 {
+  [k: string]: FieldBinding;
+}
+export interface UnmappedField {
+  field: Field3;
+  action?: Action;
+  note?: Note;
+  [k: string]: unknown;
+}
+export interface ScheduleConfig {
+  cron?: Cron;
+  watch?: Watch;
+  [k: string]: unknown;
+}
+/**
+ * ADR-108: the recipe as a typed DAG. A v1 recipe that has none is read as its canonical
+ * chain (`pipeline_from_recipe`), derived at read time and never stored back.
+ */
+export interface PipelineGraph {
+  nodes?: Nodes;
+  edges?: Edges1;
+  [k: string]: unknown;
+}
+/**
+ * One stage of a pipeline. `config` carries the stage's own settings (a source node's
+ * connector profile and location, a domain node's pack) — its keys are each stage's declared
+ * vocabulary, validated by `services/ingest/pipeline.py`, never free code.
+ */
+export interface PipelineNode {
+  id: Id1;
+  kind: PipelineNodeKind;
+  label: Label1;
+  config?: Config;
+  [k: string]: unknown;
+}
+export interface Config {
+  [k: string]: unknown;
+}
+/**
+ * A data dependency: `source` feeds `target`. The graph is acyclic (validated at save).
+ */
+export interface PipelineEdge {
+  source: Source;
+  target: Target;
+  [k: string]: unknown;
+}

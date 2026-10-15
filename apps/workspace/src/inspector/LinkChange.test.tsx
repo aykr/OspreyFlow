@@ -1,0 +1,343 @@
+// @vitest-environment jsdom
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import type { EdgeTypeDef } from "../../../../packages/schemas/generated";
+import { makeEdge } from "../testing/fixtures";
+import { LinkChange } from "./LinkChange";
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
+
+const EDGE_TYPES: EdgeTypeDef[] = [
+  { name: "ASSOCIATE_OF", from: ["Person"], to: ["Person"] },
+  {
+    name: "FAMILY_OF",
+    from: ["Person"],
+    to: ["Person"],
+    properties: [{ name: "relation", type: "string", required: true }],
+  },
+  { name: "SAME_AS", from: ["*"], to: ["*"], system: true },
+];
+
+const edge = makeEdge("e1", "a", "b", { type: "ASSOCIATE_OF", occurrences: 3 });
+
+function mount(onChanged = vi.fn(), openSignal = 0) {
+  render(
+    <LinkChange
+      apiBaseUrl="http://api.test"
+      bearerToken="tok"
+      investigationId="inv-1"
+      edge={edge}
+      sourceType="Person"
+      targetType="Person"
+      edgeTypes={EDGE_TYPES}
+      openSignal={openSignal}
+      onChanged={onChanged}
+    />,
+  );
+  return onChanged;
+}
+
+function stubFetch(status: number, json: unknown) {
+  const fetchMock = vi.fn(async () => ({ ok: status === 200, status, json: async () => json }));
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+describe("LinkChange", () => {
+  it("is closed until asked, and opens from the link menu's signal", () => {
+    mount();
+    expect(screen.queryByLabelText("Link type")).toBeNull();
+    cleanup();
+    mount(vi.fn(), 1);
+    expect(screen.getByLabelText("Link type")).toBeTruthy();
+  });
+
+  it("offers the types the two ends allow and never a same-as type", () => {
+    mount(vi.fn(), 1);
+    const options = Array.from(screen.getByLabelText("Link type").querySelectorAll("option")).map(
+      (o) => o.textContent,
+    );
+    expect(options).toEqual(["Associate of", "Family of"]);
+  });
+
+  it("will not save without a reason", () => {
+    mount(vi.fn(), 1);
+    fireEvent.change(screen.getByLabelText("Records behind it"), { target: { value: "7" } });
+    const save = screen.getByRole("button", { name: "Save change" }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText(/Why is it being changed/), { target: { value: "Seen again" } });
+    expect(save.disabled).toBe(false);
+  });
+
+  it("shows the fields the chosen type records, and says which are required", () => {
+    mount(vi.fn(), 1);
+    fireEvent.change(screen.getByLabelText("Link type"), { target: { value: "FAMILY_OF" } });
+    expect(screen.getByLabelText(/relation \(required\)/)).toBeTruthy();
+  });
+
+  it("sends only the change with its reason and hands the result to the caller", async () => {
+    const result = { edge: { ...edge, id: "e2" }, delta: { op: "replace_edge", seq: 2 }, change: { id: "c1" } };
+    const fetchMock = stubFetch(200, result);
+    const onChanged = mount(vi.fn(), 1);
+    fireEvent.change(screen.getByLabelText("Records behind it"), { target: { value: "7" } });
+    fireEvent.change(screen.getByLabelText(/Why is it being changed/), { target: { value: "Seen again" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save change" }));
+    await waitFor(() => expect(onChanged).toHaveBeenCalledWith(result));
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("http://api.test/v1/investigations/inv-1/links/e1/change");
+    expect(JSON.parse(String(init.body))).toEqual({ reason: "Seen again", occurrences: 7 });
+    expect(screen.getByRole("status").textContent).toContain("Link changed");
+  });
+
+  it("says what is wrong before asking the server, and keeps the form open", () => {
+    const fetchMock = stubFetch(200, {});
+    mount(vi.fn(), 1);
+    fireEvent.change(screen.getByLabelText("Link type"), { target: { value: "FAMILY_OF" } });
+    fireEvent.change(screen.getByLabelText(/Why is it being changed/), { target: { value: "Told so" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save change" }));
+    expect(screen.getByRole("alert").textContent).toBe("relation is required for Family of.");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("shows the server's refusal and records nothing when the save fails", async () => {
+    stubFetch(422, { error: "invalid_link_change", detail: "'FAMILY_OF' does not permit to='Organisation'" });
+    const onChanged = mount(vi.fn(), 1);
+    fireEvent.change(screen.getByLabelText("Records behind it"), { target: { value: "7" } });
+    fireEvent.change(screen.getByLabelText(/Why is it being changed/), { target: { value: "r" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save change" }));
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("does not permit"));
+    expect(onChanged).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("Link type")).toBeTruthy();
+  });
+
+  it("says plainly when the save did not happen at all", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Promise.reject(new TypeError("offline"))));
+    mount(vi.fn(), 1);
+    fireEvent.change(screen.getByLabelText("Records behind it"), { target: { value: "7" } });
+    fireEvent.change(screen.getByLabelText(/Why is it being changed/), { target: { value: "r" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save change" }));
+    await waitFor(() =>
+      expect(screen.getByRole("alert").textContent).toBe(
+        "The link was not changed. Nothing was recorded; try again.",
+      ),
+    );
+  });
+
+  it("Escape closes the form and puts the link's own values back", () => {
+    mount(vi.fn(), 1);
+    fireEvent.change(screen.getByLabelText("Records behind it"), { target: { value: "9" } });
+    fireEvent.keyDown(screen.getByLabelText("Records behind it"), { key: "Escape" });
+    expect(screen.queryByLabelText("Link type")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Change this link…" }));
+    expect((screen.getByLabelText("Records behind it") as HTMLInputElement).value).toBe("3");
+  });
+});
+
+// ADR-081 step B: the form asks what stands behind the link, with no default.
+describe("LinkChange and the basis", () => {
+  const BASIS_TYPES: EdgeTypeDef[] = [
+    { name: "ASSOCIATE_OF", from: ["Person"], to: ["Person"], basis: "direct" },
+    { name: "LIKELY_ASSOCIATE_OF", from: ["Person"], to: ["Person"], basis: "probabilistic" },
+  ];
+  function mountWith(link: ReturnType<typeof makeEdge>, onChanged = vi.fn()) {
+    render(
+      <LinkChange
+        apiBaseUrl="http://api.test"
+        bearerToken="tok"
+        investigationId="inv-1"
+        edge={link}
+        sourceType="Person"
+        targetType="Person"
+        edgeTypes={BASIS_TYPES}
+        openSignal={1}
+        onChanged={onChanged}
+      />,
+    );
+    return onChanged;
+  }
+
+  it("asks with two unchecked choices for a link of a Direct type", () => {
+    mountWith(edge);
+    const group = screen.getByRole("radiogroup", { name: /stands behind/i });
+    const radios = Array.from(group.querySelectorAll("input[type=radio]")) as HTMLInputElement[];
+    expect(radios.map((r) => r.value)).toEqual(["direct", "probabilistic"]);
+    expect(radios.every((r) => !r.checked)).toBe(true);
+  });
+
+  it("will not save until the basis is chosen, then sends the mark with the reason", async () => {
+    const fetchMock = stubFetch(200, {
+      edge: { ...edge, id: "e2", basis: "probabilistic" },
+      delta: { seq: 2, op: "replace_edge", old_edge_id: "e1", edge: { ...edge, id: "e2" } },
+      change: { id: "c1", reason: "Inferred from timing." },
+    });
+    mountWith(edge);
+    fireEvent.change(screen.getByLabelText(/Why is it being changed/), { target: { value: "Inferred from timing." } });
+    fireEvent.click(screen.getByRole("button", { name: "Save change" }));
+    expect((await screen.findByRole("alert")).textContent).toMatch(/stands behind/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByLabelText(/^Probabilistic/));
+    fireEvent.click(screen.getByRole("button", { name: "Save change" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = (fetchMock.mock.calls[0] as unknown as [string, RequestInit]);
+    expect(JSON.parse(String(init.body))).toEqual({ reason: "Inferred from timing.", basis: "probabilistic" });
+  });
+
+  it("states the one possible basis as fixed text for a link that is already probabilistic", () => {
+    mountWith(makeEdge("e9", "a", "b", { type: "LIKELY_ASSOCIATE_OF" }));
+    expect(screen.queryByRole("radiogroup", { name: /stands behind/i })).toBeNull();
+    expect(document.body.textContent).toMatch(/Probabilistic/);
+    expect(document.body.textContent).toMatch(/only basis/i);
+  });
+});
+
+describe("LinkChange: defining a new type (ADR-090 C2)", () => {
+  const proposal = {
+    id: "p1",
+    name: "KNOWN_TO",
+    label: "Known to",
+    from_types: ["Person"],
+    to_types: ["Person"],
+    directed: true,
+    investigation_id: "inv-1",
+    owning_unit: "unit-1",
+    proposed_by: "analyst-1",
+    proposed_at: "2026-10-05T10:00:00Z",
+    reason: "By sight",
+    status: "pending",
+  };
+
+  it("proposes a type from the form, then offers it chosen and marked as proposed", async () => {
+    const fetchMock = stubFetch(200, proposal);
+    const onTypeProposed = vi.fn();
+    render(
+      <LinkChange
+        apiBaseUrl="http://api.test"
+        bearerToken="tok"
+        investigationId="inv-1"
+        edge={edge}
+        sourceType="Person"
+        targetType="Person"
+        edgeTypes={EDGE_TYPES}
+        openSignal={1}
+        onChanged={vi.fn()}
+        onTypeProposed={onTypeProposed}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Define a new type…" }));
+    fireEvent.change(screen.getByLabelText("Name (required)"), { target: { value: "Known to" } });
+    expect((screen.getByLabelText("Type ID") as HTMLInputElement).value).toBe("KNOWN_TO");
+    fireEvent.change(screen.getByLabelText("Why does no type fit? (required)"), { target: { value: "By sight" } });
+    fireEvent.click(screen.getByRole("button", { name: "Propose type" }));
+
+    await waitFor(() => expect((screen.getByLabelText("Link type") as HTMLSelectElement).value).toBe("KNOWN_TO"));
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("http://api.test/v1/investigations/inv-1/link-types");
+    expect(JSON.parse(String(init.body))).toMatchObject({ name: "KNOWN_TO", label: "Known to", reason: "By sight" });
+    const chosen = screen.getByLabelText("Link type").querySelector("option:checked");
+    expect(chosen?.textContent).toBe("Known to (proposed)");
+    expect(onTypeProposed).toHaveBeenCalledWith(expect.objectContaining({ name: "KNOWN_TO", basis: "probabilistic" }));
+    // A proposed type is probabilistic: the basis is stated, not asked.
+    expect(screen.getByText(/the only basis this link may have/)).toBeTruthy();
+  });
+
+  it("shows the server's sentence when it refuses the name, and proposes nothing", async () => {
+    stubFetch(422, { error: "proposal_refused", detail: "KNOWN_TO is already offered in this case: use it instead." });
+    mount(vi.fn(), 1);
+    fireEvent.click(screen.getByRole("button", { name: "Define a new type…" }));
+    fireEvent.change(screen.getByLabelText("Name (required)"), { target: { value: "Known to" } });
+    fireEvent.change(screen.getByLabelText("Why does no type fit? (required)"), { target: { value: "By sight" } });
+    fireEvent.click(screen.getByRole("button", { name: "Propose type" }));
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("already offered"));
+    expect((screen.getByLabelText("Link type") as HTMLSelectElement).value).toBe("ASSOCIATE_OF");
+  });
+
+  it("marks a type the case has proposed in the list", () => {
+    render(
+      <LinkChange
+        apiBaseUrl="http://api.test"
+        bearerToken="tok"
+        investigationId="inv-1"
+        edge={edge}
+        sourceType="Person"
+        targetType="Person"
+        edgeTypes={[...EDGE_TYPES, { name: "KNOWN_TO", from: ["Person"], to: ["Person"], basis: "probabilistic" }]}
+        proposedTypes={new Set(["KNOWN_TO"])}
+        openSignal={1}
+        onChanged={vi.fn()}
+      />,
+    );
+    const options = Array.from(screen.getByLabelText("Link type").querySelectorAll("option")).map((o) => o.textContent);
+    expect(options).toContain("Known to (proposed)");
+  });
+});
+
+// ADR-102: the link's handling is changed on purpose; lowering it asks for a confirmation.
+describe("LinkChange, handling", () => {
+  const SCHEME = {
+    name: "uk-le",
+    classification: ["PUBLIC", "OFFICIAL", "OFFICIAL-SENSITIVE", "SECRET"],
+    handling_codes: {
+      P: { label: "Lawful sharing permitted", dissemination: "permitted" as const },
+      R: { label: "Recipient restricted", dissemination: "restricted" as const },
+    },
+    action_codes: { A1: { label: "Covert development", direct_action: false, originator_permission: true } },
+    sanitisation_codes: { S2: { label: "Consult originator", consult_originator: true } },
+  };
+
+  function mountWithScheme() {
+    render(
+      <LinkChange
+        apiBaseUrl="http://api.test"
+        bearerToken="tok"
+        investigationId="inv-1"
+        edge={edge}
+        sourceType="Person"
+        targetType="Person"
+        edgeTypes={EDGE_TYPES}
+        openSignal={1}
+        onChanged={vi.fn()}
+        handlingScheme={SCHEME}
+      />,
+    );
+  }
+
+  it("is not offered without the deployment's scheme", () => {
+    mount(vi.fn(), 1);
+    expect(screen.queryByLabelText("Classification")).toBeNull();
+  });
+
+  it("starts at the link's handling and asks for a confirmation before lowering it", async () => {
+    const fetchMock = stubFetch(200, {});
+    mountWithScheme();
+    expect((screen.getByLabelText("Classification") as HTMLSelectElement).value).toBe("OFFICIAL");
+    fireEvent.change(screen.getByLabelText("Classification"), { target: { value: "PUBLIC" } });
+    fireEvent.change(screen.getByLabelText("Why is it being changed? (required)"), { target: { value: "Released" } });
+    expect(screen.getByText("This lowers the link's classification: only an Author may, and it is recorded.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save change" }));
+    expect(await screen.findByText("This lowers the link's classification. Confirm that you mean to lower it.")).toBeTruthy();
+    expect(fetchMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByLabelText("I mean to lower this link's handling"));
+    fireEvent.click(screen.getByRole("button", { name: "Save change" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const body = JSON.parse((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body as string);
+    expect(body.handling.classification).toBe("PUBLIC");
+    expect(body.confirm_lower).toBe(true);
+  });
+
+  it("raises without asking", async () => {
+    const fetchMock = stubFetch(200, {});
+    mountWithScheme();
+    fireEvent.change(screen.getByLabelText("Handling code"), { target: { value: "R" } });
+    fireEvent.change(screen.getByLabelText("Why is it being changed? (required)"), { target: { value: "Restricted now" } });
+    expect(screen.queryByLabelText("I mean to lower this link's handling")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save change" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const body = JSON.parse((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body as string);
+    expect(body.handling.handling_code).toBe("R");
+    expect(body.confirm_lower).toBeUndefined();
+  });
+});

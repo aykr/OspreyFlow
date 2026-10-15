@@ -1,0 +1,721 @@
+/* The twenty primitives — `spec/02_GLASS_FRONTEND.md` §8. Built once, here.
+   Every colour is a `var(--token)` from `spec/design/tokens.css` — no
+   colour is introduced that isn't already a token (CLAUDE.md). */
+
+.btn {
+  font: inherit;
+  font-size: var(--fs-13);
+  line-height: var(--lh-13);
+  padding: var(--sp-6) var(--sp-12);
+  border-radius: var(--r-control);
+  border: 1px solid var(--border);
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+}
+.btn:hover { background: var(--surface-hover); }
+.btn:disabled { color: var(--text-disabled); cursor: not-allowed; }
+/* "Current" is not an action (ADR-097, DESIGN.md §3.2): a pressed or active control is primary text
+   on the raised surface with a 2px underline, never brass. */
+.btn[aria-pressed="true"] {
+  background: var(--surface-raised); color: var(--text-primary);
+  box-shadow: inset 0 -2px 0 var(--text-primary);
+}
+.btn--primary { background: var(--brass); border-color: var(--brass); color: var(--brass-ink); }
+.btn--primary:hover { background: var(--brass-hover); border-color: var(--brass-hover); }
+.btn--primary:active { background: var(--brass-press); border-color: var(--brass-press); }
+/* The quiet tier (ADR-097, design review item 7): no border, the hover surface on hover; most
+   toolbar and bar actions. Primary (brass) is at most one per region; secondary keeps the hairline. */
+.btn--quiet { background: transparent; border-color: transparent; color: var(--text-primary); }
+.btn--quiet:hover, .btn--quiet:focus-visible { background: var(--surface-hover); }
+
+.icon-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px;
+  border-radius: var(--r-control);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.icon-btn:hover { background: var(--surface-hover); color: var(--text-primary); }
+.icon-btn[aria-pressed="true"] { background: var(--surface-raised); color: var(--text-primary); box-shadow: inset 0 -2px 0 var(--text-primary); }
+
+.input, .select {
+  font: inherit; font-size: var(--fs-13);
+  padding: var(--sp-6) var(--sp-8);
+  border-radius: var(--r-control);
+  border: 1px solid var(--border);
+  background: var(--surface-sunken);
+  color: var(--text-primary);
+}
+.input::placeholder { color: var(--text-tertiary); }
+.input:disabled { color: var(--text-disabled); }
+
+.select { appearance: none; }
+
+.combobox { position: relative; }
+.combobox__listbox {
+  position: absolute; z-index: 20; margin-top: var(--sp-4);
+  min-width: 100%; max-height: 240px; overflow-y: auto;
+  background: var(--surface-raised); border-radius: var(--r-overlay);
+  box-shadow: var(--overlay-shadow);
+}
+.combobox__option { padding: var(--sp-6) var(--sp-8); cursor: pointer; color: var(--text-primary); }
+.combobox__option:hover, .combobox__option[aria-selected="true"] { background: var(--surface-hover); }
+
+.slider { -webkit-appearance: none; width: 100%; height: 4px; border-radius: var(--r-chip); background: var(--border); }
+/* A control at rest is neutral; brass only while it has focus (ADR-097, DESIGN.md §3.2). */
+.slider::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: var(--text-secondary); cursor: pointer; }
+.slider:focus-visible::-webkit-slider-thumb { background: var(--brass); }
+
+.range-slider { position: relative; height: 20px; }
+.range-slider__track { position: absolute; top: 8px; left: 0; right: 0; height: 4px; border-radius: var(--r-chip); background: var(--border); }
+.range-slider__fill { position: absolute; top: 8px; height: 4px; border-radius: var(--r-chip); background: var(--text-secondary); }
+.range-slider__handle {
+  position: absolute; top: 3px; width: 14px; height: 14px; margin-left: -7px;
+  border-radius: 50%; background: var(--text-secondary); border: 2px solid var(--surface-app); cursor: pointer;
+}
+.range-slider__handle:focus-visible { background: var(--brass); }
+
+.resolution-threshold-control { display: flex; align-items: center; gap: var(--sp-8); }
+.resolution-threshold-control input[type="range"] { width: 120px; }
+.resolution-threshold-control__name { font-size: var(--fs-12); font-weight: 600; color: var(--text-tertiary); white-space: nowrap; }
+.resolution-threshold-control__label {
+  font-size: var(--fs-12); color: var(--text-secondary); white-space: nowrap; min-width: 64px;
+}
+
+.checkbox { width: 16px; height: 16px; accent-color: var(--text-primary); }
+
+.radio-group { display: flex; flex-direction: column; gap: var(--sp-6); }
+.radio-group__option { display: flex; align-items: center; gap: var(--sp-6); color: var(--text-primary); }
+.radio-group__option input { accent-color: var(--text-primary); }
+
+/* The switch is 32 by 24 to press (ADR-097 step 3, a 24px target) and draws an 18px track inside. */
+.toggle {
+  position: relative; width: 32px; height: 24px; padding: 0;
+  background: transparent; border: none; cursor: pointer; flex-shrink: 0;
+}
+.toggle::before {
+  content: ""; position: absolute; left: 0; right: 0; top: 3px; height: 18px; border-radius: var(--r-chip);
+  background: var(--border);
+}
+.toggle[aria-checked="true"]::before { background: var(--text-primary); }
+.toggle__thumb {
+  position: absolute; top: 5px; left: 2px; width: 14px; height: 14px; border-radius: 50%;
+  background: var(--n11); transition: transform var(--dur-fast) var(--ease);
+}
+.toggle[aria-checked="true"] .toggle__thumb { background: var(--surface-app); }
+.toggle[aria-checked="true"] .toggle__thumb { transform: translateX(14px); }
+
+.tabs { display: flex; border-bottom: 1px solid var(--border-subtle); gap: var(--sp-16); }
+.tabs__tab {
+  background: none; border: none; color: var(--text-secondary); font: inherit; font-size: var(--fs-13);
+  padding: var(--sp-8) 0; cursor: pointer; border-bottom: 2px solid transparent;
+}
+.tabs__tab[aria-selected="true"] { color: var(--text-primary); border-bottom-color: var(--text-primary); }
+
+/* Docked panels: hairline, no shadow. */
+.panel {
+  background: var(--surface-panel);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-panel);
+}
+.panel__title {
+  font-size: var(--fs-16); font-weight: 600; color: var(--text-primary);
+  padding: var(--sp-12) var(--sp-16); border-bottom: 1px solid var(--border-subtle);
+}
+.panel__body { padding: var(--sp-16); }
+
+/* Overlays: shadow, no hairline. */
+.drawer {
+  /* Above every canvas-docked overlay (`.canvas-zoom`/`.canvas-legend` at 10, the selection bar
+     at 12) and the open menus at 40: without a layer of its own, the canvas's zoom cluster drew
+     over the Questions drawer's own text (the owner, 9 October 2026). */
+  position: fixed; top: 0; bottom: 0; right: 0; width: 360px; z-index: 45;
+  background: var(--surface-panel); box-shadow: var(--overlay-shadow);
+  border-radius: var(--r-overlay) 0 0 var(--r-overlay);
+  transition: transform var(--dur-panel) var(--ease);
+  /* The title stays; the body scrolls. Without it a drawer taller than the window was cut off at
+     the window's height, and the Explore panel's later sections could not be reached (8 October
+     2026, `keyboard/explore.spec.ts`). */
+  display: flex; flex-direction: column;
+}
+.drawer > .panel__body { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.drawer__title { display: flex; justify-content: space-between; align-items: center; gap: var(--sp-8); }
+
+.popover {
+  background: var(--surface-raised); box-shadow: var(--overlay-shadow);
+  border-radius: var(--r-overlay); padding: var(--sp-12);
+}
+
+.tooltip {
+  background: var(--n11); color: var(--surface-app);
+  font-size: var(--fs-11); line-height: var(--lh-11);
+  padding: var(--sp-4) var(--sp-8); border-radius: var(--r-control);
+  box-shadow: var(--overlay-shadow);
+}
+
+.context-menu, .radial-menu__list {
+  background: var(--surface-raised); box-shadow: var(--overlay-shadow);
+  border-radius: var(--r-overlay); padding: var(--sp-4); min-width: 180px;
+  list-style: none; margin: 0;
+}
+.context-menu__item, .radial-menu__item {
+  padding: var(--sp-6) var(--sp-8); border-radius: var(--r-control);
+  color: var(--text-primary); cursor: pointer; font-size: var(--fs-13);
+}
+/* The radial layout's entries are bare buttons floating over the canvas, so they need their own
+   surface: without one the browser's light button face showed under near-white text (seen
+   30 September 2026). The list layout sits on `.radial-menu__list`'s surface already. */
+.radial-menu__item {
+  background: var(--surface-raised); border: none;
+  box-shadow: var(--overlay-shadow); font-family: inherit; white-space: nowrap;
+}
+/* The right-click list (ADR-078): the name at the left, its count quieter at the right edge, and a
+   small heading over each group with a hairline between groups. Tokens only. */
+.radial-menu__list { min-width: 240px; }
+/* Above the canvas's own layers: its labels and nodes were drawn over the menu's top row. */
+.radial-menu, .radial-menu__list { z-index: 40; }
+.radial-menu__list .radial-menu__item {
+  display: flex; justify-content: space-between; align-items: baseline; gap: var(--sp-16);
+  white-space: nowrap;
+}
+.radial-menu__count { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.radial-menu__group { list-style: none; padding: var(--sp-4) 0 0; margin: 0; }
+.radial-menu__group + .radial-menu__group {
+  border-top: 1px solid var(--border-subtle); margin-top: var(--sp-4);
+}
+.radial-menu__group-title {
+  display: block; padding: var(--sp-2) var(--sp-8); color: var(--text-secondary);
+  font-size: var(--fs-12); font-weight: 600; letter-spacing: 0.02em;
+}
+.radial-menu__group-items { list-style: none; margin: 0; padding: 0; }
+.context-menu__item:hover, .context-menu__item:focus-visible,
+.radial-menu__item:hover, .radial-menu__item:focus-visible { background: var(--surface-menu-hover); }
+
+.table { width: 100%; border-collapse: collapse; font-size: var(--fs-13); }
+.table th {
+  text-align: left; font-size: var(--fs-12); font-weight: 600; color: var(--text-secondary);
+  padding: var(--sp-6) var(--sp-8); border-bottom: 1px solid var(--border-subtle);
+}
+.table td { padding: var(--sp-6) var(--sp-8); border-bottom: 1px solid var(--border-subtle); color: var(--text-primary); }
+.table tr:hover td { background: var(--surface-hover); }
+
+.histogram { display: flex; align-items: flex-end; gap: 1px; height: 48px; }
+.histogram__bar { flex: 1; background: var(--seq-4); border-radius: var(--r-control) var(--r-control) 0 0; cursor: pointer; }
+/* Data, so the data ramp, deeper on hover and when pressed (ADR-097, DESIGN.md §3.5). */
+.histogram__bar:hover { background: var(--seq-5); }
+.histogram__bar[aria-pressed="true"] { background: var(--seq-6); }
+
+.toast {
+  background: var(--surface-raised); box-shadow: var(--overlay-shadow);
+  border-radius: var(--r-overlay); padding: var(--sp-8) var(--sp-12);
+  color: var(--text-primary); font-size: var(--fs-13);
+  display: flex; align-items: center; gap: var(--sp-8);
+}
+/* A kind is said by a glyph and in words, never by a stripe (DESIGN.md §3.3, §10). */
+.toast__glyph { font-weight: 700; flex: none; }
+.toast--error .toast__glyph { color: var(--error); }
+.toast--warning .toast__glyph { color: var(--warning); }
+.toast--success .toast__glyph { color: var(--success); }
+
+/* The top bar (ADR-065). Whole items wrap to a second line when the window is narrow; a label is
+   never broken in two. */
+.app-header {
+  display: flex; flex-wrap: wrap; align-items: center;
+  gap: var(--sp-8) var(--sp-12);
+  padding: var(--sp-8) var(--sp-16);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.app-header .btn { white-space: nowrap; padding-left: var(--sp-8); padding-right: var(--sp-8); }
+/* The account, at the right-hand end. */
+.app-header__account { margin-left: auto; }
+
+/* Which application is open (ADR-065): a two-part switch, the open one marked as current is, and a
+   line under the bar while the Ingest Studio is open; neutral, since current is not brass (ADR-097). */
+.app-switcher { display: inline-flex; border: 1px solid var(--border); border-radius: var(--r-control); overflow: hidden; }
+.app-switcher .btn { border: 0; border-radius: 0; background: transparent; color: var(--text-secondary); }
+.app-switcher .btn:hover { background: var(--surface-hover); }
+.app-switcher .btn[aria-pressed="true"] { background: var(--surface-raised); color: var(--text-primary); box-shadow: inset 0 -2px 0 var(--text-primary); }
+.app-header[data-app="ingest"] { border-bottom: 2px solid var(--text-primary); }
+
+/* The search box carries its Filters button inside its own right-hand end. */
+.global-search { position: relative; min-width: 280px; }
+.global-search__field { position: relative; }
+/* The hint and the Filters panel are laid over the page under the box. In the page's flow they made the
+ * one-line top bar grow a second line (ADR-071). The hint never takes a click and dissolves when its
+ * time is up; it stays in the page, so a screen reader still has it. */
+.global-search__status {
+  position: absolute; top: 100%; left: 0; z-index: 35; margin-top: var(--sp-4);
+  max-width: 360px; padding: var(--sp-4) var(--sp-8);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-overlay);
+  color: var(--text-secondary);
+  font-size: var(--fs-12, var(--fs-13));
+  pointer-events: none;
+  transition: opacity 400ms ease;
+}
+.global-search__status[data-faded="true"] { opacity: 0; }
+.global-search .search-filters {
+  position: absolute; top: 100%; left: 0; z-index: 40; margin-top: var(--sp-4);
+  min-width: 260px;
+  border-radius: var(--r-overlay);
+  box-shadow: var(--overlay-shadow);
+}
+.global-search__field .input { width: 100%; box-sizing: border-box; padding-right: 52px; }
+.global-search__filters {
+  position: absolute; right: var(--sp-4); top: 50%; transform: translateY(-50%);
+  display: inline-flex; align-items: center; gap: var(--sp-4);
+  padding: var(--sp-4);
+  border: 1px solid transparent; border-radius: var(--r-control);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+.global-search__filters:hover { background: var(--surface-hover); color: var(--text-primary); }
+.global-search__filters[aria-expanded="true"],
+.global-search__filters[data-active="true"] { color: var(--text-primary); box-shadow: inset 0 -2px 0 var(--text-primary); }
+.global-search__count { font-size: var(--fs-12, var(--fs-13)); line-height: 1; }
+
+/* A button that opens a small panel (case choice, account). */
+.menu { position: relative; display: inline-block; }
+.menu-button { display: inline-flex; align-items: center; gap: var(--sp-6); max-width: 200px; }
+.menu-button__label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-flex; min-width: 0; }
+/* In the account button the user name may be cut short; the clearance never is. */
+.menu-button__name { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.menu-button__fixed { flex: none; margin-left: var(--sp-4); }
+.menu-panel {
+  position: absolute; top: 100%; left: 0; z-index: 40; margin-top: var(--sp-4);
+  min-width: 260px; max-width: 420px;
+  display: flex; flex-direction: column; gap: var(--sp-6);
+  padding: var(--sp-8);
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--r-overlay);
+  box-shadow: var(--overlay-shadow);
+}
+.menu-button--account { max-width: 260px; }
+.menu-panel--right { left: auto; right: 0; }
+.menu-panel__item {
+  text-align: left; font: inherit; font-size: var(--fs-13);
+  padding: var(--sp-6) var(--sp-8);
+  border: 1px solid transparent; border-radius: var(--r-control);
+  background: transparent; color: var(--text-primary); cursor: pointer;
+}
+.menu-panel__item:hover { background: var(--surface-hover); }
+.menu-panel__item[aria-current="true"] { border-color: var(--border); color: var(--text-primary); font-weight: 600; }
+.menu-panel__rule { border: 0; border-top: 1px solid var(--border-subtle); margin: var(--sp-2, 2px) 0; width: 100%; }
+.menu-panel__list { display: flex; flex-direction: column; gap: var(--sp-2, 2px); max-height: 280px; overflow-y: auto; }
+.menu-panel__term { color: var(--text-secondary); font-size: var(--fs-12, var(--fs-13)); }
+.menu-panel__value { overflow-wrap: anywhere; }
+
+/* The strip of case tabs above the workspace (ADR-084): the original case first, then its open
+   branches, then the Branches menu. Tokens only. */
+
+/* ADR-096: the three side panels (Inspector, Query builder, Metrics), denser, so more fits and is
+   easier to scan and move through. Tokens only; the rest of the Glass is unchanged. */
+.inspector, .metrics-panel, .query-builder-panel { font-size: var(--fs-12); line-height: var(--lh-12); }
+.inspector .panel__title, .metrics-panel .panel__title, .query-builder-panel .panel__title {
+  font-size: var(--fs-13); line-height: var(--lh-13); padding: var(--sp-6) var(--sp-12);
+}
+.inspector .panel__body, .metrics-panel .panel__body, .query-builder-panel .panel__body { padding: var(--sp-8); }
+.inspector .btn, .metrics-panel .btn, .query-builder-panel .btn {
+  font-size: var(--fs-12); line-height: var(--lh-12); padding: var(--sp-4) var(--sp-8);
+}
+.inspector .input, .inspector .select, .metrics-panel .input, .metrics-panel .select,
+.query-builder-panel .input, .query-builder-panel .select {
+  font-size: var(--fs-12); padding: var(--sp-4) var(--sp-6);
+}
+.inspector dl, .inspector dd, .inspector p { margin-top: 0; margin-bottom: var(--sp-4); }
+
+/* A part of a panel that folds away (ADR-096): minimalist and bordered, the owner's choice of style.
+   One hairline box per part, a little space between them, the header a full-width quiet row. */
+/* ADR-115 E6 (review item 14): rows divided by a hairline, not boxes. */
+.accordion-section {
+  border-bottom: 1px solid var(--border-subtle);
+}
+.accordion-section__heading { margin: 0; font-size: inherit; font-weight: inherit; }
+.accordion-section__header {
+  display: flex; align-items: center; gap: var(--sp-6); width: 100%;
+  min-height: var(--h-control-36); padding: var(--sp-6) var(--sp-8);
+  background: none; border: none; border-radius: var(--r-control);
+  color: var(--text-primary); font: inherit; font-size: var(--fs-13); font-weight: 600;
+  line-height: var(--lh-13); text-align: left; cursor: pointer;
+}
+.accordion-section__header:hover, .accordion-section__header:focus-visible { background: var(--surface-hover); }
+.accordion-section__chevron { color: var(--text-tertiary); flex: none; transition: transform var(--dur-fast) var(--ease); }
+.accordion-section__header[aria-expanded="true"] .accordion-section__chevron { transform: rotate(90deg); }
+@media (prefers-reduced-motion: reduce) { .accordion-section__chevron { transition: none; } }
+.accordion-section__content { padding: var(--sp-8); }
+
+/* The selection bar (ADR-097 step 1, design review item 2): floating, bottom centre of the canvas,
+   an overlay, so a shadow and no hairline (DESIGN.md §6). Inverse surface (the tooltip's own
+   `n11`-on-`surface-app` pairing), so it never reads as part of the right-click menu, which sits
+   on `surface-raised` beside it (the owner, 9 October 2026: "the right menu and quick menu gets
+   confusing"). */
+.selection-bar {
+  position: absolute; left: 50%; bottom: var(--sp-12); transform: translateX(-50%); z-index: 12;
+  display: flex; align-items: center; gap: var(--sp-4);
+  padding: var(--sp-4) var(--sp-4) var(--sp-4) var(--sp-12);
+  background: var(--n11); color: var(--surface-app); box-shadow: var(--overlay-shadow);
+  border-radius: var(--r-panel); font-size: var(--fs-12); line-height: var(--lh-12); white-space: nowrap;
+}
+.selection-bar__count { margin-right: var(--sp-8); color: var(--surface-app); font-weight: 600; font-variant-numeric: tabular-nums; }
+.selection-bar .btn {
+  font-size: var(--fs-12); line-height: var(--lh-12); padding: var(--sp-4) var(--sp-8);
+  background: transparent; border-color: var(--n8); color: var(--surface-app);
+}
+.selection-bar .btn:hover, .selection-bar .btn:focus-visible { background: var(--n9); }
+/* The bar after the reference (the owner, 14 October 2026: "more elegant and intuitive"): one line,
+   quiet actions with no box of their own, Clear after a hairline. */
+.selection-bar .btn--quiet { border-color: transparent; }
+.selection-bar__divider { width: 1px; height: 16px; margin: 0 var(--sp-2); background: var(--n8); }
+/* ADR-098 Amendment 4: *Show links* · *− direct +*, one control read as a sentence. */
+.selection-bar__links { display: inline-flex; align-items: center; }
+.selection-bar__stepper { display: inline-flex; align-items: center; border-left: 1px solid var(--n8); padding-left: var(--sp-2); }
+.selection-bar__step {
+  width: 22px; height: 24px; display: grid; place-items: center; padding: 0;
+  font: inherit; font-size: var(--fs-13); color: var(--surface-app); background: transparent;
+  border: 0; border-radius: var(--r-control); cursor: pointer;
+}
+.selection-bar__step:hover:not(:disabled), .selection-bar__step:focus-visible { background: var(--n9); }
+.selection-bar__step:disabled { opacity: 0.35; cursor: default; }
+.selection-bar__reading { min-width: 5.5em; text-align: center; font-family: var(--mono); font-size: var(--fs-11); color: var(--surface-app); }
+
+/* The workspace shell (ADR-097 step 1, design review items 1 and 16). */
+.classification-strip {
+  box-sizing: border-box; height: 20px; flex: none; display: flex; align-items: center; justify-content: center;
+  background: var(--surface-raised); border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-primary); font-size: var(--fs-11); line-height: var(--lh-11); font-weight: 600;
+}
+.top-bar { box-sizing: border-box; height: var(--h-top-bar); flex: none; flex-wrap: nowrap; padding-top: 0; padding-bottom: 0; }
+.top-bar__search { flex: 1 1 280px; min-width: 280px; max-width: 480px; }
+/* Narrow windows (ADR-115 Amendment 2): two lines rather than one too wide to see — the case and
+   search on the first, the views and the account, clearance included, on the second. */
+@media (max-width: 1099px) {
+  .top-bar { height: auto; min-height: var(--h-top-bar); flex-wrap: wrap; padding-top: var(--sp-6); padding-bottom: var(--sp-6); }
+}
+.brand-mark { display: inline-flex; align-items: center; gap: var(--sp-6); flex: none; }
+.brand-mark__name { font-weight: 700; font-size: var(--fs-14); color: var(--text-primary); }
+/* A segmented control: one choice of several, current shown as current (ADR-097, review item 7). */
+.segmented { display: inline-flex; border: 1px solid var(--border); border-radius: var(--r-control); overflow: hidden; flex: none; }
+.segmented__item {
+  font: inherit; font-size: var(--fs-12); line-height: var(--lh-12); padding: var(--sp-4) var(--sp-8);
+  background: transparent; border: 0; color: var(--text-secondary); cursor: pointer; min-height: 24px;
+}
+.segmented__item + .segmented__item { border-left: 1px solid var(--border-subtle); }
+.segmented__item:hover { background: var(--surface-hover); color: var(--text-primary); }
+.segmented__item[aria-pressed="true"] { background: var(--surface-raised); color: var(--text-primary); box-shadow: inset 0 -2px 0 var(--text-primary); }
+.left-rail {
+  box-sizing: border-box; width: var(--w-rail); flex: none; display: flex; flex-direction: column; gap: var(--sp-4);
+  padding: var(--sp-6) var(--sp-6); border-right: 1px solid var(--border-subtle); background: var(--surface-panel);
+}
+.left-rail[data-expanded="true"] { width: 180px; }
+.left-rail__item {
+  display: flex; align-items: center; gap: var(--sp-8); height: var(--h-rail-button); min-width: var(--h-rail-button);
+  padding: 0 var(--sp-8); box-sizing: border-box;
+  background: transparent; border: 0; border-radius: var(--r-control); color: var(--text-secondary);
+  font: inherit; font-size: var(--fs-12); cursor: pointer; text-align: left;
+}
+.left-rail__item:hover, .left-rail__item:focus-visible { background: var(--surface-hover); color: var(--text-primary); }
+.left-rail__item[aria-pressed="true"] { background: var(--surface-raised); color: var(--text-primary); box-shadow: inset 2px 0 0 var(--text-primary); }
+.left-rail__help { margin-top: auto; }
+.left-rail__help + .left-rail__toggle { margin-top: 0; }
+.left-rail__toggle { margin-top: auto; }
+.left-rail__item { position: relative; }
+/* A count on a rail entry (ADR-115 E6): mono, small, at the icon's top right. */
+.left-rail__badge {
+  position: absolute; top: var(--sp-2); left: var(--sp-20); min-width: var(--sp-12); padding: 0 var(--sp-2);
+  font-size: var(--fs-11); line-height: var(--lh-11); text-align: center;
+  color: var(--text-primary); background: var(--surface-hover); border-radius: var(--r-pill);
+}
+.left-rail__glyph { width: var(--sp-16); text-align: center; font-weight: 700; }
+.left-rail__name { white-space: nowrap; }
+/* A view's own toolbar (ADR-097 step 1): what belongs to one view, docked above it (DESIGN.md §5a). */
+.view-toolbar {
+  box-sizing: border-box; height: var(--h-canvas-toolbar); flex: none; display: flex; align-items: center; gap: var(--sp-8); padding: 0 var(--sp-8);
+  border-bottom: 1px solid var(--border-subtle); background: var(--surface-panel); font-size: var(--fs-12);
+}
+/* The case tabs in the rail's Cases panel (Amendment 1): a list, each branch indented beneath its case. */
+/* A side panel's one header row (ADR-097 step 1, design review item 8): 28px, the name at `--fs-12`
+   600 in secondary text, a hairline below; the handle and the arranging menu quiet. The panel's own
+   title is not drawn again inside it. */
+.side-panel-header {
+  box-sizing: border-box; min-height: 28px; flex: none; display: flex; align-items: center; flex-wrap: wrap;
+  gap: var(--sp-4); padding: 0 var(--sp-4) 0 var(--sp-2); border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-secondary); font-size: var(--fs-12); line-height: var(--lh-12); font-weight: 600;
+}
+.side-panel-header[draggable="true"] { cursor: grab; }
+.side-panel-header__name { flex: 1; }
+.side-panel-header__menu {
+  min-width: 24px; min-height: 24px; background: transparent; border: 0; border-radius: var(--r-control);
+  color: var(--text-secondary); font: inherit; cursor: pointer;
+}
+.side-panel-header__menu:hover, .side-panel-header__menu:focus-visible, .side-panel-header__menu[aria-expanded="true"] { background: var(--surface-hover); color: var(--text-primary); }
+.side-panel-header__moves { display: flex; gap: var(--sp-2); width: 100%; justify-content: flex-end; padding-bottom: var(--sp-4); }
+.side-panel-header__moves[hidden] { display: none; }
+[data-panel-slot] .panel > .panel__title { display: none; }
+/* The graph canvas (ADR-097 step 2, design review item 10). The measurement grid of DESIGN.md §9
+   exception 4: 1px `--border-subtle` lines on an 8px lattice, on this surface and no other. */
+.network-canvas {
+  background-color: var(--surface-sunken);
+  background-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 16px 16px;
+}
+/* The zoom cluster and the legend: docked overlays on the canvas, a hairline and no shadow; ADR-115 E4
+   (the reference): one column at the canvas's top right, the legend over the zoom group. Below the
+   toolbar as drawn — the canvas measures it into `--canvas-toolbar-height`, since it wraps to a
+   second row on a narrow canvas (the owner, 14 October 2026). */
+.canvas-corner {
+  position: absolute; z-index: 10; right: var(--sp-8); top: calc(var(--canvas-toolbar-height, var(--h-canvas-toolbar)) + var(--sp-8));
+  display: flex; flex-direction: column; align-items: flex-end; gap: var(--sp-8); pointer-events: none;
+}
+.canvas-corner > * { pointer-events: auto; }
+.canvas-zoom {
+  display: flex; flex-direction: column; background: var(--surface-panel);
+  border: 1px solid var(--border-subtle); border-radius: var(--r-control);
+}
+.canvas-zoom__readout {
+  min-width: var(--h-control-28); min-height: var(--h-control-28); display: grid; place-items: center;
+  padding: 0 var(--sp-4); font-size: var(--fs-11); color: var(--text-secondary); border-top: 1px solid var(--border-subtle);
+}
+.canvas-zoom__readout + .canvas-zoom__button { border-top: 1px solid var(--border-subtle); }
+.canvas-zoom__button {
+  min-width: var(--h-control-28); min-height: var(--h-control-28); display: grid; place-items: center; padding: 0;
+  background: transparent; border: 0; color: var(--text-secondary); font: inherit; font-size: var(--fs-13); cursor: pointer;
+}
+.canvas-zoom__button + .canvas-zoom__button { border-top: 1px solid var(--border-subtle); }
+.canvas-zoom__button:hover, .canvas-zoom__button:focus-visible { background: var(--surface-hover); color: var(--text-primary); }
+.canvas-legend {
+  max-width: 220px;
+  background: var(--surface-panel); border: 1px solid var(--border-subtle); border-radius: var(--r-control);
+  font-size: var(--fs-12); line-height: var(--lh-12); color: var(--text-secondary);
+}
+/* Moved from its dock it floats: an overlay's shadow, no hairline (DESIGN.md §6). */
+.canvas-legend--moved { border-color: transparent; box-shadow: var(--overlay-shadow); }
+.canvas-legend__head { display: flex; align-items: center; }
+.canvas-legend__grip {
+  flex: none; min-width: 24px; min-height: 24px; display: grid; place-items: center; padding: 0;
+  background: transparent; border: 0; color: var(--text-tertiary); font: inherit; cursor: grab; touch-action: none;
+}
+.canvas-legend__grip:active { cursor: grabbing; }
+.canvas-legend__grip:hover, .canvas-legend__grip:focus-visible { color: var(--text-primary); }
+.canvas-legend__toggle {
+  flex: 1; min-height: 24px; text-align: left; padding: var(--sp-4) var(--sp-8);
+  background: transparent; border: 0; color: inherit; font: inherit; font-weight: 600; cursor: pointer;
+}
+.canvas-legend__toggle:hover, .canvas-legend__toggle:focus-visible { color: var(--text-primary); }
+.canvas-legend__list { list-style: none; margin: 0; padding: 0 var(--sp-8) var(--sp-6); display: grid; gap: var(--sp-2); }
+.canvas-legend__list[hidden] { display: none; }
+.canvas-legend__list li { display: flex; justify-content: space-between; gap: var(--sp-8); color: var(--text-primary); }
+/* The canvas toolbar (ADR-097 step 2, design review item 12): one docked row along the canvas's top
+   edge, a hairline below and no shadow (DESIGN.md §6); labelled groups, the Show group one segmented
+   control. Its controls are quiet buttons here, not the floating overlay buttons they are elsewhere. */
+.canvas-toolbar {
+  box-sizing: border-box; position: absolute; z-index: 10; top: 0; left: 0; right: 0; min-height: var(--h-canvas-toolbar);
+  display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-4) var(--sp-12); padding: var(--sp-2) var(--sp-8);
+  background: var(--surface-panel); border-bottom: 1px solid var(--border-subtle);
+  font-size: var(--fs-12); line-height: var(--lh-12);
+}
+.canvas-toolbar__group { display: flex; align-items: center; gap: var(--sp-4); }
+.canvas-toolbar__group--end { margin-left: auto; }
+.canvas-toolbar__label { color: var(--text-tertiary); font-weight: 600; }
+.canvas-toolbar__status { display: inline-flex; align-items: center; gap: var(--sp-4); position: relative; }
+.canvas-toolbar__note { color: var(--text-secondary); }
+.canvas-toolbar .radial-menu__item {
+  box-shadow: none; background: transparent; padding: var(--sp-2) var(--sp-8); min-height: 24px;
+  font-size: var(--fs-12); color: var(--text-secondary);
+}
+.canvas-toolbar .radial-menu__item:hover, .canvas-toolbar .radial-menu__item:focus-visible { background: var(--surface-hover); color: var(--text-primary); }
+.canvas-toolbar .radial-menu__item[aria-pressed="true"], .canvas-toolbar .radial-menu__item[aria-expanded="true"] {
+  background: var(--surface-raised); color: var(--text-primary); box-shadow: inset 0 -2px 0 var(--text-primary);
+}
+.canvas-toolbar .radial-menu__item:disabled { color: var(--text-disabled); cursor: default; }
+.canvas-toolbar select { font-size: var(--fs-12); min-height: 24px; max-width: 150px; }
+.canvas-toolbar__show { border-color: var(--border-subtle); overflow: visible; }
+.canvas-toolbar__show > * + * { border-left: 1px solid var(--border-subtle); }
+.canvas-toolbar__show .radial-menu__item { border-radius: 0; }
+/* A toolbar menu's panel, laid over the canvas under its button: an overlay, so a shadow. */
+.canvas-menu { position: relative; display: flex; }
+.canvas-menu-panel {
+  position: absolute; top: calc(100% + var(--sp-4)); left: 0; z-index: 30; min-width: 240px;
+  box-shadow: var(--overlay-shadow);
+}
+.canvas-menu-panel--end { left: auto; right: 0; }
+/* The timeline's header (ADR-097 step 3): the mode switch, a note when it is shown by the hour, and
+   an overflow menu for setting exact dates and overlaying another case, laid over the chart. */
+.timeline__note { color: var(--text-secondary); font-size: var(--fs-12); }
+.timeline__more { position: relative; display: inline-flex; }
+.timeline__menu {
+  position: absolute; right: 0; top: calc(100% + var(--sp-4)); z-index: 30;
+  display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-4); padding: var(--sp-8);
+  background: var(--surface-raised); border: 1px solid var(--border-subtle); border-radius: var(--r-control);
+  box-shadow: var(--overlay-shadow);
+}
+/* ADR-097 step 3 (design review item 15): room to read the case and to type a search; words kept
+   for assistive technology that the bar does not show. */
+.menu-button--case { min-width: 240px; max-width: 320px; }
+.case-scope { font-size: var(--fs-11); color: var(--text-secondary); border: 1px solid var(--border); border-radius: var(--r-control); padding: 0 var(--sp-4); white-space: nowrap; letter-spacing: 0.02em; }
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap; border: 0;
+}
+/* Where nodes were before the last re-layout, under reduced motion (02_GLASS_FRONTEND.md §3.4). */
+.previous-positions { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 2; overflow: hidden; }
+.previous-positions__line { stroke: var(--border-strong); stroke-width: 1; stroke-dasharray: 4 2; }
+.previous-positions__mark { fill: none; stroke: var(--text-secondary); stroke-width: 1.5; }
+/* The status bar (02_GLASS_FRONTEND.md §2 rule 4; ADR-097 step 3): counts as pairs. */
+.status-bar {
+  min-height: var(--h-status-bar); box-sizing: border-box;
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--sp-4) var(--sp-16);
+  padding: 0 var(--sp-16);
+  border-top: 1px solid var(--border-subtle); color: var(--text-secondary); font-size: var(--fs-11); line-height: var(--lh-11);
+}
+.status-bar__counts { display: flex; flex-wrap: wrap; gap: var(--sp-4) var(--sp-16); }
+.status-bar__tip { display: flex; align-items: center; gap: var(--sp-8); min-width: 0; }
+.status-bar__tip-label { font-weight: 600; color: var(--text-primary); }
+.status-bar__next { min-height: var(--h-control-24); padding: 0 var(--sp-6); font-size: var(--fs-11); }
+.status-pair { display: inline-flex; align-items: baseline; gap: var(--sp-4); white-space: nowrap; }
+.status-pair .value { color: var(--text-primary); }
+/* The grid switched off from the canvas toolbar's Show group (owner, 6 October 2026). */
+.network-canvas--no-grid { background-image: none; }
+/* A side panel's name folds the whole panel (owner, 6 October 2026). */
+.side-panel-header__toggle {
+  display: inline-flex; align-items: center; gap: var(--sp-4); min-height: 24px; padding: 0 var(--sp-4);
+  background: transparent; border: 0; border-radius: var(--r-control); color: inherit; font: inherit; text-align: left; cursor: pointer;
+}
+.side-panel-header__toggle:hover, .side-panel-header__toggle:focus-visible { color: var(--text-primary); background: var(--surface-hover); }
+.side-panel-header__chevron { transition: transform var(--dur-fast) var(--ease); transform: rotate(90deg); }
+.side-panel-header__toggle[aria-expanded="false"] .side-panel-header__chevron { transform: none; }
+@media (prefers-reduced-motion: reduce) { .side-panel-header__chevron { transition: none; } }
+/* Marking an entity by hand in the reader (ADR-098 decision 5). */
+.reader-mark { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-8); padding: var(--sp-8) 0; border-top: 1px solid var(--border-subtle); font-size: var(--fs-13); }
+.reader-mark__title { font-weight: 600; color: var(--text-secondary); }
+.reader-mark input { min-width: 240px; min-height: 24px; }
+.reader-mark select { min-height: 24px; }
+.reader-mark__message { color: var(--text-secondary); }
+
+/* ADR-111 Amendment 3: the Superset frame the embedded SDK adds fills its panel. */
+.embedded-dashboard {
+  display: flex;
+}
+.embedded-dashboard iframe {
+  flex: 1;
+  width: 100%;
+  min-height: 480px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-panel, 4px);
+  background: var(--surface-panel);
+}
+
+/* Start (ADR-114 Amendment 5 point 9): a tile per place, and the mark as the way back to it. */
+.brand-mark-button { display: inline-flex; align-items: center; padding: var(--sp-4); margin: calc(-1 * var(--sp-4)); border: 0; border-radius: var(--r-control); background: none; color: inherit; font: inherit; cursor: pointer; }
+.brand-mark-button:hover, .brand-mark-button:focus-visible { background: var(--surface-hover); }
+.start-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: var(--sp-16); }
+.start-tile {
+  display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-8); text-align: left;
+  padding: var(--sp-16); min-height: 160px; font: inherit; color: var(--text-primary); cursor: pointer;
+  background: var(--surface-panel); border: 1px solid var(--border-subtle); border-radius: var(--r-panel);
+  transition: background-color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+}
+.start-tile:hover { background: var(--surface-hover); }
+.start-tile:focus-visible { background: var(--surface-hover); border-color: var(--brass); }
+.start-tile__title { font-size: var(--fs-16); font-weight: 600; }
+.start-tile__does { color: var(--text-secondary); }
+.start-tile__then { margin-top: auto; }
+
+/* A key, as the reference sets one (ADR-115 E4): mono, in a hairline box. */
+.key-cap {
+  display: inline-block; min-width: var(--sp-16); box-sizing: border-box; padding: 0 var(--sp-4);
+  border: 1px solid var(--border); border-radius: var(--r-1);
+  font: 600 var(--fs-11) / var(--lh-11) var(--mono); text-align: center; color: inherit;
+}
+/* The canvas's own focus ring (DESIGN.md §8; ADR-115 E4): inset, so it is never clipped by the
+   panels beside it. It used to be suppressed. */
+.network-canvas:focus-visible { outline: 2px solid var(--brass); outline-offset: -2px; }
+/* The Inspector's single node (ADR-115 E4; the reference): a 96px key column, the node's marking as a
+   badge, and the provenance stroke as the canvas draws it. */
+.inspector-keys { margin: 0; display: grid; gap: var(--sp-4); }
+.inspector-keys > div { display: grid; grid-template-columns: var(--w-inspector-key) minmax(0, 1fr); gap: var(--sp-8); }
+.inspector-keys dd { margin: 0; overflow-wrap: anywhere; }
+.marking-badge {
+  margin-left: auto; flex: none; padding: 0 var(--sp-4); font-size: var(--fs-11); font-weight: 600;
+  color: var(--text-secondary); border: 1px solid var(--border-subtle); border-radius: var(--r-1);
+}
+.provenance-stroke line { stroke: var(--text-secondary); stroke-width: 1.5; }
+/* The bottom panel's row (ADR-115 E4; DESIGN.md §5a): 34px — the chevron, the title, the summary. */
+.bottom-panel__head {
+  box-sizing: border-box; height: var(--h-timeline); flex: none;
+  display: flex; align-items: center; gap: var(--sp-8); padding: 0 var(--sp-8);
+}
+.bottom-panel__toggle { min-width: var(--h-control-24); min-height: var(--h-control-24); padding: 0; }
+.bottom-panel__title { font-size: var(--fs-12); font-weight: 600; color: var(--text-secondary); }
+.timeline-strip { flex: 1; min-width: 0; display: flex; align-items: center; gap: var(--sp-12); }
+.timeline-strip__bars { flex: 1; height: var(--sp-16); display: flex; align-items: flex-end; gap: 1px; overflow: hidden; }
+.timeline-strip__bar { flex: 1; min-width: 1px; background: var(--seq-2); }
+.timeline-strip__range { flex: none; font-size: var(--fs-11); color: var(--text-tertiary); }
+.layout-rerun { min-width: var(--h-control-24); min-height: var(--h-control-24); padding: 0; display: inline-grid; place-items: center; }
+/* A link's hover tooltip (ADR-115 E5): an overlay, so a shadow and no hairline (DESIGN.md §6). */
+.link-tooltip {
+  position: absolute; z-index: 30; pointer-events: none; display: grid; gap: var(--sp-2);
+  padding: var(--sp-4) var(--sp-8); background: var(--surface-raised); box-shadow: var(--overlay-shadow);
+  border-radius: var(--r-2); font-size: var(--fs-12); line-height: var(--lh-12); color: var(--text-secondary);
+}
+.link-tooltip__type { color: var(--text-primary); font-weight: 600; }
+/* The workspace's welcome panel (ADR-115 E6; DESIGN.md §5a): an overlay at the canvas's top left —
+   a shadow, no hairline — 320px (280px below 1100), leaving 72px clear for the selection bar. */
+.workspace-welcome {
+  position: absolute; z-index: 15; left: var(--sp-8); top: calc(var(--h-canvas-toolbar) + var(--sp-8));
+  width: var(--w-welcome-panel); box-sizing: border-box; max-height: calc(100% - var(--h-canvas-toolbar) - 72px);
+  overflow-y: auto; padding: var(--sp-12) var(--sp-16) var(--sp-16);
+  background: var(--surface-raised); border-radius: var(--r-3); box-shadow: var(--overlay-shadow);
+  font-size: var(--fs-13); line-height: var(--lh-13);
+}
+@media (max-width: 1099px) { .workspace-welcome { width: var(--w-welcome-panel-narrow); } }
+.workspace-welcome__head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-8); }
+.workspace-welcome__head h2 { margin: 0; font-size: var(--fs-16); line-height: var(--lh-16); font-weight: 700; }
+.workspace-welcome__close { min-width: var(--h-control-24); min-height: var(--h-control-24); padding: 0; }
+.workspace-welcome__summary { margin: var(--sp-8) 0 var(--sp-12); color: var(--text-secondary); }
+.workspace-welcome h3 { margin: var(--sp-12) 0 var(--sp-6); font-size: var(--fs-12); line-height: var(--lh-12); font-weight: 600; color: var(--text-secondary); }
+.workspace-welcome__history, .workspace-welcome__keys { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--sp-4); }
+.workspace-welcome__step {
+  width: 100%; display: grid; gap: var(--sp-2); text-align: left; padding: var(--sp-4) var(--sp-6);
+  font: inherit; color: var(--text-primary); background: none; border: 0; border-radius: var(--r-1); cursor: pointer;
+}
+.workspace-welcome__step:hover { background: var(--surface-hover); }
+.workspace-welcome__step .value { font-size: var(--fs-11); color: var(--text-tertiary); }
+.workspace-welcome__keys li { display: grid; grid-template-columns: var(--sp-40) minmax(0, 1fr); align-items: center; gap: var(--sp-8); }
+/* ADR-115 E6 (DESIGN.md §5a): below 1100px the toolbar's "Last change" note gives its room back. */
+.canvas-toolbar__last-change { flex: 0 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-tertiary); }
+@media (max-width: 1099px) { .canvas-toolbar__last-change { display: none; } }
+
+/* One tree of cases (ADR-084 Amendment 4): each case, its branches beneath it, in the case menu and
+   the Cases drawer alike. */
+.case-tree__list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--sp-2); }
+.case-tree__row { display: grid; gap: var(--sp-4); }
+.case-tree__row--branch { padding-left: var(--sp-16); }
+.case-tree__line { display: flex; align-items: center; gap: var(--sp-8); min-height: var(--h-control-28); }
+.case-tree__name {
+  flex: 1; min-width: 0; text-align: left; padding: var(--sp-4) var(--sp-8); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font: inherit; font-size: var(--fs-13); color: var(--text-primary); background: transparent;
+  border: 0; border-radius: var(--r-control); cursor: pointer;
+}
+.case-tree__row--branch .case-tree__name { color: var(--text-secondary); }
+.case-tree__name:hover, .case-tree__name:focus-visible { background: var(--surface-hover); color: var(--text-primary); }
+.case-tree__name[aria-current="page"] { font-weight: 600; color: var(--text-primary); background: var(--surface-raised); box-shadow: inset 2px 0 0 var(--text-primary); }
+.case-tree__meta { flex: none; font-size: var(--fs-11); color: var(--text-tertiary); }
+.case-tree__more {
+  flex: none; width: 24px; height: 24px; display: grid; place-items: center; padding: 0; font: inherit;
+  color: var(--text-secondary); background: transparent; border: 0; border-radius: var(--r-control); cursor: pointer;
+}
+.case-tree__more:hover, .case-tree__more:focus-visible, .case-tree__more[aria-expanded="true"] { background: var(--surface-hover); color: var(--text-primary); }
+.case-tree__actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-4); padding-left: var(--sp-8); font-size: var(--fs-12); }
+.case-tree__actions--confirm > span { flex-basis: 100%; color: var(--text-secondary); }
+.case-tree__danger { color: var(--error); }
+.case-tree__problem { margin: var(--sp-4) 0 0; font-size: var(--fs-12); color: var(--error); }
+

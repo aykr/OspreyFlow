@@ -1,0 +1,139 @@
+[project]
+name = "ospreyflow"
+version = "0.0.0"
+requires-python = ">=3.12"
+dependencies = [
+    "pyarrow>=25.0.1",
+    "pydantic>=2.9",
+    "pyyaml>=6.0",
+    "jsonschema>=4.23",
+    "python-ulid>=3.0",
+    "httpx>=0.27",
+    "duckdb>=1.1",
+    "phonenumbers>=8.13",
+    "pyproj>=3.6",
+    "python-dateutil>=2.9",
+    "valkey>=6.1.1",
+    "msgpack>=1.2.2",
+    "fastapi>=0.141.1",
+    "uvicorn[standard]>=0.53.0",
+    "pyjwt>=2.14.0",
+    "cryptography>=50.0.1",
+    "asyncpg>=0.31.0",
+    "websockets>=17.1",
+    # `UploadFile`/`File(...)` — the site-image upload route
+    # (`services/api/site_images.py`) is the first multipart endpoint in
+    # the Conduit; FastAPI shells out to this package to parse the body.
+    "python-multipart>=0.0.20",
+    # A tier-4 WMTS capabilities document (`services/api/tier4_registration.py`)
+    # is untrusted, network-fetched, deployer-configured XML — stdlib
+    # `xml.etree.ElementTree` is vulnerable to XXE/billion-laughs against
+    # exactly that kind of input; `defusedxml` is the safe drop-in.
+    "defusedxml>=0.7.1",
+    # Pinned exactly, not >=: 4.x/5.x add a hard, non-optional dependency on
+    # `igraph`, which is GPL-licensed and fails `make licence-check` —
+    # `spec/06_DECISIONS.md` ADR-021 has the full finding. 3.9.9 depends on
+    # `phonetics` (MIT) instead. Re-check `igraph` is still absent from
+    # `requires_dist` on PyPI before ever bumping this pin.
+    "splink==3.9.9",
+    # `adapters/compute_rustworkx` — ComputePort Tier 2, `00_ARCHITECTURE.md` §2.3.
+    # Apache-2.0, Rust core.
+    "rustworkx>=0.15",
+    # Community detection only (`louvain_communities`) — Leiden is unavailable on either
+    # compute tier (no browser-ecosystem implementation, and the standard Python route,
+    # `leidenalg`, pulls in GPL-licensed `igraph` — the same package ADR-021 already
+    # rejected for Splink). BSD-3; the bare install has zero required dependencies
+    # (numpy/scipy/matplotlib are opt-in `extras` this build does not need) — confirmed via
+    # `Requires-Dist` before adding, not assumed light. `spec/06_DECISIONS.md` ADR-029 has
+    # the full finding; `04_VAULT_BACKEND.md` already named NetworkX as a conformance
+    # reference implementation before this pin made it a real one.
+    "networkx>=3.4",
+    "croniter>=6.2.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "mypy>=1.13",
+    "ruff>=0.7",
+    "pip-licenses>=5.0",
+    "types-pyyaml>=6.0",
+    "types-jsonschema>=4.23",
+    "types-python-dateutil>=2.9",
+    "types-defusedxml>=0.7",
+    "types-networkx>=3.4",
+]
+
+[tool.mypy]
+# `cli`: the `ospreyflow` command's own package, which the install page imports (ADR-114).
+mypy_path = "packages:cli"
+python_version = "3.12"
+strict = true
+namespace_packages = true
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+module = "pyarrow.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "asyncpg.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "msgpack.*"
+ignore_missing_imports = true
+
+# `splink==3.9.9` (spec/06_DECISIONS.md ADR-021) and its own transitive `phonetics`/`pandas`
+# dependencies ship no type stubs or py.typed marker.
+[[tool.mypy.overrides]]
+module = "splink.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "phonetics.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "pandas.*"
+ignore_missing_imports = true
+
+# `croniter` (spec/06_DECISIONS.md ADR-110) ships no py.typed marker.
+[[tool.mypy.overrides]]
+module = "croniter.*"
+ignore_missing_imports = true
+
+# `geopy` (spec/06_DECISIONS.md ADR-108 ruling Q5's online geocoding) ships no py.typed marker.
+[[tool.mypy.overrides]]
+module = "geopy.*"
+ignore_missing_imports = true
+
+# The recognisers' own model libraries (ADR-098) are installed only in their own images, not in the
+# development environment CI type-checks from; and none ships a py.typed marker.
+[[tool.mypy.overrides]]
+module = ["stanza.*", "transformers.*", "spacy.*"]
+ignore_missing_imports = true
+
+[tool.ruff]
+target-version = "py312"
+src = ["packages", "services"]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.uv]
+package = false
+
+# ADR-108 phase D (9-10 October 2026): the in-process recognisers and address enrichment.
+# Installed where extraction pipelines run; the CI image deliberately carries none of them.
+# Licences: spec/00_ARCHITECTURE.md §7 (deepparse is the recorded LGPL-3.0 exception).
+[project.optional-dependencies]
+extraction = [
+    "spacy>=3.8",
+    "transformers>=4.50",
+    "torch>=2.6",
+    "deepparse>=0.9",
+    "geopy>=2.4",
+]

@@ -1,0 +1,286 @@
+# The default ontology — spec/01_DOMAIN_MODEL.md §1.
+#
+# `SAME_AS` and `NOT_SAME_AS` are not listed here: the loader always injects
+# both as system edge types (ADR-006), regardless of what a deployment's
+# ontology says, so they are never hand-authored or removable.
+#
+# v4 (Phase 2): COMMUNICATED_WITH gained `duration_s`/`direction` — a
+# content change, not a fixture fix, so it bumps the version like any other
+# ontology change would. A recipe still declaring `ontology_version: 3` is
+# blocked by `services/ingest/engine.py`'s `run_recipe` until it is opened
+# and re-published against v4 (`09_INGEST_STUDIO.md`).
+#
+# v5 (Phase 2, corrected in v6): Location briefly gained `lon`/`lat`/
+# `source_crs`/`source_x`/`source_y` directly — a real defect, since
+# 03_CONDUIT_MIDDLEWARE.md §5.1 states geometry lives in the analytics
+# store with the graph node holding only a reference. v6 replaces all
+# five with a single optional `geometry_ref`.
+#
+# v6 (Phase 2): Location gained `geometry_ref` (optional — a jurisdiction
+# or an administrative boundary has no single point and must be able to
+# carry none at all) pointing at a row in the analytics store's geometry
+# reference partition (`01_DOMAIN_MODEL.md` §7.1, `schemas/analytics.py`'s
+# `GeometryRecord`). Never `lon`/`lat`/`source_x`/`source_y` on the node
+# itself — see the v5 note above for why that was wrong.
+#
+# v7 (Phase 5): Location gained `name` (optional — a bare grid cell has
+# none). A gazetteer connector (`services/ingest/connectors/geo/`)
+# produces named places — "Cranford", a city, a POI — and
+# `02_GLASS_FRONTEND.md` §3.5's gazetteer search resolves free-text place
+# mentions against exactly this property. `place_kind` (an OSM `place=*`/
+# POI-tag value) is deliberately not a property here: the recipe engine's
+# `_resolve_binding` treats an empty bound field as a rejected row, not an
+# omitted property (`services/ingest/engine.py`), so a genuinely optional
+# per-node classification has no way to bind cleanly yet — recorded as an
+# open item rather than worked around with a fabricated default value.
+# Every recipe fixture pinned to `ontology_version: 6` is bumped to 7
+# alongside this change — none of them bind `name`, so nothing about their
+# own behaviour changes; they are just re-published against the current
+# ontology, the same re-publish `09_INGEST_STUDIO.md` describes for any
+# ontology edit.
+#
+# v8 (Phase 5, the HMP fixture's graph side): three additions, none of
+# them external-gazetteer identifiers, because none of this is external
+# data. `Location` gained `site_ref` — a deployment-internal reference
+# (a yard, a wing, a cell, eventually a site-grid cell) distinct from
+# `uprn`/`osm_id`/etc., which all name a place in an *external* gazetteer.
+# `Organisation` gained `org_ref` (the same idea, for an internal group
+# with no Companies House number or EIN) and `name` (it had no display
+# property at all until now — the same gap `name` closed for `Location`
+# in v7). `Document` gained `title`, for the same reason. Every recipe
+# fixture pinned to `ontology_version: 7` is bumped to 8 alongside this.
+#
+# v9 (Phase 5 Checkpoint 3c): four new *external*-gazetteer identifiers on
+# `Location` — the same category `uprn`/`gnis_feature_id`/`tiger_geoid`/
+# `osm_id` already are, not the internal `*_ref` category v8 added.
+# `os_place_id` (OS Open Names), `postcode` (Code-Point Open — a
+# postcode-centroid gazetteer entry, distinct from the `postcode` Knowledge
+# Adapter's own normalised-string output on other entity types),
+# `gss_code` (Boundary-Line's ONS administrative-area code — this is the
+# one identifier here whose `Location` typically has no `geometry_ref` at
+# all, per that property's own existing "a jurisdiction... must be able to
+# carry none" allowance), and `nad_address_id` (US National Address
+# Database). Every recipe fixture pinned to `ontology_version: 8` is
+# bumped to 9 alongside this.
+#
+# v10 (ADR-055, the PaySim dataset): an account is an `Endpoint`, so `endpoint_kind` gained
+# `account` (customers and merchants alike). `TRANSACTED` gained `amount` (float) and
+# `transaction_type` (CASH_IN, CASH_OUT, DEBIT, PAYMENT, TRANSFER) so a money flow can be followed
+# by value from the graph itself. Fraud labels are deliberately not edge properties: they live on
+# the analytics events. Every recipe fixture pinned to `ontology_version: 10` is bumped to 10
+# alongside this.
+#
+# v11 (ADR-074): the names and titles an analyst types into the search box are now `indexed`, so
+# the type-ahead finds them: `Person.family_name` and `given_names`, `Organisation.name` and
+# `Document.title`. Nothing a recipe may write changed; the version moves because a property's
+# `indexed` flag is ontology content, and the schema step creates an index for each. A sensitive
+# property is never marked, since a prefix match against a masked value would let a reader who
+# may not see it guess it (`tests/ontology/test_searchable_names.py`). Every recipe fixture pinned
+# to `ontology_version: 10` is bumped to 11 alongside this.
+# v12 (ADR-094): content the model can read. `Document` gained `media_kind` (text, image, video)
+# and `object_ref` (the file's name in the object store; a file is never kept in the graph), and
+# `HOLDS` links a device, endpoint, person or organisation to the Document it holds. A recipe may now
+# write both, so the version moves; every recipe fixture pinned to 11 is bumped to 12 alongside this,
+# and a published recipe is flagged once to be reopened and published again.
+# ADR-079 (no version change): each entity type gained an optional `icon`, the drawing the Glass
+# puts inside its shape. The version does not move: nothing a recipe writes, an index or an
+# adapter reads has changed, and moving it would flag every published recipe as stale for a
+# change that only affects how a node looks. The names are a closed list in `ontology.schema.json`.
+# ADR-081 (no version change): every relationship type declares its `basis`, `direct` or
+# `probabilistic`, and may carry a `colour` (one of the nine data-channel names) and a `thickness`
+# (1 to 5). All the types below are `direct`; the loader injects `SAME_AS` as `probabilistic` and
+# `NOT_SAME_AS` with none. The version does not move, for the reason ADR-079 gives: nothing a recipe
+# writes, an index or an adapter reads has changed in this step, and moving it would flag every
+# published recipe as stale. (The Ingest Studio's refusal of a Probabilistic type, build step D,
+# is a recipe rule and may revisit that.)
+# v13 (ADR-105): one entity's own picture. `DEPICTS` runs from an image `Document` to the Person,
+# Organisation, Vehicle, Device, Location or Asset it shows, with `shown` false once the picture is
+# removed (the link is superseded, never deleted). A recipe may write it, so the version moves;
+# every recipe fixture pinned to 12 is bumped to 13 alongside this, and a published recipe is
+# flagged once to be reopened and published again.
+# v14 (ADR-105 Amendment 2, the owner's choice, 9 October 2026): an Endpoint may carry a picture
+# too, so `DEPICTS` gains Endpoint at its `to` end. The same republish-once consequence applies;
+# every fixture pinned to 13 is bumped to 14 alongside this.
+# v15 (ADR-109 ruling 2, the owner's, 10 October 2026): an alert is a graph node as well as a queue
+# row — `Alert`, written `inferred` by the rule that raised it at the highest handling of what it
+# references, linked by the system link `ALERTED_ON` to every entity it concerns (any type, so a
+# pack's `Account` is reached). The republish-once consequence applies; fixtures bumped to 15.
+# v16 (ADR-109 phase F, the KYC addendum, 10 October 2026): `VERIFIED_BY` from a customer to the
+# Document that verifies them, with the Document's kind, expiry and fraud mark; an organisation's
+# country and industry; a party's screening `listing` and `list_name`; `ip` as an endpoint kind;
+# an organisation may use an endpoint. Republish once; fixtures bumped to 16.
+version: 16
+entity_types:
+  - name: Person
+    pole_class: person
+    channel: indigo
+    shape: circle
+    icon: person
+    identifiers: [nino, pnc_id, prison_number]
+    properties:
+      - {name: family_name, type: string, required: true, indexed: true}
+      - {name: given_names, type: string, indexed: true}
+      - {name: date_of_birth, type: date, sensitivity: high}
+      - {name: aliases, type: "string[]"}
+      # v16, ADR-109 phase F: a party as a screening list names it (sanction, PEP, adverse media).
+      - {name: listing, type: enum, values: [sanction, pep, adverse_media]}
+      - {name: list_name, type: string}
+    resolution:
+      blocking: [soundex(family_name), year(date_of_birth)]
+      comparisons: [jaro_winkler(family_name), levenshtein(given_names), exact(date_of_birth)]
+
+  - name: Endpoint
+    pole_class: object
+    channel: cyan
+    shape: hexagon
+    icon: phone
+    identifiers: [e164, handle, email, imsi]
+    properties:
+      - {name: value_raw, type: string}
+      - {name: value_normalised, type: string, indexed: true, required: true}
+      - {name: endpoint_kind, type: enum, values: [msisdn, imsi, email, handle, iban, card, account, ip]}
+
+  - name: Device
+    pole_class: object
+    channel: plum
+    shape: square
+    icon: device
+    identifiers: [imei]
+
+  - name: Location
+    pole_class: location
+    channel: ochre
+    shape: pin
+    icon: pin
+    identifiers: [uprn, gnis_feature_id, tiger_geoid, osm_id, site_ref, os_place_id, postcode, gss_code, nad_address_id]
+    properties:
+      # 03_CONDUIT_MIDDLEWARE.md §5.1: geometry lives in the analytics
+      # store, never on the graph node — this is a reference, not a
+      # coordinate. Not required: a jurisdiction or an administrative
+      # boundary has no single point and must be able to carry none.
+      - {name: geometry_ref, type: string}
+      # v7: a gazetteer place name — optional, since a site-grid cell or
+      # an administrative boundary has none.
+      - {name: name, type: string, indexed: true}
+
+  - name: Organisation
+    pole_class: organisation
+    channel: azure
+    shape: square
+    icon: building
+    identifiers: [org_ref]
+    properties:
+      # v8: no display property existed at all before this — the same
+      # gap `name` closed for `Location` in v7.
+      - {name: name, type: string, indexed: true}
+      # v16, ADR-109 phase F: the baseline customer risk assessment's inputs, and screening.
+      - {name: country, type: string}
+      - {name: industry, type: string}
+      - {name: listing, type: enum, values: [sanction, pep, adverse_media]}
+      - {name: list_name, type: string}
+
+  - name: Event
+    pole_class: event
+    channel: moss
+    shape: diamond
+    icon: calendar
+
+  - name: Document
+    pole_class: object
+    channel: violet
+    shape: page
+    icon: document
+    properties:
+      - {name: title, type: string, indexed: true}
+      # An email written as a Document (ADR-089 step 3, ADR-092): when it was sent, its own message
+      # id, and the analytics event it was made from, which the reader reads its text from. All
+      # optional; the version stays 11 for the reason ADR-079 gives (nothing a recipe writes changes).
+      - {name: sent_at, type: datetime}
+      - {name: message_id, type: string}
+      - {name: event_id, type: string}
+      # ADR-094 step 2: what the content is, and where its file is kept. A file is never stored in
+      # the graph: `object_ref` names it in the deployment's object store.
+      - {name: media_kind, type: enum, values: [text, image, video]}
+      - {name: object_ref, type: string}
+      # v16, ADR-109 phase F: a verifying document. KYC status is computed from these at read,
+      # never stored: expired or marked fraudulent, it no longer verifies anyone.
+      - {name: document_kind, type: enum, values: [passport, driving_licence, national_id, utility_bill, bank_statement, certificate_of_incorporation, register_extract, other]}
+      - {name: expires_on, type: date}
+      - {name: fraudulent, type: boolean}
+
+  - name: Vehicle
+    pole_class: object
+    channel: jade
+    shape: triangle
+    icon: vehicle
+
+  - name: Asset
+    pole_class: object
+    channel: rose
+    shape: diamond
+    icon: box
+
+  # v15, ADR-109: what a typology rule raised, for a person to triage. Never loaded by a recipe.
+  - name: Alert
+    pole_class: event
+    channel: rose
+    shape: triangle
+    icon: flag
+    properties:
+      - {name: rule_id, type: string, required: true, indexed: true}
+      - {name: typology, type: string}
+      - {name: words, type: string}
+      - {name: raised_at, type: datetime}
+
+edge_types:
+  - name: COMMUNICATED_WITH
+    from: [Endpoint]
+    to: [Endpoint]
+    directed: true
+    basis: direct
+    temporal: true
+    properties:
+      - {name: duration_s, type: float}
+      - {name: direction, type: enum, values: [inbound, outbound]}
+  - {name: USES,              from: [Person, Organisation], to: [Endpoint, Device], directed: true, basis: direct}
+  # v16, ADR-109 phase F: a customer to the document that verifies them.
+  - {name: VERIFIED_BY,       from: [Person, Organisation], to: [Document], directed: true, basis: direct}
+  - {name: PRESENT_AT,        from: [Person, Device, Vehicle], to: [Location], directed: true, temporal: true, basis: direct}
+  - {name: MENTIONED_IN,      from: ["*"], to: [Document], directed: true, basis: direct}
+  # v15, ADR-109: an alert to what it concerns. A rule's finding, so Probabilistic; a system link,
+  # so never offered to an analyst to draw.
+  - {name: ALERTED_ON,        from: [Alert], to: ["*"], directed: true, basis: probabilistic, system: true}
+  # ADR-094 step 2: content held by an entity (a phone's photos, videos and saved files), recorded
+  # by the source that holds it, so Direct.
+  - {name: HOLDS,             from: [Device, Endpoint, Person, Organisation], to: [Document], directed: true, basis: direct}
+  # ADR-105: a picture of one entity, held in the case as evidence; the Glass draws it on that node.
+  - name: DEPICTS
+    from: [Document]
+    to: [Person, Organisation, Vehicle, Device, Location, Asset, Endpoint]
+    directed: true
+    basis: direct
+    properties:
+      - {name: shown, type: boolean}
+  - {name: ASSOCIATE_OF,      from: [Person], to: [Person], directed: false, basis: direct}
+  - name: FAMILY_OF
+    from: [Person]
+    to: [Person]
+    directed: false
+    basis: direct
+    properties:
+      - {name: relation, type: string}
+  - {name: MEMBER_OF,         from: [Person], to: [Organisation], directed: true, basis: direct}
+  - name: TRANSACTED
+    from: [Asset, Endpoint]
+    to: [Asset, Endpoint]
+    directed: true
+    basis: direct
+    temporal: true
+    properties:
+      - {name: amount, type: float}
+      - {name: transaction_type, type: enum, values: [CASH_IN, CASH_OUT, DEBIT, PAYMENT, TRANSFER]}
+  # By convention the source is an Endpoint of kind `imsi` only — an MSISDN
+  # reaches the same Device via SAME_AS to its IMSI Endpoint first, never
+  # directly (06_DECISIONS.md ADR-023). `from`/`to` check entity type, not
+  # `endpoint_kind`, so this is not schema-enforced.
+  - {name: PAIRED_WITH,       from: [Endpoint], to: [Device], directed: true, temporal: true, basis: direct}

@@ -1,0 +1,861 @@
+"""`python -m harness.apply` — the scripted golden-path deploy.
+
+`06_DECISIONS.md` ADR-049's Stage 2 §3. `05_DEPLOYMENT.md` §2.3's headless equivalent of clicking
+Launch, and the thing Stage 2's exit test #2 measures: from a fresh clone, one command reaches a
+health-checked stack on `local-lite`.
+
+## The stages, in order, and why the order is the deliverable
+
+1. **Render** (Stage 2 §1) — `deploy/generated/<profile>/`, plus the identity-provider realm.
+2. **Preflight `--gate`** (Stage 2 §2) — exits non-zero while any check fails, **before** anything
+   is built or started. A deploy that builds images and then discovers the ports are taken has
+   wasted several minutes to tell you something it knew at the start.
+3. **Build** — `docker compose build` for the OspreyFlow-owned images (Stage 2 §5a gave them
+   `build:` contexts precisely so this needs no registry).
+4. **Up, and wait** — `docker compose up -d --wait`, then a per-service health wait that **names
+   the service that did not become healthy**. `--wait` on its own reports "container is unhealthy"
+   without saying which, and on a twelve-container stack that is the difference between a diagnosis
+   and a search.
+5. **Seed**, when asked, under §2.4's **ordering guard** — below.
+6. **Verify** — the three-sided token-exchange check ADR-043's amendment specifies. Part of what
+   "health-checked" means: a stack whose principal resolution does not work is not a stack anyone
+   can use.
+
+## §2.4's ordering guard, and what it actually guards against
+
+`DEMO_GUIDE.md` records the fault in its own words: "seeding needs the Conduit stopped (DuckDB takes
+an exclusive lock the Conduit's own `AnalyticsPort` also holds a handle to) — so the Conduit starts
+twice, not once, with seeding in between."
+
+So when seeding is requested this module **resets the database, seeds while the Conduit is stopped,
+and starts the Conduit afterwards** — and refuses outright if asked to seed into a running Conduit
+rather than quietly working around it. A deploy that silently stopped the Conduit to seed would be
+making a data-affecting decision on the operator's behalf.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from harness.keycloak_admin import (
+    grant_service_account_roles,
+    set_demo_admin_password,
+    set_demo_analyst_password,
+)
+from harness.keycloak_theme import write_login_theme
+from harness.preflight import ALL_CHECKS, PreflightContext
+from harness.preflight.result import Status
+from harness.realm import (
+    CONDUIT_CLIENT_ID,
+    DEMO_ADMIN_SUBJECT,
+    DEMO_ANALYST_SUBJECT,
+    generate_client_secret,
+    render_realm_json,
+)
+from harness.render import (
+    BUILD_CONTEXT_FROM_OUTPUT_DIR,
+    DEFAULT_CONFIG_PATH,
+    DEFAULT_OUT_ROOT,
+    REPO_ROOT,
+    load_config,
+    render,
+    render_litellm_config,
+    write_config_copy,
+)
+from harness.render import write as write_artefacts
+from harness.reporting import reporting_secrets
+from harness.site import answer_localhost_with_loopback, sites
+from schemas.deployment import OspreyConfig, Profile
+
+#: How long any one service gets to become healthy. Generous because the Conduit applies the graph
+#: schema at startup and Keycloak imports a realm, and because a timeout that fires on a slow
+#: machine teaches an operator to raise it rather than to read it.
+DEFAULT_HEALTH_TIMEOUT_SECONDS = 300
+
+
+class ApplyFailed(RuntimeError):
+    """A stage failed. Carries the stage name so the caller reports *where*, not only *that*."""
+
+    def __init__(self, stage: str, detail: str) -> None:
+        self.stage = stage
+        self.detail = detail
+        super().__init__(f"{stage}: {detail}")
+
+
+def analytics_secret_lines(config: OspreyConfig) -> str:
+    """ClickHouse's password, minted here once and written under both names — the server's
+    (`OSPREY_CLICKHOUSE_PASSWORD`, read by the compose file) and the Conduit's
+    (`CLICKHOUSE_PASSWORD`, read by the adapter) — so the two cannot drift, as ArcadeDB's once did.
+    Nothing for a DuckDB deployment (ADR-114 decision 9)."""
+    if config.components.analytics_engine.value != "clickhouse":
+        return ""
+    password = generate_client_secret()
+    return f"OSPREY_CLICKHOUSE_PASSWORD={password}\nCLICKHOUSE_PASSWORD={password}\n"
+
+
+def provider_secret_lines(config: OspreyConfig, environ: Mapping[str, str]) -> str:
+    """A client's own model provider's key (ADR-114 Amendment 6, point 4), carried from the
+    installer's environment into the deployment's secrets file only — read there by the LiteLLM
+    gateway alone, never by the Conduit, never in `osprey.yaml` or a generated file, never printed.
+    A provider named without its key stops the install here, in words."""
+    if config.models.provider is None:
+        return ""
+    key = environ.get("OSPREY_MODEL_PROVIDER_KEY", "")
+    if not key:
+        raise ApplyFailed(
+            "render",
+            f"models.provider names {config.models.provider.name}, and "
+            "OSPREY_MODEL_PROVIDER_KEY is not set. Set it in this terminal (it is kept only in the "
+            "deployment's own secrets file) and run the install again.",
+        )
+    return f"OSPREY_MODEL_PROVIDER_KEY={key}\n"
+
+
+def mail_secret_lines(config: OspreyConfig, environ: Mapping[str, str]) -> str:
+    """The mail server's password, carried from the installer's own environment into the
+    deployment's secrets file (ADR-114 Amendment 5) — never into `osprey.yaml`, never printed. A
+    server that needs
+    signing in to, installed without it, stops the install here rather than leaving invitations that
+    fail later."""
+    if config.mail is None or not config.mail.username:
+        return ""
+    password = environ.get("OSPREY_SMTP_PASSWORD", "")
+    if not password:
+        raise ApplyFailed(
+            "render",
+            f"the mail server signs in as {config.mail.username}, and OSPREY_SMTP_PASSWORD is not "
+            "set. Set it in this terminal (it is kept only in the deployment's own secrets file) "
+            "and run the install again.",
+        )
+    return f"OSPREY_SMTP_PASSWORD={password}\n"
+
+
+class SeedOrderingRefused(ApplyFailed):
+    """§2.4's ordering guard, refusing rather than working around. See the module docstring."""
+
+
+@dataclass
+class ApplyResult:
+    profile: str
+    #: `(stage, outcome, seconds)`. The duration is recorded because `deploy/RUNBOOK.md` has to
+    #: state a recovery time per path (`05_DEPLOYMENT.md` §6), and a total tells an operator
+    #: nothing about which stage to plan a window around — on `local-lite` the answer is
+    #: overwhelmingly container start-up rather than the data.
+    stages: list[tuple[str, str, float]] = field(default_factory=list)
+    started_at: float = field(default_factory=time.monotonic)
+    _last: float = field(default_factory=time.monotonic)
+
+    def record(self, stage: str, outcome: str) -> None:
+        now = time.monotonic()
+        self.stages.append((stage, outcome, now - self._last))
+        self._last = now
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return time.monotonic() - self.started_at
+
+
+def _compose(compose_file: Path) -> list[str]:
+    """Every compose call reads the deployment's own env file.
+
+    Without `--env-file`, the secrets `apply` generates into `deployment.env` are invisible to
+    compose — interpolation falls back to defaults, and a `${...:?}` variable aborts the command
+    with a message about an unset variable rather than about a missing file. Found running the
+    golden path: the env file was written correctly and then never used.
+    """
+    return [
+        "docker",
+        "compose",
+        "--env-file",
+        str(compose_file.parent / "deployment.env"),
+        "-f",
+        str(compose_file),
+    ]
+
+
+def _run(args: list[str], *, stage: str, cwd: Path | None = None, timeout: int = 1800) -> str:
+    result = subprocess.run(
+        args, capture_output=True, text=True, cwd=cwd, timeout=timeout, check=False
+    )
+    if result.returncode != 0:
+        raise ApplyFailed(stage, f"{' '.join(args)} exited {result.returncode}\n{result.stderr}")
+    return result.stdout
+
+
+def compose_services(compose_file: Path) -> list[str]:
+    out = _run(_compose(compose_file) + ["config", "--services"], stage="inspect")
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def services_declaring_a_health_check(compose_file: Path) -> list[str]:
+    """Only services with a declared health check can be waited on. The batch loader has none by
+    design (`05_DEPLOYMENT.md` §3: a job that runs once and exits has no health to report), so
+    waiting on everything would wait forever on something that is working correctly."""
+    declared = []
+    for service in compose_services(compose_file):
+        inspected = _run(
+            _compose(compose_file) + ["ps", "--format", "json", service],
+            stage="inspect",
+        )
+        for line in inspected.splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if row.get("Health"):
+                declared.append(service)
+                break
+    return declared
+
+
+def wait_for_health(
+    compose_file: Path, *, timeout_seconds: int = DEFAULT_HEALTH_TIMEOUT_SECONDS
+) -> dict[str, str]:
+    """Waits per service and **names the one that did not make it**.
+
+    `docker compose up --wait` already fails on an unhealthy container, but its message does not
+    say which — on a twelve-container stack that is a search rather than a diagnosis, which is why
+    this exists alongside it rather than trusting it.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    final: dict[str, str] = {}
+    pending = set(services_declaring_a_health_check(compose_file))
+    while pending and time.monotonic() < deadline:
+        for service in sorted(pending):
+            rows = _run(
+                _compose(compose_file) + ["ps", "--format", "json", service],
+                stage="health",
+            )
+            health = ""
+            for line in rows.splitlines():
+                if line.strip():
+                    health = json.loads(line).get("Health", "")
+            final[service] = health
+            if health == "healthy":
+                pending.discard(service)
+        if pending:
+            time.sleep(3)
+    if pending:
+        named = ", ".join(f"{s} ({final.get(s) or 'no health reported'})" for s in sorted(pending))
+        raise ApplyFailed(
+            "health",
+            f"after {timeout_seconds}s these service(s) were not healthy: {named}. "
+            f"`docker compose -f {compose_file} logs <service>` has the reason.",
+        )
+    return final
+
+
+def _conduit_is_running(compose_file: Path) -> bool:
+    rows = _run(
+        _compose(compose_file) + ["ps", "--format", "json", "api"],
+        stage="seed",
+    )
+    return any(
+        json.loads(line).get("State") == "running" for line in rows.splitlines() if line.strip()
+    )
+
+
+def _workspace_url(config: OspreyConfig) -> str:
+    """The Glass, by name through the front proxy (ADR-114 Amendment 4)."""
+    return sites(config).glass
+
+
+def _conduit_url(args: argparse.Namespace, config: OspreyConfig) -> str:
+    """Where the *host* can reach the Conduit.
+
+    Not the same question as where the Conduit listens. With `network.expose_conduit` off — the
+    default since 25 September 2026 — nothing on the host can reach port 8000 at all, and the only
+    route in is the workspace's own nginx proxying `/v1`. With it on, the direct port is preferred
+    because it takes the proxy out of whatever the operator is diagnosing.
+    """
+    if config.network.expose_conduit:
+        return f"http://127.0.0.1:{args.api_port}"
+    return _workspace_url(config)
+
+
+def create_investigation(issuer: str, realm: str, secret: str, api_url: str) -> str:
+    """Creates the investigation the seed tags its data with, and returns its id.
+
+    **This is why the Conduit starts twice.** `DEMO_GUIDE.md` states the constraint in its own
+    words: creating an investigation is an HTTP call and needs the Conduit *running*; seeding needs
+    it *stopped*, because DuckDB takes an exclusive lock the Conduit's own `AnalyticsPort` holds a
+    handle to. So: up, create, stop, seed, up again.
+
+    The bearer token is obtained by exchanging for the realm's own verify subject — the same
+    mechanism the post-launch verify uses, rather than a second way of getting a token. That
+    subject carries the clearance and org_unit claims a `Principal` needs, because the rendered
+    realm gives it them for exactly this reason.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    from harness.realm import CONDUIT_CLIENT_ID, VERIFY_SUBJECT
+
+    token_url = f"{issuer}/realms/{realm}/protocol/openid-connect/token"
+
+    def post(
+        url: str, data: dict[str, str], headers: dict[str, str] | None = None
+    ) -> dict[str, Any]:
+        request = urllib.request.Request(
+            url, data=urllib.parse.urlencode(data).encode(), headers=headers or {}, method="POST"
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload: dict[str, Any] = _json.loads(response.read().decode())
+            return payload
+
+    try:
+        own = post(
+            token_url,
+            {
+                "grant_type": "client_credentials",
+                "client_id": CONDUIT_CLIENT_ID,
+                "client_secret": secret,
+            },
+        )
+        exchanged = post(
+            token_url,
+            {
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "client_id": CONDUIT_CLIENT_ID,
+                "client_secret": secret,
+                "subject_token": own["access_token"],
+                "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                "requested_subject": VERIFY_SUBJECT,
+                "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            },
+        )
+        request = urllib.request.Request(
+            f"{api_url}/v1/investigations",
+            headers={"Authorization": f"Bearer {exchanged['access_token']}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return str(_json.loads(response.read().decode())["id"])
+    except (urllib.error.HTTPError, urllib.error.URLError, KeyError, OSError) as error:
+        detail = error.read().decode()[:300] if isinstance(error, urllib.error.HTTPError) else error
+        raise ApplyFailed("seed", f"could not create an investigation to seed into: {detail}")
+
+
+def seed(compose_file: Path, datasets: list[str], investigation_id: str) -> None:
+    """§2.4's ordering guard, as behaviour rather than as a comment.
+
+    Refuses if the Conduit is running. The alternative — stopping it silently — would be taking a
+    data-affecting decision on the operator's behalf, and the whole point of the guard is that the
+    ordering is made visible rather than worked around.
+
+    **The seed runs inside the deployment's own network, not on the host.** `05_DEPLOYMENT.md` §7
+    puts every store on an internal network with only the workspace and the Conduit exposed, so a
+    host-side seed would need those ports published — a real security regression to make a demo
+    convenient. Instead a one-shot container from the Conduit's own image runs the script, with
+    `scripts/` and `packages/` mounted read-only: the image deliberately does not contain `scripts/`
+    (a deployment does not ship its seeding tools), and mounting keeps it that way.
+    """
+    if _conduit_is_running(compose_file):
+        raise SeedOrderingRefused(
+            "seed",
+            "the Conduit is running, and seeding needs it stopped — DuckDB takes an exclusive "
+            "lock its AnalyticsPort also holds. Stop it first (`docker compose -f "
+            f"{compose_file} stop api`), seed, then start it. Refusing rather than stopping it "
+            "for you: that is a data-affecting decision and it is yours to make.",
+        )
+    root = compose_file.parent / BUILD_CONTEXT_FROM_OUTPUT_DIR
+    for dataset in datasets:
+        # Round 13cb: `scenarios` joins the other two under owner ruling R8 — every acceptance
+        # row must be performable through the analyst's own door, and eleven were not because the
+        # deployment was never seeded with what they need. A `KeyError` here is the right failure
+        # for an unknown dataset: it names the dataset, and `--seed` is an operator's own typing.
+        script = {
+            "hmp": "scripts.seed_hmp_fixture",
+            "fixture-corp": "scripts.seed_fixture_corp",
+            "scenarios": "scripts.seed_scenarios",
+        }[dataset]
+        output = _run(
+            _compose(compose_file)
+            + [
+                "run",
+                "--rm",
+                "--no-deps",
+                "--entrypoint",
+                "python",
+                "-v",
+                f"{root.resolve()}/scripts:/app/scripts:ro",
+                # The synthetic generators the seeds call live in `packages/demo_fixtures/`, which
+                # the image carries, so the seed no longer needs the test tree mounted (it used to
+                # import them from `tests/`, which is why seeding was checkout-only;
+                # `spec/06_DECISIONS.md` ADR-054).
+                "api",
+                "-m",
+                script,
+                "--investigation-scope",
+                investigation_id,
+            ],
+            stage="seed",
+        )
+        # **Every line, not the last one.** Each seed script reports its counts as it goes — the
+        # HMP fixture's 400 Person nodes and 10 yards are printed before the event totals — and
+        # taking only the final line discarded exactly the numbers an operator would check the
+        # seed against. A seed that reports "done" is not evidence that it seeded anything.
+        for line in output.splitlines():
+            if line.strip():
+                print(f"  seed[{dataset}]: {line.strip()}")
+
+
+def object_store_lines(user: str, password: str) -> str:
+    """Where the services find the object store, and its credentials (ADR-114 Amendment 9: the
+    store is SeaweedFS, its S3 face on 8333; the `MINIO_*` names the services read are kept)."""
+    return (
+        f"OSPREY_MINIO_USER={user}\n"
+        f"OSPREY_MINIO_PASSWORD={password}\n"
+        "MINIO_ENDPOINT=objectstore:8333\n"
+        f"MINIO_ACCESS_KEY={user}\n"
+        f"MINIO_SECRET_KEY={password}\n"
+    )
+
+
+class ApplyRefused(ApplyFailed):
+    """Apply cannot go on, said in words: what is missing and where it comes from."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__("render", detail)
+
+
+def _needed(environ: Mapping[str, str], name: str, why: str) -> str:
+    value = environ.get(name)
+    if not value:
+        raise ApplyRefused(
+            f"{name} is not set: {why}. On a cloud server the first boot reads it from the cloud's "
+            "secret store; by hand, export it before running the install"
+        )
+    return value
+
+
+def managed_service_lines(
+    config: OspreyConfig,
+    *,
+    environ: Mapping[str, str],
+    minted: str,
+    object_store_password: str,
+    object_store_user: str = "ospreyflow",
+) -> str:
+    """Where the services find Postgres and the object stores (`05_DEPLOYMENT.md` §3a): the
+    deployment's own containers, or what `external:` names — a managed server's password and a Blob
+    key read from `environ` (the first boot put them there from the cloud's secret store), never
+    minted and never in `osprey.yaml`."""
+    external = config.external
+    pg = external.postgres
+    if pg is not None:
+        password = _needed(environ, "OSPREY_POSTGRES_PASSWORD", "the managed database's password")
+        host, port, user, database = pg.host, pg.port, pg.user, pg.database
+    else:
+        password, host, port, user, database = minted, "postgres", 5432, "osprey", "ospreyflow"
+    lines = [
+        f"OSPREY_POSTGRES_PASSWORD={password}",
+        # **Every one of these, not just the host**: `services/api/config.py` defaults the port to
+        # 5433 (the developer stack's), and the containers read `OSPREY_POSTGRES_*` while the
+        # Conduit reads `POSTGRES_*` — both names carry one value or they silently disagree.
+        f"POSTGRES_HOST={host}",
+        f"POSTGRES_PORT={port}",
+        f"POSTGRES_USER={user}",
+        f"POSTGRES_PASSWORD={password}",
+        f"POSTGRES_DB={database}",
+        f"OSPREY_POSTGRES_USER={user}",
+        f"OSPREY_POSTGRES_DB={database}",
+    ]
+    if pg is not None:
+        lines.append(f"POSTGRES_SSLMODE={pg.sslmode}")
+    store = external.object_store
+    if store is not None:
+        lines += [
+            f"MINIO_ENDPOINT={store.endpoint}",
+            "MINIO_USE_SSL=true",
+            f"MINIO_REGION={store.region}",
+            f"MINIO_BUCKET_PREFIX={store.bucket_prefix}",
+            f"MINIO_CREDENTIALS={store.credentials}",
+        ]
+        if store.credentials == "keys":
+            lines += [
+                "MINIO_ACCESS_KEY="
+                + _needed(environ, "OSPREY_S3_ACCESS_KEY", "the object store's access key"),
+                "MINIO_SECRET_KEY="
+                + _needed(environ, "OSPREY_S3_SECRET_KEY", "the object store's secret key"),
+            ]
+        text = "\n".join(lines) + "\n"
+    else:
+        own_store = object_store_lines(object_store_user, object_store_password)
+        text = "\n".join(lines) + "\n" + own_store
+    media = external.media
+    if media is not None:
+        key = _needed(environ, "AZURE_STORAGE_KEY", "the Blob storage account's key")
+        text += (
+            "OSPREY_MEDIA_STORE=blob\n"
+            f"AZURE_STORAGE_ACCOUNT={media.blob_account}\n"
+            f"AZURE_MEDIA_CONTAINER={media.blob_container}\n"
+            f"AZURE_STORAGE_KEY={key}\n"
+        )
+    return text
+
+
+def release_registry(lock_text: str) -> str:
+    """Where a release's owned images live (ADR-114 Amendment 8 point 10): the Conduit's repository
+    in the release's lock, without its name — a user repository's own `ghcr.io/<owner>`."""
+    entries = (yaml.safe_load(lock_text) or {}).get("images") or []
+    api = [e for e in entries if isinstance(e, dict) and e.get("service") == "api"]
+    if not api:
+        raise ApplyFailed("release", "the release's lock names no image of the Conduit (api)")
+    return str(api[0]["repository"]).rsplit("/", 1)[0]
+
+
+def pin_release_images(out_dir: Path, lock_path: Path) -> None:
+    """Every image the verified lock names, pinned by its digest before anything starts."""
+    from harness.update import pin_images
+
+    pin_images(out_dir, lock_path.read_text(encoding="utf-8"))
+
+
+def render_deployment(config: OspreyConfig, out_dir: Path, *, images_from: Path | None) -> Any:
+    """Step 1: the deployment's files, and — for an install from a release — its images pinned to
+    the verified lock before anything can start them."""
+    rendered = render(config, allow_unpinned=True)
+    write_artefacts(rendered, out_dir)
+    if images_from is not None:
+        pin_release_images(out_dir, images_from)
+    return rendered
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="python -m harness.apply",
+        description="The scripted golden-path deploy — spec/05_DEPLOYMENT.md §2.3.",
+    )
+    parser.add_argument("--profile", default=None, help="Overrides osprey.yaml's own profile.")
+    parser.add_argument(
+        "--build",
+        action="store_true",
+        help=(
+            "Build owned images from this checkout's own source rather than pulling them by "
+            "digest — the developer/CI path (round 07). Equivalent to declaring "
+            "components.source_path in osprey.yaml, using this checkout's own root. Never set "
+            "for a real customer deployment, which has no checkout to build from."
+        ),
+    )
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    parser.add_argument("--out-root", type=Path, default=DEFAULT_OUT_ROOT)
+    parser.add_argument("--seed", default="", help="Comma-separated: hmp,fixture-corp,scenarios")
+    parser.add_argument(
+        "--health-timeout", type=int, default=DEFAULT_HEALTH_TIMEOUT_SECONDS, metavar="SECONDS"
+    )
+    parser.add_argument(
+        "--keycloak-url",
+        default=None,
+        help=(
+            "Where the rendered Keycloak is reachable, for the post-launch verify. Default: the "
+            "deployment's identity origin, through the front proxy."
+        ),
+    )
+    parser.add_argument("--realm", default="osprey")
+    parser.add_argument(
+        "--images-from",
+        type=Path,
+        default=None,
+        help=(
+            "A release's verified versions.lock (ADR-114 Amendment 8 point 10): run exactly its "
+            "images, pinned by digest, and build nothing. `ospreyflow install` passes it on a "
+            "release tag, after verifying the release."
+        ),
+    )
+    parser.add_argument(
+        "--no-build",
+        action="store_true",
+        help=(
+            "Use the images already present rather than building them. For a registry-pull "
+            "deployment, or a re-apply whose Dockerfiles have not changed."
+        ),
+    )
+    parser.add_argument(
+        "--api-port",
+        default=os.environ.get("OSPREY_API_PORT", "8000"),
+        help="Where the Conduit is published on this host, for the seed's investigation call.",
+    )
+    parser.add_argument(
+        "--skip-verify",
+        action="store_true",
+        help="Skip the post-launch token-exchange verify. Reported in the summary when used.",
+    )
+    parser.add_argument(
+        "--demo-analyst",
+        action="store_true",
+        help=(
+            "Render a disposable analyst subject that can sign in interactively, with an "
+            "apply-time password written into the deployment's own environment file and printed "
+            "once. Absent by default. 06_DECISIONS.md ADR-050 objection 3."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv if argv is not None else sys.argv[1:])
+    config = load_config(args.config)
+    if args.profile:
+        # `model_copy(update=...)` does not validate, so a bare string would sail through and fail
+        # several lines later on `.value` with a message naming neither the flag nor the profile.
+        # Coercing through the enum makes an unknown profile fail here, by name.
+        config = config.model_copy(update={"profile": Profile(args.profile)})
+    if args.build:
+        components = config.components.model_copy(update={"source_path": str(REPO_ROOT)})
+        config = config.model_copy(update={"components": components})
+    if args.images_from is not None:
+        # The release's own registry, so the render names the images the lock pins.
+        os.environ["OSPREY_IMAGE_REGISTRY"] = release_registry(
+            args.images_from.read_text(encoding="utf-8")
+        )
+        args.no_build = True
+    out_dir = args.out_root / config.profile.value
+    result = ApplyResult(profile=config.profile.value)
+    # ADR-114 Amendment 4 decision 7: the deployment's names reach the proxy on this machine
+    # whatever the operating system's resolver does with `*.localhost`.
+    answer_localhost_with_loopback()
+    if args.keycloak_url is None:
+        args.keycloak_url = sites(config).identity
+
+    try:
+        # 1. Render.
+        rendered = render_deployment(config, out_dir, images_from=args.images_from)
+        write_config_copy(args.config, out_dir)
+        (out_dir / "realm.json").write_text(
+            render_realm_json(config, demo_analyst=args.demo_analyst), encoding="utf-8"
+        )
+        # Round 13cda — the LiteLLM proxy's routing table, written the same way and for the same
+        # reason as the realm above: a generated *service config*, mounted by the compose file,
+        # rather than one of `05_DEPLOYMENT.md` §2.1's four operator-facing artefacts.
+        (out_dir / "litellm.yaml").write_text(render_litellm_config(config), encoding="utf-8")
+        # The sign-in page's look, beside the compose file that mounts it
+        # (harness/keycloak_theme.py).
+        write_login_theme(out_dir, reset_by_email=config.mail is not None)
+        secret = generate_client_secret()
+        admin_password = generate_client_secret()
+        # ADR-114 Amendment 5: Keycloak's own login on the deployment's Postgres.
+        keycloak_db_password = generate_client_secret()
+        arcadedb_password = generate_client_secret()
+        postgres_password = generate_client_secret()
+        # Only minted when asked for, like every other secret here — never derived from anything
+        # in the repository, never printed except in the one-time summary at the very end
+        # (06_DECISIONS.md ADR-050 objection 3's resolution).
+        demo_analyst_password = generate_client_secret() if args.demo_analyst else None
+        # The second demo subject (ADR-051) exists exactly when the first does, and has its own
+        # password: two people, two credentials.
+        demo_admin_password = generate_client_secret() if args.demo_analyst else None
+        minio_user = "ospreyflow"
+        minio_password = generate_client_secret()
+        env_path = out_dir / "deployment.env"
+        # Both minted here and written only into generated, gitignored output — 05_DEPLOYMENT.md
+        # §2.5 ("never sees a secret… records where to look, never what it found") and §7
+        # ("never in osprey.yaml, never in an image"). Neither is derived from anything in the
+        # repository, and neither is printed.
+        env_path.write_text(
+            env_path.read_text(encoding="utf-8")
+            + "\n# Generated at apply time, never version-controlled (05_DEPLOYMENT.md §2.5/§7).\n"
+            + f"OSPREY_OIDC_CLIENT_SECRET={secret}\n"
+            + f"OSPREY_KEYCLOAK_ADMIN_PASSWORD={admin_password}\n"
+            + f"OSPREY_KEYCLOAK_DB_PASSWORD={keycloak_db_password}\n"
+            # One value, two names: the compose file sets the server's own root password from
+            # `OSPREY_ARCADEDB_PASSWORD`, and the Conduit's adapter reads `ARCADEDB_ROOT_PASSWORD`.
+            # They were generated separately at first, and the Conduit died on a 403 "User/Password
+            # not valid" that named neither variable.
+            + f"OSPREY_ARCADEDB_PASSWORD={arcadedb_password}\n"
+            + f"ARCADEDB_ROOT_PASSWORD={arcadedb_password}\n"
+            # The Conduit reads these at startup and refuses to start without the first, which is
+            # its own deliberate fail-fast. Pointed at the Keycloak this same deploy renders.
+            + f"OIDC_JWKS_URL=http://keycloak:8080/realms/{args.realm}"
+            + "/protocol/openid-connect/certs\n"
+            + f"OIDC_TOKEN_EXCHANGE_URL=http://keycloak:8080/realms/{args.realm}"
+            + "/protocol/openid-connect/token\n"
+            + f"OIDC_TOKEN_EXCHANGE_CLIENT_ID={CONDUIT_CLIENT_ID}\n"
+            + f"OIDC_TOKEN_EXCHANGE_CLIENT_SECRET={secret}\n"
+            + f"OIDC_ADMIN_USERS_URL=http://keycloak:8080/admin/realms/{args.realm}/users\n"
+            # ADR-111 Amendment 2: the reporting components' secrets, only for what is switched on.
+            + reporting_secrets(config)
+            + analytics_secret_lines(config)
+            + mail_secret_lines(config, os.environ)
+            + provider_secret_lines(config, os.environ)
+            + "ARCADEDB_HOST=arcadedb\nVALKEY_HOST=valkey\n"
+            # Postgres and the object stores: the deployment's own, or the cloud's (05 §3a).
+            + managed_service_lines(
+                config,
+                environ=os.environ,
+                minted=postgres_password,
+                object_store_password=minio_password,
+                object_store_user=minio_user,
+            )
+            + (
+                f"OSPREY_DEMO_ANALYST_PASSWORD={demo_analyst_password}\n"
+                if demo_analyst_password is not None
+                else ""
+            )
+            + (
+                f"OSPREY_DEMO_ADMIN_PASSWORD={demo_admin_password}\n"
+                if demo_admin_password is not None
+                else ""
+            ),
+            encoding="utf-8",
+        )
+        result.record("render", f"{len(rendered.artefacts) + 1} artefact(s) → {out_dir}")
+
+        # 2. Preflight, before anything is built or started.
+        context = PreflightContext(config=config, out_dir=out_dir)
+        failures = []
+        for module in ALL_CHECKS:
+            check = module.check(context)
+            if check.status is Status.FAIL:
+                failures.append(f"{check.check}: {check.what_is_wrong} — {check.what_to_do}")
+        if failures:
+            raise ApplyFailed("preflight", "\n  ".join(failures))
+        result.record("preflight", "all checks pass or skip")
+
+        compose_file = out_dir / "compose.yaml"
+
+        # 3. Build the owned images.
+        #
+        # `--no-build` exists for the two real cases where building here is wrong: a `cluster`
+        # deployment pulls its images from a registry rather than building them on the node
+        # (`05_DEPLOYMENT.md` §3), and a re-apply against a checkout whose Dockerfiles have not
+        # changed should not spend minutes rebuilding them. It is not a way to deploy images that
+        # do not exist — `up` fails immediately and by name if one is missing.
+        if args.no_build:
+            result.record("build", "skipped (--no-build): using the images already in the daemon")
+        else:
+            _run(_compose(compose_file) + ["build"], stage="build")
+            result.record("build", "owned images built from this checkout")
+
+        # 4. Up, then a per-service wait that names what did not make it.
+        _run(_compose(compose_file) + ["up", "-d", "--wait"], stage="up")
+        health = wait_for_health(compose_file, timeout_seconds=args.health_timeout)
+        result.record("up", f"{len(health)} service(s) healthy")
+
+        # 4b. The two service-account grants a realm import cannot express, because it would need
+        # client ids that do not exist until the import has run. Separate grants on purpose: the
+        # pre-check must not borrow the impersonation client's own authority.
+        grant_service_account_roles(
+            issuer=args.keycloak_url,
+            realm=args.realm,
+            admin_user="admin",
+            admin_password=admin_password,
+            client_secret=secret,
+        )
+        result.record("grants", "impersonation + view-users on the Conduit's service account")
+
+        # 4c. The demo analyst's password — a realm import cannot carry it (harness/realm.py's own
+        # "Not in" paragraph), so it is set the same way the client secret is: after import, with
+        # the apply-time value this process just minted.
+        if demo_analyst_password is not None:
+            set_demo_analyst_password(
+                issuer=args.keycloak_url,
+                realm=args.realm,
+                admin_user="admin",
+                admin_password=admin_password,
+                password=demo_analyst_password,
+            )
+            result.record("demo-analyst", "password set on the disposable analyst subject")
+        if demo_admin_password is not None:
+            set_demo_admin_password(
+                issuer=args.keycloak_url,
+                realm=args.realm,
+                admin_user="admin",
+                admin_password=admin_password,
+                password=demo_admin_password,
+            )
+            result.record("demo-admin", "password set on the disposable admin subject")
+
+        # 5. Seed, under the ordering guard.
+        datasets = [d for d in args.seed.split(",") if d]
+        investigation_id = ""
+        if datasets:
+            # Up, create, stop, seed, up again — the ordering the DuckDB lock forces.
+            # **Through the workspace, not the Conduit's own port.** Since the owner's decision
+            # of 25 September 2026 the Conduit is not published unless `osprey.yaml` asks
+            # (05_DEPLOYMENT.md §2.6 item 1), so the host has exactly one way in — the same
+            # same-origin proxy the Glass uses. Reaching for `--api-port` here would have made
+            # the seed work only on a deployment configured the way it no longer is by default.
+            investigation_id = create_investigation(
+                args.keycloak_url, args.realm, secret, _conduit_url(args, config)
+            )
+            _run(_compose(compose_file) + ["stop", "api"], stage="seed")
+            seed(compose_file, datasets, investigation_id)
+            _run(_compose(compose_file) + ["start", "api"], stage="seed")
+            wait_for_health(compose_file, timeout_seconds=args.health_timeout)
+            result.record(
+                "seed",
+                f"{', '.join(datasets)} into investigation {investigation_id} "
+                "(Conduit stopped for the seed, then restarted)",
+            )
+
+        # 6. Verify — the three assertions, against the running deployment.
+        if args.skip_verify:
+            result.record("verify", "SKIPPED — --skip-verify was passed")
+        else:
+            import asyncio
+
+            from harness.verify import OPERATOR_FAILURE_MESSAGE, run_verify
+
+            issuer = args.keycloak_url
+            verified = asyncio.run(
+                run_verify(
+                    issuer=issuer,
+                    realm=args.realm,
+                    conduit_secret=secret,
+                    unprivileged_secret=secret,
+                )
+            )
+            bad = [v for v in verified if not v.ok]
+            if bad:
+                raise ApplyFailed(
+                    "verify",
+                    OPERATOR_FAILURE_MESSAGE
+                    + "\n  "
+                    + "\n  ".join(f"{v.assertion}: {v.detail}" for v in bad),
+                )
+            result.record("verify", f"{len(verified)}/3 assertions green")
+
+    except ApplyFailed as failure:
+        print(f"\napply: FAILED at stage '{failure.stage}'\n  {failure.detail}", file=sys.stderr)
+        for stage, outcome, seconds in result.stages:
+            print(f"  (completed) {stage} [{seconds:.0f}s]: {outcome}", file=sys.stderr)
+        return 1
+
+    print(f"apply: {result.profile} ready in {result.elapsed_seconds:.0f}s")
+    for stage, outcome, seconds in result.stages:
+        print(f"  {stage:<10} [{seconds:>3.0f}s]  {outcome}")
+    # The two exposed surfaces, and nothing else — `05_DEPLOYMENT.md` §7 puts every store on an
+    # internal network. The investigation id is carried in the query string because the Glass reads
+    # it from there on first load; without it the workspace opens on an empty working set and the
+    # seeded data looks as though it never arrived.
+    glass_url = f"{_workspace_url(config)}/"
+    if investigation_id:
+        glass_url += f"?investigation={investigation_id}"
+    print(f"\n  the Glass:   {glass_url}")
+    if config.network.expose_conduit:
+        print(f"  the Conduit: http://127.0.0.1:{args.api_port}/healthz")
+    else:
+        print(f"  the Conduit: {_conduit_url(args, config)}/healthz (through the workspace proxy)")
+    # Printed once, here, and nowhere else — never echoed by a later command.
+    # `06_DECISIONS.md` ADR-050 objection 3's resolution.
+    if demo_analyst_password is not None:
+        print(f"\n  sign in as {DEMO_ANALYST_SUBJECT} with the password in {env_path}")
+        print(f"  the Admin console account is {DEMO_ADMIN_SUBJECT}, same file")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

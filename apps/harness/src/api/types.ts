@@ -1,0 +1,142 @@
+// `OspreyConfig` and its own sections are re-exported from the generated schema, never
+// hand-written here — `CLAUDE.md`'s own Conventions: "TypeScript types are generated from
+// [the Pydantic models]; drift is a build failure." `packages/schemas/generated/index.ts`'s own
+// barrel does not re-export `Profile`/`GraphStore`/`AnalyticsEngine` (each collides with an
+// unrelated type of the same bare name generated from a different Pydantic module), so these come
+// from `OspreyConfig.ts` directly — `apps/workspace/src/watches/StatusBadge.tsx` already
+// establishes this as the way to reach a type the barrel does not carry.
+export type {
+  AnalyticsEngine,
+  ComponentsConfig,
+  GraphStore,
+  ModelsConfig,
+  OspreyConfig,
+  Profile,
+} from "../../../../packages/schemas/generated/OspreyConfig";
+
+// The two response shapes below are `harness/screens.py`'s own plain dataclasses, not Pydantic
+// models — `generate_ts.py` only reads `schemas.deployment.ALL_MODELS`, so these are hand-written,
+// kept intentionally small and matched field-for-field against `harness/webapp.py`'s own
+// `_footprint_json`/`_consequences_json`.
+/** `GET /api/model-choices` (`harness/webapp.py`, ADR-095): the config's own lists of pinned
+ * models for each job, and the defaults the product ships with. */
+export type ModelJob = "extraction" | "vision" | "transcription" | "embedding";
+export type ModelChoices = Record<ModelJob, { name: string }[]> & {
+  defaults: Record<ModelJob, string>;
+};
+
+export interface ProfileOptions {
+  label: string;
+  machines: string;
+  memory_gb_floor: number;
+  orchestrator: string;
+  allowed_graph_stores: string[];
+  allowed_analytics_engines: string[];
+}
+
+export interface Consequences {
+  profile: string;
+  machines: string;
+  memory_gb_floor: number;
+  orchestrator: string;
+  graph_store: string;
+  analytics_engine: string;
+  egress_exception: boolean;
+  egress_detail: string | null;
+}
+
+// `scripts/real_data_exceptions.py`'s own `RealDataException` — a plain dataclass, not a Pydantic
+// model, so hand-written here for the same reason as the two interfaces above.
+export interface RealDataException {
+  dataset: string;
+  approved_uses: string[];
+  added_by: string;
+  added_date: string;
+  device: string;
+  justification: string;
+  decision_record: string;
+  revisit?: string;
+}
+
+export interface NewRealDataException {
+  dataset: string;
+  approved_uses: string[];
+  added_by: string;
+  device: string;
+  justification: string;
+  decision_record: string;
+  revisit?: string;
+}
+
+// `harness/geospatial.py`'s `register_provider_step`'s own return shape — `MapConfig`, already
+// generated; re-exported here rather than duplicated.
+export type { MapConfig } from "../../../../packages/schemas/generated/MapConfig";
+
+// `harness/preflight/result.py`'s own `CheckResult` — a plain dataclass, not a Pydantic model,
+// hand-written for the same reason as `ProfileOptions`/`Consequences` above. `status` mirrors
+// `harness.preflight.result.Status`'s own four values exactly.
+export interface PreflightCheckResult {
+  check: string;
+  status: "pass" | "fail" | "skip" | "warn";
+  what_is_wrong: string;
+  what_to_do: string;
+  rechecked_at: string;
+  detail: string[];
+}
+
+// `harness/render.py`'s own `RenderResult`/`diff_for` — the shape `POST /api/artefacts/generate`
+// returns.
+export interface ArtefactsResult {
+  profile: string;
+  osprey_yaml: string;
+  artefacts: Record<string, string>;
+  diffs: Record<string, string>;
+  confirmed: boolean;
+}
+
+// `docker context show`'s own real output — `05_DEPLOYMENT.md` §2.4's target-confirmation guard.
+export interface LaunchTarget {
+  docker_context: string;
+  confirmed: boolean;
+}
+
+// The guided install page (`harness/install_page.py`, ADR-114 Amendment 3, stage B2c). Hand-written
+// like the interfaces above: these are the page's own plain JSON, not Pydantic models.
+export type InstallMode = "lite" | "small" | "enterprise";
+
+export interface InstallCloud {
+  provider?: "aws" | "azure";
+  region?: string;
+  domain?: string;
+  size?: "small" | "medium" | "large";
+}
+
+/** The body of `PUT /api/install/answers`, which `ospreyflow.answers.load_answers` checks. */
+export interface InstallAnswers {
+  mode: InstallMode;
+  demo_packs?: string[];
+  paysim_file?: string;
+  cloud?: InstallCloud;
+}
+
+export interface InstallPack {
+  id: string;
+  title: string;
+  shows: string;
+  delivery: string;
+  licence: string;
+}
+
+export interface InstallState {
+  mode: InstallMode;
+  answers: InstallAnswers;
+  packs: InstallPack[];
+  modes: Record<InstallMode, { available: boolean; says?: string }>;
+  /** The person's home folder, where suggested folders go. */
+  home: string;
+}
+
+export interface DoctorResult {
+  lines: string[];
+  returncode: number;
+}
