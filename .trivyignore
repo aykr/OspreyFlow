@@ -1,0 +1,48 @@
+# CVE-2026-85061 — MapLibre GL JS: XSS Sanitizer Bypass in DOM.sanitize()
+# via Live NamedNodeMap Removal Skip. Fixed upstream in maplibre-gl 6.4.1.
+#
+# `@sigma/layer-maplibre` (ADR-014, spec/06_DECISIONS.md — the binding that
+# camera-syncs MapLibre with our Sigma v3 canvas) pins its peer dependency
+# to `maplibre-gl: ^4.5.0` and has no release compatible with a patched
+# 6.x line; its own 4.0.0-alpha line needs Sigma v4-alpha, which we do not
+# run. 4.7.1 is the newest release that satisfies both constraints, so the
+# fix is not adoptable without dropping the ADR-014 mechanism entirely.
+#
+# Threat model, stated precisely: exploiting this requires a compromised
+# or malicious osprey.yaml / provider profile reaching MapLibre's
+# AttributionControl through its HTML-sanitizing code path — not analyst
+# input, not document content. Mitigated in this codebase by disabling
+# MapLibre's built-in AttributionControl entirely and rendering a
+# provider's attribution ourselves as a plain escaped text node
+# (apps/workspace/src/map/MapView.tsx) — never through DOM.sanitize(), so
+# "sanitize the input first" is not the claimed mitigation; the broken
+# sanitizer is simply not in the code path at all for this string.
+#
+# Revisit trigger: drop this entry the moment either holds —
+# (a) @sigma/layer-maplibre ships a release compatible with
+#     maplibre-gl >=6.4.1, or
+# (b) a maplibre-gl 4.x patch release backports the DOM.sanitize() fix.
+# Check both at the start of any later phase that touches apps/workspace's
+# map dependencies, not only when this file is next edited by hand.
+CVE-2026-85061
+
+# CVE-2026-54499 — Stanza: code execution through a poisoned model file (pickle), in the NER image
+# (services/ner). Fixed in Stanza 1.12.2, which imports udtools (GPL-2.0-or-later) unconditionally,
+# so the fix is not adoptable under the licence register (00_ARCHITECTURE.md §7). ADR-098
+# Amendment 5 has the decision. Mitigated: the models are downloaded only at image build and every
+# file is checked against services/ner/models.sha256 (and no other file may be there), so the image
+# loads only the files pinned; nothing a user supplies is ever loaded as a model.
+# Revisit by the date below, or sooner if either holds: a Stanza release without udtools, or
+# udtools under a licence the register allows.
+CVE-2026-54499 exp:2027-01-15
+
+# CVE-2026-78669, CVE-2026-78667, CVE-2026-97031 — Go's net/http, x/net/http2 and crypto/tls:
+# denial of service against a SERVER (HTTP/2 SETTINGS floods, Range headers, TLS ECH), found in the
+# docker CLI and its compose plugin, which the harness image copies from docker:29-cli. The harness
+# runs both only as clients of the local Docker socket; nothing serves through them. No Compose release carries
+# the fixed libraries yet (v5.6.0, 2 October 2026, has x/net 0.58.0 and Go 1.26.8). ADR-114
+# Amendment 24 has the decision. These expire on the date below so the scan fails again if Compose
+# has not caught up: rebuild on a newer docker:*-cli then, and drop these lines.
+CVE-2026-78669 exp:2026-12-14
+CVE-2026-78667 exp:2026-12-14
+CVE-2026-97031 exp:2026-12-14

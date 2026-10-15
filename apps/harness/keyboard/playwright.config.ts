@@ -1,11 +1,20 @@
+import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { defineConfig } from "@playwright/test";
 
 // A scratch `osprey.yaml`, not this checkout's real one — `harness.webapp`'s own `Save` actions
 // really write to disk, and this suite must never touch the repository's own committed config.
 const SCRATCH_CONFIG = join(tmpdir(), `osprey-keyboard-spec-${process.pid}.yaml`);
+// It builds from this checkout (`components.source_path`), so Generate renders without a published
+// release's digests: pull mode refuses an image no release has locked, and this commit has none
+// (CI found it, 15 October 2026). Generate's own refusal is `test_render.py`'s to prove.
+writeFileSync(
+  SCRATCH_CONFIG,
+  `profile: local-lite\ncomponents:\n  source_path: ${fileURLToPath(new URL("../../..", import.meta.url))}\n`,
+);
 
 // A scratch real-data-exceptions file — the Governance screen's own exceptions panel really
 // reads/writes disk too, and `--real-data-exceptions`'s own default is
@@ -65,7 +74,8 @@ export default defineConfig({
       // `uv run`, the same invocation `ci.yml`'s own jobs already use, rather than a bare
       // `python`, which this repo's own convention never assumes is the right interpreter.
       command:
-        `uv run python -m harness.webapp --host 127.0.0.1 --port ${API_PORT} ` +
+        // The real console on a host of fixed size: keyboard/console_fixed_host.py says why.
+        `uv run python apps/harness/keyboard/console_fixed_host.py --host 127.0.0.1 --port ${API_PORT} ` +
         `--config ${SCRATCH_CONFIG} --real-data-exceptions ${SCRATCH_RDE} ` +
         `--out-root ${SCRATCH_OUT_ROOT} --apply-command '${FAKE_APPLY_COMMAND}'`,
       port: Number(API_PORT),

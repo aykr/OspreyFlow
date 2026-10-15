@@ -373,7 +373,8 @@ def git_sha(repo_root: Path = REPO_ROOT) -> str:
 #: `05_DEPLOYMENT.md` §3/§5/§7's own reference for where a customer checks for a published
 #: release once the digest resolvers above have failed to find one — named here so
 #: `UnpinnedImagesError`'s own message and those sections stay one string apart, not two to drift.
-RELEASES_URL = "https://github.com/ospreyflow/ospreyflow-dev/releases"
+#: The user repository (ADR-114 Amendment 21).
+RELEASES_URL = "https://github.com/aykr/OspreyFlow/releases"
 
 
 class UnpinnedImagesError(RuntimeError):
@@ -960,6 +961,12 @@ def compose_services(config: OspreyConfig, images: Sequence[ServiceImage]) -> di
             # weights are fetched by `ollama-models` below, into the volume it reads.
             service["entrypoint"] = ["/bin/ollama"]
             service["command"] = ["serve"]
+            # Two servers share the model volume: this one, and `ollama-models`' while it pulls. A
+            # server prunes unreferenced blobs when it starts, a download's `-partial` file among
+            # them, so this one starting or restarting mid-pull failed the pull ("rename
+            # ...-partial ...: no such file or directory", a user's install, 15 October 2026). It
+            # never pulls, so it never needs to prune.
+            service["environment"] = {"OLLAMA_NOPRUNE": "1"}
             services["ollama-models"] = _model_download_step(
                 str(service["image"]),
                 volume="ollama-models:/root/.ollama",
