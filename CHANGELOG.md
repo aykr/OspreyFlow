@@ -6,6 +6,41 @@ update. Work not yet in a release is listed under *Unreleased*.
 
 ## Unreleased
 
+## v0.2.0 — 2026-10-18
+
+- **Prison and custody cases.** The crime case analysis pack (NIEM) gains an **incident** — an
+  assault, a disorder or a find, with what was found and when — and the links a prison intelligence
+  analyst works with: **shared a cell with** (the cell and the dates), **co-defendant of**, **in
+  conflict with** (the reason), **visited** (in person or by video), and a person's **role in** an
+  incident. Each link type has its own colour. The core model is unchanged, so no pipeline needs
+  republishing.
+- **The legend lists the links in view and filters them.** Under the types, each link type in its
+  colour with how many, and a box to leave the type out of the view or bring it back.
+- **The HMP demonstration case is a prison intelligence network.** Around its principal subject and
+  relay group: cell histories, co-defendants, conflicts (one known only from intelligence, and so
+  SECRET), incidents with who was involved, visitors in person and by video, prison-phone and outside
+  numbers with their calls, and accounts with their payments — on the graph, the timeline and the
+  map, where the prison, its yards and the outside towns are places. Everything in it is invented.
+  A deployment that added HMP before this release gains the
+  network with `ospreyflow demo add hmp`; the people and incidents it has are not added twice.
+- **Security: a pipeline reads its source only from the ingest folder.** A pipeline author could
+  give a draft any server path and read the file back as sample rows; a path outside the ingest
+  folder is now refused, whether or not it exists. Every deployment on v0.1.x should update.
+- **Fixed: an account is on the map where it is held, and a payment draws as a line.** The map
+  placed only locations, so an account's branch point was never shown.
+- **Fixed: the legend no longer runs over the open timeline;** it scrolls inside the canvas.
+- **Fixed: Explore's *Add… → Just this entity* adds just that entity.** It drew the entity three
+  links out, as choosing a search result does, and *with all n links* did the same before its own
+  one-link step; on a busy case that put hundreds of nodes on the canvas. What Explore adds now
+  also reaches the case's working set, so the counts and legend see it straight away.
+- **Fixed: a resolution run no longer undoes an analyst's link.** A model's later match of a pair an
+  analyst had linked by hand (or confirmed) replaced the link's confirmation and score with the
+  model's, so the pair could stop showing as one. An analyst's decision now stands until an analyst
+  changes it.
+- **Fixed: new evidence for a corrected link is kept.** Once a link had been corrected or confirmed,
+  a later load touching the same pair could add its evidence to the old version, which no view
+  shows. It now goes to the current link.
+
 ## v0.1.1 — 2026-10-15
 
 - **The Glass stays responsive while a large case's icons load.** When a node icon finished

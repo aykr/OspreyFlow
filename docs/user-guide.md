@@ -11,10 +11,12 @@ engineers. The screenshots show the synthetic demonstration cases; no real data 
 <!-- document-control:begin -->
 ## Document control
 
-**Version 1.2** · 2026-10-15 · For OspreyFlow v0.1.0 · Issued
+**Version 1.4** · 2026-10-18 · For OspreyFlow v0.2.0 · Issued
 
 | Version | Date | What changed |
 | --- | --- | --- |
+| 1.4 | 2026-10-18 | §5.3: accounts where they are held, and payments as lines, on the map. |
+| 1.3 | 2026-10-18 | §5.2: link types in the legend, left out of the view or brought back, and the custody links of a prison case. |
 | 1.2 | 2026-10-15 | A cover page, contents, a list of figures, and this version history. |
 | 1.1 | 2026-10-14 | Cases and their branches shown as one tree; a branch renamed or deleted where it is listed. |
 | 1.0 | 2026-10-14 | First issue, with screenshots of the synthetic demonstration cases. |
@@ -130,6 +132,18 @@ inferred by a model, **dotted** unresolved. Hovering names its type and how many
 two. Right-click a link (or `L`, then `\`) for its menu: its emails, events or messages; **Change
 link…**; its change history; a note; or hide it.
 
+**Link types.** A link's colour says its type where the type has one. Under the types, the
+**legend** lists the links in view — each type in its colour, with how many — and each has a box:
+clear it to leave that type out of the view, tick it to bring it back (in this tab only; nothing is
+removed). **Show links** on a node draws one type at a time, so you can, for instance, follow only
+who shared a cell with whom. A prison or custody case (the **HMP** demonstration case is one) carries the links a
+prison intelligence analyst works with: **shared a cell with** (with the cell and the dates),
+**co-defendant of**, **in conflict with** (with a reason), **visited** (in person or by video), and a
+person's **role in** an incident (an assault, a disorder or a find, with what was found), beside the
+phones, calls, accounts and payments any case can hold. Two prisoners who call the same outside
+number, or are paid from the same account, are joined through that number or account on the graph,
+and the number's or account's calls and payments are on the timeline and the map.
+
 **Same-as links.** Records OspreyFlow thinks are one are joined by a same-as link. Its menu offers
 **Collapse into one node** (for this view only), **Confirm as the same**, **Mark as not the same**
 and **Explain this link**. Confirming or marking needs a reason, kept in the audit with your name.
@@ -147,7 +161,9 @@ Author; the case you were in is unchanged.
 
 ![The map, with sites, boundaries and hotspot cells](images/user/06-map.png)
 
-The map shows the same working set and selection as the graph. **Add site** places a building's plan
+The map shows the same working set and selection as the graph. A location is drawn at its point,
+and so is an account, where it is held; a link between two things on the map is drawn as a line —
+a payment from an outside account into a prisoner's private cash, for instance. **Add site** places a building's plan
 on the map from four matched points and draws a grid whose cells become locations. **Draw boundary**
 filters to what falls inside it. **Hotspot cells** counts what is in each cell, and filters as you
 choose. If the deployment's basemap is not built, the map says so.
