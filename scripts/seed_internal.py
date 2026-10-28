@@ -1,7 +1,8 @@
 """Loads an internal demo dataset into the running deployment, in one command.
 
     PYTHONPATH=.:packages python -m scripts.seed_internal <dataset> [--stop-api]
-    (or, for a demo pack: ospreyflow demo add paysim | hmp | fixture-corp | operation-ledger)
+    (or, for a demo pack: ospreyflow demo add paysim | hmp | fixture-corp | operation-ledger |
+    prison-intelligence)
 
 A caller may run a dataset of its own (`seed_internal(datasets=…, code_mounts=…)`, `main(…)`): its
 code folder is mounted read-only beside this checkout's, and every check below — the local
@@ -18,6 +19,10 @@ The case the data goes into is made by the seed itself, named, and shared with t
 by their identity-provider subjects (the Conduit's principal ids): the demo administrator as Author,
 the demo analyst as Editor. Those subjects are read from Keycloak here, on the host, where its admin
 API is published.
+
+**The Prison Intelligence Dataset's three steps** (ADR-127 Amendment 23): `--reset-live` restores it
+between rehearsals and, like a seed, needs the Conduit stopped (`--stop-api`); `--release-batch-2`
+and `--publish-reports-fallback` are run mid-demo and leave the Conduit running (`_mid_demo`).
 
 **The Conduit must be stopped while a seed runs** (DuckDB's exclusive lock). With it running this
 refuses and names `--stop-api`; stopping it is yours to choose, as in `harness.apply`. When it was
@@ -77,6 +82,9 @@ class Dataset:
     bulk: bool = False
     #: Whether the seed keeps its addresses and rewrites its links on `--replace-links`.
     rewrites_links: bool = False
+    #: Whether the seed has a rehearsal reset and two mid-demo commands (`--reset-live`,
+    #: `--release-batch-2`, `--publish-reports-fallback`: ADR-127 Amendment 23).
+    rehearsal: bool = False
 
 
 #: The PaySim graph sample: the first fraud transactions and everything touching their accounts.
@@ -100,6 +108,13 @@ DATASETS: dict[str, Dataset] = {
         data_folder="PaySIM_Dataset",
         sampled=True,
         bulk=True,
+    ),
+    # ADR-127 Amendment 23: the synthetic Prison Intelligence Dataset, loaded through the Ingest
+    # Studio's own engine from files the seed writes into the dataset's folder of the ingest root.
+    "prison-intelligence": Dataset(
+        script="scripts.seed_pid",
+        case_name="Prison Intelligence Dataset (synthetic demo)",
+        rehearsal=True,
     ),
     # ADR-114 Amendment 23: real data, an optional download each user makes and accepts.
     "enron": Dataset(
@@ -130,11 +145,37 @@ def _checkout_mounts(repo_root: Path, code: Sequence[tuple[Path, str]] = ()) -> 
         f"{repo_root}/packages:/app/packages:ro",
         "-v",
         f"{repo_root}/services:/app/services:ro",
+        # The connector layouts the recipes read (the call recipe's, the profile a publish builds
+        # its recipe from): the image holds only the copy it was built with (ADR-127 Amendment 34).
+        "-v",
+        f"{repo_root}/connectors:/app/connectors:ro",
     ]
     # A caller's own code folder, read-only too, at the place its modules are imported from.
     for host, container in code:
         mounts += ["-v", f"{host}:{container}:ro"]
     return mounts
+
+
+RESOLUTION_SWITCH = "OSPREY_POST_INGEST_RESOLUTION"
+
+
+def _switch_args(directory: Path) -> list[str]:
+    """The deployment's rendered `OSPREY_POST_INGEST_RESOLUTION`, passed into the one-shot so the
+    seed judges the switch the Conduit runs with (ADR-127 Amendment 34). A deployment rendered
+    before the setting existed runs with it on, the default, and is told so."""
+    value = "on"
+    env = directory / "deployment.env"
+    if env.is_file():
+        for line in env.read_text(encoding="utf-8").splitlines():
+            if line.startswith(f"{RESOLUTION_SWITCH}="):
+                value = line.partition("=")[2].strip() or "on"
+    return ["-e", f"{RESOLUTION_SWITCH}={value}"]
+
+
+def _run_as_args(subs: Mapping[str, str]) -> list[str]:
+    """The demo engineer's sign-in subject, the id the Conduit knows him by, where the identity
+    provider has him; a local stack without one takes his username, and the seed says so."""
+    return ["--run-as", subs[DEMO_ENGINEER_SUBJECT]] if DEMO_ENGINEER_SUBJECT in subs else []
 
 
 def _run(argv: Sequence[str]) -> str:
@@ -227,6 +268,10 @@ def seed_internal(
     clear_shared_stores: bool = False,
     confirm: str | None = None,
     accept_strays: int = 0,
+    reset_live: bool = False,
+    release_batch_2: bool = False,
+    publish_reports_fallback: bool = False,
+    check: bool = False,
     datasets: Mapping[str, Dataset] = DATASETS,
     code_mounts: Sequence[tuple[Path, str]] = (),
 ) -> list[str]:
@@ -238,6 +283,22 @@ def seed_internal(
         raise SeedRefused("--repair-strays and --restore-missing are run one at a time")
     if apply and not (repair_strays or restore_missing):
         raise SeedRefused("--apply only goes with --repair-strays or --restore-missing")
+    rehearsal_steps = [
+        flag
+        for flag, asked in (
+            ("--reset-live", reset_live),
+            ("--release-batch-2", release_batch_2),
+            ("--publish-reports-fallback", publish_reports_fallback),
+            ("--check", check),
+        )
+        if asked
+    ]
+    if rehearsal_steps and not spec.rehearsal:
+        raise SeedRefused(
+            f"{', '.join(rehearsal_steps)} is only built for prison-intelligence so far"
+        )
+    if len(rehearsal_steps) > 1:
+        raise SeedRefused(f"{' and '.join(rehearsal_steps)} are run one at a time")
     if clear_shared_stores and not spec.sampled:
         raise SeedRefused("--clear-shared-stores is only built for paysim so far")
     if clear_shared_stores and vault is None:
@@ -318,6 +379,20 @@ def seed_internal(
         raise SeedRefused(
             f"the dataset is not provisioned: {data_root / spec.data_folder} is missing"
         )
+    if release_batch_2 or publish_reports_fallback or check:
+        return _mid_demo(
+            spec,
+            repo_root,
+            directory,
+            run,
+            lookup_subs(directory),
+            "--release-batch-2"
+            if release_batch_2
+            else "--check"
+            if check
+            else "--publish-reports-fallback",
+            code_mounts,
+        )
     if compare_vaults is not None:
         return _compare_vaults(repo_root, directory, run, *compare_vaults)
     if spike_bulk_transport:
@@ -370,6 +445,7 @@ def seed_internal(
         "--entrypoint",
         "python",
         *mounts,
+        *_switch_args(directory),
         "api",
         "-m",
         spec.script,
@@ -377,6 +453,7 @@ def seed_internal(
         spec.case_name,
         "--org-unit",
         DEMO_UNIT,
+        *(_run_as_args(subs) if spec.rehearsal else []),
         "--grant",
         f"{subs[DEMO_ADMIN_SUBJECT]}=author",
         "--grant",
@@ -406,6 +483,8 @@ def seed_internal(
         argv.append("--replace-links")
     if reset_graph_database:
         argv.append("--reset-graph-database")
+    if reset_live:
+        argv.append("--reset-live")
     if vault is not None:
         argv += ["--vault", vault]
     if spec.bulk:
@@ -453,6 +532,46 @@ def _inspect(
         argv += ["--inspect-record", record]
     if vault is not None:
         argv += ["--vault", vault]
+    output = run(argv)
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def _mid_demo(
+    spec: Dataset,
+    repo_root: Path,
+    directory: Path,
+    run: Callable[[Sequence[str]], str],
+    subs: Mapping[str, str],
+    flag: str,
+    code_mounts: Sequence[tuple[Path, str]] = (),
+) -> list[str]:
+    """The two commands a presenter runs mid-demo (ADR-127 Amendment 23): `--release-batch-2` copies
+    a file into the dataset's folder, and `--publish-reports-fallback` writes only Postgres and the
+    recipe repository, so neither needs DuckDB and **the Conduit is left running**: it is never
+    stopped or started here, and no case is made or shared. Run in a one-shot container from the
+    Conduit's image with the checkout's code mounted (as the inspection modes are), not by `exec`
+    into the running one, whose image may hold an older copy of the code. The unit is passed because
+    the fallback publishes in it."""
+    argv = [
+        *_compose(directory / "compose.yaml"),
+        "run",
+        "--rm",
+        "--no-deps",
+        "--entrypoint",
+        "python",
+        *_checkout_mounts(repo_root, code_mounts),
+        *_switch_args(directory),
+        "api",
+        "-m",
+        spec.script,
+        flag,
+        "--org-unit",
+        DEMO_UNIT,
+        *_run_as_args(subs),
+    ]
+    if flag == "--check":
+        # It reads the case, so it is told which (it makes none, and shares none).
+        argv += ["--case-name", spec.case_name]
     output = run(argv)
     return [line.strip() for line in output.splitlines() if line.strip()]
 
@@ -674,6 +793,10 @@ def main(
     repair_strays = "--repair-strays" in args
     restore_missing = "--restore-missing" in args
     clear_shared_stores = "--clear-shared-stores" in args
+    reset_live = "--reset-live" in args
+    release_batch_2 = "--release-batch-2" in args
+    publish_reports_fallback = "--publish-reports-fallback" in args
+    check = "--check" in args
     confirm: str | None = None
     if "--confirm" in args:
         value = args[args.index("--confirm") + 1 :][:1]
@@ -769,7 +892,8 @@ def main(
             "[--probe-lookup-cost [--probe-sizes A,B,C]] "
             "[--graph-fraud-rows N|all] "
             "[--repair-strays | --restore-missing [--apply] [--repair-limit N]] "
-            "[--clear-shared-stores --vault ID [--accept-strays N] [--confirm V:E:N]]",
+            "[--clear-shared-stores --vault ID [--accept-strays N] [--confirm V:E:N]] "
+            "[--reset-live | --release-batch-2 | --publish-reports-fallback | --check]",
             file=sys.stderr,
         )
         return 2
@@ -799,6 +923,10 @@ def main(
             clear_shared_stores=clear_shared_stores,
             confirm=confirm,
             accept_strays=accept_strays,
+            reset_live=reset_live,
+            release_batch_2=release_batch_2,
+            publish_reports_fallback=publish_reports_fallback,
+            check=check,
             datasets=datasets,
             code_mounts=code_mounts,
         )
@@ -823,6 +951,12 @@ def main(
         return 0
     if clear_shared_stores:
         print("seed: clearing finished; read the report above for what was, or was not, deleted.")
+        return 0
+    if reset_live:
+        print("seed: reset finished; the report above says what it restored and could not undo.")
+        return 0
+    if release_batch_2 or publish_reports_fallback or check:
+        print("seed: done; the Conduit was left running.")
         return 0
     if repair_strays or restore_missing:
         print(

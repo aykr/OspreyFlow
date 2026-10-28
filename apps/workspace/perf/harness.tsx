@@ -8,7 +8,7 @@ import { createRoot } from "react-dom/client";
 
 import "../src/design/tokens.css";
 import "../src/design/primitives.css";
-import { GlassCanvas } from "../src/canvas/GlassCanvas";
+import { GlassCanvas, type GlassCanvasHandle } from "../src/canvas/GlassCanvas";
 import { OntologyRegistry } from "../src/ontology/schema";
 import { createWorkingSet } from "../src/workingset/store";
 import { generateFixture } from "./fixture";
@@ -17,6 +17,8 @@ import type { OntologySchema } from "../../../packages/schemas/generated";
 declare global {
   interface Window {
     __PERF__?: { readyAt: number | null };
+    /** What `perf/community-links.spec.ts` asks the canvas (ADR-119). */
+    __CANVAS__?: Pick<GlassCanvasHandle, "linkDrawn" | "nodeDrawnAs" | "zoomTo" | "cameraState" | "selectLink" | "highlightNodes">;
   }
 }
 
@@ -44,13 +46,16 @@ const workingSet = createWorkingSet();
 const ontology = new OntologyRegistry(FIXTURE_SCHEMA);
 
 const { nodes, edges } = generateFixture();
-workingSet.store.getState().applyDelta({ seq: 1, op: "snapshot", nodes, edges, filtered_count: 0 });
+workingSet.store.getState().applyDelta({ seq: 1, op: "snapshot", nodes, edges });
 
 const container = document.getElementById("root");
 if (!container) throw new Error("#root not found");
 
 createRoot(container).render(
   <GlassCanvas
+    ref={(handle) => {
+      window.__CANVAS__ = handle ?? undefined;
+    }}
     graph={workingSet.graph}
     store={workingSet.store}
     ontology={ontology}

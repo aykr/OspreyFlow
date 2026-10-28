@@ -6,12 +6,14 @@ export type NodeId = string;
 export type ValidFrom = string;
 export type ValidTo = string | null;
 export type Occurrences = number;
+export type Writes = number;
 export type Basis = ("direct" | "probabilistic") | null;
 export type ProvenanceState = "asserted" | "inferred" | "unresolved";
 export type DocumentId = string;
 export type Locator = string;
 export type ExcerptHash = string;
 export type Sources = SourceRef[];
+export type SourcesWithheld = boolean;
 export type ExtractedBy = string | null;
 export type ExtractionConfidence = number | null;
 export type FirstSeen = string;
@@ -42,6 +44,7 @@ export interface EdgeWrite {
   properties?: Properties;
   interval?: Interval | null;
   occurrences?: Occurrences;
+  writes?: Writes;
   basis?: Basis;
   provenance: Provenance;
   handling: Handling;
@@ -64,6 +67,7 @@ export interface Interval {
 export interface Provenance {
   state: ProvenanceState;
   sources: Sources;
+  sources_withheld?: SourcesWithheld;
   extracted_by?: ExtractedBy;
   extraction_confidence?: ExtractionConfidence;
   first_seen: FirstSeen;

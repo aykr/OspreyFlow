@@ -17,9 +17,13 @@ import type { DocumentReaderView } from "../reader/readerApi";
 import { linkTypeName } from "../canvas/linkLabel";
 import type { EntityVisual } from "../ontology/schema";
 import { SelectionList } from "./SelectionList";
+import { onEntityPicturesChange } from "../canvas/entityPictures";
+import { onIconChoicesChange, valueIconShownFor } from "../canvas/iconChoices";
+import { describeIconForValue } from "../canvas/valueIcons";
 import { TypeChip } from "./TypeChip";
 import { NeighbourhoodRisk, type NeighbourhoodRiskProps } from "./NeighbourhoodRisk";
 import { SharedContacts, type SharedContactsProps } from "./SharedContacts";
+import { SOURCES_WITHHELD_TEXT } from "./sourcesWithheld";
 import type { HandlingScheme } from "../ingest/api";
 
 function isResolutionLink(type: string): boolean {
@@ -140,6 +144,18 @@ export function Inspector({
   // selection just because a counter is above zero.
   const seen = useRef({ note: 0, change: 0, events: 0, history: 0 });
   const [request, setRequest] = useState<PartRequest | null>(null);
+  // A change of the analyst's icon choice or of an entity's own picture decides whether a value icon
+  // is drawn, so the line naming it is worked out again.
+  const [, setIconSeq] = useState(0);
+  useEffect(() => {
+    const again = () => setIconSeq((n) => n + 1);
+    const offChoices = onIconChoicesChange(again);
+    const offPictures = onEntityPicturesChange(again);
+    return () => {
+      offChoices();
+      offPictures();
+    };
+  }, []);
   const signals = {
     note: linkEditing?.openNoteSignal ?? 0,
     change: linkEditing?.openChangeSignal ?? 0,
@@ -500,6 +516,20 @@ function NodeView({
               <dt style={{ color: "var(--text-secondary)" }}>ID</dt>
               <dd className="identifier">{node.id}</dd>
             </div>
+            {(() => {
+              // ADR-128 Decision 4: which icon this node's value stands for, when its type maps one.
+              // Only when the renderer draws it: the node's own picture and the analyst's choice for
+              // the type come first (`valueIconShownFor`, shared with the legend).
+              const rule = visualFor?.(node.type)?.iconByValue;
+              const given = valueIconShownFor(node.id, node.type, rule, node.properties);
+              if (!rule || !given) return null;
+              return (
+                <div>
+                  <dt style={{ color: "var(--text-secondary)" }}>Icon for this value</dt>
+                  <dd className="value">{describeIconForValue(rule.property, given)}</dd>
+                </div>
+              );
+            })()}
             {Object.entries(node.properties ?? {}).map(([key, value]) => (
               <div key={key}>
                 <dt style={{ color: "var(--text-secondary)" }}>{key}</dt>
@@ -570,13 +600,17 @@ function NodeView({
         section(
           "source",
           "Source",
-          <ul style={{ margin: 0, paddingLeft: "var(--sp-16)" }}>
-            {node.provenance.sources.map((source, i) => (
-              <li key={i} className="value">
-                {source.document_id} · {source.locator}
-              </li>
-            ))}
-          </ul>,
+          node.provenance.sources_withheld ? (
+            <p style={{ margin: 0, color: "var(--text-secondary)" }}>{SOURCES_WITHHELD_TEXT}</p>
+          ) : (
+            <ul style={{ margin: 0, paddingLeft: "var(--sp-16)" }}>
+              {node.provenance.sources.map((source, i) => (
+                <li key={i} className="value">
+                  {source.document_id} · {source.locator}
+                </li>
+              ))}
+            </ul>
+          ),
         )}
       {assessment &&
         section(

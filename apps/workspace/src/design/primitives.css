@@ -279,6 +279,18 @@
 .global-search__filters[aria-expanded="true"],
 .global-search__filters[data-active="true"] { color: var(--text-primary); box-shadow: inset 0 -2px 0 var(--text-primary); }
 .global-search__count { font-size: var(--fs-12, var(--fs-13)); line-height: 1; }
+/* "Add many from a list" (ADR-128): a second button at the box's right-hand end, beside Filters, and the
+ * panel it opens, laid over the page under the box as the Filters panel is. */
+.global-search__add { right: calc(var(--sp-4) + var(--sp-32)); }
+.global-search[data-add="true"] .global-search__field .input { padding-right: 84px; }
+.global-search__add-panel {
+  position: absolute; top: 100%; left: 0; z-index: 40; margin-top: var(--sp-4);
+  width: 360px; max-width: 90vw; padding: var(--sp-12);
+  background: var(--surface-panel);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-overlay);
+  box-shadow: var(--overlay-shadow);
+}
 
 /* A button that opens a small panel (case choice, account). */
 .menu { position: relative; display: inline-block; }
@@ -364,6 +376,7 @@
   border-radius: var(--r-panel); font-size: var(--fs-12); line-height: var(--lh-12); white-space: nowrap;
 }
 .selection-bar__count { margin-right: var(--sp-8); color: var(--surface-app); font-weight: 600; font-variant-numeric: tabular-nums; }
+.selection-bar__note { margin-right: var(--sp-8); color: var(--surface-app); }
 .selection-bar .btn {
   font-size: var(--fs-12); line-height: var(--lh-12); padding: var(--sp-4) var(--sp-8);
   background: transparent; border-color: var(--n8); color: var(--surface-app);
@@ -517,6 +530,8 @@
 .canvas-legend__list[hidden] { display: none; }
 .canvas-legend__list li { display: flex; justify-content: space-between; gap: var(--sp-8); color: var(--text-primary); }
 .canvas-legend__links { border-top: 1px solid var(--border-subtle); padding-top: var(--sp-6); }
+.canvas-legend__meaning { display: flex; align-items: center; gap: var(--sp-6); }
+.canvas-legend__meaning img { flex: none; }
 .canvas-legend__link { display: flex; align-items: center; gap: var(--sp-6); cursor: pointer; }
 /* 24 by 24, the Glass's minimum target (ADR-097 step 3); not brass, which is for the primary action
    and focus only (DESIGN.md §3.2). */
@@ -525,8 +540,11 @@
 /* The canvas toolbar (ADR-097 step 2, design review item 12): one docked row along the canvas's top
    edge, a hairline below and no shadow (DESIGN.md §6); labelled groups, the Show group one segmented
    control. Its controls are quiet buttons here, not the floating overlay buttons they are elsewhere. */
+/* One layer above the corner's legend and zoom cluster (10): the toolbar's open menus and the Clear view
+   prompt hang down over the right-hand legend, and as part of the toolbar's own layer they were drawn
+   under it, so a longer legend (ADR-128's icons by value) covered the prompt's buttons. */
 .canvas-toolbar {
-  box-sizing: border-box; position: absolute; z-index: 10; top: 0; left: 0; right: 0; min-height: var(--h-canvas-toolbar);
+  box-sizing: border-box; position: absolute; z-index: 11; top: 0; left: 0; right: 0; min-height: var(--h-canvas-toolbar);
   display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-4) var(--sp-12); padding: var(--sp-2) var(--sp-8);
   background: var(--surface-panel); border-bottom: 1px solid var(--border-subtle);
   font-size: var(--fs-12); line-height: var(--lh-12);
@@ -591,6 +609,7 @@
 .status-bar__next { min-height: var(--h-control-24); padding: 0 var(--sp-6); font-size: var(--fs-11); }
 .status-pair { display: inline-flex; align-items: baseline; gap: var(--sp-4); white-space: nowrap; }
 .status-pair .value { color: var(--text-primary); }
+.status-bar__withheld { color: var(--text-primary); white-space: nowrap; }
 /* The grid switched off from the canvas toolbar's Show group (owner, 6 October 2026). */
 .network-canvas--no-grid { background-image: none; }
 /* A side panel's name folds the whole panel (owner, 6 October 2026). */
@@ -699,6 +718,27 @@
 .workspace-welcome__step:hover { background: var(--surface-hover); }
 .workspace-welcome__step .value { font-size: var(--fs-11); color: var(--text-tertiary); }
 .workspace-welcome__keys li { display: grid; grid-template-columns: var(--sp-40) minmax(0, 1fr); align-items: center; gap: var(--sp-8); }
+/* A view pushed past the cap (ADR-124 decision 2): centred over the canvas, a shadow and no hairline, as
+   the welcome panel is; the reader's own figure, two ways out. */
+.view-over-cap {
+  position: fixed; z-index: 20; left: 50%; top: calc(var(--h-canvas-toolbar) + var(--sp-24)); transform: translateX(-50%);
+  width: var(--w-right-panel-max); max-width: calc(100% - var(--sp-16)); box-sizing: border-box;
+  max-height: calc(100vh - var(--h-canvas-toolbar) - var(--sp-24)); overflow-y: auto;
+  padding: var(--sp-16); background: var(--surface-raised); border-radius: var(--r-3); box-shadow: var(--overlay-shadow);
+  font-size: var(--fs-13); line-height: var(--lh-13); color: var(--text-primary);
+}
+.view-over-cap__title { margin: 0 0 var(--sp-8); font-size: var(--fs-16); line-height: var(--lh-16); font-weight: 700; }
+.view-over-cap__figure { margin: 0 0 var(--sp-8); font-weight: 600; }
+.view-over-cap__why, .view-over-cap__hint { margin: 0 0 var(--sp-12); color: var(--text-secondary); }
+.view-over-cap__actions { display: flex; gap: var(--sp-8); flex-wrap: wrap; margin-bottom: var(--sp-12); }
+.view-over-cap__form { display: grid; gap: var(--sp-12); }
+.view-over-cap__types { margin: 0; padding: 0; border: 0; display: grid; gap: var(--sp-4); }
+.view-over-cap__types legend { padding: 0; margin-bottom: var(--sp-4); font-size: var(--fs-12); font-weight: 600; color: var(--text-secondary); }
+.view-over-cap__type { display: flex; align-items: center; gap: var(--sp-8); min-height: var(--h-control-24); }
+.view-over-cap__window { display: flex; gap: var(--sp-12); flex-wrap: wrap; }
+.view-over-cap__window label { display: grid; gap: var(--sp-4); font-size: var(--fs-12); color: var(--text-secondary); }
+.view-over-cap__message { margin: var(--sp-12) 0 0; color: var(--text-primary); font-weight: 600; }
+.view-over-cap__reopen { position: fixed; z-index: 20; left: 50%; top: calc(var(--h-canvas-toolbar) + var(--sp-8)); transform: translateX(-50%); }
 /* ADR-115 E6 (DESIGN.md §5a): below 1100px the toolbar's "Last change" note gives its room back. */
 .canvas-toolbar__last-change { flex: 0 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-tertiary); }
 @media (max-width: 1099px) { .canvas-toolbar__last-change { display: none; } }

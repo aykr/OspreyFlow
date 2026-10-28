@@ -71,10 +71,37 @@ test("50k/250k fixture reaches a first interactive frame within the CI software-
 });
 
 test("a sustained pan/zoom sweep holds a CI-appropriate minimum frame rate", async ({ page }) => {
+  // Loading may take up to 90 s and the sweep up to 20 s, past the config's 120 s.
+  test.setTimeout(180_000);
+  // `PERF_CPU_THROTTLE=2` runs the page at about the speed of a CI runner (CI measured 1.9 times
+  // slower than the owner's machine, 20 October 2026), so a regression CI would catch can be shown
+  // red locally before the gate is trusted (CLAUDE.md rule 15). Unset in CI.
+  const throttle = Number(process.env.PERF_CPU_THROTTLE ?? "1");
+  if (throttle > 1) {
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send("Emulation.setCPUThrottlingRate", { rate: throttle });
+  }
   await page.goto("/perf/harness.html");
   await page.waitForFunction(() => window.__PERF__?.readyAt != null, undefined, {
     timeout: 60_000,
   });
+  // Panning is measured once the first frame has been drawn: `readyAt` marks the canvas existing,
+  // and the first frame's drawing runs for seconds after it, so a sweep started there measured the
+  // tail of loading (two or three frames in its two seconds) rather than panning, and passed or
+  // failed with the first frame (20 October 2026; on main, Sigma 3 passed by loading sooner though
+  // settled it pans at 2.7 s a frame in software). Settled means the page answers within 100 ms,
+  // then three seconds more for what follows the first frame (ADR-119's grouping by community).
+  await expect
+    .poll(
+      async () => {
+        const asked = Date.now();
+        await page.evaluate(() => 1);
+        return Date.now() - asked;
+      },
+      { timeout: 90_000, intervals: [0] },
+    )
+    .toBeLessThan(100);
+  await page.waitForTimeout(3000);
 
   const canvas = page.locator("canvas.sigma-nodes");
   const box = await canvas.boundingBox();
@@ -82,9 +109,10 @@ test("a sustained pan/zoom sweep holds a CI-appropriate minimum frame rate", asy
   const cx = box.x + box.width / 2;
   const cy = box.y + box.height / 2;
 
-  const frameTimesMs = await page.evaluate(async ({ cx, cy }) => {
+  const sweep = await page.evaluate(async ({ cx, cy }) => {
     const samples: number[] = [];
-    let last = performance.now();
+    const started = performance.now();
+    let last = started;
     const onFrame = () => {
       const now = performance.now();
       samples.push(now - last);
@@ -97,12 +125,18 @@ test("a sustained pan/zoom sweep holds a CI-appropriate minimum frame rate", asy
     };
     raf = requestAnimationFrame(loop);
 
-    // Simulate a pan+zoom sweep over ~2s: dispatch synthetic wheel/mouse
-    // events directly (no real OS input available inside `page.evaluate`).
+    // Simulate a pan+zoom sweep: dispatch synthetic wheel/mouse events directly (no real OS input
+    // available inside `page.evaluate`). The sweep runs for at least 2 s and until eight frames have
+    // finished, up to 20 s. A fixed 2 s finished two or three frames at CI's ~2 s a frame, so the
+    // average was the elapsed time over 2 or 3 and the gate passed or failed on which (every
+    // failure from 25 to 26 October 2026 was a two-frame sweep, docs-only commits among them, at
+    // 3,124 to 3,421 ms; three-frame sweeps read 1,327 to 2,324 ms). A page stalled for the whole
+    // sweep still finishes few frames in 20 s and fails.
     const el = document.elementFromPoint(cx, cy);
-    const deadline = performance.now() + 2000;
+    const minimumUntil = performance.now() + 2000;
+    const cap = performance.now() + 20_000;
     let angle = 0;
-    while (performance.now() < deadline) {
+    while (performance.now() < cap && (performance.now() < minimumUntil || samples.length < 8)) {
       angle += 0.2;
       el?.dispatchEvent(
         new WheelEvent("wheel", {
@@ -115,12 +149,15 @@ test("a sustained pan/zoom sweep holds a CI-appropriate minimum frame rate", asy
       await new Promise((resolve) => setTimeout(resolve, 16));
     }
     cancelAnimationFrame(raf);
-    return samples;
+    return { frames: samples.length, elapsedMs: performance.now() - started };
   }, { cx, cy });
 
-  const meaningfulSamples = frameTimesMs.filter((t) => t > 0);
-  const averageFrameMs =
-    meaningfulSamples.reduce((sum, t) => sum + t, 0) / Math.max(1, meaningfulSamples.length);
+  // The time the sweep took, over the frames it finished. The frame still being drawn when it ends
+  // counts as time but not as a frame: averaging only finished frames let a page stalled for most
+  // of the sweep report a fast average from its last two (two 15 ms frames in a two-second sweep),
+  // and counting the unfinished one as a frame halved a stall (a planted three-second stall on
+  // every camera move passed at 1,514 ms "per frame"; 20 October 2026).
+  const averageFrameMs = sweep.elapsedMs / Math.max(1, sweep.frames);
 
   // 60fps real-hardware target = 16.67ms/frame. CI's software-rendered
   // proxy is calibrated against an observed baseline on this fixture
@@ -130,7 +167,7 @@ test("a sustained pan/zoom sweep holds a CI-appropriate minimum frame rate", asy
   // not a tight budget that would make this test flaky on ordinary CI
   // variance.
   console.log(
-    `perf sweep: ${averageFrameMs.toFixed(1)} ms per frame over ${meaningfulSamples.length} frames`,
+    `perf sweep: ${averageFrameMs.toFixed(1)} ms per frame over ${sweep.frames} frames in ${sweep.elapsedMs.toFixed(0)} ms`,
   );
   expect(averageFrameMs).toBeLessThan(3000);
 });

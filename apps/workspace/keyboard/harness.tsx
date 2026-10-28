@@ -15,7 +15,11 @@ import { applyTheme } from "../src/theme/theme";
 import "../src/design/primitives.css";
 import { GlassCanvas, type GlassCanvasHandle } from "../src/canvas/GlassCanvas";
 import { SelectionList } from "../src/inspector/SelectionList";
+import { createCrossFilterStore } from "../src/crossfilter/store";
 import { OntologyRegistry } from "../src/ontology/schema";
+import { bringFactIntoView } from "../src/questions/graphFacts";
+import { QuestionsPanel } from "../src/questions/QuestionsPanel";
+import { Timeline } from "../src/timeline/Timeline";
 import { createWorkingSet } from "../src/workingset/store";
 import type { OntologySchema, Node, Edge } from "../../../packages/schemas/generated";
 
@@ -59,6 +63,9 @@ declare global {
       /** Land a `reproject` delta, as the server sends when the resolution slider moves: each node
        * named takes the cluster id given. */
       reproject: (clusterIds: Record<string, string>) => void;
+      /** The cluster id the working set holds on a node now (ADR-124: what a manual link's answer
+       * moved), or `null` when it holds none. */
+      clusterOf: (nodeId: string) => string | null;
     };
     /** How many nodes are folded into Group Nodes now (ADR-066). */
     __GROUPED__?: number;
@@ -83,7 +90,16 @@ const BASE_SCHEMA: OntologySchema = {
     },
     // Phase 6a Stage 4 (B6): the only fixture data the "View messages" radial-menu item needs —
     // it is offered on `Endpoint`-type nodes specifically (`GlassCanvas.tsx`'s own condition).
-    { name: "Endpoint", pole_class: "object", channel: "cyan", shape: "hexagon", icon: "phone", identifiers: [] },
+    // ADR-128 Amendment 3: the neutral device drawing is the type's; a PIN account's kind draws a keypad.
+    {
+      name: "Endpoint",
+      pole_class: "object",
+      channel: "cyan",
+      shape: "hexagon",
+      icon: "device",
+      icon_by_value: { property: "endpoint_kind", icons: { msisdn: "phone", handle: "keypad", account: "account" } },
+      identifiers: [],
+    },
   ],
   edge_types: [
     { name: "ASSOCIATE_OF", from: ["Person"], to: ["Person"], directed: false },
@@ -154,11 +170,12 @@ window.__CANVAS__ = {
       seq: workingSet.store.getState().seq + 1,
       op: "reproject",
       reason: "keyboard fixture",
-      merged: 0,
-      split: Object.keys(clusterIds).length,
-      affected: Object.keys(clusterIds).length,
       affected_cluster_ids: clusterIds,
     }),
+  clusterOf: (id) =>
+    workingSet.graph.hasNode(id)
+      ? (workingSet.graph.getNodeAttribute(id, "data").resolution?.cluster_id ?? null)
+      : null,
 };
 
 window.__KEYBOARD__ = {
@@ -209,6 +226,11 @@ const SCHEMA: OntologySchema = wantsSameAs
         }
       : BASE_SCHEMA;
 
+// `?questions=1` puts the Questions panel beside the real canvas, wired as `App.tsx` wires it: a
+// chosen `[G-n]` goes to the canvas through `bringFactIntoView` (ADR-129, rule 13), so
+// `questions.spec.ts` proves the selection on the real canvas, not on a recording fake.
+const wantsQuestions = new URLSearchParams(window.location.search).get("questions") === "1";
+
 const workingSet = createWorkingSet();
 const ontology = new OntologyRegistry(SCHEMA);
 
@@ -228,7 +250,8 @@ const nodes = [
   node("n1"),
   node("n2", { resolution: { cluster_id: "n2" } }),
   node("n3", { resolution: { cluster_id: "n2" } }),
-  node("n4", { type: "Endpoint", properties: { value_normalised: "n4" } }),
+  // ADR-128 Decision 4: a PIN account (`handle`), so it is drawn with the keypad, not the type's drawing.
+  node("n4", { type: "Endpoint", properties: { value_normalised: "n4", endpoint_kind: "handle" } }),
   // **`n5` is deliberately disconnected — it has no edge to anything, ever.** Round 12d: every
   // other node here is on one chain, so arrow-walk (which follows `graph.neighbors`) can reach
   // all of them, and a walkthrough over this fixture could not tell whether the canvas had a
@@ -327,10 +350,16 @@ if (wantsLinkStyle) {
     edges.push(basis ? { ...link, basis } : link);
   }
 }
-workingSet.store.getState().applyDelta({ seq: 1, op: "snapshot", nodes, edges, filtered_count: 0 });
+workingSet.store.getState().applyDelta({ seq: 1, op: "snapshot", nodes, edges });
 
 const container = document.getElementById("root");
 if (!container) throw new Error("#root not found");
+
+// `?fixture=lit` is ADR-128's (B3, select what is lit): the chain above with the real timeline under
+// it, so a keyboard walkthrough can set a window by Set exact dates, run Select what is lit, and
+// branch what it selected, as App does. The timeline's own reads are answered by the spec.
+const wantsLit = new URLSearchParams(window.location.search).get("fixture") === "lit";
+const litStore = createCrossFilterStore("http://keyboard-test.invalid", "unused", "keyboard-fixture");
 
 // `?judged=n1:2,n2:1` gives those nodes that many judgements, for the count drawn beside a node
 // (ADR-070).
@@ -404,7 +433,11 @@ createRoot(container).render(
         window.__KEYBOARD__!.selectedEdge = edge ? edge.id : null;
       }}
       getEventsWindow={() =>
-        wantsEmails ? { validFrom: "2001-05-01T00:00:00Z", validTo: "2001-05-31T00:00:00Z" } : null
+        wantsLit
+          ? litStore.store.getState().window
+          : wantsEmails
+            ? { validFrom: "2001-05-01T00:00:00Z", validTo: "2001-05-31T00:00:00Z" }
+            : null
       }
       onOpenDocument={(nodeId) => {
         window.__KEYBOARD__!.openedDocument = nodeId;
@@ -429,6 +462,34 @@ createRoot(container).render(
         before Phase 7 Stage 4, since the canvas's own onKeyDown used to intercept every Tab
         press regardless. */}
     <button id="after-canvas" data-harness-only="">After canvas</button>
+    {wantsLit && (
+      <div style={{ width: 900, height: 260 }}>
+        <Timeline
+          apiBaseUrl="http://keyboard-test.invalid"
+          bearerToken="unused"
+          investigationScope="keyboard-fixture"
+          crossFilterStore={litStore}
+          getNodeIds={() => workingSet.graph.nodes()}
+          getEdgeIds={() => workingSet.graph.edges()}
+          onSelectLit={() => {
+            const { window, cells } = litStore.store.getState();
+            if (window) void canvasHandle.current?.selectLit(window, cells);
+          }}
+        />
+      </div>
+    )}
     <HarnessSelectionList />
+    {wantsQuestions && (
+      <QuestionsPanel
+        apiBaseUrl="http://keyboard-test.invalid"
+        bearerToken="unused"
+        investigationId="keyboard-fixture"
+        onDelta={() => undefined}
+        selection={{ nodeIds: [], linkIds: [] }}
+        onSelectFacts={(citation) => {
+          if (canvasHandle.current) bringFactIntoView(canvasHandle.current, citation);
+        }}
+      />
+    )}
   </>,
 );

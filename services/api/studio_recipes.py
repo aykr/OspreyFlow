@@ -18,9 +18,10 @@ a published recipe for a further edit — the previous version is flipped to
 attribution on already-loaded elements keeps meaning what it said), and
 `flag_stale` — the reverse index `§6`'s opening paragraph promises: "an
 ontology edit flags every recipe that depends on the changed version." It is
-deliberately not a separate index structure; `status='published' AND
-ontology_version != :current` over this same table already answers "which
-recipes does this ontology version affect" in one statement, and
+deliberately not a separate index structure; `status='published'` with an
+`ontology_version` other than the current one, or a pinned pack (`pack_versions`,
+ADR-120 D10) at another version than the one loaded, over this same table already
+answers "which recipes does this ontology version affect" in one statement, and
 `create_new_version`'s own supersede step is what keeps that `WHERE
 status='published'` scan meaning "the one live version of this recipe", not
 every version that was ever published.
@@ -29,22 +30,35 @@ every version that was ever published.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import Protocol
 
 import asyncpg
+import yaml
+from services.ingest.engine import StaleRecipeError, check_recipe_pins
+from services.ingest.pipeline import recipe_packs
+from services.ingest.recipe_loader import load_recipe
+from services.ingest.recipe_rules import check_recipe_rules, template_elements
 
 from conduit_common.identity import new_id
-from schemas.domain import Principal
+from ontology.handling import HandlingScheme
+from schemas.domain import Handling, OntologySchema, Principal
 from schemas.ingest import (
+    DeduplicateConfig,
     PipelineGraph,
+    Recipe,
     RowTemplate,
     StudioRecipeDraft,
     StudioRecipeStatus,
     UnmappedField,
+    check_source_declarations,
 )
 
 from .dataset_scope import made_in, reach_clause
+from .studio_map import validate_handling_tightens
+from .studio_publish import pack_versions_for
 
 _BOOTSTRAP_SQL = """
 CREATE TABLE IF NOT EXISTS studio_recipes (
@@ -74,7 +88,15 @@ ALTER TABLE studio_recipes ADD COLUMN IF NOT EXISTS schedule_set_at TIMESTAMPTZ;
 ALTER TABLE studio_recipes ADD COLUMN IF NOT EXISTS schedule_case TEXT;
 ALTER TABLE studio_recipes ADD COLUMN IF NOT EXISTS schedule_paused BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE studio_recipes ADD COLUMN IF NOT EXISTS schedule_paused_reason TEXT;
+-- ADR-120 D10, Amendment 1: the pack versions it was published against; NULL until published
+-- (and for one published before pinning, until the start-up backfill stamps it).
+ALTER TABLE studio_recipes ADD COLUMN IF NOT EXISTS pack_versions JSONB;
 """
+
+#: ADR-120 Amendment 1, decision 4: the versions the packs stood at when pinning began, which is
+#: what a recipe published before it was written against. Stamped by `backfill_pack_versions` and
+#: never changed, so a later bump reads as a bump.
+LEGACY_PACK_VERSIONS: dict[str, int] = {"niem": 2, "fibo": 1, "stix": 1}
 
 
 class StudioRecipeNotFoundError(Exception):
@@ -109,6 +131,177 @@ class StudioRecipeCannotVersionError(Exception):
     definition (its own successor already exists)."""
 
 
+class SeededRecipePinsDiffer(ValueError):
+    """A recipe entered by the seed pins packs other than the ones its own types call for
+    (`pack_versions_for`): a publish would never have stamped it so."""
+
+
+class SeededRecipeContentDiffers(ValueError):
+    """A recipe entered by the seed is already in the registry at that version with other content.
+    The row is left as it is: a version is immutable once entered (`create_new_version`), so the
+    seed never rewrites one, and a changed committed file needs a new version."""
+
+
+class SeededRecipeNoLegalBasis(ValueError):
+    """A recipe entered by the seed declares no legal basis. Connect requires one, and a row
+    without it is not `ready_for_profile`, a state a Studio publish never reaches."""
+
+
+class SeededRecipeAnotherPublished(ValueError):
+    """Another version of the recipe is already published (or flagged). A recipe has one live
+    version (`create_new_version` supersedes the one before), so the seed never makes a second."""
+
+
+def check_seeded_recipe(recipe: Recipe, ontology: OntologySchema, scheme: HandlingScheme) -> None:
+    """The refusals a committed recipe passes before the seed enters it as published (ADR-127
+    Amendment 23): what Map's save and a run both check, none of which `enter_published_for_seed`
+    may skip. Raises, naming the cause, and writes nothing (it touches no store).
+
+    - `validate_handling_tightens` (`HandlingLoosenedError`) for each element's own marking against
+      the source's, as Map's save makes it;
+    - `check_recipe_rules` (`RecipeRuleError`) as a run makes it, with the units and the declared
+      marking columns the recipe carries;
+    - the ontology it was made against, and `check_recipe_pins` (`StaleRecipeError`): each pack it
+      names or writes is pinned at the version this ontology carries;
+    - its pins are exactly `pack_versions_for` (`SeededRecipePinsDiffer`): a pin for a pack it
+      neither names nor writes, which the engine ignores and a publish never stamps, is refused."""
+    if not (recipe.defaults.legal_basis or "").strip():
+        raise SeededRecipeNoLegalBasis(
+            f"recipe {recipe.id!r} v{recipe.version} declares no legal basis in its defaults"
+        )
+    if recipe.ontology_version != ontology.version:
+        raise StaleRecipeError(
+            f"recipe {recipe.id!r} targets ontology version {recipe.ontology_version}, but the "
+            f"loaded ontology is version {ontology.version}"
+        )
+    # The source's marking against each element's own first: `check_recipe_rules` refuses a
+    # loosening too, in its own words, and would hide this one's if it ran first.
+    baseline = Handling.model_validate(recipe.defaults.handling)
+    for element in template_elements(recipe.row_template):
+        validate_handling_tightens(baseline, element.handling, scheme)
+    check_recipe_rules(
+        recipe.row_template,
+        ontology,
+        units=recipe.defaults.units,
+        defaults_handling=recipe.defaults.handling,
+        scheme=scheme,
+        declared_columns=recipe.defaults.handling_columns,
+    )
+    check_recipe_pins(recipe, ontology)
+    pins = pack_versions_for(recipe.pipeline, recipe.row_template, ontology)
+    if (recipe.pack_versions or {}) != pins:
+        raise SeededRecipePinsDiffer(
+            f"recipe {recipe.id!r} v{recipe.version} pins {recipe.pack_versions!r}, but its types "
+            f"call for {pins!r}"
+        )
+
+
+def _seeded_row_differences(
+    row: asyncpg.Record,
+    *,
+    label: str,
+    content: dict[str, object],
+    pack_versions: dict[str, int],
+    ontology_version: int,
+    dataset_id: str,
+    owning_unit: str,
+    git_path: str,
+) -> list[str]:
+    """The columns of a registry row that are not what entering this recipe would write, by name
+    (the whole row is "the same content": ADR-127 Amendment 26). Written by the seed, so `status`
+    is `published`."""
+    differing: list[str] = []
+    if row["label"] != label:
+        differing.append("label")
+    if json.loads(row["content"]) != json.loads(json.dumps(content)):
+        differing.append("content")
+    if _pins_from_column(row["pack_versions"]) != pack_versions:
+        differing.append("pack_versions")
+    for column, wanted in (
+        ("ontology_version", ontology_version),
+        ("dataset_id", dataset_id),
+        ("owning_unit", owning_unit),
+        ("git_path", git_path),
+        ("status", StudioRecipeStatus.PUBLISHED.value),
+    ):
+        if row[column] != wanted:
+            differing.append(column)
+    return differing
+
+
+def _seeded_content(recipe: Recipe, source_location: str | None) -> dict[str, object]:
+    """A committed recipe's content as a `studio_recipes` row holds it: `_content_json`'s shape,
+    with the units and the marking columns beside the handling, as Connect declares them."""
+    handling: dict[str, object] = dict(recipe.defaults.handling)
+    if recipe.defaults.units:
+        handling["units"] = list(recipe.defaults.units)
+    if recipe.defaults.handling_columns:
+        handling["handling_columns"] = dict(recipe.defaults.handling_columns)
+    return {
+        "connector_profile": recipe.connector.profile,
+        "source_location": source_location,
+        "handling": handling,
+        "legal_basis": recipe.defaults.legal_basis,
+        "row_template": recipe.row_template.model_dump(by_alias=True),
+        "unmapped_fields": [f.model_dump() for f in recipe.unmapped_fields],
+        "pipeline": recipe.pipeline.model_dump(by_alias=True) if recipe.pipeline else None,
+        "deduplicate": recipe.deduplicate.model_dump() if recipe.deduplicate else None,
+    }
+
+
+async def _existing_seeded_row(
+    conn: asyncpg.Connection,
+    recipe: Recipe,
+    content: dict[str, object],
+    *,
+    dataset_id: str,
+    owning_unit: str,
+    git_path: str,
+) -> asyncpg.Record | None:
+    """The row a seed would meet entering `recipe`, or None when there is none; refuses, naming each
+    column, a row at that version that differs from what entering would write
+    (`SeededRecipeContentDiffers`), and a second published version of a recipe that has a live one
+    (`SeededRecipeAnotherPublished`). One definition of "the same row", for
+    `enter_published_for_seed` and for `check_seeded_row`, which the seed makes before it commits
+    the recipe file (ADR-127 Amendment 30), so a committed file never differs from its row."""
+    existing = await conn.fetchrow(
+        "SELECT * FROM studio_recipes WHERE recipe_id = $1 AND version = $2",
+        recipe.id,
+        recipe.version,
+    )
+    if existing is not None:
+        differing = _seeded_row_differences(
+            existing,
+            label=recipe.label,
+            content=content,
+            pack_versions=recipe.pack_versions or {},
+            ontology_version=recipe.ontology_version,
+            dataset_id=dataset_id,
+            owning_unit=owning_unit,
+            git_path=git_path,
+        )
+        if differing:
+            raise SeededRecipeContentDiffers(
+                f"recipe {recipe.id!r} v{recipe.version} is already in the registry and "
+                f"differs in {', '.join(differing)}; it is left as it is, and a changed "
+                "file needs a new version"
+            )
+        return existing
+    live = await conn.fetchval(
+        "SELECT version FROM studio_recipes WHERE recipe_id = $1 AND version <> $2 "
+        "AND status = ANY($3::text[]) LIMIT 1",
+        recipe.id,
+        recipe.version,
+        [StudioRecipeStatus.PUBLISHED.value, StudioRecipeStatus.FLAGGED.value],
+    )
+    if live is not None:
+        raise SeededRecipeAnotherPublished(
+            f"recipe {recipe.id!r} already has version {live} published; a recipe has "
+            f"one live version, so v{recipe.version} is not entered"
+        )
+    return None
+
+
 def _content_json(draft: StudioRecipeDraft, **overrides: object) -> str:
     """The draft's one content document, every sibling field carried — the rule `update_draft`'s
     row-template comment states, now in one place so no writer can forget a field (ADR-108 phase B:
@@ -123,9 +316,34 @@ def _content_json(draft: StudioRecipeDraft, **overrides: object) -> str:
         else None,
         "unmapped_fields": [f.model_dump() for f in draft.unmapped_fields],
         "pipeline": draft.pipeline.model_dump(by_alias=True) if draft.pipeline else None,
+        # ADR-127 decision 5: what makes a row the same row again, kept with the rest of the
+        # content so every writer carries it and a new version keeps it.
+        "deduplicate": draft.deduplicate.model_dump() if draft.deduplicate else None,
     }
     whole.update(overrides)
     return json.dumps(whole)
+
+
+def _pins_from_column(raw: object) -> dict[str, int] | None:
+    """The `pack_versions` column as a map: asyncpg hands JSONB back as text unless a codec is
+    set, and this pool sets none, as `content` above is read the same way. A value that is not a
+    JSON object (a `null`, a scalar, an array), or whose versions are not integers, is no pins at
+    all, exactly as SQL NULL (ADR-120 Amendment 3, decision 1; an object of that kind is flagged
+    by `flag_stale`, not re-stamped): nothing that reads the column can
+    be stopped by it."""
+    if raw is None:
+        return None
+    decoded = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(decoded, dict):
+        return None
+    pins: dict[str, int] = {}
+    for pack, version in decoded.items():
+        # A whole number only, as `flag_stale`'s `p.v::text ~ '^[0-9]+$'` reads it: not a bool, a
+        # float (a JSON `1.0`), a string or a negative.
+        if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+            return None
+        pins[str(pack)] = version
+    return pins
 
 
 def _row_to_draft(row: asyncpg.Record) -> StudioRecipeDraft:
@@ -158,8 +376,12 @@ def _row_to_draft(row: asyncpg.Record) -> StudioRecipeDraft:
         pipeline=PipelineGraph.model_validate(content["pipeline"])
         if content.get("pipeline")
         else None,
+        deduplicate=DeduplicateConfig.model_validate(content["deduplicate"])
+        if content.get("deduplicate")
+        else None,
         verified_at=data["verified_at"],
         ontology_version=data["ontology_version"],
+        pack_versions=_pins_from_column(data.get("pack_versions")),
         git_path=data["git_path"],
         published_by=data["published_by"],
         published_at=data["published_at"],
@@ -173,6 +395,34 @@ def _row_to_draft(row: asyncpg.Record) -> StudioRecipeDraft:
         schedule_paused_reason=data.get("schedule_paused_reason"),
         dataset_id=data.get("dataset_id"),
     )
+
+
+_SOURCE_DECLARATIONS = ("units", "handling_columns")
+
+
+class SourceDeclarationsInvalidError(ValueError):
+    """The handling a draft would hold after a PATCH declares what the source cannot support: a
+    unit column with no units, or malformed `units` or `handling_columns` (ADR-127 decision 3)."""
+
+
+def carry_source_declarations(
+    old: dict[str, object], new: dict[str, object] | None
+) -> dict[str, object] | None:
+    """A new handling replaces the old whole, and what the source declares beside its marking
+    (ADR-127 decision 3: the `units` its rows may name, the `handling_columns` that carry each
+    part) rides inside it: a handling that does not mention one keeps the draft's own, so editing
+    the marking in Connect does not silently drop them. An explicit empty value clears it."""
+    if new is None:
+        return new
+    carried = {k: old[k] for k in _SOURCE_DECLARATIONS if k in old and k not in new}
+    merged = {**new, **carried} if carried else new
+    # What was kept is judged as Connect judges a handling: a unit column needs the units a PATCH
+    # may have just emptied. Refused here, before `update_draft` writes anything.
+    try:
+        check_source_declarations(dict(merged))
+    except ValueError as exc:
+        raise SourceDeclarationsInvalidError(str(exc)) from exc
+    return merged
 
 
 class StudioRecipeStore:
@@ -200,6 +450,7 @@ class StudioRecipeStore:
         source_location: str | None,
         handling: dict[str, object],
         legal_basis: str | None,
+        deduplicate: DeduplicateConfig | None = None,
     ) -> StudioRecipeDraft:
         recipe_id = new_id()
         content = json.dumps(
@@ -208,6 +459,9 @@ class StudioRecipeStore:
                 "source_location": source_location,
                 "handling": handling,
                 "legal_basis": legal_basis,
+                "deduplicate": deduplicate.model_dump()
+                if deduplicate and deduplicate.key
+                else None,
             }
         )
         created_at = datetime.now(UTC)
@@ -277,23 +531,26 @@ class StudioRecipeStore:
         source_location: str | None = None,
         handling: dict[str, object] | None = None,
         legal_basis: str | None = None,
+        deduplicate: DeduplicateConfig | None = None,
     ) -> StudioRecipeDraft:
+        """`deduplicate` (ADR-127 decision 5): `None` leaves the draft's own, a config replaces it,
+        and one with an empty `key` clears it (the draft then keeps no keys)."""
         draft = await self.get_authorized(recipe_id, principal)
         if draft.status is not StudioRecipeStatus.DRAFT:
             raise StudioRecipeNotADraftError(recipe_id)
-        content = _content_json(
-            draft,
-            **{
-                k: v
-                for k, v in {
-                    "connector_profile": connector_profile,
-                    "source_location": source_location,
-                    "handling": handling,
-                    "legal_basis": legal_basis,
-                }.items()
-                if v is not None
-            },
-        )
+        overrides: dict[str, object] = {
+            k: v
+            for k, v in {
+                "connector_profile": connector_profile,
+                "source_location": source_location,
+                "handling": carry_source_declarations(draft.handling, handling),
+                "legal_basis": legal_basis,
+            }.items()
+            if v is not None
+        }
+        if deduplicate is not None:
+            overrides["deduplicate"] = deduplicate.model_dump() if deduplicate.key else None
+        content = _content_json(draft, **overrides)
         async with self._pool.acquire() as conn:
             await conn.execute(
                 "UPDATE studio_recipes SET label = $1, content = $2, verified_at = NULL "
@@ -408,6 +665,7 @@ class StudioRecipeStore:
         principal: Principal,
         *,
         ontology_version: int,
+        pack_versions: dict[str, int],
         git_path: str,
         schedule_cron: str | None,
         schedule_watch: str | None,
@@ -420,7 +678,12 @@ class StudioRecipeStore:
         committed it at `git_path` by the time this is called — this
         method only flips the registry row, and is the single place that
         enforces "Verify must pass before publish" (§5) mechanically,
-        against `verified_at` rather than by re-running a dry run here."""
+        against `verified_at` rather than by re-running a dry run here. `pack_versions` has no
+        default and refuses `None` (ADR-120 Amendment 1, decision 5; Amendment 2, decision 3): a
+        fresh publish can never store "not pinned" and be mistaken for a legacy row by the next
+        start's backfill."""
+        if pack_versions is None:
+            raise ValueError("pack_versions is required to publish; pass {} for a recipe with none")
         draft = await self.get_authorized(recipe_id, principal)
         if draft.status is not StudioRecipeStatus.DRAFT:
             raise StudioRecipeNotADraftError(recipe_id)
@@ -431,7 +694,8 @@ class StudioRecipeStore:
                 "UPDATE studio_recipes SET status = $1, ontology_version = $2, git_path = $3, "
                 "published_by = $4, published_at = $5, schedule_cron = $6, schedule_watch = $7, "
                 "schedule_timezone = $10, schedule_owner = $11, schedule_set_at = $12, "
-                "schedule_case = $13, schedule_paused = FALSE, schedule_paused_reason = NULL "
+                "schedule_case = $13, schedule_paused = FALSE, schedule_paused_reason = NULL, "
+                "pack_versions = $14::jsonb "
                 "WHERE recipe_id = $8 AND version = $9",
                 StudioRecipeStatus.PUBLISHED.value,
                 ontology_version,
@@ -446,6 +710,7 @@ class StudioRecipeStore:
                 principal.id if (schedule_cron or schedule_watch) else None,
                 now if (schedule_cron or schedule_watch) else None,
                 schedule_case if (schedule_cron or schedule_watch) else None,
+                json.dumps(pack_versions),
             )
         return await self.get(recipe_id)
 
@@ -517,9 +782,7 @@ class StudioRecipeStore:
             )
         return [_row_to_draft(r) for r in rows]
 
-    async def retime(
-        self, recipe_id: str, *, cron: str, timezone: str, now: datetime
-    ) -> None:
+    async def retime(self, recipe_id: str, *, cron: str, timezone: str, now: datetime) -> None:
         """A new time for an existing schedule (ADR-110 Amendment 3, point 2: the Admin area's
         *Change schedule*): the owner, the case and the paused state are kept; the time it was set
         moves to now, so slots before the change are not counted as missed."""
@@ -591,7 +854,240 @@ class StudioRecipeStore:
                 )
         return await self.get(recipe_id)
 
-    async def flag_stale(self, current_ontology_version: int) -> list[str]:
+    async def enter_published_for_seed(
+        self,
+        recipe: Recipe,
+        *,
+        source_location: str,
+        git_path: str,
+        dataset_id: str,
+        owning_unit: str,
+        published_by: str,
+        now: datetime,
+        ontology: OntologySchema,
+        scheme: HandlingScheme,
+    ) -> StudioRecipeDraft:
+        """Enters a committed recipe as published, keeping its id and version (ADR-127 Amendment 23,
+        "The recipes"): for the Prison Intelligence seed, which has no analyst to take a draft
+        through Connect, Map, Verify and Publish. **Confined**: no route may call it, since it
+        skips every gate a publish has (the roles, the unit check, `verified_at`); the one caller
+        is the Prison Intelligence seed's own module (the confinement test names it).
+
+        Refuses first, writing nothing (`check_seeded_recipe`): the rules, a marking that loosens
+        the source's, a pin that is not the ontology's or not `pack_versions_for`.
+
+        **Writes** `content` from the file (`connector_profile`; `source_location`; `handling` with
+        its `units` and `handling_columns`; `legal_basis`; `row_template`; `unmapped_fields`;
+        `deduplicate`; `pipeline` if it has one) and the columns `ontology_version`,
+        `pack_versions`, `published_by`, `published_at` (`now`), `verified_at` (`now`: the file is
+        what the engine's own golden test ran), `dataset_id`, `owning_unit` and `git_path`. No
+        schedule is set, so the scheduler never runs it of its own accord.
+
+        **A row already there** at that id and version that is what entering would write, in every
+        column (the content, the label, the pins, the ontology version, the dataset, the unit, the
+        path and the status), is left exactly as it is, whatever `now` is; one that differs in any
+        raises `SeededRecipeContentDiffers` naming each, and is left as it is. A recipe with no
+        legal basis (`SeededRecipeNoLegalBasis`), and a second published version of one that has a
+        live version already (`SeededRecipeAnotherPublished`), are refused. Returns the version
+        entered, never the recipe's latest."""
+        check_seeded_recipe(recipe, ontology, scheme)
+        content = _seeded_content(recipe, source_location)
+        async with self._pool.acquire() as conn, conn.transaction():
+            # One writer per recipe at a time, so two seeds cannot both find it absent.
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", recipe.id)
+            existing = await _existing_seeded_row(
+                conn,
+                recipe,
+                content,
+                dataset_id=dataset_id,
+                owning_unit=owning_unit,
+                git_path=git_path,
+            )
+            if existing is None:
+                await conn.execute(
+                    "INSERT INTO studio_recipes (recipe_id, version, ontology_version, label, "
+                    "status, content, git_path, owning_unit, created_by, published_by, created_at, "
+                    "published_at, verified_at, dataset_id, pack_versions) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $10, $10, $11, "
+                    "$12::jsonb)",
+                    recipe.id,
+                    recipe.version,
+                    recipe.ontology_version,
+                    recipe.label,
+                    StudioRecipeStatus.PUBLISHED.value,
+                    json.dumps(content),
+                    git_path,
+                    owning_unit,
+                    published_by,
+                    now,
+                    dataset_id,
+                    json.dumps(recipe.pack_versions or {}),
+                )
+            row = await conn.fetchrow(
+                "SELECT * FROM studio_recipes WHERE recipe_id = $1 AND version = $2",
+                recipe.id,
+                recipe.version,
+            )
+        assert row is not None
+        # The version just entered, not `get`'s latest: a later draft of the recipe may exist.
+        return _row_to_draft(row)
+
+    async def check_seeded_row(
+        self,
+        recipe: Recipe,
+        *,
+        source_location: str,
+        git_path: str,
+        dataset_id: str,
+        owning_unit: str,
+    ) -> None:
+        """The comparison `enter_published_for_seed` makes with the row it would meet, made on its
+        own and writing nothing (ADR-127 Amendment 30): the Prison Intelligence seed asks it before
+        it commits the recipe's file to the recipe repository, so that a row that differs is refused
+        by name with nothing committed and a committed file never differs from its published row.
+        Raises `SeededRecipeContentDiffers` or `SeededRecipeAnotherPublished` exactly as entering
+        would; a recipe with no row yet passes. Reads only, so it takes no lock and is no gate a
+        route could pass through: it enters nothing."""
+        content = _seeded_content(recipe, source_location)
+        async with self._pool.acquire() as conn:
+            await _existing_seeded_row(
+                conn,
+                recipe,
+                content,
+                dataset_id=dataset_id,
+                owning_unit=owning_unit,
+                git_path=git_path,
+            )
+
+    async def enter_draft_for_seed(
+        self,
+        recipe: Recipe,
+        *,
+        source_location: str,
+        dataset_id: str,
+        owning_unit: str,
+        created_by: str,
+        now: datetime,
+        pipeline: PipelineGraph,
+    ) -> StudioRecipeDraft:
+        """R9's first draft (ADR-127 Amendment 23, "R9's draft"): a draft at the recipe's own id and
+        version, in `owning_unit`, holding what Connect holds (the connector, the source, the
+        marking and its declarations, the legal basis, the dataset) from the committed file, the
+        `pipeline` given, and **no** `row_template`, `unmapped_fields` or `deduplicate`, so Map is
+        not done. Not verified, not published, no path.
+
+        For the first seed only: `restore_to_draft` needs a row to restore from, and a recipe the
+        seed has never entered has none. **A row of that id already there, at any version and in
+        any status, is left exactly as it is** and returned (the latest): a second seed, or one
+        after the rehearsal's reset, must not write over what an engineer did or what the reset
+        restored. **Confined** like `enter_published_for_seed`: it skips the author's gates, and
+        the one caller is the Prison Intelligence seed's own module.
+
+        Refuses first, writing nothing: a recipe with no legal basis (`SeededRecipeNoLegalBasis`),
+        and a declaration the source cannot hold (`check_source_declarations`)."""
+        if not (recipe.defaults.legal_basis or "").strip():
+            raise SeededRecipeNoLegalBasis(
+                f"recipe {recipe.id!r} v{recipe.version} declares no legal basis in its defaults"
+            )
+        content = _seeded_content(recipe, source_location)
+        check_source_declarations(dict(content["handling"]))  # type: ignore[call-overload]
+        content.update(
+            row_template=None,
+            unmapped_fields=[],
+            deduplicate=None,
+            pipeline=pipeline.model_dump(by_alias=True),
+        )
+        async with self._pool.acquire() as conn, conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", recipe.id)
+            row = await conn.fetchrow(
+                "SELECT * FROM studio_recipes WHERE recipe_id = $1 ORDER BY version DESC LIMIT 1",
+                recipe.id,
+            )
+            if row is None:
+                await conn.execute(
+                    "INSERT INTO studio_recipes (recipe_id, version, label, status, content, "
+                    "owning_unit, created_by, created_at, dataset_id) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                    recipe.id,
+                    recipe.version,
+                    recipe.label,
+                    StudioRecipeStatus.DRAFT.value,
+                    json.dumps(content),
+                    owning_unit,
+                    created_by,
+                    now,
+                    dataset_id,
+                )
+                row = await conn.fetchrow(
+                    "SELECT * FROM studio_recipes WHERE recipe_id = $1 "
+                    "ORDER BY version DESC LIMIT 1",
+                    recipe.id,
+                )
+        assert row is not None
+        return _row_to_draft(row)
+
+    async def restore_to_draft(
+        self,
+        recipe_id: str,
+        *,
+        created_by: str,
+        owning_unit: str,
+        now: datetime,
+        pipeline: PipelineGraph,
+    ) -> StudioRecipeDraft:
+        """R9's reset (ADR-127 Amendment 23, "The reset"): a draft at the next version, in
+        `owning_unit`, with `row_template`, `unmapped_fields` and `deduplicate` cleared, so Map is
+        not done; what Connect holds (the connector, the source, the marking and its declarations,
+        the legal basis, the dataset) is carried from the latest version. The draft's `pipeline` is
+        the one given, never the latest version's (ADR-127 Amendment 25): a version published from a
+        file holds none, and the seed's starting pipeline is what R9's draft is to hold.
+
+        **In the same transaction** the latest version, **whatever its status** (published,
+        flagged, or a draft), is set to `superseded`, so afterwards `feeding` lists no such recipe
+        and `list_drafts` lists exactly this one. A failure in either statement leaves both as they
+        were. **Confined** like `enter_published_for_seed`: it skips the author's and approver's
+        gates, and the one caller is the Prison Intelligence seed's own module."""
+        async with self._pool.acquire() as conn, conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", recipe_id)
+            row = await conn.fetchrow(
+                "SELECT * FROM studio_recipes WHERE recipe_id = $1 ORDER BY version DESC LIMIT 1",
+                recipe_id,
+            )
+            if row is None:
+                raise StudioRecipeNotFoundError(recipe_id)
+            previous = _row_to_draft(row)
+            content = _content_json(
+                previous,
+                row_template=None,
+                unmapped_fields=[],
+                deduplicate=None,
+                pipeline=pipeline.model_dump(by_alias=True),
+            )
+            await conn.execute(
+                "UPDATE studio_recipes SET status = $1 WHERE recipe_id = $2 AND version = $3",
+                StudioRecipeStatus.SUPERSEDED.value,
+                recipe_id,
+                previous.version,
+            )
+            await conn.execute(
+                "INSERT INTO studio_recipes (recipe_id, version, label, status, content, "
+                "owning_unit, created_by, created_at, dataset_id) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                recipe_id,
+                previous.version + 1,
+                previous.label,
+                StudioRecipeStatus.DRAFT.value,
+                content,
+                owning_unit,
+                created_by,
+                now,
+                previous.dataset_id,
+            )
+        return await self.get(recipe_id)
+
+    async def flag_stale(
+        self, current_ontology_version: int, current_pack_versions: dict[str, int]
+    ) -> list[str]:
         """The reverse index `09_INGEST_STUDIO.md` §6 promises: run once
         whenever the ontology reloads (`services/api/app.py`'s `lifespan`
         — this deployment's only "reload" trigger today is a process
@@ -602,14 +1098,126 @@ class StudioRecipeStore:
         guarantees at most one version of a given `recipe_id` is ever
         `published` at a time — an older version is `superseded` the
         moment a newer one is opened, never left `published` alongside it.
-        Returns the flagged `recipe_id`s, for the caller to log/audit."""
+        A recipe is also flagged when any pack it pins is at another version, or no longer
+        loaded, than `current_pack_versions` (ADR-120 D10); a row with no pins is never flagged on
+        packs, only on the core version. One statement, so the two tests cannot disagree about
+        which rows they saw. An object with a pinned value that is not a JSON whole number
+        (`"1"`, `1.5`, `true`) is flagged too, however it reads against the loaded version
+        (ADR-120 Amendment 3, decision 1). Returns the flagged `recipe_id`s, for the caller to
+        log/audit."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 "UPDATE studio_recipes SET status = $1 "
-                "WHERE status = $2 AND ontology_version IS NOT NULL "
-                "AND ontology_version != $3 RETURNING recipe_id",
+                "WHERE status = $2 AND ("
+                "(ontology_version IS NOT NULL AND ontology_version != $3) "
+                "OR (pack_versions IS NOT NULL AND jsonb_typeof(pack_versions) = 'object' "
+                "AND EXISTS ("
+                "SELECT 1 FROM jsonb_each(pack_versions) AS p(k, v) "
+                "WHERE jsonb_typeof(p.v) <> 'number' OR p.v::text !~ '^[0-9]+$' "
+                "OR ($4::jsonb -> p.k) IS DISTINCT FROM p.v))"
+                ") RETURNING recipe_id",
                 StudioRecipeStatus.FLAGGED.value,
                 StudioRecipeStatus.PUBLISHED.value,
                 current_ontology_version,
+                json.dumps(current_pack_versions),
             )
         return [row["recipe_id"] for row in rows]
+
+    async def backfill_pack_versions(
+        self,
+        read_recipe: Callable[[str], Recipe | None],
+        ontology: OntologySchema,
+    ) -> list[str]:
+        """Stamp the pins of every published recipe that has none (ADR-120 Amendment 1, decisions
+        4 and 6): each is read from its committed file and given the legacy version of every pack
+        it names or writes (`{}` when it names and writes none, so it is not read again at the
+        next start). A recipe whose file cannot be read, or that names or writes a pack with no
+        legacy version, is flagged, never stamped with a guess, and its id returned. Only
+        published rows with no pins are read (a column holding a JSON value that is not an object
+        counts as none, ADR-120 Amendment 3); any other row is left exactly as it is. No row lock
+        is held while a file is read, so each write re-checks that its row is still published and
+        unpinned, and a row superseded or pinned meanwhile is left unchanged."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT recipe_id, version, git_path FROM studio_recipes "
+                "WHERE status = $1 AND (pack_versions IS NULL "
+                "OR jsonb_typeof(pack_versions) <> 'object') ORDER BY recipe_id, version",
+                StudioRecipeStatus.PUBLISHED.value,
+            )
+        flagged: list[str] = []
+        for row in rows:
+            git_path = row["git_path"]
+            recipe = read_recipe(git_path) if isinstance(git_path, str) else None
+            pins: dict[str, int] | None = None
+            if recipe is not None:
+                packs = recipe_packs(recipe.pipeline, recipe.row_template, ontology)
+                if all(pack in LEGACY_PACK_VERSIONS for pack in packs):
+                    pins = {pack: LEGACY_PACK_VERSIONS[pack] for pack in packs}
+            async with self._pool.acquire() as conn:
+                if pins is None:
+                    # A file that cannot be read, or a pack with no legacy version: no guess.
+                    done = await conn.execute(
+                        "UPDATE studio_recipes SET status = $1 "
+                        "WHERE recipe_id = $2 AND version = $3 AND status = $4 "
+                        "AND (pack_versions IS NULL OR jsonb_typeof(pack_versions) <> 'object')",
+                        StudioRecipeStatus.FLAGGED.value,
+                        row["recipe_id"],
+                        row["version"],
+                        StudioRecipeStatus.PUBLISHED.value,
+                    )
+                    if done.endswith(" 1"):
+                        flagged.append(row["recipe_id"])
+                    continue
+                await conn.execute(
+                    "UPDATE studio_recipes SET pack_versions = $1::jsonb "
+                    "WHERE recipe_id = $2 AND version = $3 AND status = $4 "
+                    "AND (pack_versions IS NULL OR jsonb_typeof(pack_versions) <> 'object')",
+                    json.dumps(pins),
+                    row["recipe_id"],
+                    row["version"],
+                    StudioRecipeStatus.PUBLISHED.value,
+                )
+        return flagged
+
+
+class _PinStore(Protocol):
+    """What `reconcile_recipe_pins` needs of the registry; the real store satisfies it."""
+
+    def backfill_pack_versions(
+        self, read_recipe: Callable[[str], Recipe | None], ontology: OntologySchema
+    ) -> Awaitable[list[str]]: ...
+
+    def flag_stale(
+        self, current_ontology_version: int, current_pack_versions: dict[str, int]
+    ) -> Awaitable[list[str]]: ...
+
+
+async def reconcile_recipe_pins(
+    store: _PinStore,
+    ontology: OntologySchema,
+    read_recipe: Callable[[str], Recipe | None],
+) -> list[str]:
+    """Start-up's one step (ADR-120 Amendment 1, decision 6): stamp the legacy recipes' pins,
+    then flag every published recipe whose core version or pinned packs differ from the ontology
+    in force. Stamping first matters: a row with no pins is not flagged on packs, so flagging
+    first would leave a legacy NIEM recipe published past a bump. Returns every id flagged by
+    either pass, once each."""
+    unreadable = await store.backfill_pack_versions(read_recipe, ontology)
+    stale = await store.flag_stale(ontology.version, ontology.packs)
+    return list(dict.fromkeys([*unreadable, *stale]))
+
+
+def recipe_reader(repo_root: Path) -> Callable[[str], Recipe | None]:
+    """Reads a recipe from the recipe repository by its row's `git_path`; a missing, unreadable
+    or malformed file is `None`, which the backfill takes as "flag it" (ADR-120 Amendment 1,
+    decision 6). A file that is not text (`UnicodeDecodeError`) or any other `ValueError` from
+    reading it is unreadable too, so a bad row can never stop the start-up (the same rule)."""
+
+    def read(git_path: str) -> Recipe | None:
+        try:
+            return load_recipe(repo_root / git_path)
+        except (OSError, ValueError, yaml.YAMLError):
+            # `ValueError` covers `UnicodeDecodeError` and pydantic's `ValidationError`.
+            return None
+
+    return read

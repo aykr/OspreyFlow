@@ -2,6 +2,7 @@
 // Source: packages/schemas/domain.py, analytics.py, ingest.py, profile.py, model.py and compute.py, via generate_ts.py
 export type RowsRead = number;
 export type RowsDeduplicated = number;
+export type RowsAlreadyLoaded = number;
 export type SampleIsWholeSource = boolean;
 export type ValuesMasked = boolean;
 export type Created = number;
@@ -12,6 +13,14 @@ export type Count = number;
 export type RowIndex = number;
 export type Reason1 = string;
 export type Sample = string;
+export type Classification = string;
+export type HandlingCode = string;
+export type ActionCode = string | null;
+export type SanitisationCode = string | null;
+export type OrgUnitId = string;
+export type ReviewDate = string | null;
+export type LegalBasis = string | null;
+export type SampleUnreadable = boolean;
 export type Samples = RejectionRecord[];
 export type Rejections = RejectionGroup[];
 export type NodeId = string;
@@ -21,18 +30,12 @@ export type DocumentId = string;
 export type Locator = string;
 export type ExcerptHash = string;
 export type Sources = SourceRef[];
+export type SourcesWithheld = boolean;
 export type ExtractedBy = string | null;
 export type ExtractionConfidence = number | null;
 export type FirstSeen = string;
 export type LastConfirmed = string | null;
 export type PrincipalId = string;
-export type Classification = string;
-export type HandlingCode = string;
-export type ActionCode = string | null;
-export type SanitisationCode = string | null;
-export type OrgUnitId = string;
-export type ReviewDate = string | null;
-export type LegalBasis = string | null;
 export type ClusterId = string;
 export type ClusterScore = number | null;
 export type ResolutionRun = string | null;
@@ -58,6 +61,7 @@ export type CorpusPairCount = number;
 export type CorpusSourceDegree = number;
 export type CorpusTargetDegree = number;
 export type CorpusTotalOccurrences = number;
+export type ParameterSet = string | null;
 export type ComputedAt = string;
 export type Basis = ("direct" | "probabilistic") | null;
 export type Datasets1 = string[];
@@ -72,6 +76,7 @@ export type Edges = Edge[];
 export interface VerifyReport {
   rows_read: RowsRead;
   rows_deduplicated: RowsDeduplicated;
+  rows_already_loaded?: RowsAlreadyLoaded;
   sample_is_whole_source: SampleIsWholeSource;
   values_masked: ValuesMasked;
   entities_by_type?: EntitiesByType;
@@ -129,6 +134,19 @@ export interface RejectionRecord {
   row_index: RowIndex;
   reason: Reason1;
   sample: Sample;
+  marking?: Handling | null;
+  sample_unreadable?: SampleUnreadable;
+  [k: string]: unknown;
+}
+export interface Handling {
+  classification: Classification;
+  handling_code: HandlingCode;
+  action_code?: ActionCode;
+  sanitisation_code?: SanitisationCode;
+  originator: OrgUnitId;
+  owning_unit: OrgUnitId;
+  review_date?: ReviewDate;
+  legal_basis?: LegalBasis;
   [k: string]: unknown;
 }
 export interface Node {
@@ -148,6 +166,7 @@ export interface Properties {
 export interface Provenance {
   state: ProvenanceState;
   sources: Sources;
+  sources_withheld?: SourcesWithheld;
   extracted_by?: ExtractedBy;
   extraction_confidence?: ExtractionConfidence;
   first_seen: FirstSeen;
@@ -159,17 +178,6 @@ export interface SourceRef {
   document_id: DocumentId;
   locator: Locator;
   excerpt_hash: ExcerptHash;
-  [k: string]: unknown;
-}
-export interface Handling {
-  classification: Classification;
-  handling_code: HandlingCode;
-  action_code?: ActionCode;
-  sanitisation_code?: SanitisationCode;
-  originator: OrgUnitId;
-  owning_unit: OrgUnitId;
-  review_date?: ReviewDate;
-  legal_basis?: LegalBasis;
   [k: string]: unknown;
 }
 export interface ResolutionState {
@@ -230,6 +238,7 @@ export interface WeightComponents {
   corpus_source_degree: CorpusSourceDegree;
   corpus_target_degree: CorpusTargetDegree;
   corpus_total_occurrences: CorpusTotalOccurrences;
+  parameter_set?: ParameterSet;
   computed_at: ComputedAt;
   [k: string]: unknown;
 }

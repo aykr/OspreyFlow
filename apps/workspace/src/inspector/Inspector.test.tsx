@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 import Graph from "graphology";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { Edge, Node } from "../../../../packages/schemas/generated";
+import { forgetIconChoicesForTest, setIconChoice } from "../canvas/iconChoices";
 import { Inspector, type InspectorProps } from "./Inspector";
 
 afterEach(() => {
@@ -199,6 +200,18 @@ describe("Inspector sections (ADR-096)", () => {
     expect(screen.getByText("d1 · p.1")).toBeTruthy();
   });
 
+  it("a node whose sources are withheld says so in Source, and never that none were recorded", () => {
+    stubNotes();
+    const withheld = {
+      ...person,
+      provenance: { state: "asserted", sources: [], sources_withheld: true, first_seen: "x" },
+    } as unknown as Node;
+    render(<Inspector node={withheld} assessment={assessment} />);
+    fireEvent.click(header("Source"));
+    expect(screen.getByText("Its sources are in data this case does not read")).toBeTruthy();
+    expect(screen.queryByText(/No sources recorded/)).toBeNull();
+  });
+
   it("with no node selected, Judgements is open", () => {
     stubNotes();
     render(<Inspector node={null} assessment={assessment} />);
@@ -297,5 +310,71 @@ describe("Inspector states (ADR-097 step 1, design review item 4)", () => {
   it("nothing selected: says how to begin, with one action", () => {
     render(<Inspector node={null} />);
     expect(screen.getByText("Select a node, or press / to search.")).toBeTruthy();
+  });
+});
+
+// ADR-128 Decision 4 (B7): the Inspector says which icon a value stands for.
+describe("Inspector: a value icon", () => {
+  const endpointVisual = {
+    channel: "cyan",
+    shape: "hexagon",
+    icon: "device",
+    iconByValue: { property: "endpoint_kind", icons: { handle: "keypad", msisdn: "phone" } },
+  } as const;
+  const visualFor: NonNullable<InspectorProps["visualFor"]> = (type) =>
+    type === "Endpoint" ? endpointVisual : { channel: "indigo", shape: "circle", icon: "person" };
+  const endpointOf = (properties: Record<string, unknown>) =>
+    ({ id: "e1", type: "Endpoint", properties, provenance: { state: "asserted", sources: [], first_seen: "x" } }) as unknown as Node;
+
+  it("names the drawing and the value it stands for, when the node's value is mapped", () => {
+    stubNotes();
+    render(<Inspector node={endpointOf({ endpoint_kind: "handle" })} assessment={assessment} visualFor={visualFor} />);
+    expect(screen.getByText("Icon for this value")).toBeTruthy();
+    expect(screen.getByText("Keypad (endpoint kind handle)")).toBeTruthy();
+  });
+
+  it("says nothing of an icon for a value the map leaves out, or a node without the property", () => {
+    stubNotes();
+    const { rerender } = render(<Inspector node={endpointOf({ endpoint_kind: "email" })} assessment={assessment} visualFor={visualFor} />);
+    expect(screen.queryByText("Icon for this value")).toBeNull();
+    rerender(<Inspector node={endpointOf({})} assessment={assessment} visualFor={visualFor} />);
+    expect(screen.queryByText("Icon for this value")).toBeNull();
+  });
+
+  it("says nothing of an icon for a type that has no rule", () => {
+    stubNotes();
+    const person = { id: "a", type: "Person", properties: { endpoint_kind: "handle" }, provenance: { state: "asserted", sources: [], first_seen: "x" } } as unknown as Node;
+    render(<Inspector node={person} assessment={assessment} visualFor={visualFor} />);
+    expect(screen.queryByText("Icon for this value")).toBeNull();
+  });
+});
+
+
+// The renderer gives the analyst's own choice for the type precedence over a value icon, so the
+// Inspector must not name an icon the node is not drawn with.
+describe("Inspector: a value icon the analyst's choice replaces", () => {
+  const visualFor: NonNullable<InspectorProps["visualFor"]> = () => ({
+    channel: "cyan",
+    shape: "hexagon",
+    icon: "device",
+    iconByValue: { property: "endpoint_kind", icons: { handle: "keypad" } },
+  });
+  const endpoint = { id: "e1", type: "Endpoint", properties: { endpoint_kind: "handle" }, provenance: { state: "asserted", sources: [], first_seen: "x" } } as unknown as Node;
+
+  afterEach(() => forgetIconChoicesForTest());
+
+  it("says nothing of it once a drawing is chosen for the type, and says it again when the choice goes", async () => {
+    forgetIconChoicesForTest();
+    stubNotes();
+    render(<Inspector node={endpoint} assessment={assessment} visualFor={visualFor} />);
+    expect(screen.getByText("Icon for this value")).toBeTruthy();
+    act(() => {
+      setIconChoice("Endpoint", { kind: "glyph", name: "shield" });
+    });
+    expect(screen.queryByText("Icon for this value")).toBeNull();
+    act(() => {
+      setIconChoice("Endpoint", null);
+    });
+    expect(screen.getByText("Icon for this value")).toBeTruthy();
   });
 });

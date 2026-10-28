@@ -1,5 +1,6 @@
 import type { Map as MapLibreMap } from "maplibre-gl";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useStore } from "zustand/react";
 
 import type {
   Edge,
@@ -10,7 +11,8 @@ import type {
   PublicMapConfig,
   Sighting,
 } from "../../../packages/schemas/generated";
-import { fetchGeoBins, fetchSightings } from "./analytics/api";
+import { fetchSightings } from "./analytics/api";
+import { followCrossFilterWithMapBins } from "./crossfilter/mapBins";
 import {
   clearRedirectCallbackParams,
   completeSignInFromRedirect,
@@ -80,8 +82,12 @@ import { CasePicker } from "./investigation/CasePicker";
 import { CaseSwitcher } from "./investigation/CaseSwitcher";
 import { CaseTree } from "./investigation/CaseTree";
 import { CaseAccessPanel } from "./investigation/CaseAccessPanel";
-import { CaseDatasets } from "./investigation/CaseDatasets";
+import { CaseSettings } from "./investigation/CaseSettings";
+import { CaseBrief } from "./investigation/CaseBrief";
+import type { AttachmentKind } from "./investigation/briefApi";
+import { placeOf, revealPanel } from "./investigation/openAttachment";
 import { caseIsOpenable, openCase } from "./investigation/cases";
+import { bringFactIntoView } from "./questions/graphFacts";
 import { QuestionsPanel } from "./questions/QuestionsPanel";
 import { ExplorePanel } from "./explore/ExplorePanel";
 import type { BusyDay, RankedLink } from "./explore/exploreApi";
@@ -122,6 +128,7 @@ import {
   type SocketLike,
 } from "./workingset/deltaClient";
 import { createWorkingSet } from "./workingset/store";
+import { applyRestoredSnapshot, ViewOverCapGate } from "./workingset/ViewOverCapGate";
 
 // **An empty base URL means same-origin, and that is what a rendered
 // deployment builds with** (05_DEPLOYMENT.md §2.6 item 1, owner's decision
@@ -194,6 +201,14 @@ const GEO_BIN_PRECISION = 8;
 
 export function App() {
   const workingSetRef = useRef(createWorkingSet());
+  // Read from the store itself, not copied into this component's own state by a subscription that a
+  // change of case tears down: the reset on a new case would then never reach the bar.
+  const withheld = useStore(workingSetRef.current.store, (s) => s.withheld);
+  // ADR-124 decision 2: the server says the reader's own view is past a cap, and sends nothing
+  // more until they try again. `ViewOverCapGate` shows the dialog; this holds the live client it
+  // asks to resync, and a restore's own snapshot asks the same (`applyRestoredSnapshot`).
+  const deltaClientRef = useRef<DeltaClient | null>(null);
+  const resyncFromNothing = useCallback(() => deltaClientRef.current?.requestResync(null), []);
   const glassCanvasRef = useRef<GlassCanvasHandle>(null);
   const [groupedCount, setGroupedCount] = useState(0);
   // How many judgements rest on each node, drawn as a small count beside it (ADR-070).
@@ -529,6 +544,9 @@ export function App() {
   useHelpKey(openWelcome);
   // ADR-097 Amendment 1: the case and its branches, reached from the rail.
   const [casesOpen, setCasesOpen] = useState(false);
+  // ADR-128 decision 3: opening a saved trend from the case brief starts the Reports view on Trends;
+  // the count re-mounts the place so a second open starts there again.
+  const [reportsStart, setReportsStart] = useState<{ tab?: "trends"; opened: number }>({ opened: 0 });
   // ADR-098 decision 4: the case's questions to the model, open at once in a case branched for them.
   const [questionsOpen, setQuestionsOpen] = useState(handoff.view === "questions");
   // ADR-100: where to start in a case's data, from the rail (and over an empty canvas).
@@ -553,7 +571,6 @@ export function App() {
   const [counts, setCounts] = useState({
     nodes: 0,
     edges: 0,
-    filteredCount: 0,
   });
   // The highest classification among the nodes and links in the view (ADR-097 Amendment 1), read
   // again whenever the view's counts change.
@@ -614,6 +631,21 @@ export function App() {
   }, [investigationId, bearerToken, rights, view]);
   // Which application is open, and (so the switch can go back to it) the Glass view last open.
   const app = view === "ingest" ? "ingest" : "glass";
+  // ADR-128 decision 3: an attachment of the case brief opens where the thing lives (`openAttachment.ts`).
+  const openBriefAttachment = (kind: AttachmentKind, id: string) => {
+    const place = placeOf(kind, id);
+    setCasesOpen(false);
+    if (place.place === "case") {
+      openCase(id);
+    } else if (place.place === "reports") {
+      setReportsStart((now) => ({ tab: place.tab, opened: now.opened + 1 }));
+      setView("reports");
+    } else {
+      setView("graph");
+      // The side panels are on the page once the graph view is drawn: reveal one on the next tick.
+      window.setTimeout(() => revealPanel(place.panel), 0);
+    }
+  };
   const lastGlassView = useRef<"graph" | "map" | "reports" | "admin" | "dashboards" | "dossier" | "watches" | "alerts" | "ownership">("graph");
   // ADR-109 phase B: an alert put on the canvas is highlighted once the canvas has drawn it.
   const pendingHighlight = useRef<string[] | null>(null);
@@ -763,6 +795,11 @@ export function App() {
   // A case's degree marks are its own: another case opens with none.
   useEffect(() => setDegreeMarks(new Map()), [investigationId]);
 
+  // What the open case withholds from this reader is the case's own (ADR-124 decision 5): another
+  // case opens knowing nothing of it until its snapshot says. Declared before the stream's effect so
+  // it runs first on a change of case.
+  useEffect(() => workingSetRef.current.store.getState().resetCase(), [investigationId]);
+
   // The count of judgements beside each node (ADR-070): fetched when the case opens, then kept
   // current by the Judgements tab each time it reloads the list. A failure leaves no badges; it
   // never blocks the canvas.
@@ -785,15 +822,11 @@ export function App() {
   useEffect(() => {
     if (!investigationId || !bearerToken) return;
     const workingSet = workingSetRef.current;
-    const unsubscribe = workingSet.store.subscribe((state) => {
+    const unsubscribe = workingSet.store.subscribe(() => {
       setCounts({
         nodes: workingSet.graph.order,
         edges: workingSet.graph.size,
-        filteredCount: state.filteredCount,
       });
-      for (const notice of state.notices) {
-        setToast(notice.message);
-      }
       // A delta can add/remove working-set nodes the cross-filter has never
       // seen — re-derive dimming against the current membership so a newly
       // streamed-in node gets its correct dimmed state right away, per
@@ -847,12 +880,17 @@ export function App() {
             new WebSocket(
               `${wsUrl}/v1/investigations/${investigationId}/stream?ticket=${encodeURIComponent(body.ticket)}`,
             ) as unknown as SocketLike,
-          { onDelta: (delta) => workingSet.store.getState().applyDelta(delta) },
+          {
+            onDelta: (delta) => workingSet.store.getState().applyDelta(delta),
+            onViewOverCap: (wouldBe) => workingSet.store.getState().setViewOverCap(wouldBe),
+          },
         );
+        deltaClientRef.current = client;
       });
     return () => {
       cancelled = true;
       client?.close();
+      deltaClientRef.current = null;
       unsubscribe();
     };
   }, [investigationId, bearerToken, handleUnauthenticatedResponse]);
@@ -883,28 +921,14 @@ export function App() {
     // layer *does* restrict to the active brush window — `02_GLASS_
     // FRONTEND.md` §3.4's "the map restricts to it" is this bullet, named
     // literally.
-    async function refresh(state: CrossFilterStoreState) {
-      const filter = buildEventFilter(
-        scope,
-        state.window,
-        state.selectedNodeIds,
-      );
-      const bins = await fetchGeoBins(API_BASE_URL, bearerToken, {
-        filter,
-        precision: GEO_BIN_PRECISION,
-      });
-      setGeoBins(bins);
-    }
-    let lastWindow = crossFilter.store.getState().window;
-    let lastSelected = crossFilter.store.getState().selectedNodeIds;
-    void refresh(crossFilter.store.getState());
-    const unsubscribe = crossFilter.store.subscribe((state) => {
-      if (state.window === lastWindow && state.selectedNodeIds === lastSelected)
-        return;
-      lastWindow = state.window;
-      lastSelected = state.selectedNodeIds;
-      void refresh(state);
-    });
+    const unsubscribe = followCrossFilterWithMapBins(
+      crossFilter.store,
+      API_BASE_URL,
+      bearerToken,
+      scope,
+      GEO_BIN_PRECISION,
+      setGeoBins,
+    );
     return () => unsubscribe();
   }, [investigationId, bearerToken]);
 
@@ -924,20 +948,29 @@ export function App() {
     const scope = investigationId;
     const entityId = selectedNode.id;
     let cancelled = false;
-    function refresh(window: CrossFilterStoreState["window"]) {
+    // The chosen weekly cells narrow the trail as they narrow the dimming (ADR-130 Amendment 1).
+    // A newer read supersedes an older one, so a slow older answer arriving last is dropped.
+    let latest = 0;
+    function refresh(
+      window: CrossFilterStoreState["window"],
+      cells: CrossFilterStoreState["cells"],
+    ) {
+      latest += 1;
+      const mine = latest;
       if (!window) {
         setSightings([]);
         return;
       }
       void fetchSightings(API_BASE_URL, bearerToken, {
-        filter: buildEventFilter(scope, window, [entityId]),
+        filter: buildEventFilter(scope, window, [entityId], cells),
       }).then((result) => {
-        if (!cancelled) setSightings(result);
+        if (!cancelled && mine === latest) setSightings(result);
       });
     }
-    refresh(crossFilter.store.getState().window);
+    const initial = crossFilter.store.getState();
+    refresh(initial.window, initial.cells);
     const unsubscribe = crossFilter.store.subscribe((state) =>
-      refresh(state.window),
+      refresh(state.window, state.cells),
     );
     return () => {
       cancelled = true;
@@ -1116,6 +1149,7 @@ export function App() {
               bearerToken={bearerToken}
               investigationId={investigationId}
               entityTypes={ontologySchema?.entity_types.map((e) => e.name) ?? []}
+              onApplyDelta={applyStarterDelta}
               screenNodes={() => {
                 const graph = workingSetRef.current.graph;
                 return graph.nodes().map((id) => graph.getNodeAttribute(id, "data"));
@@ -1317,7 +1351,7 @@ export function App() {
           />
         )}
         {view === "reports" && (
-          <ReportsPlace apiBaseUrl={API_BASE_URL} bearerToken={bearerToken} investigationId={investigationId} canDownload={canDownloadFeed(rights)} rights={rights} />
+          <ReportsPlace key={reportsStart.opened} initialTab={reportsStart.tab} apiBaseUrl={API_BASE_URL} bearerToken={bearerToken} investigationId={investigationId} canDownload={canDownloadFeed(rights)} rights={rights} />
         )}
         {view === "dashboards" && (
           <div style={{ flex: 1, display: "flex", padding: "var(--sp-16)", minHeight: 0 }}>
@@ -1345,7 +1379,9 @@ export function App() {
                 bearerToken={bearerToken}
                 investigationId={investigationId}
                 nodeCount={counts.nodes}
-                onRestored={(snapshot) => workingSetRef.current.store.getState().applyDelta(snapshot)}
+                onRestored={(snapshot) =>
+                  applyRestoredSnapshot(workingSetRef.current.store, resyncFromNothing, snapshot)
+                }
                 onClose={() => {
                   setWelcomeOpen(false);
                   if (principal?.sub) setWelcomeDismissed(principal.sub, true);
@@ -1700,6 +1736,7 @@ export function App() {
                             bearerToken={bearerToken}
                             investigationId={investigationId}
                             schema={ontologySchema}
+                            selectedNodeIds={selectedNodeIds}
                           />
                         ),
                       },
@@ -1751,6 +1788,15 @@ export function App() {
               crossCaseInvestigationScope={crossCaseScope || undefined}
               onCrossCaseScopeChange={setCrossCaseScope}
               onPlaybackFractionChange={setPlaybackFraction}
+              // ADR-128 decision 2 (B3): offered only while the canvas is the view on screen.
+              onSelectLit={
+                view === "graph"
+                  ? () => {
+                      const { window: lit, cells } = crossFilterStore.store.getState();
+                      if (lit) void glassCanvasRef.current?.selectLit(lit, cells);
+                    }
+                  : undefined
+              }
             />
           </div>
         </BottomPanelFrame>
@@ -1762,8 +1808,19 @@ export function App() {
           nodeCount={counts.nodes}
           edgeCount={counts.edges}
           dimmedCount={dimmedNodeIds.size}
-          filteredCount={counts.filteredCount}
+          withheld={withheld}
           groupedCount={groupedCount}
+        />
+      )}
+      {bearerToken && investigationId && (
+        <ViewOverCapGate
+          store={workingSetRef.current.store}
+          requestResync={resyncFromNothing}
+          entityTypes={ontologySchema?.entity_types.map((e) => e.name) ?? []}
+          apiBaseUrl={API_BASE_URL}
+          bearerToken={bearerToken}
+          investigationId={investigationId}
+          onBranchOpened={(id) => openCase(id)}
         />
       )}
       <ProposedTypes
@@ -1814,6 +1871,17 @@ export function App() {
             setReaderFallback(undefined);
             setReaderDocumentId(id);
           }}
+          // ADR-129: the graph facts asked about are what is selected and one link around it, and
+          // inside the timeline window when one is set; a `[G-n]` chosen in an answer selects what
+          // it stands for on the canvas and brings it into view.
+          selection={{
+            nodeIds: selectedNodeIds,
+            linkIds: selectedLink ? [selectedLink.id] : [],
+          }}
+          getTimelineWindow={() => crossFilterRef.current?.store.getState().window ?? null}
+          onSelectFacts={(citation) => {
+            if (glassCanvasRef.current) bringFactIntoView(glassCanvasRef.current, citation);
+          }}
         />
       </Drawer>
       {/* ADR-084 Amendment 4: the cases and their branches, one tree, as the case menu shows them. */}
@@ -1837,11 +1905,22 @@ export function App() {
           >
             Browse all cases
           </Button>
-          {/* ADR-099: what the open case reads, changed by its Author. */}
-          <CaseDatasets
+          {/* ADR-128 decision 3: the case's brief, read by anyone who may read the case and edited by
+              its Author; an attachment opens where the thing lives. */}
+          <CaseBrief
             apiBaseUrl={API_BASE_URL}
             bearerToken={bearerToken}
             investigationId={investigationId}
+            rights={rights}
+            onOpenAttachment={openBriefAttachment}
+          />
+          {/* ADR-099, ADR-126: what the open case reads and its domain models, changed by its Author
+              (who holds `share_case`); the listing is read once for both. */}
+          <CaseSettings
+            apiBaseUrl={API_BASE_URL}
+            bearerToken={bearerToken}
+            investigationId={investigationId}
+            rights={rights}
             onChanged={() => window.location.reload()}
           />
           {/* ADR-052 §9: who can open the case — its Author gives and removes levels. */}
@@ -1855,7 +1934,7 @@ export function App() {
         apiBaseUrl={API_BASE_URL}
         bearerToken={bearerToken}
         onRestored={(snapshot) =>
-          workingSetRef.current.store.getState().applyDelta(snapshot)
+          applyRestoredSnapshot(workingSetRef.current.store, resyncFromNothing, snapshot)
         }
       />
       <ExportPanel

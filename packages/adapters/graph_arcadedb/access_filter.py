@@ -30,7 +30,7 @@ nothing.
 
 from __future__ import annotations
 
-from ontology.handling import HandlingScheme
+from ontology.handling import HandlingScheme, is_restricted
 from schemas.domain import Principal
 
 from .gremlin_literals import groovy_string_list_literal, groovy_string_literal
@@ -41,9 +41,7 @@ class AccessFilter:
         self._scheme = scheme
         self._rank = {classification: i for i, classification in enumerate(scheme.classification)}
         self._restricted_codes = {
-            code
-            for code, defn in scheme.handling_codes.items()
-            if defn.dissemination == "restricted"
+            code for code in scheme.handling_codes if is_restricted(code, scheme)
         }
         self._non_restricted_codes = [
             code for code in scheme.handling_codes if code not in self._restricted_codes
@@ -74,16 +72,11 @@ class AccessFilter:
     ) -> str:
         """The two exclusions `gremlin_has_step` bundles in that are not
         principal-dependent at all — reverted and (unless lifted)
-        superseded (`01_DOMAIN_MODEL.md` §2.4) — factored out so a caller
-        that must *not* also compile the two access axes
-        (`ExpandBuilder.render_candidate_count_gremlin`, the unfiltered
-        half of `Subgraph.filtered_count`'s comparison, §8.2) can still
-        exclude the same not-really-there-any-more elements without
-        reproducing the clearance/handling-code compilation below.
+        superseded (`01_DOMAIN_MODEL.md` §2.4) — factored out of `gremlin_has_step`, which adds the
+        two handling axes to them.
 
-        `datasets` (ADR-099) is carried here, not with the two handling axes, because the candidate
-        count must apply it too: what lies outside a case's datasets is not hidden from the case,
-        it is not in its world, and counting it would say there is more."""
+        `datasets` (ADR-099) is carried here, not with the two handling axes: what lies outside a
+        case's datasets is not hidden from the case, it is not in its world."""
         steps = ['has("reverted",false)']
         if not include_superseded:
             steps.append('hasNot("superseded_by")')
@@ -94,8 +87,8 @@ class AccessFilter:
 
     def gremlin_has_step(self, principal: Principal, *, include_superseded: bool = False) -> str:
         """Both handling axes, plus two more that are not
-        principal-dependent at all: a reverted element (`services/ingest`'s
-        `revert_load`, `01_DOMAIN_MODEL.md` §2.4) is invisible to every
+        principal-dependent at all: a reverted element (`services/ingest/load_revert.py`,
+        `01_DOMAIN_MODEL.md` §2.4) is invisible to every
         read regardless of clearance, and a superseded node — the old
         revision a correction has replaced (`supersede_node`, same §2.4) —
         is invisible by default too, since "excluded from reads by

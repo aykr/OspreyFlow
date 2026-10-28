@@ -1,7 +1,7 @@
 """The Working-Set Service's orchestration — `spec/03_CONDUIT_MIDDLEWARE.md`
 §4, "the most important component in the Conduit". Owns four things
 nothing else in the platform can safely do on its own: the cap check that
-never truncates, `filtered_count`'s derivation (`01_DOMAIN_MODEL.md` §8.2),
+never truncates (counted over the reader's own projected view, ADR-124 decision 2),
 the reconnect-or-resnapshot decision for the delta protocol (§3.2), and —
 the divergence-review fix — the per-read handling projection §4 itself
 requires: "The stored set is source-fidelity. The projection applied on
@@ -23,28 +23,35 @@ using the same predicate the adapter's compiled Gremlin is built from
 principal was entitled to fetch is not disclosed to a different principal
 who is not.
 
-`filtered_count`'s own derivation is unrelated arithmetic over two
-properly-authorised `GraphPort` calls for the *same* expand:
-`expand()` (filtered, what the analyst actually gets) and
-`expand_candidate_count()` (unfiltered, no principal, count-only) — see
-`ports/graph.py`'s docstring for why a bare count from the second call
-cannot itself leak anything the first call didn't already legitimately
-compute the boundary of.
+No count of what a reader may not read leaves this class (ADR-124 decision 1): a figure tied to a
+seed, a link type or a colleague's action can be made to point at the one item it counts. The caps
+are the same: each is counted over `_project` of the stored set for the reader asking, plus what the
+request adds, so a stored item the reader may not read moves no figure they are shown.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+import logging
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from services.api.access import narrow_to_visible
+from services.api.cache import principal_class
 from services.api.change_stream import ChangeStreamEntry, ChangeStreamWriter
 from services.resolve.projection import DEFAULT_THRESHOLD, compute_clusters, diff_clusters
 from valkey.asyncio import Valkey
 
 from conduit_common.identity import new_edge_id, now_utc
-from ontology.handling import HandlingScheme, principal_may_read
+from ontology.errors import HandlingSchemeError
+from ontology.handling import (
+    HandlingScheme,
+    principal_may_read,
+    principal_may_view,
+    withhold_sources,
+)
 from ports.graph import GraphPort
 from schemas.domain import (
     CONNECTIONS_SHOWN,
@@ -56,6 +63,7 @@ from schemas.domain import (
     EdgeId,
     EdgeWrite,
     ExpandRequest,
+    Handling,
     Node,
     NodeId,
     Principal,
@@ -64,18 +72,22 @@ from schemas.domain import (
     SourceRef,
 )
 
+from .access_index import ABSENT, AccessEntries, AccessSignature
 from .models import (
     MAX_EDGES,
     MAX_NODES,
+    BranchFilter,
     CardinalityPreview,
     ClusterExplanation,
     ClusterNotFoundError,
     DeltaAdd,
-    DeltaNotice,
     DeltaRemove,
+    DeltaRemoveSent,
     DeltaReplaceEdge,
+    DeltaReplaceEdgeSent,
     DeltaReproject,
     DeltaSnapshot,
+    DeltaViewOverCap,
     ExpansionOutcome,
     LimitExceeded,
     LimitExceededError,
@@ -83,10 +95,16 @@ from .models import (
     NodeNotInWorkingSetError,
     NothingToBranchError,
     PairwiseExplanation,
+    RemovedElement,
+    RemovedRecord,
+    ResolutionOutcome,
     SameNodeAssertionError,
     WorkingSetDelta,
+    WorkingSetDeltaSent,
 )
 from .store import WorkingSetStorage
+
+_log = logging.getLogger(__name__)
 
 
 def _decode_comparison_vector(raw: Any) -> dict[str, Any] | None:
@@ -96,21 +114,228 @@ def _decode_comparison_vector(raw: Any) -> dict[str, Any] | None:
     return result
 
 
-def _filtered_count(candidate_count: int, delivered_count: int) -> int:
-    """`candidate_count` (`GraphPort.expand_candidate_count`) is always
-    `>=` `delivered_count` (`len(Subgraph.nodes)`) by construction — the
-    filtered result is a subset of the unfiltered candidates over the same
-    scope. `max(..., 0)` is defensive, not load-bearing: it guards against
-    an adapter bug inverting that invariant becoming a *negative* reported
-    count instead of a wrong-but-visible one."""
-    return max(candidate_count - delivered_count, 0)
-
+#: ADR-124 decision 4: the only two reasons a `DeltaReproject` is sent with. What the service stores
+#: is one of them too; an older entry may hold prose that names ids, and is sent as the threshold.
+REASON_THRESHOLD = "resolution_threshold"
+REASON_MANUAL = "manual_resolution"
 
 #: ADR-098 decision 1: an expansion that adds at most this many new nodes, into a view of at most
 #: `AUTO_LINKS_MAX_VIEW_NODES`, also brings the links among its nodes and the view. Beyond either,
 #: the canvas offers *Show links among these*.
 AUTO_LINKS_MAX_NEW_NODES = 100
 AUTO_LINKS_MAX_VIEW_NODES = 2_000
+
+#: How many readable-signature sets one service keeps (`WorkingSetService._reader_counts`). Each is
+#: a handful of short keys, so the bound is only a bound.
+READABLE_CACHE_SIZE = 256
+
+#: How many ids one membership read of the counted index takes (`_ReaderCounts.visible_among`).
+_MEMBERSHIP_CHUNK = 5_000
+
+
+class _SignaturesRenumbered(Exception):
+    """The entries were read at another epoch than the signature table they would be judged by."""
+
+
+@dataclass
+class _ReaderCounts:
+    """One reader's figures for a case, read at one moment (ADR-124 decision 2, Amendment 4): how
+    many nodes and links are in their projected view, and what is needed to say whether some named
+    ids are. Never the view itself: nothing the caps and previews need is the whole set.
+
+    `readable` is the signature keys in use (a node or a link carries them) that the reader may
+    read; `nodes` and `edges` are the sums of the store's counts over them (a link counts when its
+    own signature and both ends' are readable, and an end that is not stored never is).
+    `judgements` is the memo of which signature keys the reader may read, shared with the service's
+    cache; a signature is judged when something carries it and not before.
+
+    `epoch` is the epoch the signature table was read at. A rebuild that renumbers the signatures
+    replaces it, and the numbers in entries read afterwards name other signatures than this table
+    does; `would_add` notices (the entries carry the epoch they were read at), calls `reload`,
+    which reads the counts again and replaces `signatures`, `readable`, `nodes` and `edges` here,
+    and starts over. Callers read `nodes` and `edges` after `would_add`, never before."""
+
+    store: WorkingSetStorage
+    case: str
+    principal: Principal
+    scheme: HandlingScheme
+    signatures: Mapping[str, AccessSignature]
+    judgements: dict[str, bool]
+    readable: frozenset[str]
+    nodes: int
+    edges: int
+    epoch: str = ""
+    reload: Callable[[], Awaitable[None]] | None = None
+
+    def is_readable(self, key: str | None) -> bool:
+        """Whether the reader may read signature `key`; one the store has no definition for (a
+        signature stored since the counts were read) is not."""
+        if key is None or key not in self.signatures:
+            return False
+        if key not in self.judgements:
+            signature = self.signatures[key]
+            self.judgements[key] = principal_may_read(
+                signature.handling(), list(signature.datasets), self.principal, self.scheme
+            )
+        return self.judgements[key]
+
+    def visibly_stored(self, entries: AccessEntries) -> tuple[set[NodeId], set[EdgeId]]:
+        """Of the ids `entries` was read for, those in the reader's view now: a node whose
+        signature they may read, a link whose own and both ends' signatures they may read."""
+        nodes = {i for i, sig in entries.nodes.items() if self.is_readable(sig)}
+        edges = {
+            i
+            for i, (sig, source, target) in entries.edges.items()
+            if self.is_readable(sig)
+            and self.is_readable(entries.ends.get(source))
+            and self.is_readable(entries.ends.get(target))
+        }
+        return nodes, edges
+
+    async def would_add(
+        self,
+        node_ids: Iterable[NodeId],
+        edge_ids: Iterable[EdgeId],
+        nodes: Iterable[Node] = (),
+    ) -> tuple[int, int, AccessEntries]:
+        """How many of these ids are not yet in the reader's view, and the entries they were judged
+        by (also what says which of them the store holds at all).
+
+        **A node the store does not hold completes the links stored at it.** Removing a node leaves
+        its links stored with that end `absent`; when the node comes back they join the view
+        whether or not the request names them. For each such new node the links at it are read
+        (the adjacency holds them whether or not the node is stored), and each that the reader may
+        read, whose other end is stored and readable or is one of the new nodes, is counted too
+        (once, and not again if the request names it). `nodes` gives the bodies of the new nodes,
+        which says whether a new node is readable; an id with no body is taken to be.
+
+        **A renumbering between the counts and the entries** is met by reading the counts again
+        and starting over, once; a second one raises (nothing is served from a table that keeps
+        changing)."""
+        for attempt in (0, 1):
+            try:
+                return await self._would_add_once(node_ids, edge_ids, nodes)
+            except _SignaturesRenumbered:
+                if attempt or self.reload is None:
+                    raise
+                await self.reload()
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    async def _entries(
+        self, node_ids: Sequence[NodeId], edge_ids: Sequence[EdgeId]
+    ) -> AccessEntries:
+        entries = await self.store.access_entries(self.case, node_ids, edge_ids)
+        if entries.epoch != self.epoch:
+            raise _SignaturesRenumbered
+        return entries
+
+    async def _would_add_once(
+        self,
+        node_ids: Iterable[NodeId],
+        edge_ids: Iterable[EdgeId],
+        nodes: Iterable[Node],
+    ) -> tuple[int, int, AccessEntries]:
+        node_list = list(dict.fromkeys(node_ids))
+        edge_list = list(dict.fromkeys(edge_ids))
+        entries = await self._entries(node_list, edge_list)
+        visible_nodes, visible_edges = self.visibly_stored(entries)
+        new_edges = len(edge_list) - len(visible_edges)
+        arriving = [n for n in node_list if n not in entries.nodes]
+        if arriving:
+            bodies = {n.id: n for n in nodes}
+            arriving_readable = {
+                n: (
+                    principal_may_read(
+                        bodies[n].handling, bodies[n].datasets, self.principal, self.scheme
+                    )
+                    if n in bodies
+                    else True
+                )
+                for n in arriving
+            }
+            at = await self.store.adjacent_edge_ids(self.case, arriving)
+            completed_ids = sorted({e for es in at.values() for e in es} - set(edge_list))
+            if completed_ids:
+                links = await self._entries([], completed_ids)
+                for sig, source, target in links.edges.values():
+                    if self.is_readable(sig) and all(
+                        arriving_readable[end]
+                        if end in arriving_readable
+                        else self.is_readable(links.ends.get(end))
+                        for end in (source, target)
+                    ):
+                        new_edges += 1
+        return len(node_list) - len(visible_nodes), new_edges, entries
+
+    async def visibly_stored_among(self, node_ids: Iterable[NodeId]) -> set[NodeId]:
+        """Of the named ids, those the store holds and the reader may read: the membership read of
+        the counted access index, one entry per id asked about (ADR-124 decision 3). An id the store
+        holds but the reader may not read is not in the result, exactly as one it does not hold is
+        not: nothing downstream can tell them apart."""
+        nodes, _ = await self.visible_among(node_ids, ())
+        return nodes
+
+    async def visible_among(
+        self, node_ids: Iterable[NodeId], edge_ids: Iterable[EdgeId]
+    ) -> tuple[set[NodeId], set[EdgeId]]:
+        """Of the named node and link ids, those in the reader's view now: a node whose signature
+        they may read, a link whose own and both ends' signatures they may read, an end that is not
+        stored never. Read from the counted index in chunks (`_MEMBERSHIP_CHUNK` ids to a read), so
+        that a restore's whole case is a bounded number of reads and no body. A renumbering met
+        between the counts and the entries is handled as `would_add` handles it."""
+        nodes: set[NodeId] = set()
+        edges: set[EdgeId] = set()
+        node_list = list(dict.fromkeys(node_ids))
+        edge_list = list(dict.fromkeys(edge_ids))
+        for start in range(0, len(node_list), _MEMBERSHIP_CHUNK):
+            chunk = node_list[start : start + _MEMBERSHIP_CHUNK]
+            nodes |= (await self._visible_chunk(chunk, []))[0]
+        for start in range(0, len(edge_list), _MEMBERSHIP_CHUNK):
+            chunk = edge_list[start : start + _MEMBERSHIP_CHUNK]
+            edges |= (await self._visible_chunk([], chunk))[1]
+        return nodes, edges
+
+    async def _visible_chunk(
+        self, node_ids: Sequence[NodeId], edge_ids: Sequence[EdgeId]
+    ) -> tuple[set[NodeId], set[EdgeId]]:
+        for attempt in (0, 1):
+            try:
+                entries = await self._entries(node_ids, edge_ids)
+            except _SignaturesRenumbered:
+                if attempt or self.reload is None:
+                    raise
+                await self.reload()
+            else:
+                return self.visibly_stored(entries)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    async def visible_node_ids(self) -> set[NodeId]:
+        """The ids of the reader's visible nodes. Only for a view the counts have shown to be
+        small (`expand` asks the graph for the links among them): reads the store's node entries."""
+        return {
+            node_id
+            for node_id, sig in (await self.store.stored_node_signatures(self.case)).items()
+            if self.is_readable(sig)
+        }
+
+
+@dataclass(frozen=True)
+class Restored:
+    """What a restore makes: the snapshot that is stored and published, which every reader projects
+    to their own view (ADR-124 decision 6), and the restorer's own response, which is that snapshot
+    projected for the restorer and never the stored whole."""
+
+    published: DeltaSnapshot
+    response: DeltaSnapshot
+
+
+@dataclass(frozen=True)
+class RevertRemoval:
+    """One case a revert removed elements from, and the stored removal it appended: published as it
+    is (`notify.publish_delta`), which projects it for each connected reader."""
+
+    investigation_id: str
+    delta: DeltaRemove
 
 
 class WorkingSetService:
@@ -131,6 +356,13 @@ class WorkingSetService:
         # (`06_DECISIONS.md` ADR-037's own amendment names manual assertion, B11's mechanism, as
         # one of its three accepted producers — `services/api/change_stream.py`'s own docstring).
         self._valkey = valkey
+        #: Which signatures a reader may read, by (case, epoch, signatures version, access class):
+        #: see `_reader_counts`. Per service, never shared between processes or between stores.
+        self._readable: OrderedDict[tuple[str, str, int, str], dict[str, bool]] = OrderedDict()
+        #: How many times a reader's view could not be counted against the caps because a
+        #: signature in use carries a handling code the scheme no longer defines (the cap check
+        #: was skipped). Never expected to move; each is also logged.
+        self.uncountable_views = 0
 
     def _project(
         self,
@@ -149,15 +381,17 @@ class WorkingSetService:
         # A link's ends are judged against `nodes` and, where given, the rest of the working set
         # (`known`): a delta replayed or pushed alone carries only its own nodes, and a link from
         # one of them to a node already on the canvas is the reader's to see (9 October 2026: it was
-        # dropped and counted hidden). A link whose end is in neither has left the view: it is left
-        # out and not counted, since nothing is withheld from the reader by it.
+        # dropped as though hidden). A link whose end is in neither has left the view: it is left
+        # out, since nothing is withheld from the reader by it.
         ends = {**(known or {}), **{n.id: n for n in nodes}}
         readable = {
             node_id
             for node_id, n in ends.items()
             if principal_may_read(n.handling, n.datasets, principal, self._scheme)
         }
-        visible_nodes = [n for n in nodes if n.id in readable]
+        # ADR-130 Amendment 2: each element is sent with its sources only where every dataset it
+        # belongs to is one the reader's case reads. A copy: the stored bodies keep the record.
+        visible_nodes = [withhold_sources(n, principal) for n in nodes if n.id in readable]
         visible_edges: list[Edge] = []
         hidden_edges = 0
         for e in edges:
@@ -168,7 +402,7 @@ class WorkingSetService:
                 and e.source in readable
                 and e.target in readable
             ):
-                visible_edges.append(e)
+                visible_edges.append(withhold_sources(e, principal))
             else:
                 hidden_edges += 1
         hidden_count = (len(nodes) - len(visible_nodes)) + hidden_edges
@@ -179,41 +413,130 @@ class WorkingSetService:
         delta: WorkingSetDelta,
         principal: Principal,
         known: Mapping[NodeId, Node] | None = None,
-    ) -> tuple[WorkingSetDelta, int]:
+    ) -> WorkingSetDeltaSent:
         """Re-filters one already-recorded delta for `principal` — the
         replay-on-reconnect path (`sync`) and the live WebSocket push
         (`app.py`'s `_forward_notifications`) both need this: a delta
         recorded when a *different* principal populated the store must
         not reach *this* principal's socket or reconnect catch-up
-        verbatim. Returns the filtered delta and how much of it was
-        hidden, so a caller handling several deltas at once (`sync`) can
-        aggregate one `DeltaNotice` rather than emitting one per delta.
-        `DeltaRemove`/`DeltaReproject`/`DeltaNotice` carry nothing
-        disclosable and pass through unchanged, hidden count zero."""
+        verbatim. It returns the delta alone: how much it hid is not reported to anyone
+        (ADR-124 decision 1).
+
+        **Every delta is projected** (decision 4): a removal names ids and a replacement names two
+        links, so each carries a record of what it names (`DeltaRemove.removed`,
+        `DeltaReplaceEdge.removed`) from which this decides what `principal` is sent, and the
+        sent forms never hold the record. A reproject is sent with a fixed reason code and only
+        the cluster keys the reader may read. `known` is the working set's nodes, which a link's
+        ends and a cluster's keys are judged against; without it no end or key can be judged and
+        none is sent."""
         if isinstance(delta, DeltaAdd):
-            nodes, edges, hidden = self._project(delta.nodes, delta.edges, principal, known)
-            return delta.model_copy(update={"nodes": nodes, "edges": edges}), hidden
+            nodes, edges, _ = self._project(delta.nodes, delta.edges, principal, known)
+            return delta.model_copy(update={"nodes": nodes, "edges": edges})
         if isinstance(delta, DeltaSnapshot):
-            nodes, edges, hidden = self._project(delta.nodes, delta.edges, principal)
-            return (
-                delta.model_copy(update={"nodes": nodes, "edges": edges, "filtered_count": hidden}),
-                hidden,
-            )
+            nodes, edges, _ = self._project(delta.nodes, delta.edges, principal)
+            # `withheld` is `sync`'s full snapshot's alone (ADR-124 decision 5): whatever a stored
+            # snapshot carries, replayed or pushed, is not sent.
+            return delta.model_copy(update={"nodes": nodes, "edges": edges, "withheld": None})
+        if isinstance(delta, DeltaRemove):
+            return self._project_removal(delta, principal, known)
         if isinstance(delta, DeltaReplaceEdge):
-            # A change keeps the link's marking and its ends, so whoever could not see the old link
-            # cannot see the new one: for them the step is nothing, counted as one withheld item,
-            # and the new link's content does not leave. Judged on the link's own marking because a
-            # delta carries no ends to judge it by, which is the safe side of that gap.
-            if principal_may_read(
-                delta.edge.handling, delta.edge.datasets, principal, self._scheme
-            ):
-                return delta, 0
-            return DeltaRemove(seq=delta.seq, node_ids=[]), 1
-        return delta, 0
+            return self._project_replacement(delta, principal, known)
+        if isinstance(delta, DeltaReproject):
+            readable = {
+                node_id
+                for node_id in delta.affected_cluster_ids
+                if node_id in (known or {})
+                and principal_may_read(
+                    (known or {})[node_id].handling,
+                    (known or {})[node_id].datasets,
+                    principal,
+                    self._scheme,
+                )
+            }
+            return DeltaReproject(
+                seq=delta.seq,
+                reason=REASON_MANUAL if delta.reason == REASON_MANUAL else REASON_THRESHOLD,
+                affected_cluster_ids={
+                    k: v for k, v in delta.affected_cluster_ids.items() if k in readable
+                },
+            )
+        # No rule for it, so nothing to send: a delta of a kind added later names ids of its own,
+        # and passing it on unprojected is how a hidden one reaches a socket.
+        raise TypeError(f"no projection for a delta of type {type(delta).__name__}")
+
+    def _may_read_element(self, element: RemovedElement | None, principal: Principal) -> bool:
+        return element is not None and principal_may_read(
+            element.handling, element.datasets, principal, self._scheme
+        )
+
+    def _may_read_ends(
+        self,
+        ends: Sequence[NodeId | None],
+        principal: Principal,
+        known: Mapping[NodeId, Node] | None,
+        removed: RemovedRecord | None = None,
+    ) -> bool:
+        """Whether `principal` may read every one of these nodes, judged by the working set's body
+        (`known`) or, for a node removed in the same delta, by its record. A node found in neither
+        cannot be judged and is not readable: the safe side."""
+        for end in ends:
+            if end is None:
+                return False
+            body = (known or {}).get(end)
+            if body is not None:
+                if not principal_may_read(body.handling, body.datasets, principal, self._scheme):
+                    return False
+            elif not self._may_read_element((removed.nodes if removed else {}).get(end), principal):
+                return False
+        return True
+
+    def _project_removal(
+        self, delta: DeltaRemove, principal: Principal, known: Mapping[NodeId, Node] | None
+    ) -> DeltaRemoveSent:
+        record = delta.removed or RemovedRecord()
+        node_ids = [
+            node_id
+            for node_id in delta.node_ids
+            if self._may_read_element(record.nodes.get(node_id), principal)
+        ]
+        edge_ids = [
+            edge_id
+            for edge_id in delta.edge_ids
+            if (element := record.edges.get(edge_id)) is not None
+            and self._may_read_element(element, principal)
+            and self._may_read_ends([element.source, element.target], principal, known, record)
+        ]
+        return DeltaRemoveSent(seq=delta.seq, node_ids=node_ids, edge_ids=edge_ids)
+
+    def _project_replacement(
+        self, delta: DeltaReplaceEdge, principal: Principal, known: Mapping[NodeId, Node] | None
+    ) -> DeltaAdd | DeltaRemoveSent | DeltaReplaceEdgeSent:
+        """The four rows of ADR-124 decision 4: the replace, the new link alone as an addition, the
+        old link alone as a removal, or nothing. Each half is judged by its own marking and both of
+        its ends."""
+        new = delta.edge
+        new_ok = principal_may_read(
+            new.handling, new.datasets, principal, self._scheme
+        ) and self._may_read_ends([new.source, new.target], principal, known)
+        old = delta.removed
+        old_ok = (
+            old is not None
+            and self._may_read_element(old, principal)
+            and self._may_read_ends([old.source, old.target], principal, known)
+        )
+        if old_ok and new_ok:
+            return DeltaReplaceEdgeSent(
+                seq=delta.seq, old_edge_id=delta.old_edge_id, edge=withhold_sources(new, principal)
+            )
+        if new_ok:
+            return DeltaAdd(seq=delta.seq, edges=[withhold_sources(new, principal)])
+        if old_ok:
+            return DeltaRemoveSent(seq=delta.seq, edge_ids=[delta.old_edge_id])
+        return DeltaRemoveSent(seq=delta.seq)
 
     async def project_live(
         self, investigation_id: str, delta: WorkingSetDelta, principal: Principal
-    ) -> tuple[WorkingSetDelta, int]:
+    ) -> WorkingSetDeltaSent:
         """A live push, projected for `principal` with its links' ends judged against the working
         set as it now stands (`_project`'s `known`)."""
         known = await self._store.source_fidelity_nodes(investigation_id)
@@ -229,7 +552,7 @@ class WorkingSetService:
 
     async def set_resolution_threshold(
         self, investigation_id: str, tau: float, principal: Principal
-    ) -> DeltaReproject:
+    ) -> ResolutionOutcome:
         """`PUT /v1/resolution/threshold` (`03_CONDUIT_MIDDLEWARE.md` §3.5, §4): "resolution
         collapse at the session's τ" re-projected against the *full* source-fidelity node set —
         not merely the nodes a single prior `expand()` happened to include — since a threshold
@@ -241,11 +564,13 @@ class WorkingSetService:
         method needed, and the same access filter every other read already goes through
         (`03_CONDUIT_MIDDLEWARE.md` §6: "Filtering in the Conduit after retrieval is forbidden").
 
-        The delta this returns/records carries the three summary counts `01_DOMAIN_MODEL.md` §4's
-        own example gives ("3 entities merged, 1 split, 47 nodes affected") plus, since Phase 6a
-        Stage 2, the affected nodes' own new cluster ids (`DeltaReproject.affected_cluster_ids`) —
-        never the full working set, bounded by `affected` — so a client can update cluster
-        rendering in place instead of re-fetching via `sync`/`current_membership` on every move.
+        The outcome this returns carries the three summary counts `01_DOMAIN_MODEL.md` §4's own
+        example gives ("3 entities merged, 1 split, 47 nodes affected"), the acting analyst's own,
+        from their own view; the delta it records, which every reader receives, does not (ADR-124
+        decision 1). The delta carries, since Phase 6a Stage 2, the affected nodes' own new cluster
+        ids (`DeltaReproject.affected_cluster_ids`) — never the full working set — so a client
+        can update cluster rendering in place instead of re-fetching via `sync`/`current_membership`
+        on every move.
 
         `node_ids` is narrowed to `principal`'s own visible subset of the investigation-shared
         population before either `compute_clusters` call — access control lives in the adapter.
@@ -301,18 +626,20 @@ class WorkingSetService:
         seq = await self._store.next_seq(investigation_id)
         delta = DeltaReproject(
             seq=seq,
-            reason=f"resolution threshold changed from {old_tau} to {tau}",
-            merged=delta_counts.merged,
-            split=delta_counts.split,
-            affected=delta_counts.nodes_affected,
+            reason=REASON_THRESHOLD,
             affected_cluster_ids=delta_counts.affected_cluster_ids,
         )
         await self._store.append_delta(investigation_id, delta)
-        return delta
+        return ResolutionOutcome(
+            delta=delta,
+            merged=delta_counts.merged,
+            split=delta_counts.split,
+            affected=delta_counts.nodes_affected,
+        )
 
     async def manual_link(
         self, investigation_id: str, node_a: NodeId, node_b: NodeId, principal: Principal
-    ) -> tuple[DeltaReproject, ChangeStreamEntry | None]:
+    ) -> tuple[ResolutionOutcome, ChangeStreamEntry | None]:
         """`POST /v1/resolution/link` (`03_CONDUIT_MIDDLEWARE.md` §3.5): "analyst-asserted
         `SAME_AS`" — `01_DOMAIN_MODEL.md` §4: "a manual link is a `SAME_AS` with score 1.0 and
         `provenance.state = asserted`." Only `score` is set on the new edge: `model_version`/
@@ -339,7 +666,7 @@ class WorkingSetService:
 
     async def manual_split(
         self, investigation_id: str, node_a: NodeId, node_b: NodeId, principal: Principal
-    ) -> tuple[DeltaReproject, ChangeStreamEntry | None]:
+    ) -> tuple[ResolutionOutcome, ChangeStreamEntry | None]:
         """`POST /v1/resolution/split` (`03_CONDUIT_MIDDLEWARE.md` §3.5): "analyst-asserted
         `NOT_SAME_AS`" — `01_DOMAIN_MODEL.md` §4: "a manual split is a `NOT_SAME_AS` edge that the
         projection always honours and no future resolution run may override." `compute_clusters`
@@ -367,7 +694,7 @@ class WorkingSetService:
         edge_type: str,
         properties: dict[str, Any],
         reason: str,
-    ) -> tuple[DeltaReproject, ChangeStreamEntry | None]:
+    ) -> tuple[ResolutionOutcome, ChangeStreamEntry | None]:
         if node_a == node_b:
             raise SameNodeAssertionError(node_a)
 
@@ -450,11 +777,13 @@ class WorkingSetService:
 
         tx = await self._graph.begin_transaction()
         try:
-            await self._graph.upsert_edges([edge_write], tx)
+            (stored_id,) = await self._graph.upsert_edges([edge_write], tx)
         except Exception:
             await self._graph.rollback_transaction(tx)
             raise
         await self._graph.commit_transaction(tx)
+        # The link the store holds: a write that merged into a link of its audience is that link.
+        new_edge = new_edge.model_copy(update={"id": stored_id})
 
         entry: ChangeStreamEntry | None = None
         if self._valkey is not None:
@@ -484,14 +813,17 @@ class WorkingSetService:
         seq = await self._store.next_seq(investigation_id)
         delta = DeltaReproject(
             seq=seq,
-            reason=f"manual {reason} between {node_a} and {node_b}",
-            merged=delta_counts.merged,
-            split=delta_counts.split,
-            affected=delta_counts.nodes_affected,
+            reason=REASON_MANUAL,
             affected_cluster_ids=delta_counts.affected_cluster_ids,
         )
         await self._store.append_delta(investigation_id, delta)
-        return delta, entry
+        outcome = ResolutionOutcome(
+            delta=delta,
+            merged=delta_counts.merged,
+            split=delta_counts.split,
+            affected=delta_counts.nodes_affected,
+        )
+        return outcome, entry
 
     async def explain_cluster(
         self, investigation_id: str, cluster_id: ClusterId, principal: Principal
@@ -552,6 +884,82 @@ class WorkingSetService:
             cluster_id=cluster_id, member_node_ids=sorted(member_ids), pairs=pairs
         )
 
+    async def _reader_counts(self, investigation_id: str, principal: Principal) -> _ReaderCounts:
+        """`principal`'s own figures for the case (ADR-124 decision 2): the nodes and links in their
+        projected view, which is what `_project` keeps of the stored set, where a link counts only
+        when it and both its ends are readable. Not a count of readable elements one by one: a
+        readable link to a node the reader may not read is not in their view, and counting it would
+        let the figure move with the hidden node. Every cap and every preview figure is these
+        counts plus what the request adds.
+
+        **From counts, not the set** (Amendment 4): reading and validating every body cost 3.2 s of
+        a 3.4 s preview at 50,000 nodes and 100,000 links, and loading an entry per element still
+        cost 1.1 s at 250,000 links. The store keeps, in the transaction of each write, the
+        number of nodes of each signature and of links of each (link, source end, target end)
+        signatures, with `ABSENT` for an end that is not stored. Which signatures the reader may
+        read is `principal_may_read` over the signature table alone, which is small; the figures
+        are sums over the readable ones. The same rules as `_project`, which
+        `test_access_index.py` holds this to after every one of a run of random writes.
+
+        **Which signatures are readable is kept** by (case, epoch, signatures version, access
+        class). The signatures version counts up when a signature is first stored, so a case that
+        gains a signature is a new key; the epoch is new after a `clear`, which restarts the
+        signatures' keys, so a case that starts again is never taken for the one before. The access
+        class (`cache.principal_class`: clearance, the receivable codes, `org_unit`, the datasets)
+        is part of the key because a reader of another class must never be given another's
+        readable set: that would be a rule 3 matter."""
+        view = _ReaderCounts(
+            self._store,
+            investigation_id,
+            principal,
+            self._scheme,
+            {},
+            {},
+            frozenset(),
+            0,
+            0,
+        )
+
+        async def reload() -> None:
+            await self._read_counts_into(view)
+
+        view.reload = reload
+        await reload()
+        return view
+
+    async def _read_counts_into(self, view: _ReaderCounts) -> None:
+        """Read the case's counts and set `view` from them: its signature table and epoch, the
+        memo of judgements for (case, epoch, signatures version, access class), the readable
+        signatures and the figures. Also what a request does again when a renumbering is met
+        between its reads (`_ReaderCounts.would_add`)."""
+        investigation_id, principal = view.case, view.principal
+        counts = await self._store.access_counts(investigation_id)
+        key = (investigation_id, counts.epoch, counts.sigs_version, principal_class(principal))
+        judgements = self._readable.get(key)
+        if judgements is None:
+            judgements = self._readable[key] = {}
+            while len(self._readable) > READABLE_CACHE_SIZE:
+                self._readable.popitem(last=False)
+        else:
+            self._readable.move_to_end(key)
+        view.signatures = counts.signatures
+        view.judgements = judgements
+        view.epoch = counts.epoch
+        # Only signatures something carries are judged: the table keeps one for as long as the case
+        # lives, and one whose handling code the scheme has since dropped cannot be judged.
+        in_use = {k for k, n in counts.node_counts.items() if n > 0} | {
+            k for triple, n in counts.edge_counts.items() if n > 0 for k in triple if k != ABSENT
+        }
+        view.readable = frozenset(k for k in in_use if view.is_readable(k))
+        view.nodes = sum(n for k, n in counts.node_counts.items() if k in view.readable)
+        view.edges = sum(
+            n
+            for (edge_sig, source_sig, target_sig), n in counts.edge_counts.items()
+            if edge_sig in view.readable
+            and source_sig in view.readable
+            and target_sig in view.readable
+        )
+
     async def seed(
         self,
         investigation_id: str,
@@ -559,52 +967,103 @@ class WorkingSetService:
         edges: Sequence[Edge],
         principal: Principal,
     ) -> ExpansionOutcome:
-        """`POST /seed` (`03_CONDUIT_MIDDLEWARE.md` §3.2) — from a search
-        result or saved subgraph. Unlike `expand`, the input here is
-        caller-supplied `Node`/`Edge` objects, not the output of a
-        `GraphPort` call this service already trusts — so `seed` is the
-        one write path that must itself validate the seeding principal
-        can see what they are handing in, via the same `_project` used on
-        every read. Without this, a principal could write content into a
-        store a *different*, later reader is authorised to open that not
-        even the seeder themselves could legitimately see: a poisoning
-        vector the read-time filter alone does not close, since it only
-        ever narrows what a read discloses, never what a write accepts.
-        Redaction is not deletion here either (`00_ARCHITECTURE.md` §5):
-        anything the seeder submitted but is not entitled to see is
-        silently dropped from what gets stored, and `filtered_count`
-        reports how much — the same field `expand` uses, same meaning,
-        just measured against the caller's own submission instead of
-        against `expand_candidate_count`, since there is no single
-        `ExpandRequest` scope to ask that about here."""
-        visible_nodes, visible_edges, hidden = self._project(nodes, edges, principal)
-        return await self._add(
-            investigation_id, visible_nodes, visible_edges, filtered_count=hidden
-        )
+        """`POST /seed` (`03_CONDUIT_MIDDLEWARE.md` §3.2) — from a search result or saved subgraph,
+        and the one write path every server-side caller of a seed goes through (ADR-124 decision 7).
+
+        **What is stored is what the Vault holds, never what the caller wrote.** Each submitted
+        node id is read through `GraphPort.get_nodes`, and each link id through `get_edges`, for
+        the seeding principal (the case-scoped one, so the case's datasets apply, ADR-099): the
+        Vault's bodies are stored, and a caller's body is used for its id alone. A body forged to
+        look readable is therefore never stored, and a hidden id, a superseded id and an id the
+        Vault does not hold are left out alike, with the same response and the same following
+        snapshot and no error to tell them apart (ids are derived and can be guessed, so a seed
+        must not be a membership test, rule 4).
+
+        **Verify each link.** `get_edges` returns a link only when it and both its ends are
+        readable in the Vault; this keeps it only if each end is also seeded in this request (and
+        returned) or already in the reader's view. A link to a node neither on the canvas nor in
+        the request is dropped, as one to a hidden node is.
+
+        The cap is counted over the reader's view after this filtering (`_add`). The cost is two
+        by-id reads (one of nodes, one of links) and, for links with an end not in the request, one
+        read of the counted index."""
+        node_ids = list(dict.fromkeys(n.id for n in nodes))
+        edge_ids = list(dict.fromkeys(e.id for e in edges))
+        vault_nodes = {n.id: n for n in await self._graph.get_nodes(node_ids, principal)}
+        vault_edges = {e.id: e for e in await self._graph.get_edges(edge_ids, principal)}
+        seeded = [vault_nodes[i] for i in node_ids if i in vault_nodes]
+        wanted_ends = {
+            end for e in vault_edges.values() for end in (e.source, e.target)
+        } - vault_nodes.keys()
+        on_the_canvas: set[NodeId] = set()
+        if wanted_ends:
+            reader = await self._reader_counts(investigation_id, principal)
+            on_the_canvas = await reader.visibly_stored_among(wanted_ends)
+        verified = vault_nodes.keys() | on_the_canvas
+        kept = [
+            vault_edges[i]
+            for i in edge_ids
+            if i in vault_edges
+            and vault_edges[i].source in verified
+            and vault_edges[i].target in verified
+        ]
+        return await self._add(investigation_id, seeded, kept, principal)
+
+    async def add_by_identifiers(
+        self,
+        investigation_id: str,
+        nodes: Sequence[Node],
+        principal: Principal,
+        *,
+        with_links: bool = False,
+    ) -> ExpansionOutcome:
+        """ADR-128 decision 1 (B2): the nodes `add_by_identifiers.resolve_identifiers` found, added
+        through `seed`, so the Vault is read again for each, the cap is counted over the reader's
+        view and a breach is the typed `LimitExceededError` with nothing added (rule 2).
+
+        **By default no links**: the nodes alone, and "Show links among all" draws them.
+        **`with_links`** brings every link among the added nodes and the nodes already on the
+        canvas, in the same single add, so a breach by the links leaves the nodes out too. Past
+        `AUTO_LINKS_MAX_VIEW_NODES` (the canvas and the new nodes together) they cannot be named to
+        the graph in one ask (`expand`'s own limit), so no link is asked for and the outcome says
+        `not_asked`, as `expand`'s does (rule 2: `added` would claim every link among what was
+        named was brought, and none was asked for)."""
+        if not with_links:
+            return await self.seed(investigation_id, nodes, [], principal)
+        view = await self._reader_counts(investigation_id, principal)
+        new_ids = {n.id for n in nodes}
+        new_count, _, _ = await view.would_add(new_ids, ())
+        if view.nodes + new_count > AUTO_LINKS_MAX_VIEW_NODES:
+            outcome = await self.seed(investigation_id, nodes, [], principal)
+            return outcome.model_copy(update={"links_among": "not_asked"})
+        wanted = new_ids | await view.visible_node_ids()
+        among = await self._graph.edges_among(sorted(wanted), principal)
+        outcome = await self.seed(investigation_id, nodes, among, principal)
+        return outcome.model_copy(update={"links_among": "added"})
 
     async def expand(
         self, investigation_id: str, req: ExpandRequest, principal: Principal
     ) -> ExpansionOutcome:
-        """`POST /expand`. Two `GraphPort` calls over the *same* `req`:
-        the filtered result the analyst receives, and the unfiltered
-        candidate count this service is the first authority able to
-        compare it against (`01_DOMAIN_MODEL.md` §8.2)."""
+        """`POST /expand`: the filtered result the analyst receives, added to the working set. No
+        figure for what the filter left out is asked for or returned (ADR-124 decision 1)."""
         subgraph = await self._graph.expand(req, principal)
-        candidate_count = await self._graph.expand_candidate_count(
-            req, datasets=principal.datasets
-        )
-        filtered_count = _filtered_count(candidate_count, len(subgraph.nodes))
         # ADR-098: the links the expansion did not walk along, among its nodes and the view, when
-        # it is small enough to ask; all of them or, if they would pass the cap, none.
-        existing = await self._store.node_ids(investigation_id)
-        new_count = len({n.id for n in subgraph.nodes} - existing)
-        view = existing | {n.id for n in subgraph.nodes}
-        if new_count > AUTO_LINKS_MAX_NEW_NODES or len(view) > AUTO_LINKS_MAX_VIEW_NODES:
+        # it is small enough to ask; all of them or, if they would pass the cap, none. The view is
+        # the reader's own (ADR-124 decision 2): a stored node they may not read is not in it, so
+        # neither the choice to ask nor the cap moves with it.
+        view = await self._reader_counts(investigation_id, principal)
+        new_ids = {n.id for n in subgraph.nodes}
+        new_count, _, _ = await view.would_add(new_ids, ())
+        view_size = view.nodes + new_count
+        if new_count > AUTO_LINKS_MAX_NEW_NODES or view_size > AUTO_LINKS_MAX_VIEW_NODES:
             outcome = await self._add(
-                investigation_id, subgraph.nodes, subgraph.edges, filtered_count=filtered_count
+                investigation_id, subgraph.nodes, subgraph.edges, principal, view=view
             )
             return outcome.model_copy(update={"links_among": "not_asked"})
-        among = await self._graph.edges_among(sorted(view), principal)
+        # The view is small here, so its nodes can be named for the graph.
+        among = await self._graph.edges_among(
+            sorted(await view.visible_node_ids() | new_ids), principal
+        )
         walked = {e.id for e in subgraph.edges}
         extra = [e for e in among if e.id not in walked]
         try:
@@ -612,14 +1071,15 @@ class WorkingSetService:
                 investigation_id,
                 subgraph.nodes,
                 [*subgraph.edges, *extra],
-                filtered_count=filtered_count,
+                principal,
+                view=view,
             )
             return outcome.model_copy(update={"links_among": "added"})
         except LimitExceededError:
             if not extra:
                 raise
         outcome = await self._add(
-            investigation_id, subgraph.nodes, subgraph.edges, filtered_count=filtered_count
+            investigation_id, subgraph.nodes, subgraph.edges, principal, view=view
         )
         return outcome.model_copy(update={"links_among": "view_full"})
 
@@ -637,8 +1097,15 @@ class WorkingSetService:
         Past one degree (Amendment 4), also the routes between each pair of them: the fewest
         degrees that join the pair, up to `degree`, as ADR-116 finds them (`paths_at_length`, the
         reader's search in the adapter), their nodes and links added with the direct ones."""
-        view = await self._store.node_ids(investigation_id)
-        ids = view if node_ids is None else view & set(node_ids)
+        # What the reader may read of the ids named, before anything else (ADR-124 decision 3): a
+        # stored id they may not read is dropped here exactly as one the store does not hold is, so
+        # nothing after this, in the result or in the time it takes, depends on which it was.
+        reader = await self._reader_counts(investigation_id, principal)
+        ids = (
+            await reader.visible_node_ids()
+            if node_ids is None
+            else await reader.visibly_stored_among(node_ids)
+        )
         among = await self._graph.edges_among(sorted(ids), principal)
         route_nodes: dict[NodeId, Node] = {}
         route_edges: dict[EdgeId, Edge] = {e.id: e for e in among}
@@ -663,7 +1130,7 @@ class WorkingSetService:
         existing_edges = await self._store.edge_ids(investigation_id)
         new_nodes = [n for n in route_nodes.values() if n.id not in existing_nodes]
         new = [e for e in route_edges.values() if e.id not in existing_edges]
-        outcome = await self._add(investigation_id, new_nodes, new, filtered_count=0)
+        outcome = await self._add(investigation_id, new_nodes, new, principal)
         return LinksAmongOutcome(
             delta=outcome.delta, added=len(new), added_nodes=len(new_nodes), degree=degree,
             unconnected_pairs=unconnected, more_routes_pairs=more,
@@ -673,39 +1140,36 @@ class WorkingSetService:
         self, investigation_id: str, req: ExpandRequest, principal: Principal
     ) -> CardinalityPreview:
         """`POST /expand/preview` — cardinality only, no mutation
-        (`03_CONDUIT_MIDDLEWARE.md` §3.2). Runs the same two `GraphPort`
-        calls `expand` does, and the same cap arithmetic, but never calls
-        `_add` — nothing is written to the store or appended to the delta
-        stream."""
+        (`03_CONDUIT_MIDDLEWARE.md` §3.2). Runs the same `GraphPort` read `expand` does, and the
+        same cap arithmetic, over the reader's own projected view plus what the request adds
+        (ADR-124 decision 2), but never calls `_add` — nothing is written to the store or appended
+        to the delta stream. The counts are the same with and without a stored item the reader may
+        not read, so a per-type preview cannot be used to find one."""
         subgraph = await self._graph.expand(req, principal)
-        candidate_count = await self._graph.expand_candidate_count(
-            req, datasets=principal.datasets
+        view = await self._reader_counts(investigation_id, principal)
+        new_nodes, new_edges, _ = await view.would_add(
+            (n.id for n in subgraph.nodes), (e.id for e in subgraph.edges), subgraph.nodes
         )
-        filtered_count = _filtered_count(candidate_count, len(subgraph.nodes))
-
-        existing_node_ids = await self._store.node_ids(investigation_id)
-        existing_edge_ids = await self._store.edge_ids(investigation_id)
-        new_node_count = len({n.id for n in subgraph.nodes} - existing_node_ids)
-        new_edge_count = len({e.id for e in subgraph.edges} - existing_edge_ids)
-
-        would_be_nodes = len(existing_node_ids) + new_node_count
-        would_be_edges = len(existing_edge_ids) + new_edge_count
-        would_breach = _cap_breach(would_be_nodes, would_be_edges)
-
+        would_be_nodes = view.nodes + new_nodes
+        would_be_edges = view.edges + new_edges
         return CardinalityPreview(
             candidate_node_count=would_be_nodes,
             candidate_edge_count=would_be_edges,
-            filtered_count=filtered_count,
-            would_breach=would_breach,
+            would_breach=_cap_breach(would_be_nodes, would_be_edges),
         )
 
     async def add_written(
-        self, investigation_id: str, nodes: Sequence[Node], edges: Sequence[Edge]
+        self,
+        investigation_id: str,
+        nodes: Sequence[Node],
+        edges: Sequence[Edge],
+        principal: Principal,
     ) -> DeltaAdd:
         """Puts nodes and links this Conduit has just written into the case's working set and
         returns the delta that says so (ADR-089: the Document an email becomes, and an entity
         accepted from it). Nothing is filtered here: the caller wrote them under a handling it
-        could itself see, and the cap check and the sequence are `_add`'s own.
+        could itself see, and the cap check and the sequence are `_add`'s own, counted over
+        `principal`'s own view (ADR-124 decision 2).
 
         ADR-099: the copy is stamped as the write was (`DatasetStampingGraph`), each element that
         names no dataset given the request's case's first; otherwise the canvas, drawn from these
@@ -717,36 +1181,45 @@ class WorkingSetService:
             into = [held[0]]
             nodes = [n if n.datasets else n.model_copy(update={"datasets": into}) for n in nodes]
             edges = [e if e.datasets else e.model_copy(update={"datasets": into}) for e in edges]
-        outcome = await self._add(investigation_id, nodes, edges, filtered_count=0)
+        outcome = await self._add(investigation_id, nodes, edges, principal)
         return outcome.delta
 
     async def ensure_room(
-        self, investigation_id: str, node_ids: Sequence[str], edge_ids: Sequence[str]
+        self,
+        investigation_id: str,
+        node_ids: Sequence[str],
+        edge_ids: Sequence[str],
+        principal: Principal,
     ) -> None:
-        """Raises `LimitExceededError` if adding these ids would take the case's working set past
-        its cap. For a caller that writes the graph first and then adds what it wrote: it asks
-        here before writing, so a refused request leaves nothing in the graph either (rule 2,
-        ADR-092)."""
-        existing_node_ids = await self._store.node_ids(investigation_id)
-        existing_edge_ids = await self._store.edge_ids(investigation_id)
-        breach = _cap_breach(
-            len(existing_node_ids | set(node_ids)), len(existing_edge_ids | set(edge_ids))
-        )
+        """Raises `LimitExceededError` if adding these ids would take `principal`'s own view of the
+        case past its cap (ADR-124 decision 2). For a caller that writes the graph first and then
+        adds what it wrote: it asks here before writing, so a refused request leaves nothing in the
+        graph either (rule 2, ADR-092)."""
+        view = await self._reader_counts(investigation_id, principal)
+        new_nodes, new_edges, _ = await view.would_add(node_ids, edge_ids)
+        breach = _cap_breach(view.nodes + new_nodes, view.edges + new_edges)
         if breach is not None:
             raise LimitExceededError(breach)
 
     async def _new_within_cap(
-        self, investigation_id: str, nodes: Sequence[Node], edges: Sequence[Edge]
+        self,
+        investigation_id: str,
+        nodes: Sequence[Node],
+        edges: Sequence[Edge],
+        principal: Principal,
+        view: _ReaderCounts | None = None,
     ) -> tuple[list[Node], list[Edge]]:
-        existing_node_ids = await self._store.node_ids(investigation_id)
-        existing_edge_ids = await self._store.edge_ids(investigation_id)
-
-        new_nodes = [n for n in nodes if n.id not in existing_node_ids]
-        new_edges = [e for e in edges if e.id not in existing_edge_ids]
-
-        would_be_nodes = len(existing_node_ids) + len(new_nodes)
-        would_be_edges = len(existing_edge_ids) + len(new_edges)
-        breach = _cap_breach(would_be_nodes, would_be_edges)
+        """What of `nodes` and `edges` is new to the store, refusing the whole request if it would
+        take `principal`'s own view past the cap. The stored set decides what is written (the
+        store's entries for these ids say which it holds); the reader's view decides what is
+        counted (ADR-124 decision 2). `view` is given by a caller that has just read it."""
+        view = view or await self._reader_counts(investigation_id, principal)
+        new_in_view_nodes, new_in_view_edges, entries = await view.would_add(
+            (n.id for n in nodes), (e.id for e in edges), nodes
+        )
+        new_nodes = [n for n in nodes if n.id not in entries.nodes]
+        new_edges = [e for e in edges if e.id not in entries.edges]
+        breach = _cap_breach(view.nodes + new_in_view_nodes, view.edges + new_in_view_edges)
         if breach is not None:
             raise LimitExceededError(breach)
         return new_nodes, new_edges
@@ -756,24 +1229,36 @@ class WorkingSetService:
         investigation_id: str,
         nodes: Sequence[Node],
         edges: Sequence[Edge],
+        principal: Principal,
         *,
-        filtered_count: int,
+        view: _ReaderCounts | None = None,
+        empty_on_failure: bool = False,
     ) -> ExpansionOutcome:
         """`03_CONDUIT_MIDDLEWARE.md` §4: "On breach the service does not
         truncate". The cap check runs — and can raise — *before* any
         write, so a would-be-breaching call never partially lands: it is
         rejected whole, or it succeeds whole, never a silent slice of
         either the requested nodes or the requested edges."""
-        new_nodes, new_edges = await self._new_within_cap(investigation_id, nodes, edges)
+        new_nodes, new_edges = await self._new_within_cap(
+            investigation_id, nodes, edges, principal, view
+        )
 
-        await self._store.add_nodes(investigation_id, new_nodes)
-        await self._store.add_edges(investigation_id, new_edges)
+        try:
+            await self._store.add_nodes(investigation_id, new_nodes)
+            await self._store.add_edges(investigation_id, new_edges)
 
-        seq = await self._store.next_seq(investigation_id)
-        delta = DeltaAdd(seq=seq, nodes=list(nodes), edges=list(edges))
-        await self._store.append_delta(investigation_id, delta)
+            seq = await self._store.next_seq(investigation_id)
+            delta = DeltaAdd(seq=seq, nodes=list(nodes), edges=list(edges))
+            await self._store.append_delta(investigation_id, delta)
+        except BaseException:
+            if empty_on_failure:
+                # A write of several chunks that stopped part-way: the case it was filling is
+                # emptied, so that what is left is nothing rather than something that looks like
+                # a complete copy.
+                await self._store.clear(investigation_id)
+            raise
 
-        return ExpansionOutcome(delta=delta, filtered_count=filtered_count)
+        return ExpansionOutcome(delta=delta)
 
     async def branch_contents(
         self,
@@ -806,6 +1291,42 @@ class WorkingSetService:
         # ids they named exist but are hidden from them.
         return visible_nodes, visible_edges, 0
 
+    async def branch_lit_contents(
+        self,
+        source_investigation_id: str,
+        principal: Principal,
+        node_ids: Sequence[NodeId],
+        lit_edge_ids: Collection[EdgeId],
+    ) -> tuple[list[Node], list[Edge]]:
+        """What a branch of what is lit would hold for `principal` (ADR-128 decision 2): the lit
+        links and the nodes they touch, and nothing else, so the branch's own timeline lies inside
+        the window. `lit_edge_ids` is the analytics port's answer for the window, already filtered
+        for `principal` in its own query; it is intersected here with the links `principal` may see
+        in the source case, so a link they may not see, or one this case does not hold, lights
+        nothing. A node is kept only where `node_ids` names it and a lit link touches it, so an id
+        they may not see, a made-up one, and a real one no lit link touches are all simply absent,
+        and `NothingToBranchError` is the same whatever the reason. A link is kept only when both
+        its ends are kept. A slice past the cap is the typed `LimitExceededError` with the slice's
+        own figures, which are the reader's (rule 3). Nothing is written, so the route calls it
+        before it creates the case."""
+        stored_nodes = await self._store.source_fidelity_nodes(source_investigation_id)
+        stored_edges = await self._store.source_fidelity_edges(source_investigation_id)
+        visible_nodes, visible_edges, _ = self._project(
+            list(stored_nodes.values()), list(stored_edges.values()), principal
+        )
+        lit_links = [e for e in visible_edges if e.id in lit_edge_ids]
+        touched = {end for e in lit_links for end in (e.source, e.target)}
+        named = set(node_ids)
+        kept = {n.id for n in visible_nodes if n.id in touched and n.id in named}
+        nodes = [n for n in visible_nodes if n.id in kept]
+        edges = [e for e in lit_links if e.source in kept and e.target in kept]
+        if not nodes:
+            raise NothingToBranchError
+        breach = _cap_breach(len(nodes), len(edges))
+        if breach is not None:
+            raise LimitExceededError(breach)
+        return nodes, edges
+
     async def branch(
         self,
         source_investigation_id: str,
@@ -825,11 +1346,11 @@ class WorkingSetService:
         snapshot at the moment it forks, not a live link back to the
         source, so later expansion of either side never touches the
         other."""
-        visible_nodes, visible_edges, hidden = await self.branch_contents(
+        visible_nodes, visible_edges, _ = await self.branch_contents(
             source_investigation_id, principal, node_ids
         )
         return await self._add(
-            new_investigation_id, visible_nodes, visible_edges, filtered_count=hidden
+            new_investigation_id, visible_nodes, visible_edges, principal, empty_on_failure=True
         )
 
     async def current_membership(self, investigation_id: str) -> tuple[list[Node], list[Edge]]:
@@ -852,6 +1373,15 @@ class WorkingSetService:
         nodes, edges = await self.current_membership(investigation_id)
         visible_nodes, visible_edges, _ = self._project(nodes, edges, principal)
         return visible_nodes, visible_edges
+
+    def may_view_all(self, handlings: Sequence[Handling], principal: Principal) -> bool:
+        """`principal` may view every one of `handlings`, by the same two axes the analytics store
+        applies to an event (`principal_may_view`). A handling the scheme no longer defines is not
+        viewable: fail closed, as `packs.item_visible` does."""
+        try:
+            return all(principal_may_view(h, principal, self._scheme) for h in handlings)
+        except HandlingSchemeError:
+            return False
 
     async def visible_node(
         self, investigation_id: str, node_id: NodeId, principal: Principal
@@ -900,34 +1430,96 @@ class WorkingSetService:
         return source.type, target.type
 
     async def replace_edge(
-        self, investigation_id: str, old_edge_id: EdgeId, new_edge: Edge
+        self, investigation_id: str, old_edge: Edge, new_edge: Edge
     ) -> DeltaReplaceEdge:
         """Swaps one link for its replacement in the working set and records the step, so a client
         that reconnects is told of it. Membership only: nothing is checked here, the caller has
-        already shown the principal may change the old link (`link_changes.py`)."""
-        await self._store.remove_edges(investigation_id, [old_edge_id])
+        already shown the principal may change the old link (`link_changes.py`).
+
+        The delta records what the old link was (its handling, datasets and ends) so that each
+        reader's projection can be decided from it (ADR-124 decision 4). The record is of the
+        working set's own stored copy of the old link, which is what its readers were sent (the
+        caller's may be the Vault's, whose datasets and marking can differ); the caller's is used
+        when the working set holds none, in which case no reader has it on a canvas.
+
+        The new link is stamped with the case's first dataset when it names none, as `add_written`
+        stamps what the Conduit writes (ADR-099): otherwise the copy the canvas is drawn from
+        belongs to none, and a reader scoped to the case is never sent it."""
+        from ..dataset_scope import case_datasets
+
+        held = case_datasets()
+        if held and not new_edge.datasets:
+            new_edge = new_edge.model_copy(update={"datasets": [held[0]]})
+        stored = await self._store.get_edge(investigation_id, old_edge.id) or old_edge
+        await self._store.remove_edges(investigation_id, [old_edge.id])
         await self._store.add_edges(investigation_id, [new_edge])
         seq = await self._store.next_seq(investigation_id)
-        delta = DeltaReplaceEdge(seq=seq, old_edge_id=old_edge_id, edge=new_edge)
+        delta = DeltaReplaceEdge(
+            seq=seq,
+            old_edge_id=old_edge.id,
+            edge=new_edge,
+            removed=RemovedElement(
+                handling=stored.handling,
+                datasets=list(stored.datasets),
+                source=stored.source,
+                target=stored.target,
+            ),
+        )
         await self._store.append_delta(investigation_id, delta)
         return delta
 
-    async def withheld_count_for(self, investigation_id: str, principal: Principal) -> int:
-        """The export gate's own trusted source for the withheld-item manifest
-        (`06_DECISIONS.md` ADR-045, `services/api/export.py::submit_export`) — computed here,
-        server-side against `principal`'s own current access over the investigation's real,
-        unfiltered membership, never accepted from a client submission. The identical arithmetic
-        `_project` already uses for the status bar's own "N hidden by handling" figure
-        (`02_GLASS_FRONTEND.md` §2) and every delta this service emits, reused rather than a second
-        count invented for export: an artefact's own manifest should say the same thing the status
-        bar already told this analyst all session, not a second, independently-computed number
-        that could drift from it. A client-supplied count would let an artefact state that nothing
-        was withheld when items were — an active misstatement of completeness, not merely an
-        omission, which is a materially worse failure than the leak ADR-045's own `disclose`
-        default already accepts the cost of."""
-        nodes, edges = await self.current_membership(investigation_id)
-        _, _, hidden = self._project(nodes, edges, principal)
-        return hidden
+    async def withheld_for(self, investigation_id: str, principal: Principal) -> bool:
+        """The export gate's own trusted source for the manifest's standing sentence
+        (`06_DECISIONS.md` ADR-045, ADR-124 decision 9, `services/api/export.py::submit_export`):
+        whether the case's stored set holds anything `principal` may not view, judged exactly as
+        `DeltaSnapshot.withheld` is (`_holds_what_the_reader_may_not_view`: the counted access
+        index, handling alone, datasets ignored). A yes or no, never a count: there is no figure
+        for withheld material anywhere (decision 1). Computed here, server-side, against
+        `principal`'s own current access, never accepted from a client submission: a client-supplied
+        flag would let an artefact state that nothing was withheld when items were, an active
+        misstatement of completeness, which is a materially worse failure than the disclosure
+        ADR-045's own `disclose` default already accepts the cost of."""
+        return await self._holds_what_the_reader_may_not_view(investigation_id, principal)
+
+    async def branch_filtered_contents(
+        self, source_investigation_id: str, principal: Principal, filt: BranchFilter
+    ) -> tuple[list[Node], list[Edge]]:
+        """What a filtered branch of `source_investigation_id` would hold for `principal` (ADR-124
+        decision 2): their own projected view, narrowed by `filt`, and nothing else. The view is
+        projected first and the filter applied to it, so a node or link they may not read is never
+        in the result and a type only hidden material holds selects what an absent type selects.
+        An empty result is `NothingToBranchError`, as for `branch`. A result past a cap is the typed
+        `LimitExceededError` with the filtered figures, which are the reader's own (rule 3). Nothing
+        is written, so the route calls it before it creates the case."""
+        stored_nodes = await self._store.source_fidelity_nodes(source_investigation_id)
+        stored_edges = await self._store.source_fidelity_edges(source_investigation_id)
+        visible_nodes, visible_edges, _ = self._project(
+            list(stored_nodes.values()), list(stored_edges.values()), principal
+        )
+        nodes = [n for n in visible_nodes if filt.keeps_node(n)]
+        kept = {n.id for n in nodes}
+        edges = [
+            e
+            for e in visible_edges
+            if e.source in kept and e.target in kept and filt.keeps_link_in_time(e)
+        ]
+        if not nodes:
+            raise NothingToBranchError
+        breach = _cap_breach(len(nodes), len(edges))
+        if breach is not None:
+            raise LimitExceededError(breach)
+        return nodes, edges
+
+    async def branch_add(
+        self,
+        new_investigation_id: str,
+        nodes: Sequence[Node],
+        edges: Sequence[Edge],
+        principal: Principal,
+    ) -> ExpansionOutcome:
+        """Writes what `branch_filtered_contents` chose into the new case, as `branch` writes its
+        own: cap-checked for the reader, and the new case emptied if a chunk fails part-way."""
+        return await self._add(new_investigation_id, nodes, edges, principal, empty_on_failure=True)
 
     async def restore(
         self,
@@ -935,7 +1527,7 @@ class WorkingSetService:
         nodes: Sequence[Node],
         edges: Sequence[Edge],
         principal: Principal,
-    ) -> DeltaSnapshot:
+    ) -> Restored:
         """`POST /history/{step}` (`03_CONDUIT_MIDDLEWARE.md` §3.1):
         replaces the working set's current membership with a previously
         recorded step's stored bodies, re-projecting the handling filter
@@ -950,51 +1542,198 @@ class WorkingSetService:
         counter, and a restore's `DeltaSnapshot` must carry the *next*
         monotonic seq, continuing the same sequence every other delta
         does, not restart it. Both nodes and edges are reconciled the same
-        way instead: whatever is no longer in the target set is removed
-        (`remove_nodes`/`remove_edges`), then the target set is re-added
-        (`add_nodes`/`add_edges` are upserts). Edges need this exactly as
-        much as nodes do — an edge added *after* the step was recorded,
+        way instead: the target set is added first (`add_nodes`/`add_edges` are
+        upserts), then whatever is no longer in it is removed (`remove_edges`, then
+        `remove_nodes`), so that a failure part-way never leaves less than the case held.
+        Edges need this exactly as much as nodes do — an edge added *after* the step was recorded,
         between two nodes both still present at that step, has both
         endpoints intact and would never be excluded by `_project`'s
         endpoint check, so without an explicit `remove_edges` pass it
         would silently survive a restore that is supposed to erase it."""
-        visible_nodes, visible_edges, hidden = self._project(nodes, edges, principal)
+        step_node_ids = {n.id for n in nodes}
+        step_edge_ids = {e.id for e in edges}
 
-        existing_node_ids = await self._store.node_ids(investigation_id)
-        target_node_ids = {n.id for n in visible_nodes}
-        stale_node_ids = existing_node_ids - target_node_ids
-        if stale_node_ids:
-            await self._store.remove_nodes(investigation_id, list(stale_node_ids))
+        # The step's members are judged against the Vault as it is now, for this restorer (the
+        # case's datasets are in `principal`, ADR-099): what comes back is what is stored, the
+        # Vault's current bodies and never the step's recorded ones, so a node raised since is not
+        # written back at its old marking, and a member the restorer may not read is not added.
+        vault_nodes = await self._graph.get_nodes(sorted(step_node_ids), principal)
+        vault_edges = await self._graph.get_edges(sorted(step_edge_ids), principal)
 
-        existing_edge_ids = await self._store.edge_ids(investigation_id)
-        target_edge_ids = {e.id for e in visible_edges}
-        stale_edge_ids = existing_edge_ids - target_edge_ids
-        if stale_edge_ids:
-            await self._store.remove_edges(investigation_id, list(stale_edge_ids))
-
-        await self._store.add_nodes(investigation_id, visible_nodes)
-        await self._store.add_edges(investigation_id, visible_edges)
-
-        seq = await self._store.next_seq(investigation_id)
-        snapshot = DeltaSnapshot(
-            seq=seq, nodes=visible_nodes, edges=visible_edges, filtered_count=hidden
+        # The cap, before anything is written (rule 2, decision 2). The restorer's own view after
+        # this restore is the Vault's readable members plus the step members they may read in the
+        # store that the Vault now withholds, which are left stored and stay in it; everything else
+        # in their view is reconciled away, and what is outside it is not counted. Steps record the
+        # whole stored set, which has no ceiling, so this is the restorer's figure and never the
+        # stored whole's (rule 3). On a breach: the typed `limit_exceeded`, and nothing written.
+        reader = await self._reader_counts(investigation_id, principal)
+        vault_node_ids = {n.id for n in vault_nodes}
+        vault_edge_ids = {e.id for e in vault_edges}
+        stored_node_ids = await self._store.node_ids(investigation_id)
+        stored_edge_ids = await self._store.edge_ids(investigation_id)
+        left_nodes, left_edges = await reader.visible_among(
+            (step_node_ids & stored_node_ids) - vault_node_ids,
+            (step_edge_ids & stored_edge_ids) - vault_edge_ids,
         )
-        await self._store.append_delta(investigation_id, snapshot)
-        return snapshot
+        breach = _cap_breach(len(vault_node_ids | left_nodes), len(vault_edge_ids | left_edges))
+        if breach is not None:
+            raise LimitExceededError(breach)
 
-    async def remove(self, investigation_id: str, node_ids: Sequence[NodeId]) -> int:
+        # The adds first and the removes last (links before nodes): the writes are chunked and a
+        # failure part-way leaves a superset of what the case held, never a loss.
+        await self._store.add_nodes(investigation_id, vault_nodes)
+        await self._store.add_edges(investigation_id, vault_edges)
+
+        # What the step lacks is reconciled only where it is in the restorer's own view (the test
+        # decision 2 uses); everything else stays stored, a readable link to a hidden end included.
+        # Read after the adds: a member the Vault has declassified is written by them, which can
+        # bring a stored link of theirs into the restorer's view.
+        reader = await self._reader_counts(investigation_id, principal)
+        stale_node_ids, stale_edge_ids = await reader.visible_among(
+            await self._store.node_ids(investigation_id) - step_node_ids,
+            await self._store.edge_ids(investigation_id) - step_edge_ids,
+        )
+        if stale_edge_ids:
+            await self._store.remove_edges(investigation_id, sorted(stale_edge_ids))
+        if stale_node_ids:
+            await self._store.remove_nodes(investigation_id, sorted(stale_node_ids))
+
+        # What is stored and published is the whole stored set, with no flag: every reader,
+        # replaying it or receiving it live, projects it to their own view (`project_delta`), so a
+        # reconnect equals a full snapshot for every reader. The restorer's response is that
+        # snapshot projected for them, never the whole.
+        all_nodes = list((await self._store.source_fidelity_nodes(investigation_id)).values())
+        all_edges = list((await self._store.source_fidelity_edges(investigation_id)).values())
+        seq = await self._store.next_seq(investigation_id)
+        snapshot = DeltaSnapshot(seq=seq, nodes=all_nodes, edges=all_edges)
+        await self._store.append_delta(investigation_id, snapshot)
+        response = self.project_delta(snapshot, principal)
+        assert isinstance(response, DeltaSnapshot)
+        return Restored(published=snapshot, response=response)
+
+    async def _record_of_nodes(
+        self,
+        investigation_id: str,
+        node_ids: Sequence[NodeId],
+        edge_ids: Sequence[EdgeId] = (),
+    ) -> RemovedRecord:
+        """What each stored node of `node_ids` is, as `principal_may_read` judges it: its handling
+        and datasets, which are its signature in the counted index (`access_counts` holds the
+        table, `access_entries` each node's number, one `HMGET`). An id the store does not hold has
+        no entry. A renumbering between the two reads is met by reading again, once."""
+        ids = list(dict.fromkeys(node_ids))
+        for attempt in (0, 1):
+            # The entries first, then the table: signatures are only ever added to it within an
+            # epoch, so a signature an entry names (written before the entries were read) is
+            # defined by a table read after them. The other order leaves a node written between the
+            # two with an entry the table does not define, and it drops out of the record.
+            entries = await self._store.access_entries(
+                investigation_id, ids, list(dict.fromkeys(edge_ids))
+            )
+            counts = await self._store.access_counts(investigation_id)
+            if entries.epoch == counts.epoch:
+                break
+            if attempt:
+                raise RuntimeError("the access index kept being renumbered under a removal")
+        record = RemovedRecord()
+        for node_id, key in entries.nodes.items():
+            signature = counts.signatures.get(key)
+            if signature is not None:
+                record.nodes[node_id] = RemovedElement(
+                    handling=signature.handling(), datasets=list(signature.datasets)
+                )
+        for edge_id, (key, source, target) in entries.edges.items():
+            signature = counts.signatures.get(key)
+            if signature is not None:
+                record.edges[edge_id] = RemovedElement(
+                    handling=signature.handling(),
+                    datasets=list(signature.datasets),
+                    source=source,
+                    target=target,
+                )
+        return record
+
+    async def remove_reverted(
+        self, node_ids: Sequence[NodeId], edge_ids: Sequence[EdgeId]
+    ) -> list[RevertRemoval]:
+        """A revert's removal (ADR-127 decision 6), which is not `remove`. `remove` is a reader's
+        act: it takes only ids whose stored body that reader may read, and leaves a link standing
+        after its end is gone. This removes **the load's own elements**, whoever may read them (no
+        principal here: the operator's clearance is no part of what a revert took back), from
+        **every case that stores any of them**; and the links that end at a removed node, named or
+        not, since nothing hung from what the load wrote may stay.
+
+        For each such case, in an order a rerun can finish: the stored delta stream is dropped (its
+        bodies, and any earlier record, can name what was reverted, so a client behind is sent a
+        full snapshot from the stores, not the reverted bodies back), the links and nodes are
+        removed, and one `DeltaRemove` is appended carrying the ids and the record of what each
+        was. The record is what lets every connected reader be sent the removal projected for
+        them (`project_delta`: only the ids that reader may read, and nothing for the rest).
+        Returns the cases changed with their stored removal, for the caller to publish; a case
+        holding none of the ids is not touched and burns no sequence number. A second call, with
+        everything gone, changes nothing and returns `[]`.
+
+        A failure after the removal and before the removal is appended cannot be rerun (nothing is
+        held any more), so the sequence number is taken before anything is removed: it leaves a
+        gap, and every client's next catch-up is a full snapshot from the stores. The sockets of
+        that case are unaware until they next resynchronise."""
+        nodes = list(dict.fromkeys(node_ids))
+        links = list(dict.fromkeys(edge_ids))
+        removals: list[RevertRemoval] = []
+        for case in await self._store.case_ids():
+            held_nodes, held_links = await self._store.held_among(case, nodes, links)
+            if not held_nodes and not held_links:
+                continue
+            adjacent = await self._store.adjacent_edge_ids(case, sorted(held_nodes))
+            hanging = {e for ids in adjacent.values() for e in ids}
+            _, stored_links = await self._store.held_among(case, [], sorted(held_links | hanging))
+            record = await self._record_of_nodes(case, sorted(held_nodes), sorted(stored_links))
+            # The number first. A process that dies after the elements are gone finds nothing held
+            # on its rerun, so the delta it never stored is not sent again; the counter having
+            # moved past every client is what tells them: the next catch-up finds a gap, not a
+            # stream with nothing after its number, and is sent a full snapshot.
+            seq = await self._store.next_seq(case)
+            await self._store.drop_deltas(case)
+            await self._store.remove_edges(case, sorted(stored_links))
+            await self._store.remove_nodes(case, sorted(held_nodes))
+            delta = DeltaRemove(
+                seq=seq,
+                node_ids=sorted(held_nodes),
+                edge_ids=sorted(stored_links),
+                removed=record,
+            )
+            await self._store.append_delta(case, delta)
+            removals.append(RevertRemoval(case, delta))
+        return removals
+
+    async def remove(
+        self, investigation_id: str, node_ids: Sequence[NodeId], principal: Principal
+    ) -> DeltaRemove:
         """`DELETE /nodes` — "remove from the working set (not from the
         Vault)" (`03_CONDUIT_MIDDLEWARE.md` §3.2). Removal never breaches a
-        cap, so there is no check to run here — only the delta to record."""
-        await self._store.remove_nodes(investigation_id, node_ids)
+        cap, so there is no check to run here — only the delta to record.
+
+        What each node was is read before it is removed, from the counted access index and not from
+        the bodies (one lookup for all the ids), and the delta records it (ADR-124 decision 4):
+        that is what lets every reader be sent only the ids they may read.
+        The delta is the stored form, which holds the record; the route publishes it as it is and
+        sends nothing of it to anyone (`project_delta`)."""
+        # Only ids whose stored body the reader may read are removed (decision 6): a hidden id and
+        # an absent one are ignored alike, with the same response and the same history entry, and
+        # the delta names only what was removed.
+        reader = await self._reader_counts(investigation_id, principal)
+        removable = await reader.visibly_stored_among(node_ids)
+        removed_ids = [i for i in dict.fromkeys(node_ids) if i in removable]
+        record = await self._record_of_nodes(investigation_id, removed_ids)
+        await self._store.remove_nodes(investigation_id, removed_ids)
         seq = await self._store.next_seq(investigation_id)
-        delta = DeltaRemove(seq=seq, node_ids=list(node_ids))
+        delta = DeltaRemove(seq=seq, node_ids=removed_ids, removed=record)
         await self._store.append_delta(investigation_id, delta)
-        return seq
+        return delta
 
     async def sync(
         self, investigation_id: str, principal: Principal, *, last_acknowledged_seq: int | None
-    ) -> list[WorkingSetDelta]:
+    ) -> list[WorkingSetDeltaSent]:
         """The reconnect decision (`03_CONDUIT_MIDDLEWARE.md` §3.2): a
         client with no prior sequence (`last_acknowledged_seq is None`, a
         first connect) or one whose last-seen sequence has fallen off the
@@ -1006,34 +1745,31 @@ class WorkingSetService:
         **for `principal`'s own view of it**: every delta returned here is
         re-projected via `project_delta` before it leaves this method,
         since the stream may hold entries a *different* principal
-        originally populated (§4's per-read handling filter). A single
-        aggregate `DeltaNotice` reports however much this call hid, rather
-        than one notice per re-filtered delta."""
+        originally populated (§4's per-read handling filter). Nothing says how much was
+        left out: no notice, no count (ADR-124 decision 1)."""
         if last_acknowledged_seq is not None:
             raw_deltas = await self._store.deltas_after(investigation_id, last_acknowledged_seq)
             if raw_deltas is not None:
-                projected: list[WorkingSetDelta] = []
-                hidden_total = 0
+                # The reader's own view, counted from the index, before anything is read or sent
+                # (decision 2): past a cap, the deltas are not sent.
+                breach = await self._view_breach(investigation_id, principal)
+                if breach is not None:
+                    seq = await self._store.current_seq(investigation_id)
+                    return [DeltaViewOverCap(seq=seq, would_be=breach)]
                 known = await self._store.source_fidelity_nodes(investigation_id)
-                for raw in raw_deltas:
-                    delta, hidden = self.project_delta(raw, principal, known)
-                    projected.append(delta)
-                    hidden_total += hidden
-                if hidden_total > 0:
-                    top_seq = projected[-1].seq
-                    projected.append(
-                        DeltaNotice(
-                            seq=top_seq,
-                            message=f"{hidden_total} item(s) withheld by handling policy",
-                            count=hidden_total,
-                        )
-                    )
-                return projected
+                return [self.project_delta(raw, principal, known) for raw in raw_deltas]
 
+        # The sequence number first, and then the bodies: a write landing between the two reads
+        # leaves a snapshot that holds it or carries a number below it, and the client replays it.
+        # Read the other way round, the snapshot would carry the write's number without its content
+        # and the client would skip that delta for good.
+        seq = await self._store.current_seq(investigation_id)
+        breach = await self._view_breach(investigation_id, principal)
+        if breach is not None:
+            return [DeltaViewOverCap(seq=seq, would_be=breach)]
         nodes = await self._store.source_fidelity_nodes(investigation_id)
         edges = await self._store.source_fidelity_edges(investigation_id)
-        seq = await self._store.current_seq(investigation_id)
-        visible_nodes, visible_edges, hidden = self._project(
+        visible_nodes, visible_edges, _ = self._project(
             list(nodes.values()), list(edges.values()), principal
         )
         return [
@@ -1041,9 +1777,82 @@ class WorkingSetService:
                 seq=seq,
                 nodes=visible_nodes,
                 edges=visible_edges,
-                filtered_count=hidden,
+                withheld=await self._holds_what_the_reader_may_not_view(
+                    investigation_id, principal
+                ),
             )
         ]
+
+    async def _view_breach(
+        self, investigation_id: str, principal: Principal
+    ) -> LimitExceeded | None:
+        """The cap `principal`'s own projected view of the case is past, or `None`: counted from
+        the counted access index (Amendment 4), so no body is read and nothing of any other
+        reader's view is in the figure (rule 3)."""
+        try:
+            view = await self._reader_counts(investigation_id, principal)
+        except HandlingSchemeError as error:
+            # A signature in use carries a handling code the scheme no longer defines: the view
+            # cannot be counted. The paths this guards behave as they did before the check (a
+            # projection of a stored element with such a code raises, one of a link with an absent
+            # end does not), and the flag treats the code as withheld (Amendment 7); none of that
+            # is decided here. It is visible, as an index rebuild is: counted, and logged.
+            self.uncountable_views += 1
+            _log.warning(
+                "the view of %s could not be counted against the caps, so the check was skipped "
+                "(%s; %d in this process)",
+                investigation_id,
+                error,
+                self.uncountable_views,
+            )
+            return None
+        return _cap_breach(view.nodes, view.edges)
+
+    async def over_cap_after(
+        self, investigation_id: str, delta: WorkingSetDeltaSent, principal: Principal
+    ) -> DeltaViewOverCap | None:
+        """For the live forward (decision 2): `DeltaViewOverCap` if `delta`, as projected for this
+        reader, adds something they can read and their view is now past a cap, else `None`. The
+        view is recounted only when something readable was added: a removal, a reproject and an
+        addition that projects to nothing cost no read. `delta` carries the sequence number it
+        replaces."""
+        adds = (
+            isinstance(delta, DeltaAdd | DeltaSnapshot) and bool(delta.nodes or delta.edges)
+        ) or isinstance(delta, DeltaReplaceEdgeSent)
+        if not adds:
+            return None
+        breach = await self._view_breach(investigation_id, principal)
+        return None if breach is None else DeltaViewOverCap(seq=delta.seq, would_be=breach)
+
+    async def _holds_what_the_reader_may_not_view(
+        self, investigation_id: str, principal: Principal
+    ) -> bool:
+        """The standing sentence's flag (ADR-124 decision 5): whether the case's stored set holds
+        any node or link whose own stored handling `principal` may not view.
+
+        **From the counted index, at a fixed cost** (Amendment 4): the signatures that some stored
+        node, or some stored link, carries (a count above zero), judged by `principal_may_view`,
+        which is handling alone. A signature folds the element's datasets in with its handling, and
+        the judgement here ignores them: material outside the case's datasets that the reader is
+        cleared for is outside the case's world, not withheld from it (ADR-099). A link counts by
+        its own signature, the first of its triple, and never by its ends: a readable link to a
+        hidden node is not withheld through the link, the node is withheld on its own. A signature
+        whose handling code the scheme no longer defines cannot be judged and counts as withheld.
+        Nothing is read per element."""
+        counts = await self._store.access_counts(investigation_id)
+        in_use = {key for key, n in counts.node_counts.items() if n > 0} | {
+            triple[0] for triple, n in counts.edge_counts.items() if n > 0
+        }
+        for key in in_use:
+            signature = counts.signatures.get(key)
+            if signature is None:
+                return True
+            try:
+                if not principal_may_view(signature.handling(), principal, self._scheme):
+                    return True
+            except HandlingSchemeError:
+                return True
+        return False
 
 
 def _cap_breach(would_be_nodes: int, would_be_edges: int) -> LimitExceeded | None:

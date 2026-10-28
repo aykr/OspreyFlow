@@ -7,6 +7,7 @@ export type DocumentId = string;
 export type Locator = string;
 export type ExcerptHash = string;
 export type Sources = SourceRef[];
+export type SourcesWithheld = boolean;
 export type ExtractedBy = string | null;
 export type ExtractionConfidence = number | null;
 export type FirstSeen = string;
@@ -44,11 +45,11 @@ export type CorpusPairCount = number;
 export type CorpusSourceDegree = number;
 export type CorpusTargetDegree = number;
 export type CorpusTotalOccurrences = number;
+export type ParameterSet = string | null;
 export type ComputedAt = string;
 export type Basis = ("direct" | "probabilistic") | null;
 export type Datasets1 = string[];
 export type Edges = Edge[];
-export type FilteredCount = number;
 export type Type2 = string;
 export type Nodes1 = StructureNode[];
 export type Weight1 = number;
@@ -71,10 +72,14 @@ export interface CommunityRequest {
   structure?: LinkStructure | null;
   [k: string]: unknown;
 }
+/**
+ * Nodes and links a read returned. It carries no count of what was left out (ADR-124
+ * Amendment 4, item 2): `filtered_count` was on it and was 0 on every read the adapter made, a
+ * field that claims completeness and is sent wherever a `Subgraph` is a response.
+ */
 export interface Subgraph {
   nodes: Nodes;
   edges: Edges;
-  filtered_count?: FilteredCount;
   [k: string]: unknown;
 }
 export interface Node {
@@ -94,6 +99,7 @@ export interface Properties {
 export interface Provenance {
   state: ProvenanceState;
   sources: Sources;
+  sources_withheld?: SourcesWithheld;
   extracted_by?: ExtractedBy;
   extraction_confidence?: ExtractionConfidence;
   first_seen: FirstSeen;
@@ -176,6 +182,7 @@ export interface WeightComponents {
   corpus_source_degree: CorpusSourceDegree;
   corpus_target_degree: CorpusTargetDegree;
   corpus_total_occurrences: CorpusTotalOccurrences;
+  parameter_set?: ParameterSet;
   computed_at: ComputedAt;
   [k: string]: unknown;
 }

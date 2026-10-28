@@ -11,38 +11,57 @@ docstring: where a load ledger lives durably "is not decided here"). What
 this module returns from a run is the `LoadReport` `run_recipe` already
 produces, attributed with `load_id`/`recipe_id`/`recipe_version` exactly the
 way `StagedRow` already threads those through (`01_DOMAIN_MODEL.md` §2.4) —
-enough for `revert_load` (`services/ingest/revert.py`) to act on later, once
-a durable ledger exists to hand it one (Phase 8's own territory, per
-`revert.py`'s own docstring).
+enough for the revert (`services/ingest/load_revert.py`) to act on; the run
+ledger now keeps each load's record (ADR-127 decision 6).
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Sequence
+from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from pathlib import Path
+from typing import Protocol
 
 import yaml
-from services.ingest.engine import recipe_handlings, run_recipe
+from services.ingest.engine import (
+    RowRejected,
+    recipe_handlings,
+    row_marking,
+    run_recipe,
+)
 from services.ingest.geometries import POINT_GEOMETRY_VERSION, point_geometries
+from services.ingest.pipeline import recipe_packs
 from services.ingest.recipe_loader import load_recipe
+from services.ingest.recipe_rules import check_reference_matches
 
-from ontology.handling import merge_handling
+from conduit_common.transactions import rollback_keeping_failure
+from ontology.handling import HandlingScheme, merge_handling
 from ports.analytics import AnalyticsPort
 from ports.graph import GraphPort
 from ports.media import MediaStore
 from schemas.analytics import EventRecord
-from schemas.domain import EdgeWrite, NodeWrite, OntologySchema, Principal
+from schemas.domain import EdgeWrite, Handling, HeldRow, NodeWrite, OntologySchema, Principal
 from schemas.ingest import (
     LoadReport,
+    PipelineGraph,
     Recipe,
     RecipeDefaults,
+    RejectionRecord,
+    RowTemplate,
     ScheduleConfig,
     StudioRecipeDraft,
     StudioRecipeStatus,
 )
 
-from .rule_evaluation import PreCommitVerdict, RuleGate, alert_handling, held_rows_for
+from .rule_evaluation import (
+    PreCommitVerdict,
+    RuleGate,
+    RuleWrites,
+    alert_handling,
+    held_rows_for,
+)
 from .studio_profile import _read_rows as _read_recipe_rows
 from .studio_profile import connector_for
 
@@ -50,7 +69,9 @@ __all__ = [
     "GitCommitError",
     "RecipeNotRunnableError",
     "build_recipe",
+    "load_published_recipe",
     "load_with_rules",
+    "pack_versions_for",
     "recipe_git_relative_path",
     "run_published_recipe",
     "serialise_recipe",
@@ -62,9 +83,7 @@ __all__ = [
 #: from this file (`services/api/studio_publish.py` -> `services/api` ->
 #: `services` -> repo root) — the same `.parents[2]` computation
 #: `services/api/app.py`'s own `_SITE_GRID_RECIPE_PATH` already uses.
-_REPO_ROOT = Path(
-    os.environ.get("OSPREY_RECIPE_REPO_ROOT") or Path(__file__).resolve().parents[2]
-)
+_REPO_ROOT = Path(os.environ.get("OSPREY_RECIPE_REPO_ROOT") or Path(__file__).resolve().parents[2])
 """Where published recipes are committed.
 
 **Round 13bf: the default above is correct on a developer's host and wrong inside a container.**
@@ -107,10 +126,35 @@ class RecipeNotRunnableError(Exception):
         )
 
 
+def pack_versions_for(
+    pipeline: PipelineGraph | None, row_template: RowTemplate, ontology: OntologySchema
+) -> dict[str, int]:
+    """The pins a publish stamps (`06_DECISIONS.md` ADR-120 D10, Amendment 1): each pack the
+    pipeline names or whose types the row template writes, at the version the loaded ontology
+    carries. `{}` for a recipe that names and writes none. A pack the ontology does not carry is
+    refused by name rather than dropped, since the recipe could never run."""
+    pins: dict[str, int] = {}
+    for pack in recipe_packs(pipeline, row_template, ontology):
+        if pack not in ontology.packs:
+            raise ValueError(
+                f"the recipe needs the pack {pack!r}, which the loaded ontology does not carry"
+            )
+        pins[pack] = ontology.packs[pack]
+    return pins
+
+
+def check_before_publish(draft: StudioRecipeDraft, ontology: OntologySchema) -> None:
+    """What a publish refuses beyond Verify having passed (ADR-127 Amendment 37): a reference on a
+    field the store cannot find an entity by. Raises `RecipeRuleError`; writes nothing."""
+    assert draft.row_template is not None
+    check_reference_matches(draft.row_template, ontology)
+
+
 def build_recipe(
     draft: StudioRecipeDraft,
     *,
     ontology_version: int,
+    pack_versions: dict[str, int] | None,
     schedule_cron: str | None,
     schedule_watch: str | None,
 ) -> Recipe:
@@ -120,7 +164,11 @@ def build_recipe(
     `StudioRecipeStore.publish` has already confirmed `verified_at` is
     set, which itself implies a row template exists (Verify cannot run
     without one, `services/api/studio_verify.py`'s own
-    `RowTemplateMissingError`)."""
+    `RowTemplateMissingError`).
+
+    `pack_versions` has no default and may be `None` (ADR-120 Amendment 2, decision 3): a
+    re-commit passes the row's pins exactly as stored, none included; a fresh publish always
+    passes a map, and the store's `publish` refuses `None`."""
     assert draft.row_template is not None
     schedule = (
         ScheduleConfig(cron=schedule_cron, watch=schedule_watch)
@@ -135,16 +183,31 @@ def build_recipe(
         # `date_order` survives Publish. See `studio_profile.connector_for`.
         connector=connector_for(draft),
         ontology_version=ontology_version,
-        defaults=RecipeDefaults(
-            handling=draft.handling, provenance={}, legal_basis=draft.legal_basis
-        ),
+        pack_versions=pack_versions,
+        defaults=RecipeDefaults.for_source(draft.handling, draft.legal_basis),
         row_template=draft.row_template,
         unmapped_fields=draft.unmapped_fields,
         schedule=schedule,
         # ADR-108 phase C: the published YAML carries the topology the runner executes, so a run
         # is provably against what was published. `None` for a v1 draft — its YAML is unchanged.
         pipeline=draft.pipeline,
+        # ADR-127 decision 5: what makes a row the same row again, into the committed file, so a
+        # run keeps and checks the keys of the rows it loads.
+        deduplicate=draft.deduplicate,
     )
+
+
+def load_published_recipe(row: StudioRecipeDraft, repo_root: Path) -> Recipe:
+    """The committed recipe of a published Studio row, with the row's pins when the file has none
+    (`06_DECISIONS.md` ADR-120 Amendment 2, decision 1). A file committed before pinning carries no
+    `pack_versions`, while the backfill stamps the registry row; a run that read the file alone
+    would be refused by the engine for a recipe whose row is pinned. Pins written in the file
+    always win. Every load of a published row's file in `services/api` goes through here."""
+    assert row.git_path is not None
+    recipe = load_recipe(repo_root / row.git_path)
+    if recipe.pack_versions is None and row.pack_versions is not None:
+        return recipe.model_copy(update={"pack_versions": dict(row.pack_versions)})
+    return recipe
 
 
 def serialise_recipe(recipe: Recipe) -> str:
@@ -194,9 +257,7 @@ async def _ensure_repository(repo_root: Path) -> None:
     await _run_git("config", "user.name", "OspreyFlow Ingest Studio", cwd=repo_root)
 
 
-async def write_and_commit_recipe(
-    recipe: Recipe, *, repo_root: Path = _REPO_ROOT
-) -> str:
+async def write_and_commit_recipe(recipe: Recipe, *, repo_root: Path = _REPO_ROOT) -> str:
     """Writes the recipe to `recipes/<id>.yaml` under `repo_root` and
     commits it — §6: "Publishing writes the recipe to version control, not
     only to the database." Returns the git-relative path stored as the
@@ -210,10 +271,25 @@ async def write_and_commit_recipe(
     instance's own checkout would never see this commit. Pushing to a
     shared remote (or routing every instance through one writable
     git-backed service) is real, undesigned work this phase does not do."""
-    relative_path = recipe_git_relative_path(recipe.id)
+    return await commit_recipe_file(
+        recipe.id, serialise_recipe(recipe).encode("utf-8"), version=recipe.version,
+        repo_root=repo_root,
+    )  # fmt: skip
+
+
+async def commit_recipe_file(
+    recipe_id: str, data: bytes, *, version: int, repo_root: Path = _REPO_ROOT
+) -> str:
+    """The commit half of `write_and_commit_recipe`, for a file that is to be exactly `data`:
+    writes it to `recipes/<recipe_id>.yaml` under `repo_root` and commits it as `ingest: publish
+    <id> v<version>`, and returns the git-relative path. The Prison Intelligence seed copies each
+    committed recipe here byte for byte (ADR-127 Amendment 23), which `serialise_recipe` would not
+    keep (it drops comments and reorders). A commit with nothing changed is not an error; every
+    other non-zero exit is."""
+    relative_path = recipe_git_relative_path(recipe_id)
     absolute_path = repo_root / relative_path
     absolute_path.parent.mkdir(parents=True, exist_ok=True)
-    absolute_path.write_text(serialise_recipe(recipe))
+    absolute_path.write_bytes(data)
 
     await _ensure_repository(repo_root)
 
@@ -224,7 +300,7 @@ async def write_and_commit_recipe(
     code, output = await _run_git(
         "commit",
         "-m",
-        f"ingest: publish {recipe.id} v{recipe.version}",
+        f"ingest: publish {recipe_id} v{version}",
         "--",
         relative_path,
         cwd=repo_root,
@@ -232,6 +308,43 @@ async def write_and_commit_recipe(
     if code != 0 and "nothing to commit" not in output:
         raise GitCommitError(f"git commit {relative_path!r} failed: {output}")
     return relative_path
+
+
+class LoadSink(Protocol):
+    """Where a load tells the run ledger what it has done, as it does it (ADR-127 decision 6): the
+    record when the graph commits, so a failure in anything after still leaves it, and the geometry
+    refs about to be inserted. `services/api/load_records.LedgerSink` writes them to the ledger."""
+
+    async def committed(self, report: LoadReport, *, source: str) -> None: ...
+
+    async def kept(self, recipe_id: str, case: str, keys: Sequence[str]) -> set[str]:
+        """Which of these row keys the case already kept for the recipe (ADR-127 decision 5): asked
+        only for a recipe with `deduplicate`."""
+        ...
+
+    async def fingerprints(self, recipe_id: str, case: str) -> dict[str, int]:
+        """The definitions of `deduplicate` the case's kept keys were made under, each with how
+        many loads kept keys under it: a run whose own differs is refused."""
+        ...
+
+    def hold_row_keys(self, recipe_id: str, case: str) -> AbstractAsyncContextManager[None]:
+        """Serialises runs of one recipe into one case (ADR-127 decision 5): held from the check of
+        the kept keys to the write of the load's record and keys. A second holder waits a short
+        while and is then refused (`RowKeyRunInProgress`)."""
+        ...
+
+    async def geometries(self, load_id: str, refs: Sequence[str]) -> None: ...
+
+    async def rule_writes(
+        self,
+        load_id: str,
+        *,
+        node_ids: Sequence[str],
+        created_edge_ids: Sequence[str],
+        merged_edge_ids: Sequence[str],
+    ) -> None: ...
+
+    async def uncovered(self, load_id: str) -> None: ...
 
 
 async def run_published_recipe(
@@ -247,6 +360,8 @@ async def run_published_recipe(
     analytics: AnalyticsPort | None = None,
     media: MediaStore | None = None,
     rules: RuleGate | None = None,
+    scheme: HandlingScheme | None = None,
+    sink: LoadSink | None = None,
 ) -> LoadReport:
     """§8: "Loader: run a published recipe against a file at or below their
     own clearance" — "a file", not necessarily the one Connect originally
@@ -265,12 +380,16 @@ async def run_published_recipe(
     if draft.status is not StudioRecipeStatus.PUBLISHED:
         raise RecipeNotRunnableError(draft.recipe_id, draft.status)
     assert draft.git_path is not None
-    recipe = load_recipe(repo_root / draft.git_path)
+    recipe = load_published_recipe(draft, repo_root)
 
-    read_from = draft if source_location is None else draft.model_copy(
-        update={"source_location": source_location}
+    read_from = (
+        draft
+        if source_location is None
+        else draft.model_copy(update={"source_location": source_location})
     )
-    rows = list(_read_recipe_rows(read_from))
+    # The whole file, read and parsed in a worker thread (ADR-127 Amendment 29): held on the event
+    # loop it starves the keep-alive of the transaction the run opens next.
+    rows = await asyncio.to_thread(lambda: list(_read_recipe_rows(read_from)))
     report, events, held_rows = await load_with_rules(
         recipe,
         rows,
@@ -282,6 +401,8 @@ async def run_published_recipe(
         source=read_from.source_location or draft.recipe_id,
         media=media,
         rules=rules,
+        scheme=scheme,
+        sink=sink,
     )
     # The run's events (a call's time, a message's text) go to the analytics store, as every seed's
     # do; they were dropped here, so nothing loaded through the Studio reached the timeline,
@@ -293,7 +414,13 @@ async def run_published_recipe(
     # (9 October 2026). The partition is keyed by ref and insert-only, so a ref already there is
     # not loaded twice.
     # A held row (ADR-109 ruling 1) reached no store, its place included.
-    points = point_geometries(recipe, [r for i, r in enumerate(rows) if i not in held_rows])
+    points = await asyncio.to_thread(
+        lambda: point_geometries(
+            recipe,
+            [r for i, r in enumerate(rows) if i not in held_rows],
+            scheme=scheme or (rules.scheme if rules is not None else None),
+        )
+    )
     if analytics is not None and points:
         held = {
             record.geometry_ref
@@ -303,12 +430,15 @@ async def run_published_recipe(
                 version=POINT_GEOMETRY_VERSION,
             )
         }
-        await analytics.load_geometries([p for p in points if p.geometry_ref not in held])
+        fresh = [p for p in points if p.geometry_ref not in held]
+        # Recorded before they are inserted (ADR-127 decision 6): a failure between the two leaves
+        # refs that are absent, which a revert removes nothing for, never a point nothing records.
+        if sink is not None and fresh:
+            await sink.geometries(load_id, [p.geometry_ref for p in fresh])
+        await analytics.load_geometries(fresh)
     # ADR-109 ruling 1: the case's post-commit rules, once the load's events can be read with it.
     if rules is not None:
-        report.rule_notes.extend(
-            await rules.post_commit(events, load_id=load_id, written=rules.last_written)
-        )
+        report.rule_notes.extend(await post_commit_notes(rules, events, load_id=load_id, sink=sink))
     return report
 
 
@@ -325,6 +455,8 @@ async def load_with_rules(
     media: MediaStore | None = None,
     rules: RuleGate | None = None,
     row_numbers: list[int] | None = None,
+    scheme: HandlingScheme | None = None,
+    sink: LoadSink | None = None,
 ) -> tuple[LoadReport, list[EventRecord], frozenset[int]]:
     """One load in one graph transaction, judged by the case's pre-commit rules before it commits
     (`06_DECISIONS.md` ADR-109 ruling 1). A hit loads with its alert: the `Alert` node is written
@@ -333,61 +465,101 @@ async def load_with_rules(
     runs again without them — a second pass whose remaining rows carry no money movement for a
     typology to judge, so it cannot hold again; if it ever did, the load is refused rather than
     part-loaded silently (rule 2)."""
-    unseen = (
-        alert_handling(rules.scheme, recipe_handlings(recipe)) if rules is not None else None
-    )
-    held = PreCommitVerdict()
-    skip: frozenset[int] = frozenset()
-    while True:
-        written: list[NodeWrite | EdgeWrite] = []
-        tx = await graph.begin_transaction()
-        try:
-            report, events = await run_recipe(
-                recipe,
-                rows,
-                graph=graph,
-                ontology=ontology,
-                tx=tx,
-                principal=principal,
-                load_id=load_id,
-                investigation_scope=investigation_scope,
-                source=source,
-                media=media,
-                skip_row_indices=skip,
-                row_numbers=row_numbers,
-                written=written,
-            )
-            verdict = (
-                await rules.pre_commit(
-                    events, tx, load_id=load_id, unseen=unseen, written=written
+    # ADR-127 decision 5: runs of one recipe into one case are serialised from the check of the kept
+    # keys (in `run_recipe`) to the write of the load's record and keys (`sink.committed`), so two
+    # overlapping runs cannot both find a row's key absent and both load it. Only a recipe with
+    # `deduplicate` takes the lock; it is released when the record is written, or on any failure.
+    locks = AsyncExitStack()
+    try:
+        if sink is not None and recipe.deduplicate is not None:
+            await locks.enter_async_context(sink.hold_row_keys(recipe.id, investigation_scope))
+        # What a column may bind is judged against the caller's scheme, else the case's rules' own.
+        scheme = scheme or (rules.scheme if rules is not None else None)
+        unseen = (
+            alert_handling(rules.scheme, recipe_handlings(recipe, rules.scheme))
+            if rules is not None
+            else None
+        )
+        held = PreCommitVerdict()
+        skip: frozenset[int] = frozenset()
+        while True:
+            written: list[NodeWrite | EdgeWrite] = []
+            tx = await graph.begin_transaction()
+            try:
+                report, events = await run_recipe(
+                    recipe,
+                    rows,
+                    graph=graph,
+                    ontology=ontology,
+                    tx=tx,
+                    principal=principal,
+                    load_id=load_id,
+                    investigation_scope=investigation_scope,
+                    source=source,
+                    media=media,
+                    skip_row_indices=skip,
+                    row_numbers=row_numbers,
+                    written=written,
+                    scheme=scheme,
+                    # The store of loaded rows is the ledger's, reached through the sink (ADR-127
+                    # decision 5). A recipe without `deduplicate` is asked too, for the one question
+                    # of whether the case holds keys it would reload (it keeps none itself).
+                    row_keys=sink,
                 )
-                if rules is not None
-                else PreCommitVerdict()
-            )
-        except Exception:
+                verdict = (
+                    await rules.pre_commit(
+                        events, tx, load_id=load_id, unseen=unseen, written=written
+                    )
+                    if rules is not None
+                    else PreCommitVerdict()
+                )
+            except BaseException:
+                await rollback_keeping_failure(graph, tx)
+                raise
+            if not verdict.hold:
+                break
             await graph.rollback_transaction(tx)
-            raise
-        if not verdict.hold:
-            break
-        await graph.rollback_transaction(tx)
-        if skip:
-            raise RuntimeError(
-                "rows were still unjudged after holding the first ones — nothing was loaded"
-            )
-        held = verdict
-        skip = frozenset(verdict.hold)
-    await graph.commit_transaction(tx)
+            if skip:
+                raise RuntimeError(
+                    "rows were still unjudged after holding the first ones — nothing was loaded"
+                )
+            held = verdict
+            skip = frozenset(verdict.hold)
 
-    if rules is not None:
-        await rules.after_commit(verdict)
-        if held.hold:
-            handlings = recipe_handlings(recipe)
-            marking = handlings[0]
-            for other in handlings[1:]:
-                marking = merge_handling(marking, other, rules.scheme)
-            await rules.hold(
-                held_rows_for(
-                    held,
+        # Each held row is marked by its own row's resolved marking (ADR-127 decision 3), never
+        # by the recipe's floor, whose units are the first marking's. The markings are settled
+        # before the commit: a row none can be made for (`row_marking` refuses it) is a rejection
+        # in the report, not a held row lost once the load has committed. It was left out of the
+        # graph already (it is among the rows `skip` holds back), so nothing of it is committed.
+        held_rows: list[HeldRow] = []
+        try:
+            if rules is not None and held.hold:
+                rule_scheme = rules.scheme
+                handlings = recipe_handlings(recipe, rule_scheme)
+                floor = handlings[0]
+                for other in handlings[1:]:
+                    floor = merge_handling(floor, other, rule_scheme)
+                by_row: dict[int, Handling] = {}
+                numbers = list(row_numbers) if row_numbers is not None else list(range(len(rows)))
+                position = {n: i for i, n in enumerate(numbers)}
+                refused: list[int] = []
+                for number in sorted(held.hold):
+                    if number not in position:
+                        continue
+                    try:
+                        by_row[number] = row_marking(recipe, rows[position[number]], rule_scheme)
+                    except RowRejected as exc:
+                        refused.append(number)
+                        report.rejections.append(
+                            RejectionRecord(row_index=number, reason=exc.reason, sample="")
+                        )
+                by_row_object = {id(rows[position[n]]): marking for n, marking in by_row.items()}
+                held_rows = held_rows_for(
+                    PreCommitVerdict(
+                        hold={n: v for n, v in held.hold.items() if n not in refused},
+                        findings=held.findings,
+                        notes=held.notes,
+                    ),
                     rows,
                     row_numbers=row_numbers,
                     investigation_id=rules.investigation_id,
@@ -395,12 +567,74 @@ async def load_with_rules(
                     recipe_version=recipe.version,
                     load_id=load_id,
                     source=source,
-                    handling=marking,
+                    handling=floor,
                     dataset_id=principal.datasets[0] if principal.datasets else None,
+                    row_handling=lambda row: by_row_object[id(row)],
                 )
-            )
-        report.rows_held = len(held.hold)
+        except BaseException:
+            # Anything but a refusal (`RowRejected` is handled per row above) leaves the open
+            # transaction rolled back, not abandoned: nothing of this load is committed.
+            await rollback_keeping_failure(graph, tx)
+            raise
+        await graph.commit_transaction(tx)
+        if rules is not None:
+            _fold_rule_writes(report, verdict.writes)
+        # The load's record, now: the graph holds it, and everything after (the rules, the events,
+        # the points, the resolution jobs, the change stream) can fail without losing what a revert
+        # needs.
+        if sink is not None:
+            await sink.committed(report, source=source)
+    finally:
+        await locks.aclose()
+
+    if rules is not None:
+        await rules.after_commit(verdict)
+        if held_rows:
+            await rules.hold(held_rows)
+        report.rows_held = len(held_rows)
         report.rule_notes = [*held.notes, *verdict.notes]
         rules.last_written = written
         await rules.record_expiries(written)
     return report, events, skip
+
+
+def _fold_rule_writes(report: LoadReport, writes: RuleWrites) -> None:
+    """What the pre-commit rules wrote into the load's transaction (an `Alert`, its links, what the
+    finding wrote alongside) belongs to the load (ADR-127 decision 6), so its record has it. It is
+    kept in the report's `rule_*` fields, not in `created_node_ids` and `touched_edge_ids`, which
+    the change stream and the enrich stage read as what the recipe wrote: monitors must not see an
+    alert as a new ingest node. A link a rule merged into one this load created is the load's own,
+    not a merge into another load's."""
+    report.rule_node_ids.extend(writes.node_ids)
+    report.rule_created_edge_ids.extend(writes.created_edge_ids)
+    own = {*report.created_edge_ids, *report.rule_created_edge_ids}
+    for edge_id in writes.merged_edge_ids:
+        if edge_id in own or edge_id in report.rule_merged_edge_ids:
+            continue
+        report.rule_merged_edge_ids.append(edge_id)
+
+
+async def post_commit_notes(
+    rules: RuleGate,
+    events: Sequence[EventRecord],
+    *,
+    load_id: str,
+    sink: LoadSink | None,
+) -> list[str]:
+    """The case's post-commit rules, and what they wrote told to the load's record (ADR-127
+    decision 6): an alert raised after the commit is written in a transaction of its own, so it is
+    not in the record the commit made. Best effort as the rules are: whatever was written before a
+    rule failed is still recorded."""
+    writes = RuleWrites()
+    try:
+        return await rules.post_commit(
+            events, load_id=load_id, written=rules.last_written, writes=writes
+        )
+    finally:
+        if sink is not None and writes:
+            await sink.rule_writes(
+                load_id,
+                node_ids=writes.node_ids,
+                created_edge_ids=writes.created_edge_ids,
+                merged_edge_ids=writes.merged_edge_ids,
+            )

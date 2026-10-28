@@ -10,13 +10,18 @@ export type HeaderRows = number;
 export type DateOrder = ("dmy" | "mdy") | null;
 export type SourceCrs = string | null;
 export type OntologyVersion = number;
+export type PackVersions = {
+  [k: string]: number;
+} | null;
 export type LegalBasis = string | null;
+export type Units = string[];
 export type Field = string | null;
 export type Fields = string[] | null;
 export type Transform = string | null;
 export type Map = {
   [k: string]: string;
 } | null;
+export type Optional = boolean | null;
 export type Key = FieldBinding[];
 export type Ref = string;
 export type PoleClass = string;
@@ -69,6 +74,7 @@ export interface Recipe {
   label: Label;
   connector: RecipeConnector;
   ontology_version: OntologyVersion;
+  pack_versions?: PackVersions;
   defaults?: RecipeDefaults;
   deduplicate?: DeduplicateConfig | null;
   row_template: RowTemplate;
@@ -90,6 +96,8 @@ export interface RecipeDefaults {
   provenance?: Provenance;
   handling?: Handling;
   legal_basis?: LegalBasis;
+  units?: Units;
+  handling_columns?: HandlingColumns;
   [k: string]: unknown;
 }
 export interface Provenance {
@@ -97,6 +105,9 @@ export interface Provenance {
 }
 export interface Handling {
   [k: string]: unknown;
+}
+export interface HandlingColumns {
+  [k: string]: string;
 }
 export interface DeduplicateConfig {
   key: Key;
@@ -123,6 +134,7 @@ export interface FieldBinding {
   literal?: unknown;
   transform?: Transform;
   map?: Map;
+  optional?: Optional;
   [k: string]: unknown;
 }
 export interface RowTemplate {
@@ -178,8 +190,15 @@ export interface RecipeEdge {
   provenance?: Provenance2;
   [k: string]: unknown;
 }
+/**
+ * A link's time. `at` is its start, or its only instant; `valid_to`, when bound, makes it a
+ * span (ADR-127 decision 11): the end, read from a column of its own. An empty end cell is a span
+ * still open (`Interval.valid_to` of `None`). Without `valid_to` the link is one instant, as
+ * before: its end is its start.
+ */
 export interface TemporalBinding {
   at: FieldBinding;
+  valid_to?: FieldBinding | null;
   [k: string]: unknown;
 }
 export interface Properties1 {

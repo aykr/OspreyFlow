@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 from services.extract.candidates import ExtractionCandidate
 from services.extract.recognised import properties_for
 
-from conduit_common.identity import new_id, new_node_id
+from conduit_common.identity import new_edge_id, new_id, new_node_id
 from ports.analytics import AnalyticsPort
 from ports.graph import GraphPort
 from ports.media import MediaNotFoundError, MediaStore
@@ -43,6 +43,7 @@ from schemas.domain import (
 from .dossier import MessageSpan, get_document_view
 from .email_extraction import _edge_from_write, _node_from_write
 from .event_scope import CaseRecords, visible_ancestors, with_inherited
+from .link_ids import as_stored
 from .review import CandidateStatus, DocumentNotFoundError, ExtractionCandidateStore
 from .working_set.models import DeltaAdd
 from .working_set.service import WorkingSetService
@@ -191,7 +192,7 @@ class DocumentReaderService:
             created_at=now,
         )
         mention = EdgeWrite(
-            id=f"{node.id}:mentioned-in:{document_id}",
+            id=new_edge_id(),
             type=MENTIONED_IN,
             source=node.id,
             target=document_id,
@@ -201,11 +202,11 @@ class DocumentReaderService:
             created_at=now,
         )
         # Asked before the graph is written, so a full working set leaves nothing behind (rule 2).
-        await self._working_set.ensure_room(investigation_id, [node.id], [mention.id])
+        await self._working_set.ensure_room(investigation_id, [node.id], [mention.id], principal)
         tx = await self._graph.begin_transaction()
         try:
             await self._graph.upsert_nodes([node], tx)
-            await self._graph.upsert_edges([mention], tx)
+            (mention,) = as_stored([mention], await self._graph.upsert_edges([mention], tx))
         except Exception:
             await self._graph.rollback_transaction(tx)
             raise
@@ -236,7 +237,7 @@ class DocumentReaderService:
             record.id, principal, status=CandidateStatus.ACCEPTED, node_id=node.id
         )
         delta = await self._working_set.add_written(
-            investigation_id, [_node_from_write(node)], [_edge_from_write(mention)]
+            investigation_id, [_node_from_write(node)], [_edge_from_write(mention)], principal
         )
         return DesignationResult(node_id=node.id, delta=delta)
 
@@ -250,7 +251,9 @@ class DocumentReaderService:
             ancestors = await visible_ancestors(self._investigations, case, principal)
             if ancestors:
                 _, edges = await self._working_set.current_membership(investigation_id)
-                event_filter = with_inherited(own, ancestors, [e.id for e in edges])
+                event_filter = with_inherited(
+                    own, ancestors, [e.id for e in edges], window=case.branch_window
+                )
         page = await self._analytics.list_events(
             EventListRequest(filter=event_filter, offset=0, limit=1), principal
         )

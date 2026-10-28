@@ -12,7 +12,43 @@ import { useEffect, useState } from "react";
 
 import { Button } from "../design/primitives/Button";
 import { Panel } from "../design/primitives/Panel";
-import { type AlertJumpResult, type AlertView, isScheduleNotice, jumpAlert, listAlerts } from "./api";
+import {
+  type AlertJumpResult,
+  type AlertView,
+  type FiredFile,
+  type FiredOn,
+  isScheduleNotice,
+  jumpAlert,
+  listAlerts,
+} from "./api";
+
+const COUNT = new Intl.NumberFormat("en-GB");
+const DAY = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+
+/** ADR-130: an alert is named by what it is, never by its rule id (`hotlist:<id>`). */
+function heading(alert: AlertView): string {
+  if (alert.rule_id.startsWith("hotlist:")) return "Hotlist alert";
+  if (alert.rule_id.startsWith("monitor:")) return "Monitor alert";
+  return "Alert";
+}
+
+function fileText(file: FiredFile): string {
+  if (file.row != null) return `${file.name}, row ${COUNT.format(file.row)}`;
+  if (file.records != null) {
+    return `${file.name}, ${COUNT.format(file.records)} ${file.records === 1 ? "record" : "records"}`;
+  }
+  const rows = file.rows ?? 0;
+  return `${file.name}, ${COUNT.format(rows)} ${rows === 1 ? "row" : "rows"}`;
+}
+
+/** "a.csv, row 3; b.csv, 2,013 rows; and 3 more files" — the files past five are said, not cut. */
+function fromText(fired: FiredOn): string {
+  const parts = fired.files.map(fileText);
+  if (fired.more_files > 0) {
+    parts.push(`and ${COUNT.format(fired.more_files)} more file${fired.more_files === 1 ? "" : "s"}`);
+  }
+  return parts.join("; ");
+}
 
 export interface AlertRowProps {
   alert: AlertView;
@@ -38,6 +74,16 @@ function ScheduleNoticeRow({ alert }: { alert: AlertView }) {
 export function AlertRow({ alert, onJump, jumping }: AlertRowProps) {
   if (isScheduleNotice(alert)) return <ScheduleNoticeRow alert={alert} />;
   const hasReferents = alert.mode === "full" && alert.referent_node_ids.length > 0;
+  // A hotlist alert whose evidence was readable when the list was read but whose node had gone by the
+  // time it was described (two reads, a node revoked between) is unavailable too, and nothing can
+  // be jumped into.
+  const vanished =
+    alert.mode === "full" &&
+    hasReferents &&
+    alert.evidence_available &&
+    alert.rule_id.startsWith("hotlist:") &&
+    (alert.fired_on == null || alert.fired_on.length === 0);
+  const unavailable = alert.mode === "full" && (!hasReferents || vanished);
   return (
     <li
       style={{
@@ -49,27 +95,34 @@ export function AlertRow({ alert, onJump, jumping }: AlertRowProps) {
       }}
     >
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <span className="value">{alert.rule_id}</span>
+        <span className="value">{heading(alert)}</span>
         <span className="label">{new Date(alert.created_at).toLocaleString()}</span>
       </div>
       {alert.mode === "notify_stub" && (
         <p className="label">A match fired — no evidence visible to you.</p>
       )}
-      {alert.mode === "full" && hasReferents && (
-        <ul style={{ margin: 0, paddingLeft: "var(--sp-16)" }}>
-          {alert.referent_node_ids.map((id) => (
-            <li key={id} className="value">
-              {id}
-            </li>
-          ))}
-        </ul>
+      {alert.hotlist && (
+        <p className="label" style={{ margin: 0 }}>
+          {`Hotlist: ${alert.hotlist.identifier}${alert.hotlist.kept_as_written ? " (kept as written)" : ""}`}
+          {` · review by ${DAY.format(new Date(alert.hotlist.review_date))}`}
+        </p>
       )}
-      {alert.mode === "full" && !hasReferents && (
+      {alert.mode === "full" && hasReferents && !vanished && (alert.fired_on ?? []).map((fired, index) => (
+        <div key={index} style={{ display: "flex", flexDirection: "column", gap: "var(--sp-4)" }}>
+          <span className="value">
+            {fired.sources_withheld
+              ? `Matched: ${fired.type} ${fired.label} \u2014 its sources are in data this case does not read`
+              : `Matched: ${fired.type} ${fired.label}`}
+          </span>
+          {!fired.sources_withheld && fired.files.length > 0 && <span className="label">{`From: ${fromText(fired)}`}</span>}
+        </div>
+      ))}
+      {unavailable && (
         <p className="label" style={{ color: "var(--warning)" }}>
           Evidence no longer available.
         </p>
       )}
-      <Button onClick={() => onJump(alert.id)} disabled={jumping}>
+      <Button onClick={() => onJump(alert.id)} disabled={jumping || unavailable}>
         {jumping ? "Jumping…" : "Jump into investigation"}
       </Button>
     </li>
@@ -81,16 +134,8 @@ export interface JumpResultSummaryProps {
   onOpen: (investigationId: string) => void;
 }
 
-/** `AlertJumpResult.unreadable_count` is safe to show because of what it can never mean, not
- * merely because the number itself is small: `AlertStore.get_authorized`/`list_authorized`
- * (`services/api/alerts.py`, ADR-041) filter `WHERE owner_id = $1` — an alert is only ever
- * reachable by its own recipient — and `fetch_jumpable_referents` (`watch_routes.py`) re-checks
- * every referent fresh as *this* viewer's own current principal, never a cached or historical one.
- * So `unreadable_count` can only ever recount referents belonging to an alert this same viewer
- * already had a standing claim to receive; it can shrink what they can now see, it can never
- * reveal the existence of something they had no prior claim to. The copy below is written to that
- * guarantee — "no longer accessible", never "found" or "new" — so the render layer doesn't
- * misrepresent a number the server already made safe. */
+/** ADR-124 decision 1: the summary says what was added and nothing of what could not be read — no
+ * count of it, however it is framed. */
 export function JumpResultSummary({ result, onOpen }: JumpResultSummaryProps) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "var(--sp-4)" }}>
@@ -98,12 +143,6 @@ export function JumpResultSummary({ result, onOpen }: JumpResultSummaryProps) {
         {result.seeded_count} entit{result.seeded_count === 1 ? "y" : "ies"} added to the new
         investigation.
       </p>
-      {result.unreadable_count > 0 && (
-        <p className="label" data-testid="jump-unreadable-summary">
-          {result.unreadable_count} referent{result.unreadable_count === 1 ? "" : "s"} no longer
-          accessible to you.
-        </p>
-      )}
       <Button variant="primary" onClick={() => onOpen(result.investigation.id)}>
         Open investigation
       </Button>

@@ -210,6 +210,147 @@ test("a case whose events are all on one day is shown by the hour, and asks for 
   expect(intervals).toContain(3600);
 });
 
+test("choosing the weekend by keyboard puts the cells in the map's request and dims the canvas (ADR-130 decision 2)", async ({
+  page,
+}) => {
+  const WEEKLY = {
+    bucketing: "weekday_hour",
+    buckets: [{ weekday: 5, hour: 9, count: 2 }],
+    total: 2,
+  };
+  const geoBodies: Array<{ filter: { weekday_hours?: Array<{ weekday: number; hour: number }> } }> = [];
+  const firstSeenBodies: Array<{ filter: { weekday_hours?: unknown } }> = [];
+  await page.route("**/*/v1/analytics/histogram", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(WEEKLY) });
+  });
+  await page.route("**/*/v1/analytics/geobins", async (route) => {
+    geoBodies.push(route.request().postDataJSON());
+    await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+  });
+  await page.route("**/*/v1/analytics/first-seen", async (route) => {
+    const body = route.request().postDataJSON() as { filter: { weekday_hours?: unknown } };
+    firstSeenBodies.push(body);
+    // Only node "a" has an event on a weekend; "b" and "c" have none.
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ nodes: { a: "2026-01-10T09:00:00Z" }, edges: {} }),
+    });
+  });
+  await page.goto("/keyboard/timeline-playback-harness.html?cells");
+
+  await tabToElementNamed(page, (active) => active.tag === "BUTTON" && active.text === "Cyclical");
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("button", { name: "Cyclical" })).toHaveAttribute("aria-pressed", "true");
+  await openMore(page);
+  await expect(page.getByRole("group", { name: "Choose cells (UTC)" })).toBeVisible();
+  await tabToElementNamed(page, (active) => active.tag === "BUTTON" && active.text === "Weekend");
+  await page.keyboard.press("Enter");
+
+  // The map's request carries the weekend: Saturday and Sunday, every hour.
+  await expect
+    .poll(() => geoBodies.some((b) => (b.filter.weekday_hours?.length ?? 0) === 48), { timeout: 5000 })
+    .toBe(true);
+  const weekend = geoBodies.find((b) => (b.filter.weekday_hours?.length ?? 0) === 48)!;
+  expect(new Set(weekend.filter.weekday_hours!.map((c) => c.weekday))).toEqual(new Set([5, 6]));
+  expect(new Set(weekend.filter.weekday_hours!.map((c) => c.hour)).size).toBe(24);
+  // The canvas dims what has no weekend event, by the same cells.
+  expect(firstSeenBodies.some((b) => Array.isArray(b.filter.weekday_hours))).toBe(true);
+  await expect(page.getByTestId("dimmed-nodes")).toHaveText("b,c");
+
+  // Clear (in the same menu) takes the restriction off: nothing dimmed, and the map asks again with no cells.
+  await tabToElementNamed(page, (active) => active.tag === "BUTTON" && active.text === "Clear");
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("dimmed-nodes")).toHaveText("");
+  await expect
+    .poll(() => geoBodies.at(-1)?.filter.weekday_hours === undefined, { timeout: 5000 })
+    .toBe(true);
+
+  registerCovered("TIMELINE_PLAYBACK_ACTIONS", "choose-the-weekend-by-keyboard");
+});
+
+/** Routes the weekly histogram, the map's bins and first-seen for the `?cells` harness, and records each
+ * body the map's bins were asked with. */
+async function routeWeekly(page: Page): Promise<Array<{ filter: { weekday_hours?: Array<{ weekday: number; hour: number }> } }>> {
+  const geoBodies: Array<{ filter: { weekday_hours?: Array<{ weekday: number; hour: number }> } }> = [];
+  await page.route("**/*/v1/analytics/histogram", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ bucketing: "weekday_hour", buckets: [{ weekday: 5, hour: 9, count: 2 }], total: 2 }),
+    });
+  });
+  await page.route("**/*/v1/analytics/geobins", async (route) => {
+    geoBodies.push(route.request().postDataJSON());
+    await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+  });
+  await page.route("**/*/v1/analytics/first-seen", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ nodes: {}, edges: {} }) });
+  });
+  return geoBodies;
+}
+
+async function openChooseCells(page: Page): Promise<void> {
+  await tabToElementNamed(page, (active) => active.tag === "BUTTON" && active.text === "Cyclical");
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("button", { name: "Cyclical" })).toHaveAttribute("aria-pressed", "true");
+  await openMore(page);
+  await expect(page.getByRole("group", { name: "Choose cells (UTC)" })).toBeVisible();
+}
+
+test("ticking a day checkbox by keyboard sends that day's cells in the map's request", async ({ page }) => {
+  const geoBodies = await routeWeekly(page);
+  await page.goto("/keyboard/timeline-playback-harness.html?cells");
+  await openChooseCells(page);
+
+  // Tab to the Wednesday box and tick it with Space.
+  await tabToElementNamed(page, (active) => active.tag === "INPUT" && active.ariaLabel === "Wed");
+  await page.keyboard.press("Space");
+  await expect(page.getByRole("checkbox", { name: "Wed" })).toBeChecked();
+
+  // Wednesday is 2 (0 = Monday); every hour of it is 24 cells.
+  await expect
+    .poll(() => geoBodies.some((b) => (b.filter.weekday_hours?.length ?? 0) === 24), { timeout: 5000 })
+    .toBe(true);
+  const sent = geoBodies.find((b) => (b.filter.weekday_hours?.length ?? 0) === 24)!;
+  expect(new Set(sent.filter.weekday_hours!.map((c) => c.weekday))).toEqual(new Set([2]));
+  expect(new Set(sent.filter.weekday_hours!.map((c) => c.hour)).size).toBe(24);
+
+  registerCovered("TIMELINE_PLAYBACK_ACTIONS", "tick-a-day-by-keyboard-sends-its-cells");
+});
+
+test("setting the From and To hours by keyboard sends those hours in the map's request", async ({ page }) => {
+  const geoBodies = await routeWeekly(page);
+  await page.goto("/keyboard/timeline-playback-harness.html?cells");
+  await openChooseCells(page);
+
+  // A day first, so there are cells to narrow: Monday (0).
+  await tabToElementNamed(page, (active) => active.tag === "INPUT" && active.ariaLabel === "Mon");
+  await page.keyboard.press("Space");
+  await tabToElementNamed(page, (active) => active.tag === "INPUT" && active.ariaLabel === "From hour");
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.type("9");
+  await tabToElementNamed(page, (active) => active.tag === "INPUT" && active.ariaLabel === "To hour");
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.type("11");
+
+  // Monday, hours 9 to 11: three cells.
+  await expect
+    .poll(
+      () =>
+        geoBodies.some((b) => {
+          const hours = (b.filter.weekday_hours ?? []).map((c) => c.hour).sort((x, y) => x - y);
+          return hours.length === 3 && hours[0] === 9 && hours[2] === 11;
+        }),
+      { timeout: 5000 },
+    )
+    .toBe(true);
+  const sent = geoBodies.find((b) => (b.filter.weekday_hours?.length ?? 0) === 3)!;
+  expect(sent.filter.weekday_hours!.every((c) => c.weekday === 0)).toBe(true);
+
+  registerCovered("TIMELINE_PLAYBACK_ACTIONS", "set-the-hours-by-keyboard-sends-them");
+});
+
 test("every registered timeline-playback action has its own proving test case above", () => {
   assertAllCovered("TIMELINE_PLAYBACK_ACTIONS", TIMELINE_PLAYBACK_ACTIONS);
 });

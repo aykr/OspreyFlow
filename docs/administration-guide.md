@@ -11,10 +11,11 @@ is made from the deployment's own schema, and is checked against it on every cha
 <!-- document-control:begin -->
 ## Document control
 
-**Version 1.6** · 2026-10-18 · For OspreyFlow v0.2.0 · Issued
+**Version 1.7** · 2026-10-27 · For OspreyFlow v0.2.0 · Issued
 
 | Version | Date | What changed |
 | --- | --- | --- |
+| 1.7 | 2026-10-27 | Appendix A: `components.post_ingest_resolution`, whether a load queues entity resolution afterwards. |
 | 1.6 | 2026-10-18 | §11: the HMP pack as a prison intelligence network, and adding it again after an update. |
 | 1.5 | 2026-10-15 | A cover page, contents, a list of figures, and this version history. |
 | 1.4 | 2026-10-15 | §16: a model download that stopped with `rename …-partial …`, and how to finish it. |
@@ -611,6 +612,7 @@ Made from the deployment's own schema. Settings marked *section* hold the settin
 | `components` | section | — | Which stores the deployment runs, and where their data lives. |
 | `components.graph_store` | `arcadedb` \| `janusgraph` | `arcadedb` | The graph store. |
 | `components.analytics_engine` | `duckdb` \| `clickhouse` | `duckdb` | Where events are counted: DuckDB inside the Conduit, or ClickHouse shared by several. |
+| `components.post_ingest_resolution` | bool | true | Whether a load queues entity resolution afterwards (`OSPREY_POST_INGEST_RESOLUTION`). False for a demonstration whose people must not gain automatic `SAME_AS` links; an analyst's own Resolve now still works. |
 | `components.search` | `opensearch` \| `postgres-fulltext` | `opensearch` | Search; postgres-fulltext is the lighter variant. |
 | `components.storage` | section | — | Folders: inside the containers, and on the host for ingest and tiles. |
 | `components.storage.data` | str | `/var/lib/osprey/data` | Where the deployment keeps its data inside the containers. |

@@ -155,6 +155,9 @@ class StagedEntity:
     properties: dict[str, Any]
     #: ADR-094: `{"kind": ..., "value": ...}` (the text, or the file's path) when it holds content.
     content: dict[str, str] | None = None
+    #: ADR-127 decision 3: this row's `handling` override with its columns read, when the element
+    #: binds a part of its marking to one.
+    handling: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -164,8 +167,14 @@ class StagedEdge:
     to_ref: str
     properties: dict[str, Any]
     instant: datetime | None = None
+    #: ADR-127 decision 11: the end of a span, and whether the recipe bound one. `span` with no
+    #: `valid_to` is a span still open (an empty end cell); no `span` is one instant.
+    valid_to: datetime | None = None
+    span: bool = False
     #: ADR-094: `{"kind": ..., "text": ...}` when the recipe marks this link's text.
     content: dict[str, str] | None = None
+    #: As `StagedEntity.handling`.
+    handling: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -185,6 +194,10 @@ class StagedRow:
     duplicate_row_indices: list[int] = field(default_factory=list)
     entities: list[StagedEntity] = field(default_factory=list)
     edges: list[StagedEdge] = field(default_factory=list)
+    #: ADR-127 decision 5: the row's deduplication key (canonicalised, then hashed), when the recipe
+    #: has `deduplicate` and the row's key resolved; `None` otherwise. What is kept for the case
+    #: once the row has loaded.
+    row_key: str | None = None
 
 
 def _json_default(value: object) -> object:
@@ -202,13 +215,18 @@ def _rows_to_table(rows: Sequence[StagedRow]) -> pa.Table:
             "source": [r.source for r in rows],
             "row_index": [r.row_index for r in rows],
             "duplicate_row_indices": [json.dumps(r.duplicate_row_indices) for r in rows],
+            "row_key": [r.row_key for r in rows],
             "entities_json": [
                 json.dumps([asdict(e) for e in r.entities], default=_json_default) for r in rows
             ],
             "edges_json": [
                 json.dumps(
                     [
-                        {**asdict(e), "instant": e.instant.isoformat() if e.instant else None}
+                        {
+                            **asdict(e),
+                            "instant": e.instant.isoformat() if e.instant else None,
+                            "valid_to": e.valid_to.isoformat() if e.valid_to else None,
+                        }
                         for e in r.edges
                     ]
                 )
@@ -240,7 +258,11 @@ def read_staged_rows(path: str, *, storage: ObjectStorageConfig) -> list[StagedR
     for record in table.to_pylist():
         entities = [
             StagedEntity(
-                ref=e["ref"], type=e["type"], properties=e["properties"], content=e.get("content")
+                ref=e["ref"],
+                type=e["type"],
+                properties=e["properties"],
+                content=e.get("content"),
+                handling=e.get("handling"),
             )
             for e in json.loads(record["entities_json"])
         ]
@@ -253,7 +275,12 @@ def read_staged_rows(path: str, *, storage: ObjectStorageConfig) -> list[StagedR
                 instant=datetime.fromisoformat(e["instant"]).astimezone(UTC)
                 if e["instant"]
                 else None,
+                valid_to=datetime.fromisoformat(e["valid_to"]).astimezone(UTC)
+                if e.get("valid_to")
+                else None,
+                span=bool(e.get("span", False)),
                 content=e.get("content"),
+                handling=e.get("handling"),
             )
             for e in json.loads(record["edges_json"])
         ]
@@ -267,6 +294,7 @@ def read_staged_rows(path: str, *, storage: ObjectStorageConfig) -> list[StagedR
                 duplicate_row_indices=json.loads(record["duplicate_row_indices"]),
                 entities=entities,
                 edges=edges,
+                row_key=record.get("row_key"),
             )
         )
     return rows

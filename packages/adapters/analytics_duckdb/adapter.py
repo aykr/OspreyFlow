@@ -77,7 +77,7 @@ def _row_to_event(row: tuple[object, ...]) -> EventRecord:
     (
         event_id, edge_id, edge_type, source_id, target_id, occurred_at, duration_s, cell_site,
         lat, lon, direction, properties, investigation_scope, classification, handling_code,
-        owning_unit, originator,
+        owning_unit, originator, load_id,
     ) = row
     raw = properties
     parsed = json.loads(raw) if isinstance(raw, str) else (raw or {})
@@ -101,12 +101,19 @@ def _row_to_event(row: tuple[object, ...]) -> EventRecord:
             owning_unit=cast(str, owning_unit),
             originator=cast(str, originator),
         ),
+        load_id=cast(str | None, load_id),
     )
 
 
 def _as_utc(value: object) -> datetime:
     """DuckDB hands a naive timestamp back for a TIMESTAMP column; events are written in UTC."""
     return cast(datetime, value).replace(tzinfo=UTC)
+
+
+#: ADR-130 decision 2: the weekly histogram's cells, one expression each, shared by the histogram
+#: and the `weekday_hours` predicate so the two cannot drift. UTC; weekday 0 = Monday.
+_WEEKDAY_SQL = "CAST(isodow(occurred_at) AS INTEGER) - 1"
+_HOUR_SQL = "CAST(hour(occurred_at) AS INTEGER)"
 
 
 class AnalyticsDuckDBAdapter:
@@ -129,12 +136,23 @@ class AnalyticsDuckDBAdapter:
             # ADR-084 Amendment 2: a branch's parents' events, on the links the branch holds only.
             scopes = ",".join("?" for _ in inherited.scopes)
             edges = ",".join("?" for _ in inherited.edge_ids)
+            # ADR-128 decision 2: a branch made from what is lit reads its parents' events inside
+            # its window only, ends included; its own events are not held to it.
+            held = ""
+            held_params: list[object] = []
+            if inherited.window is not None:
+                held = " AND occurred_at >= ?"
+                held_params.append(inherited.window.valid_from)
+                if inherited.window.valid_to is not None:
+                    held += " AND occurred_at <= ?"
+                    held_params.append(inherited.window.valid_to)
             clauses = [
                 f"(investigation_scope = ? OR (investigation_scope IN ({scopes}) "
-                f"AND edge_id IN ({edges})))"
+                f"AND edge_id IN ({edges}){held}))"
             ]
             params.extend(inherited.scopes)
             params.extend(inherited.edge_ids)
+            params.extend(held_params)
         if event_filter.window is not None:
             clauses.append("occurred_at >= ?")
             params.append(event_filter.window.valid_from)
@@ -158,6 +176,17 @@ class AnalyticsDuckDBAdapter:
             placeholders = ",".join("?" for _ in event_filter.event_ids)
             clauses.append(f"event_id IN ({placeholders})")
             params.extend(event_filter.event_ids)
+        if event_filter.weekday_hours is not None:
+            # ADR-130 decision 2: the weekly histogram's own cells (UTC, 0 = Monday), applied
+            # here in the WHERE. An empty set is "no cell chosen" and matches nothing.
+            if not event_filter.weekday_hours:
+                clauses.append("1 = 0")
+            else:
+                cell = f"({_WEEKDAY_SQL} = ? AND {_HOUR_SQL} = ?)"
+                cells = " OR ".join(cell for _ in event_filter.weekday_hours)
+                clauses.append(f"({cells})")
+                for chosen in event_filter.weekday_hours:
+                    params.extend([chosen.weekday, chosen.hour])
         # **A7's item-category half — round 13cdc.** Values are parameterised; only the *column*
         # is interpolated, and `_field_expression` validates it as a safe identifier first, which
         # is the same guard `cross_filter`'s own dimensions already rely on.
@@ -297,8 +326,8 @@ class AnalyticsDuckDBAdapter:
 
     def _weekday_hour_histogram(self, predicate: SqlPredicate) -> Histogram:
         rows = self._con.execute(
-            "SELECT CAST(isodow(occurred_at) AS INTEGER) - 1 AS weekday, "
-            "CAST(hour(occurred_at) AS INTEGER) AS hour, COUNT(*) AS cnt "
+            f"SELECT {_WEEKDAY_SQL} AS weekday, "
+            f"{_HOUR_SQL} AS hour, COUNT(*) AS cnt "
             f"FROM events WHERE {predicate.where} GROUP BY weekday, hour "
             "ORDER BY weekday, hour",
             predicate.params,
@@ -562,7 +591,7 @@ class AnalyticsDuckDBAdapter:
         rows = self._con.execute(
             "SELECT event_id, edge_id, edge_type, source_id, target_id, occurred_at, duration_s, "
             "cell_site, lat, lon, direction, properties, investigation_scope, "
-            "handling_classification, handling_code, owning_unit, originator "
+            "handling_classification, handling_code, owning_unit, originator, load_id "
             f"FROM events WHERE {predicate.where} "
             "ORDER BY occurred_at DESC, event_id DESC LIMIT ? OFFSET ?",
             [*predicate.params, req.limit, req.offset],
@@ -600,7 +629,7 @@ class AnalyticsDuckDBAdapter:
             "INSERT INTO events (event_id, edge_id, edge_type, source_id, target_id, "
             "occurred_at, duration_s, cell_site, lat, lon, direction, properties, "
             "investigation_scope, handling_classification, handling_code, owning_unit, "
-            "originator) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "originator, load_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 [
                     r.event_id,
@@ -620,10 +649,32 @@ class AnalyticsDuckDBAdapter:
                     r.handling.handling_code,
                     r.handling.owning_unit,
                     r.handling.originator,
+                    r.load_id,
                 ]
                 for r in records
             ],
         )
+
+    async def retract_load(self, load_id: str) -> int:
+        """`AnalyticsPort.retract_load`: the rows this load wrote, by its id alone. A row with no
+        `load_id` is `NULL`, which `= ?` never matches, so unattributed events stay."""
+        removed = self._con.execute(
+            "DELETE FROM events WHERE load_id = ? RETURNING event_id", [load_id]
+        ).fetchall()
+        return len(removed)
+
+    async def events_of_load_among(self, load_id: str, event_ids: Sequence[str]) -> set[str]:
+        """`AnalyticsPort.events_of_load_among`: by `event_id` and `load_id`, no access step."""
+        ids = list(dict.fromkeys(event_ids))
+        if not ids:
+            return set()
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._con.execute(
+            "SELECT DISTINCT event_id FROM events "
+            f"WHERE load_id = ? AND event_id IN ({placeholders})",
+            [load_id, *ids],
+        ).fetchall()
+        return {str(row[0]) for row in rows}
 
     # --- the geometry reference partition -----------------------------------
 
@@ -654,6 +705,18 @@ class AnalyticsDuckDBAdapter:
                 for r in records
             ],
         )
+
+    async def retract_geometries(self, geometry_refs: Sequence[str], *, version: int) -> int:
+        """`AnalyticsPort.retract_geometries`: these refs at this version, whatever the marking."""
+        if not geometry_refs:
+            return 0
+        placeholders = ",".join("?" for _ in geometry_refs)
+        removed = self._con.execute(
+            f"DELETE FROM geometries WHERE version = ? AND geometry_ref IN ({placeholders}) "
+            "RETURNING geometry_ref",
+            [version, *geometry_refs],
+        ).fetchall()
+        return len(removed)
 
     def _current_partition_version(self) -> int | None:
         row = self._con.execute("SELECT MAX(version) FROM geometries").fetchone()

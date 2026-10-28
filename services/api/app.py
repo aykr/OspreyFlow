@@ -27,12 +27,12 @@ import csv
 import functools
 import io
 import json
+import logging
 import os
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from dataclasses import fields as dataclass_fields
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal, cast
@@ -54,7 +54,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from scripts.build_local_basemap import GEOFABRIK_REGIONS, BasemapBuildResult, build_local_basemap
 from scripts.verify_map import verify_map
 from services.extract.writer import (
@@ -64,14 +64,20 @@ from services.extract.writer import (
     retract_node,
 )
 from services.ingest.connectors.geo.site_grid import site_grid_rows
-from services.ingest.engine import run_recipe
+from services.ingest.engine import RowKeyDefinitionChanged, RowKeyRunInProgress, run_recipe
 from services.ingest.pipeline import (
     pipeline_from_recipe,
     pipeline_rule_violations,
     pipeline_run_violations,
 )
 from services.ingest.recipe_loader import load_recipe
-from services.ingest.recipe_rules import RecipeRuleError, check_recipe_rules
+from services.ingest.recipe_rules import (
+    RecipeRuleError,
+    check_recipe_rules,
+    deduplicate_problems,
+    handling_bindings,
+    template_elements,
+)
 from services.ingest.staging import ObjectStorageConfig
 from services.ingest.transforms import STRUCTURED_PARTS
 from services.resolve.trigger import (
@@ -81,13 +87,9 @@ from services.resolve.trigger import (
 )
 from valkey.asyncio import Valkey
 
-from adapters.compute_rustworkx.adapter import ComputeRustworkxAdapter
-from adapters.graph_arcadedb.adapter import GraphArcadeDBAdapter
-from adapters.graph_arcadedb.client import ArcadeDBClient, ArcadeDBConfig
 from adapters.model_litellm.adapter import ModelLiteLLMAdapter
 from adapters.model_litellm.client import LiteLLMClient, LiteLLMConfig
 from adapters.model_litellm.errors import ExtractionFailedError, ModelUnavailableError
-from adapters.recognise_stanza import RecogniserConfig, RecogniseStanzaAdapter
 from conduit_common.identity import new_edge_id, new_id, now_utc
 from geo.bilinear import ControlPoint
 from geo.image_dimensions import (
@@ -98,8 +100,9 @@ from geo.image_dimensions import (
 from geo.wkb import polygon_wkb
 from knowledge_adapters import ARITY, REGISTRY
 from ontology.errors import OntologyError
-from ontology.handling import HandlingScheme, load_uk_le_scheme, principal_may_view
-from ontology.packs import load_deployment_ontology, pack_catalogue
+from ontology.handling import HandlingScheme, principal_may_view
+from ontology.packs import pack_catalogue
+from ontology.pattern_where import PatternConditionRefused, check_pattern_conditions
 from ontology.yardstick import Yardstick, load_phia_yardstick
 from ports.analytics import AnalyticsPort, TrendLimitExceeded
 from ports.compute import ComputePort
@@ -153,6 +156,7 @@ from schemas.domain import (
     Assumption,
     Connections,
     ConnectionsRequest,
+    DomainPack,
     Edge,
     EdgeWrite,
     ExpandRequest,
@@ -202,13 +206,14 @@ from schemas.ingest import (
     CONNECTOR_CATALOGUE,
     ConnectDraftInput,
     ConnectorCatalogueEntry,
+    DeduplicateConfig,
     DomainPackEntry,
-    LoadReport,
+    LoadReportView,
     MapHandlingPreviewRequest,
     MapHandlingPreviewResult,
     MapSampleRow,
     PipelineGraph,
-    PipelineRunReport,
+    PipelineRunReportView,
     PublishRecipeInput,
     RowTemplateUpdateInput,
     RunRecipeInput,
@@ -261,8 +266,14 @@ from . import resolution_trigger as resolution_trigger_module
 from . import review as review_module
 from . import risk as risk_module
 from . import search as search_module
+from .add_by_identifiers import (
+    MAX_IDENTIFIERS,
+    AddByIdentifiersRequest,
+    AddByIdentifiersResponse,
+    TooManyIdentifiersError,
+    resolve_identifiers,
+)
 from .alerts import AlertNotFoundError, AlertStore, AlertTriageConflict
-from .analytics_store import open_analytics
 from .assessments import (
     AssumptionListResponse,
     AssumptionNotFoundError,
@@ -286,8 +297,17 @@ from .assessments import (
 )
 from .audit import AuditWriteError, AuditWriter
 from .auth import PrincipalResolutionError, PrincipalResolver, bearer_scheme
-from .cache import CachedQuery
-from .change_stream import ChangeStreamEntry, ChangeStreamWriter
+from .case_brief import (
+    AttachmentKind,
+    BriefAttachmentBody,
+    BriefStatusBody,
+    BriefTextBody,
+    CaseBrief,
+    CaseBriefError,
+    CaseBriefService,
+    CaseBriefStore,
+)
+from .case_brief_resolvers import title_resolvers
 from .compute_routes import (
     JOB_TYPE_COMPUTE_METRIC,
     ComputeMetricAccepted,
@@ -297,12 +317,10 @@ from .compute_routes import (
 )
 from .config import ApiConfig, DeploymentModels
 from .dataset_scope import (
-    DatasetStampingGraph,
     UnknownDatasetError,
     made_in,
     outside_any_case,
     scope_to_case,
-    stamping,
 )
 from .datasets import (
     CaseDatasetsRequest,
@@ -311,7 +329,6 @@ from .datasets import (
     DatasetRefusedError,
     DatasetStore,
     InMemoryDatasetStore,
-    PostgresDatasetStore,
 )
 from .document_content import (
     UPLOAD_CONTENT_EXTENSIONS,
@@ -345,12 +362,10 @@ from .entity_pictures import (
     EntityPicture,
     EntityPictureService,
     PictureNotFoundError,
-    PictureSetResult,
+    PictureSetResponse,
 )
-from .evaluation import evaluate_hotlists_for_entry, evaluate_monitors_for_entry
 from .event_scope import visible_ancestors, with_inherited
 from .explore import (
-    EXPLORE_TTL_SECONDS,
     ExploreService,
     StarterNotOffered,
     TooManyMatches,
@@ -372,6 +387,20 @@ from .history import (
     HistoryStepNotFoundError,
     HistoryStepSummary,
     InvestigationHistoryStore,
+)
+from .history_labels import (
+    ALERT_CANVAS,
+    BRANCHED,
+    BRIEF_EDITED,
+    EXPANDED,
+    LINKS_AMONG,
+    NOT_RESTORABLE,
+    OPENED_FROM_ALERT,
+    OWNERSHIP,
+    REMOVED,
+    SEEDED,
+    SHARED_CONTACTS,
+    STARTER_QUESTION,
 )
 from .hotlists import HotlistNotFoundError, HotlistStore
 from .identity_admin import (
@@ -409,7 +438,7 @@ from .link_changes import (
     ChangeNotMadeError,
     InvalidChangeError,
     LinkChangeRequest,
-    LinkChangeResult,
+    LinkChangeResponse,
     LinkChangeService,
     LinkChangeStore,
     LinkHistoryResponse,
@@ -443,8 +472,8 @@ from .link_types import (
     RetireLinkTypeRequest,
     public_ontology,
 )
+from .load_records import LedgerSink, may_see_counts, released_from_of, report_view
 from .mapconfig_loader import load_map_config, public_view
-from .media_store import open_media_store
 from .model_routing import ModelEgressRefused, RoutedModel, model_status, routes_from_env
 from .monitors import MonitorNotFoundError, MonitorStore
 from .notify import notify_channel, publish_delta
@@ -463,6 +492,12 @@ from .packs import (
     reorder_visible,
     trend_item,
 )
+from .pattern_ask import (
+    AskToSearchRequest,
+    CouldNotExpress,
+    PatternAskService,
+    PatternProposal,
+)
 from .pattern_store import PatternNotFoundError, PatternStore
 from .patterns import (
     JOB_TYPE_PATTERN_MATCH,
@@ -477,9 +512,6 @@ from .patterns import (
 from .pipeline_run import (
     OnlineGeocode,
     RecogniserFor,
-    online_geocode_from_env,
-    recogniser_for_deployment,
-    run_published_pipeline,
 )
 from .principal_names import PrincipalNameDirectory
 from .questions import (
@@ -491,7 +523,14 @@ from .questions import (
     QuestionsService,
     QuestionsTooLargeError,
 )
-from .recipe_runs import RecipeRun, RecipeRunStore, RunTrigger
+from .recipe_run import (
+    RecipeRunDeps,
+    _evaluate_watches_best_effort,
+    _owner_resolver,
+    _rule_gate,
+    run_recipe_as,
+)
+from .recipe_runs import RecipeRun, RecipeRunStore
 from .release_notice import read_update_notice
 from .report_freshness import ReportFreshness
 from .reports import ReportLimitExceededError
@@ -511,6 +550,7 @@ from .review import (
 from .risk import NeighbourhoodTooLarge
 from .rule_evaluation import RULE_AUDIT_ACTIONS, RuleGate
 from .rule_holds import ReleaseRefused, readable_rule_audit, release_held_rows
+from .run_resources import RECIPES_REPO_ROOT, build_run_resources
 from .scheduler import (
     DEFAULT_TIMEZONE,
     ScheduleExecutor,
@@ -535,9 +575,12 @@ from .sites import ControlPointQuad, Site, SiteNotFoundError, SiteStore
 from .studio_map import (
     HandlingLoosenedError,
     RowIndexOutOfRangeError,
+    draft_handling_columns,
+    draft_units,
     get_sample_row,
     preview_element_handling,
     resolve_source_handling,
+    source_column_names,
     validate_handling_tightens,
 )
 from .studio_profile import (
@@ -547,20 +590,24 @@ from .studio_profile import (
     SourceUnreadableError,
     profile_recipe_source,
 )
-from .studio_publish import _REPO_ROOT as _PUBLISH_REPO_ROOT  # noqa: I001
 from .studio_publish import (
     GitCommitError,
     RecipeNotRunnableError,
     build_recipe,
-    run_published_recipe,
+    check_before_publish,
+    load_published_recipe,
+    pack_versions_for,
     write_and_commit_recipe,
 )
 from .studio_recipes import (
+    SourceDeclarationsInvalidError,
     StudioRecipeCannotVersionError,
     StudioRecipeNotADraftError,
     StudioRecipeNotFoundError,
     StudioRecipeNotVerifiedError,
     StudioRecipeStore,
+    recipe_reader,
+    reconcile_recipe_pins,
 )
 from .studio_verify import RowTemplateMissingError, run_verify
 from .supersede import JOB_TYPE_SUPERSEDE_NODE, run_supersede_node_job
@@ -584,7 +631,9 @@ from .tile_proxy import build_upstream_url, fetch_tile
 from .trends import (
     TrendDefinitionRefused,
     TrendStore,
+    check_in_case_domains,
     highest,
+    mark_outside_case_domains,
     name_series,
     to_request,
     trend_options,
@@ -605,64 +654,70 @@ from .watch_routes import (
 from .worker import JobWorker
 from .working_set.models import (
     MAX_NODES,
+    BranchFilter,
     CardinalityPreview,
     ClusterExplanation,
     ClusterNotFoundError,
     DeltaAdd,
-    DeltaNotice,
-    DeltaRemove,
-    DeltaReplaceEdge,
-    DeltaReproject,
+    DeltaReplaceEdgeSent,
     DeltaSnapshot,
+    DeltaViewOverCap,
     ExpansionOutcome,
     LimitExceededError,
     LinksAmongOutcome,
     LinksAmongRequest,
     NodeNotInWorkingSetError,
     NothingToBranchError,
+    ResolutionOutcome,
     SameNodeAssertionError,
-    WorkingSetDelta,
+    WorkingSetDeltaSent,
     decode_delta,
+    lacks_record,
 )
 from .working_set.service import WorkingSetService
-from .working_set.store import ValkeyWorkingSetStore
+from .working_set.store import DELTA_STREAM_MAXLEN, ValkeyWorkingSetStore
 from .ws_ticket import WsTicketResponse, mint_ws_ticket, redeem_ws_ticket
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     config = ApiConfig.from_env()
 
-    arcadedb_client = ArcadeDBClient(ArcadeDBConfig.from_env(database="ospreyflow"))
-    await arcadedb_client.create_database_if_absent()
-    handling_scheme = load_uk_le_scheme()
+    # ADR-127 Amendment 23: what a recipe run is built from (the stamping graph and its hooks, the
+    # stores a run writes, analytics, media, jobs, the principal resolver) is built by the one
+    # function the seed calls too, never a copy of it here.
+    resources = await build_run_resources(config)
+    handling_scheme = resources.handling_scheme
+    ontology = resources.ontology
+    graph = resources.graph
+    valkey = resources.valkey
+    audit = resources.audit
+    patterns_store = resources.patterns_store
+    hotlists_store = resources.hotlists_store
+    monitors_store = resources.monitors_store
+    alerts_store = resources.alerts_store
+    typology_rules = resources.typology_rules
+    held_rows = resources.held_rows
+    screening_lists = resources.screening_lists
+    kyc_expiries = resources.kyc_expiries
+    recipe_runs = resources.recipe_runs
+    extraction_candidates = resources.extraction_candidates
+    datasets_store = resources.datasets_store
+    analytics = resources.analytics
+    media = resources.media
+    recogniser = resources.recogniser
+    compute = resources.compute
+    jobs = resources.jobs
     yardstick = load_phia_yardstick()
-    ontology = load_deployment_ontology()
-    # ADR-099: the services write through `DatasetStampingGraph`, so whatever the Conduit writes
-    # for a case belongs to the case's dataset (`dataset_scope.py`).
-    graph: GraphPort = cast(
-        GraphPort, stamping(GraphArcadeDBAdapter(arcadedb_client, handling_scheme))
-    )
-    await graph.apply_schema(ontology)
-
-    valkey = Valkey(**config.valkey.client_kwargs())
-    audit = await AuditWriter.connect(config.postgres.dsn)
     investigations = await InvestigationStore.connect(config.postgres.dsn)
     history = await InvestigationHistoryStore.connect(config.postgres.dsn)
     sites = await SiteStore.connect(config.postgres.dsn)
-    patterns_store = await PatternStore.connect(config.postgres.dsn)
-    hotlists_store = await HotlistStore.connect(config.postgres.dsn)
-    monitors_store = await MonitorStore.connect(config.postgres.dsn)
-    alerts_store = await AlertStore.connect(config.postgres.dsn)
-    # ADR-109: each case's typology rules, and the rows a failing pre-commit rule holds.
-    typology_rules = await TypologyRuleStore.connect(config.postgres.dsn)
-    held_rows = await HeldRowStore.connect(config.postgres.dsn, handling_scheme)
-    screening_lists = await ScreeningListStore.connect(config.postgres.dsn)
-    kyc_expiries = await KycExpiryStore.connect(config.postgres.dsn)
-    # ADR-110 decision 6: the run ledger.
-    recipe_runs = await RecipeRunStore.connect(config.postgres.dsn)
     judgements_store = await JudgementStore.connect(config.postgres.dsn)
     link_notes_store = await LinkNoteStore.connect(config.postgres.dsn)
+    # ADR-128 decision 3: each case's brief (its information requirements).
+    case_brief_store = await CaseBriefStore.connect(config.postgres.dsn)
     link_changes_store = await LinkChangeStore.connect(config.postgres.dsn)
     link_type_store = await LinkTypeProposalStore.connect(config.postgres.dsn)
     suppression_marks = await SuppressionMarkStore.connect(config.postgres.dsn)
@@ -675,13 +730,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     trend_store = await TrendStore.connect(config.postgres.dsn)
     pack_store = await PackStore.connect(config.postgres.dsn)
     studio_recipes = await StudioRecipeStore.connect(config.postgres.dsn)
-    extraction_candidates = await ExtractionCandidateStore.connect(config.postgres.dsn)
     questions_store = await PostgresQuestionStore.connect(config.postgres.dsn)
-    # ADR-099: the datasets of each unit and of each case.
-    datasets_store = await PostgresDatasetStore.connect(config.postgres.dsn)
     app.state.datasets = datasets_store
-    # ADR-099 Amendment 6: no write names a dataset the registry does not hold.
-    cast(DatasetStampingGraph, graph).check_against(datasets_store)
     litellm_client = LiteLLMClient(LiteLLMConfig.from_env())
     # `embed_model` is the only model this adapter needs fixed at construction — `extract()`'s own
     # model is caller-supplied per call (`ExtractionRequest.model`, ADR-005), never this adapter's
@@ -701,26 +751,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # only "ontology reload" trigger today is a process restart after a new
     # `packages/ontology/default.yaml` ships — there is no live-reload admin
     # action yet (Phase 8's own territory) — so this is that routine, run
-    # once, right after the ontology this process will serve is known.
-    await studio_recipes.flag_stale(ontology.version)
-
-    # The store `components.analytics_engine` names (ADR-114 decision 9): a DuckDB file on a
-    # single machine, ClickHouse where Conduits are replicated. `analytics_store.py` refuses any
-    # other name rather than falling back.
-    analytics, close_analytics = await open_analytics(
-        config.analytics_engine,
-        duckdb_path=config.analytics_db_path,
-        handling_scheme=handling_scheme,
+    # once, right after the ontology this process will serve is known. ADR-120 Amendment 1,
+    # decision 6: it also stamps the pack pins of a recipe published before pinning (read from its
+    # committed file under the recipe repository root a publish writes to), and flags a recipe
+    # whose pinned packs are no longer the ones this process composes.
+    flagged_at_start = await reconcile_recipe_pins(
+        studio_recipes, ontology, recipe_reader(resources.recipe_repo_root)
     )
+    if flagged_at_start:
+        logger.warning(
+            "start-up flagged %d published recipe(s) as stale: %s",
+            len(flagged_at_start),
+            ", ".join(flagged_at_start),
+        )
 
     app.state.config = config
     app.state.graph = graph
     app.state.ontology = ontology
     app.state.valkey = valkey
-    # ADR-100 Amendment 3: the Explore panel's figures, kept per access class, cleared on a write.
-    explore_cache = CachedQuery(valkey, prefix="explore", ttl_seconds=EXPLORE_TTL_SECONDS)
-    app.state.explore_cache = explore_cache
-    cast(DatasetStampingGraph, graph).after_write(explore_cache.invalidate_prefix)
+    # ADR-100 Amendment 3: the Explore panel's figures, kept per access class, cleared on a write
+    # (the hook is on the graph, in `build_run_resources`).
+    app.state.explore_cache = resources.explore_cache
     app.state.working_set = WorkingSetService(
         graph, ValkeyWorkingSetStore(valkey), handling_scheme, valkey=valkey
     )
@@ -739,6 +790,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.recipe_runs = recipe_runs
     app.state.judgements_store = judgements_store
     app.state.link_notes = LinkNoteService(link_notes_store, app.state.working_set)
+    # ADR-128 decision 3, rule 3: an attachment is shown to a reader only with the title its own
+    # store gives that reader (`case_brief_resolvers.py`); each kind keeps its own access rule.
+    app.state.case_brief = CaseBriefService(
+        case_brief_store,
+        title_resolvers(
+            trends=trend_store,
+            patterns=patterns_store,
+            judgements=judgements_store,
+            graph=graph,
+            investigations=investigations,
+        ),
+    )
     # ADR-090: the ontology in force is `default.yaml` plus every proposal, composed here and after
     # each proposal and decision, in place, so every service holding `ontology` sees it.
     app.state.link_types = LinkTypeService(
@@ -755,14 +818,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         scheme=handling_scheme,
     )
     app.state.link_events = LinkEventsService(app.state.working_set, analytics, investigations)
-    # ADR-094: where a content item's file is kept; never the graph.
-    media = open_media_store()
-    # ADR-098 decision 2: the fast recogniser, the `ner` sidecar.
-    recogniser = RecogniseStanzaAdapter(RecogniserConfig.from_env())
     # ADR-108 phase C: the pipeline runner's recogniser lookup and the online geocoding
     # allow-list (`OSPREY_ONLINE_GEOCODER`), both deployment-level wiring, not per-request.
-    app.state.pipeline_recogniser_for = recogniser_for_deployment(recogniser)
-    app.state.online_geocode = online_geocode_from_env()
+    app.state.pipeline_recogniser_for = resources.recogniser_for
+    app.state.online_geocode = resources.online_geocode
     app.state.media = media
     app.state.document_reader = DocumentReaderService(
         app.state.working_set, analytics, graph, extraction_candidates, investigations, media
@@ -781,7 +840,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         recogniser=recogniser,
     )
     app.state.entity_pictures = EntityPictureService(
-        app.state.working_set, graph, media, ontology, scheme=handling_scheme
+        app.state.working_set, graph, media, ontology, scheme=handling_scheme, audit=app.state.audit
     )
     app.state.email_extraction = EmailExtractionService(
         app.state.working_set,
@@ -804,6 +863,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         extraction_candidates,
         questions_store,
         default_model=models.extraction,
+        analytics=analytics,
+        datasets=datasets_store,
+        investigations=investigations,
+    )
+    # ADR-129 decision 2: ask to search, a question turned into a pattern that nothing runs.
+    app.state.pattern_ask = PatternAskService(
+        app.state.working_set, graph, model, default_model=models.extraction
     )
     app.state.suppression_marks = suppression_marks
     app.state.gaps_store = gaps_store
@@ -815,20 +881,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.studio_recipes = studio_recipes
     app.state.extraction_candidates = extraction_candidates
     app.state.model = model
-    app.state.recipes_repo_root = _RECIPES_REPO_ROOT
+    app.state.recipes_repo_root = resources.recipe_repo_root
     app.state.handling_scheme = handling_scheme
     app.state.yardstick = yardstick
     app.state.site_image_storage = site_image_storage_config()
     app.state.tile_cache_storage = tile_cache_storage_config()
     app.state.analytics = analytics
-    # `06_DECISIONS.md` ADR-029/Phase 7 Stage 3: Tier 2 only, registered here — Tier 1
-    # (`graphology`, a Node harness, conformance-only) and Tier 3 (Phase 8a's `cluster` profile,
-    # ADR-028) have no Conduit-side adapter to construct yet. Stateless,
-    # same shape as `ComputeRustworkxAdapter`'s
-    # own `tests/conformance/registry.py` factory — no client, no lifecycle to close.
-    compute: ComputePort = ComputeRustworkxAdapter()
+    # `06_DECISIONS.md` ADR-029/Phase 7 Stage 3: Tier 2 only (built in `build_run_resources`) —
+    # Tier 1 (`graphology`, a Node harness, conformance-only) and Tier 3 (Phase 8a's `cluster`
+    # profile, ADR-028) have no Conduit-side adapter to construct yet.
     app.state.compute = compute
-    jobs = JobQueue(valkey)
     app.state.jobs = jobs
     # `06_DECISIONS.md` ADR-025: this system's first job-queue worker,
     # generalised by `job_type` rather than resolution-specific — closes
@@ -854,7 +916,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     job_worker.register(JOB_TYPE_PATTERN_MATCH, run_pattern_match_job)
     app.state.job_worker = job_worker
-    app.state.principal_resolver = PrincipalResolver(config)
+    app.state.principal_resolver = resources.principal_resolver
     # ADR-106: display names for principal ids, resolved when a read is served.
     app.state.principal_names = PrincipalNameDirectory(config)
     # ADR-112: the Admin area's people and dashboards, through the Conduit's own account.
@@ -898,23 +960,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         sweep_task.cancel()
         schedule_task.cancel()
-        await arcadedb_client.aclose()
-        await valkey.aclose()
-        await audit.close()
         await investigations.close()
         await history.close()
         await sites.close()
-        await patterns_store.close()
-        await hotlists_store.close()
-        await monitors_store.close()
-        await alerts_store.close()
-        await typology_rules.close()
-        await held_rows.close()
-        await screening_lists.close()
-        await kyc_expiries.close()
-        await recipe_runs.close()
         await judgements_store.close()
         await link_notes_store.close()
+        await case_brief_store.close()
         await link_changes_store.close()
         await link_type_store.close()
         await gaps_store.close()
@@ -924,18 +975,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await trend_store.close()
         await pack_store.close()
         await studio_recipes.close()
-        await extraction_candidates.close()
         await questions_store.close()
         await app.state.principal_names.aclose()
         await app.state.identity_admin.aclose()
         if app.state.superset_embedder is not None:
             await app.state.superset_embedder.aclose()
-        await datasets_store.close()
         # A closed store must not outlive the app that held it (a test app is started again).
         app.state.datasets = None
         await litellm_client.aclose()
-        await app.state.principal_resolver.aclose()
-        await close_analytics()
+        await resources.close()
 
 
 app = FastAPI(title="OspreyFlow Conduit", lifespan=lifespan)
@@ -1173,6 +1221,10 @@ def get_link_notes(request: Request) -> LinkNoteService:
     return request.app.state.link_notes  # type: ignore[no-any-return]
 
 
+def get_case_brief(request: Request) -> CaseBriefService:
+    return request.app.state.case_brief  # type: ignore[no-any-return]
+
+
 PrincipalDep = Annotated[Principal, Depends(get_principal)]
 PrincipalResolverDep = Annotated[PrincipalResolver, Depends(get_principal_resolver)]
 SitesDep = Annotated[SiteStore, Depends(get_sites)]
@@ -1203,6 +1255,7 @@ def get_superset_embedder(request: Request) -> SupersetEmbedder | None:
 
 SupersetEmbedderDep = Annotated[SupersetEmbedder | None, Depends(get_superset_embedder)]
 LinkNotesDep = Annotated[LinkNoteService, Depends(get_link_notes)]
+CaseBriefDep = Annotated[CaseBriefService, Depends(get_case_brief)]
 
 
 def get_document_content(request: Request) -> DocumentContentService:
@@ -1252,6 +1305,13 @@ def get_questions(request: Request) -> QuestionsService:
 
 
 QuestionsDep = Annotated[QuestionsService, Depends(get_questions)]
+
+
+def get_pattern_ask(request: Request) -> PatternAskService:
+    return request.app.state.pattern_ask  # type: ignore[no-any-return]
+
+
+PatternAskDep = Annotated[PatternAskService, Depends(get_pattern_ask)]
 
 
 def get_link_changes(request: Request) -> LinkChangeService:
@@ -1575,6 +1635,26 @@ async def _limit_exceeded_handler(request: Request, exc: LimitExceededError) -> 
     return JSONResponse(status_code=status.HTTP_409_CONFLICT, content=exc.detail.model_dump())
 
 
+@app.exception_handler(TooManyIdentifiersError)
+async def _too_many_identifiers_handler(
+    request: Request, exc: TooManyIdentifiersError
+) -> JSONResponse:
+    """ADR-128 decision 1: more than 5,000 identifiers is refused by name, with the figure, never
+    cut to the first 5,000 (rule 2)."""
+    return JSONResponse(
+        status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+        content={
+            "error": "too_many_identifiers",
+            "cap": MAX_IDENTIFIERS,
+            "received": exc.received,
+            "message": (
+                f"{exc.received:,} identifiers were given; one request reads at most "
+                f"{MAX_IDENTIFIERS:,}. Nothing was added. Split the list and add it in parts."
+            ),
+        },
+    )
+
+
 @app.exception_handler(NothingToBranchError)
 async def _nothing_to_branch_handler(request: Request, exc: NothingToBranchError) -> JSONResponse:
     """One answer whether the chosen nodes are hidden from the caller or do not exist (ADR-084)."""
@@ -1680,6 +1760,28 @@ async def _recipe_rule_handler(request: Request, exc: RecipeRuleError) -> JSONRe
     return JSONResponse(status_code=422, content={"error": "recipe_rule", "problems": exc.problems})
 
 
+@app.exception_handler(RowKeyDefinitionChanged)
+async def _row_key_definition_changed_handler(
+    request: Request, exc: RowKeyDefinitionChanged
+) -> JSONResponse:
+    """ADR-127 decision 5: the recipe's `deduplicate` is not the one this case's kept keys were made
+    under. The cause is in words, with how many loads to revert and never which."""
+    return JSONResponse(
+        status_code=409,
+        content={"error": "deduplicate_changed", "loads": exc.loads, "message": str(exc)},
+    )
+
+
+@app.exception_handler(RowKeyRunInProgress)
+async def _row_key_run_in_progress_handler(
+    request: Request, exc: RowKeyRunInProgress
+) -> JSONResponse:
+    """ADR-127 decision 5: another run of this recipe into this case is still loading."""
+    return JSONResponse(
+        status_code=409, content={"error": "run_in_progress", "message": str(exc)}
+    )
+
+
 @app.exception_handler(NotDocumentsError)
 async def _not_documents_handler(request: Request, exc: NotDocumentsError) -> JSONResponse:
     """ADR-092 Amendment 1: the events on this link carry no text, so none is a document."""
@@ -1776,6 +1878,16 @@ async def _resolution_link_handler(request: Request, exc: ResolutionLinkError) -
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={"error": "resolution_link", "detail": str(exc)},
+    )
+
+
+@app.exception_handler(CaseBriefError)
+async def _case_brief_error_handler(request: Request, exc: CaseBriefError) -> JSONResponse:
+    """ADR-128 decision 3: each refusal of the brief carries its own status and code and a sentence
+    the Glass shows as given. An attachment that does not exist and one the person may not read are
+    one refusal, in one body (`AttachmentNotFoundError`)."""
+    return JSONResponse(
+        status_code=exc.status_code, content={"error": exc.error, "detail": str(exc)}
     )
 
 
@@ -1979,15 +2091,23 @@ async def _no_documents_handler(request: Request, exc: NoDocumentsError) -> JSON
     )
 
 
+@app.exception_handler(CouldNotExpress)
+async def _could_not_express_handler(request: Request, exc: CouldNotExpress) -> JSONResponse:
+    """ADR-129 decision 2: a question, or the model's answer to it, that cannot be drawn as a
+    pattern in the case's vocabulary. The panel says it could not express the question."""
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, content=exc.body().model_dump()
+    )
+
+
 @app.exception_handler(QuestionsTooLargeError)
 async def _questions_too_large_handler(
     request: Request, exc: QuestionsTooLargeError
 ) -> JSONResponse:
-    """Rule 2: documents longer than the model reads at once are refused, never cut."""
-    return JSONResponse(
-        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-        content={"error": "documents_too_large", "would_be": exc.would_be, "limit": exc.limit},
-    )
+    """Rule 2 (ADR-129 decision 1): the documents and the evidence brief, together longer than the
+    model reads at once, are refused with the typed `limit_exceeded` and its three options, never
+    cut. It was a 413 `documents_too_large` without the options."""
+    return JSONResponse(status_code=status.HTTP_409_CONFLICT, content=exc.body().model_dump())
 
 
 @app.exception_handler(RecogniserUnavailableError)
@@ -2086,6 +2206,16 @@ async def _studio_recipe_not_found_handler(
     )
 
 
+@app.exception_handler(SourceDeclarationsInvalidError)
+async def _source_declarations_invalid_handler(
+    request: Request, exc: SourceDeclarationsInvalidError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"error": "source_declarations_invalid", "detail": str(exc)},
+    )
+
+
 @app.exception_handler(StudioRecipeNotADraftError)
 async def _studio_recipe_not_a_draft_handler(
     request: Request, exc: StudioRecipeNotADraftError
@@ -2165,6 +2295,25 @@ async def _ontology_error_handler(request: Request, exc: OntologyError) -> JSONR
     )
 
 
+@app.exception_handler(PatternConditionRefused)
+async def _pattern_condition_refused_handler(
+    request: Request, exc: PatternConditionRefused
+) -> JSONResponse:
+    """ADR-121: a condition on a pattern node the ontology does not allow (an unindexed or
+    `sensitivity: high` property, one the type does not declare) is refused by name, typed, before
+    anything is counted, run or saved; never a bare 500 and never quietly dropped."""
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "error": "pattern_condition_refused",
+            "detail": exc.detail,
+            "var": exc.var,
+            "property": exc.property_name,
+            "reason": exc.reason,
+        },
+    )
+
+
 @app.exception_handler(ConnectorNotAvailableError)
 async def _connector_not_available_handler(
     request: Request, exc: ConnectorNotAvailableError
@@ -2232,6 +2381,10 @@ class CreateInvestigationInput(BaseModel):
     #: ADR-099: the datasets the case reads, all of the creator's unit. Left out, the case gets a
     #: new dataset of its own, named after it, for the data that will be added to it.
     dataset_ids: list[str] | None = None
+    #: ADR-126: the domain packs the case carries. Left out, the column stays NULL, "never chosen",
+    #: which reads as the POLE core model; a list, empty included, is a choice. An unknown pack is a
+    #: 422.
+    domains: list[DomainPack] | None = None
 
 
 @app.post(
@@ -2255,7 +2408,9 @@ async def create_investigation(
         own = {d.id for d in await datasets.list_for_unit(principal.org_unit)}
         if not set(named) <= own:
             raise DatasetRefusedError("not every dataset is one of this unit's")
-    investigation = await investigations.create(principal, name=name)
+    investigation = await investigations.create(
+        principal, name=name, domains=body.domains if body is not None else None
+    )
     if not named:
         named = [(await datasets.create(principal, investigation.name, suffix_if_taken=True)).id]
     await datasets.set_for_case(investigation.id, named, principal)
@@ -2338,6 +2493,9 @@ class InvestigationListing(BaseModel):
     created_at: datetime
     created_by: str
     branched_from: str | None = None
+    #: ADR-126: the case's domain packs, which every reader of the case may see: it says what kind
+    #: of case it is, never what it holds.
+    domains: list[DomainPack] = Field(default_factory=list)
     #: ADR-084: this account has closed the case's tab. A flag per account, so it says nothing about
     #: anyone else's view of the same case.
     tab_hidden: bool = False
@@ -2360,6 +2518,7 @@ async def list_investigations(
             created_at=case.created_at,
             created_by=case.created_by,
             branched_from=case.branched_from,
+            domains=case.domains,
             tab_hidden=case.id in hidden,
             datasets=[d.name for d in reads],
             dataset_ids=[d.id for d in reads],
@@ -2394,15 +2553,28 @@ async def set_tab_state(
     )
 
 
-class RenameInput(BaseModel):
-    name: str
+class CaseChangeInput(BaseModel):
+    """What an Author changes on a case: its name, its domain packs, or both, at least one given
+    (ADR-126 decision 1; it replaces `RenameInput`). An empty `domains` is a change, the POLE core
+    model; a field left out, or null, is left alone."""
+
+    name: str | None = None
+    domains: list[DomainPack] | None = None
 
     @field_validator("name")
     @classmethod
-    def _not_blank(cls, value: str) -> str:
+    def _not_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         if not value.strip():
             raise ValueError("a case needs a name")
         return value.strip()
+
+    @model_validator(mode="after")
+    def _something_to_change(self) -> CaseChangeInput:
+        if self.name is None and self.domains is None:
+            raise ValueError("give a new name, new domain packs, or both")
+        return self
 
 
 @app.patch(
@@ -2410,20 +2582,41 @@ class RenameInput(BaseModel):
 )
 async def rename_investigation(
     investigation: InvestigationAuthorDep,
-    body: RenameInput,
+    body: CaseChangeInput,
     principal: PrincipalDep,
     investigations: InvestigationsDep,
     audit: AuditDep,
 ) -> Investigation:
-    await investigations.rename(investigation.id, body.name, by=principal)
-    await audit.record(
-        principal=principal,
-        action="rename_investigation",
-        investigation_id=investigation.id,
-        resolved_query={"name": body.name},
-        result_cardinality=1,
-    )
-    return investigation.model_copy(update={"name": body.name})
+    """Change the case: its name, its domain packs, or both. The handler keeps the name it had when
+    a rename was all it did, which `test_route_rights.py`'s table is keyed by. Each change is
+    audited on its own: a rename as `rename_investigation`, a change of packs as
+    `set_case_domains` with the packs before and after. The response carries the case's name and
+    packs as they now stand."""
+    # One store call, one transaction: a case removed between two separate writes would leave a
+    # rename committed and audited beside packs that were refused.
+    after = None if body.domains is None else sorted(set(body.domains))
+    await investigations.change(investigation.id, name=body.name, domains=after, by=principal)
+    changed = investigation
+    if body.name is not None:
+        await audit.record(
+            principal=principal,
+            action="rename_investigation",
+            investigation_id=investigation.id,
+            resolved_query={"name": body.name},
+            result_cardinality=1,
+        )
+        changed = changed.model_copy(update={"name": body.name})
+    if after is not None:
+        await audit.record(
+            principal=principal,
+            action="set_case_domains",
+            investigation_id=investigation.id,
+            # The stored value, so a never-chosen case (None) is not reported as a choice of POLE.
+            resolved_query={"before": investigation.domains_to_inherit(), "after": after},
+            result_cardinality=1,
+        )
+        changed = changed.model_copy(update={"domains": after, "domains_chosen": True})
+    return changed
 
 
 @app.delete(
@@ -2603,6 +2796,18 @@ async def get_investigation(
     return investigation
 
 
+def _narrowed(parent: Interval | None, asked: Interval | None) -> Interval | None:
+    """The window a new branch records: the one asked for, held inside the parent branch's own
+    (both ends included; an end of `None` runs on without end). Neither: none."""
+    if parent is None or asked is None:
+        return parent if asked is None else asked
+    ends = [t for t in (parent.valid_to, asked.valid_to) if t is not None]
+    return Interval(
+        valid_from=max(parent.valid_from, asked.valid_from),
+        valid_to=min(ends) if ends else None,
+    )
+
+
 class BranchRequest(BaseModel):
     """ADR-084. `node_ids` absent: fork the whole working set, as the cap breach's "branch" option
     always did. Present: fork only those nodes and the links between them (an empty list is a
@@ -2610,6 +2815,21 @@ class BranchRequest(BaseModel):
 
     node_ids: list[NodeId] | None = Field(default=None, max_length=50_000)
     name: str | None = None
+    #: ADR-128 decision 2 (B3, select what is lit): the brushed window, both ends inside it. With
+    #: it, the branch holds only the links with an event in the window and the nodes they touch,
+    #: derived here on the server and kept only where `node_ids` names a node. It needs a choice of
+    #: nodes: the Glass sends the window with the lit selection, never alone.
+    window: Interval | None = None
+
+    @model_validator(mode="after")
+    def _a_window_comes_with_a_choice_and_runs_forwards(self) -> BranchRequest:
+        if self.window is None:
+            return self
+        if self.node_ids is None:
+            raise ValueError("a window is sent with the nodes chosen, not alone")
+        if self.window.valid_to is not None and self.window.valid_from > self.window.valid_to:
+            raise ValueError("the window ends before it starts")
+        return self
 
 
 @app.post(
@@ -2626,6 +2846,7 @@ async def branch_investigation(
     audit: AuditDep,
     valkey: Annotated[Valkey, Depends(get_valkey)],
     datasets: DatasetsDep,
+    analytics: AnalyticsDep,
     body: BranchRequest | None = None,
 ) -> Investigation:
     # `03_CONDUIT_MIDDLEWARE.md` §3.1: "fork the working set into a new
@@ -2634,31 +2855,74 @@ async def branch_investigation(
     # principal against the *source* investigation's `owning_unit`; the
     # new investigation gets its own, from this principal, not inherited.
     node_ids = body.node_ids if body is not None else None
+    window = body.window if body is not None else None
     source_name = investigation.name or DEFAULT_CASE_NAME
     # ADR-097 (design review item 3): a branch is named for what it is, not for a selection.
     name = f"Branch of {source_name}"
-    if node_ids is not None:
+    lit_nodes: list[Node] = []
+    lit_links: list[Edge] = []
+    if window is not None:
+        # ADR-128 decision 2: what is lit is derived here, never taken from the request. The links
+        # with an event in the window come from the analytics port in its own access-filtered query
+        # for this principal, and the working set's own projection decides which of them, and which
+        # of the named nodes, this principal may see. Asked first, and before the case exists, so
+        # that an empty slice (`NothingToBranchError`) or one past the cap (`LimitExceededError`)
+        # leaves no case behind.
+        assert node_ids is not None  # `BranchRequest` refuses a window without a choice
+        lit = await analytics.first_seen(
+            FirstSeenRequest(
+                filter=await _case_event_filter(
+                    EventFilter(investigation_scope=investigation.id, window=window),
+                    principal,
+                    investigations,
+                    audit,
+                    working_set,
+                )
+            ),
+            principal,
+        )
+        lit_nodes, lit_links = await working_set.branch_lit_contents(
+            investigation.id, principal, node_ids, lit.edges.keys()
+        )
+        name = (
+            f"Branch of {source_name} ({len(lit_nodes)} lit "
+            f"{'node' if len(lit_nodes) == 1 else 'nodes'})"
+        )
+    elif node_ids is not None:
         # Asked first, and before the case exists, so that a choice with nothing visible in it
         # (`NothingToBranchError`, a 422) leaves no empty case behind.
         chosen, _, _ = await working_set.branch_contents(investigation.id, principal, node_ids)
         name = f"Branch of {source_name} ({len(chosen)} {'node' if len(chosen) == 1 else 'nodes'})"
     if body is not None and body.name is not None and body.name.strip():
         name = body.name.strip()
+    # ADR-128 decision 2: a branch made from what is lit records its window, so its timeline holds
+    # only the events inside it; a branch of a windowed case keeps that window (intersected with its
+    # own, if it has one), so it does not widen again. A branch of an ordinary case records none.
+    held_window = _narrowed(investigation.branch_window, window)
     new_investigation = await investigations.create(
-        principal, name=name, branched_from=investigation.id
+        principal,
+        name=name,
+        branched_from=investigation.id,
+        domains=investigation.domains_to_inherit(),
+        **({"branch_window": held_window} if held_window is not None else {}),
     )
     # ADR-099: a branch reads what its parent reads.
     await datasets.copy_case(investigation.id, new_investigation.id)
-    outcome = await working_set.branch(
-        investigation.id, new_investigation.id, principal, node_ids=node_ids
-    )
+    if window is not None:
+        outcome = await working_set.branch_add(
+            new_investigation.id, lit_nodes, lit_links, principal
+        )
+    else:
+        outcome = await working_set.branch(
+            investigation.id, new_investigation.id, principal, node_ids=node_ids
+        )
     await publish_delta(valkey, new_investigation.id, outcome.delta)
     await _record_history_step(
         working_set,
         history,
         new_investigation.id,
         seq=outcome.delta.seq,
-        label=f"Branched from {investigation.id}",
+        label=BRANCHED,
         principal=principal,
     )
     await audit.record(
@@ -2668,6 +2932,73 @@ async def branch_investigation(
         resolved_query={
             "new_investigation_id": new_investigation.id,
             **({"node_ids": list(node_ids)} if node_ids is not None else {}),
+            **({"window": window.model_dump(mode="json")} if window is not None else {}),
+        },
+        result_cardinality=len(outcome.delta.nodes) + len(outcome.delta.edges),
+    )
+    return new_investigation
+
+
+class BranchByFilterRequest(BranchFilter):
+    """ADR-124 decision 2, "open a filtered branch": the reader's own view, narrowed to entity
+    types, a date window, or both (`BranchFilter` has the rules). `name` is the new case's name;
+    blank means the default a branch has."""
+
+    name: str | None = None
+
+
+@app.post(
+    "/v1/investigations/{investigation_id}/branch-by-filter",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_right(Right.BRANCH_CASE))],
+)
+async def branch_investigation_by_filter(
+    investigation: InvestigationEditorDep,
+    body: BranchByFilterRequest,
+    principal: PrincipalDep,
+    investigations: InvestigationsDep,
+    working_set: WorkingSetDep,
+    history: HistoryDep,
+    audit: AuditDep,
+    valkey: Annotated[Valkey, Depends(get_valkey)],
+    datasets: DatasetsDep,
+) -> Investigation:
+    """Builds, on the server, a new case from the reader's own projected view narrowed by the filter
+    (ADR-124 decision 2), for a reader whose view a colleague's work has pushed past the cap. It is
+    created as `branch` creates one: the reader owns it, it records its origin, it takes its
+    parent's domain packs and datasets, and it records a history step. What it holds is asked first,
+    and before the case exists, so that an empty choice (`NothingToBranchError`, a 422, the same
+    answer for a type only hidden material holds as for one that does not exist) or a result still
+    past the cap (`limit_exceeded`, with the filtered figures, the reader's own) leaves no case
+    behind."""
+    nodes, edges = await working_set.branch_filtered_contents(investigation.id, principal, body)
+    name = f"Branch of {investigation.name or DEFAULT_CASE_NAME}"
+    if body.name is not None and body.name.strip():
+        name = body.name.strip()
+    new_investigation = await investigations.create(
+        principal,
+        name=name,
+        branched_from=investigation.id,
+        domains=investigation.domains_to_inherit(),
+    )
+    await datasets.copy_case(investigation.id, new_investigation.id)
+    outcome = await working_set.branch_add(new_investigation.id, nodes, edges, principal)
+    await publish_delta(valkey, new_investigation.id, outcome.delta)
+    await _record_history_step(
+        working_set,
+        history,
+        new_investigation.id,
+        seq=outcome.delta.seq,
+        label=BRANCHED,
+        principal=principal,
+    )
+    await audit.record(
+        principal=principal,
+        action="branch_by_filter",
+        investigation_id=investigation.id,
+        resolved_query={
+            "new_investigation_id": new_investigation.id,
+            "filter": body.model_dump(mode="json", exclude={"name"}),
         },
         result_cardinality=len(outcome.delta.nodes) + len(outcome.delta.edges),
     )
@@ -2675,21 +3006,47 @@ async def branch_investigation(
 
 
 async def _record_history_step(
-    working_set: WorkingSetService,
+    working_set: WorkingSetService | None,
     history: InvestigationHistoryStore,
     investigation_id: str,
     *,
     seq: int,
     label: str,
     principal: Principal,
+    snapshot: bool = True,
 ) -> HistoryStep:
     """Called after every mutation that changes working-set membership
     (the "named-step history with restore" capability) — full
     current membership, not just the mutation's own delta, so the step is
-    independently restorable (`history.py`'s module docstring)."""
-    nodes, edges = await working_set.current_membership(investigation_id)
+    independently restorable (`history.py`'s module docstring).
+
+    `snapshot=False` is for a step that is not a state of the canvas (ADR-128: an edit to the case
+    brief): no working set is read, the step holds no nodes or links, and its label is in
+    `NOT_RESTORABLE`, so it is listed and never restored."""
+    nodes: list[Node] = []
+    edges: list[Edge] = []
+    if snapshot:
+        assert working_set is not None
+        nodes, edges = await working_set.current_membership(investigation_id)
     return await history.record_step(
         investigation_id, seq=seq, label=label, created_by=principal.id, nodes=nodes, edges=edges
+    )
+
+
+async def _record_brief_edit(
+    history: InvestigationHistoryStore, investigation_id: str, principal: Principal
+) -> None:
+    """One History step for an edit to the case brief (ADR-128 decision 3): fixed text, no snapshot.
+    It takes the case's latest sequence number rather than a new one, so the change stream's own
+    count, which its clients hold, is not moved by something that is not a canvas change."""
+    await _record_history_step(
+        None,
+        history,
+        investigation_id,
+        seq=await history.last_seq(investigation_id),
+        label=BRIEF_EDITED,
+        principal=principal,
+        snapshot=False,
     )
 
 
@@ -2730,7 +3087,7 @@ async def seed(
         history,
         investigation.id,
         seq=outcome.delta.seq,
-        label=f"Seeded {len(outcome.delta.nodes)} node(s)",
+        label=SEEDED,
         principal=principal,
     )
     await audit.record(
@@ -2763,9 +3120,7 @@ async def expand(
         history,
         investigation.id,
         seq=outcome.delta.seq,
-        label=(
-            f"Expanded {len(outcome.delta.nodes)} node(s) from {len(body.request.node_ids)} seed(s)"
-        ),
+        label=EXPANDED,
         principal=principal,
     )
     await audit.record(
@@ -2804,12 +3159,7 @@ async def links_among_route(
         history,
         investigation.id,
         seq=outcome.delta.seq,
-        label=(
-            f"Showed {outcome.added} link(s) among the nodes in view"
-            if outcome.degree == 1
-            else f"Showed the routes within {outcome.degree} degrees among the selected nodes: "
-            f"{outcome.added} link(s), {outcome.added_nodes} node(s)"
-        ),
+        label=LINKS_AMONG,
         principal=principal,
     )
     await audit.record(
@@ -2844,6 +3194,74 @@ async def expand_preview(
     return preview
 
 
+@app.post(
+    "/v1/investigations/{investigation_id}/working-set/add-by-identifiers",
+    dependencies=[Depends(require_right(Right.INVESTIGATE))],
+)
+async def add_by_identifiers_route(
+    investigation: InvestigationEditorDep,
+    body: AddByIdentifiersRequest,
+    principal: PrincipalDep,
+    graph: GraphDep,
+    working_set: WorkingSetDep,
+    history: HistoryDep,
+    audit: AuditDep,
+    valkey: Annotated[Valkey, Depends(get_valkey)],
+) -> AddByIdentifiersResponse:
+    """ADR-128 decision 1 (B2): a pasted or uploaded list of identifiers, counted (`confirm: false`)
+    or added (`true`). Each is read by shape, normalised by its Knowledge Adapter and found through
+    the access-filtered `find_node`; the count is read, found, matched nothing you can see,
+    repeated. An identifier that does not exist and one the analyst may not see are one figure, one
+    lookup and one audit entry (counts only), so the route is not a membership test (rule 3). The
+    add goes through the working set's own `seed`, so past the cap it is the typed
+    `limit_exceeded` and nothing is added. More than 5,000 identifiers is refused by name, never
+    truncated. Editor, since it adds to the case's working set."""
+    try:
+        resolution = await resolve_identifiers(graph, body.identifiers, principal)
+    except TooManyIdentifiersError as exc:
+        await audit.record(
+            principal=principal,
+            action="add_by_identifiers",
+            investigation_id=investigation.id,
+            resolved_query={
+                "read": exc.received,
+                "refused": True,
+                "cap": MAX_IDENTIFIERS,
+                "confirm": body.confirm,
+                "with_links": body.with_links,
+            },
+            result_cardinality=0,
+        )
+        raise
+    counts = resolution.counts
+    outcome = None
+    if body.confirm:
+        outcome = await working_set.add_by_identifiers(
+            investigation.id, resolution.nodes, principal, with_links=body.with_links
+        )
+        await publish_delta(valkey, investigation.id, outcome.delta)
+        await _record_history_step(
+            working_set,
+            history,
+            investigation.id,
+            seq=outcome.delta.seq,
+            label=SEEDED,
+            principal=principal,
+        )
+    await audit.record(
+        principal=principal,
+        action="add_by_identifiers",
+        investigation_id=investigation.id,
+        resolved_query={
+            **counts.model_dump(),
+            "confirm": body.confirm,
+            "with_links": body.with_links,
+        },
+        result_cardinality=len(resolution.nodes),
+    )
+    return AddByIdentifiersResponse(counts=counts, added=outcome)
+
+
 @app.delete(
     "/v1/investigations/{investigation_id}/nodes",
     dependencies=[Depends(require_right(Right.INVESTIGATE))],
@@ -2857,16 +3275,15 @@ async def remove_nodes(
     audit: AuditDep,
     valkey: Annotated[Valkey, Depends(get_valkey)],
 ) -> dict[str, int]:
-    seq = await working_set.remove(investigation.id, body.node_ids)
-    await publish_delta(
-        valkey, investigation.id, DeltaRemove(seq=seq, node_ids=list(body.node_ids))
-    )
+    delta = await working_set.remove(investigation.id, body.node_ids, principal)
+    seq = delta.seq
+    await publish_delta(valkey, investigation.id, delta)
     await _record_history_step(
         working_set,
         history,
         investigation.id,
         seq=seq,
-        label=f"Removed {len(body.node_ids)} node(s)",
+        label=REMOVED,
         principal=principal,
     )
     await audit.record(
@@ -2914,17 +3331,17 @@ async def set_resolution_threshold_route(
     working_set: WorkingSetDep,
     audit: AuditDep,
     valkey: Annotated[Valkey, Depends(get_valkey)],
-) -> DeltaReproject:
-    delta = await resolution_module.set_threshold(working_set, investigation.id, body, principal)
-    await publish_delta(valkey, investigation.id, delta)
+) -> ResolutionOutcome:
+    outcome = await resolution_module.set_threshold(working_set, investigation.id, body, principal)
+    await publish_delta(valkey, investigation.id, outcome.delta)
     await audit.record(
         principal=principal,
         action="set_resolution_threshold",
         investigation_id=investigation.id,
         resolved_query={"threshold": body.threshold},
-        result_cardinality=delta.affected,
+        result_cardinality=outcome.affected,
     )
-    return delta
+    return outcome
 
 
 def _clean_reason(reason: str | None) -> str | None:
@@ -2952,15 +3369,15 @@ async def link_resolution_route(
     patterns_store: PatternsStoreDep,
     alerts_store: AlertsStoreDep,
     principal_resolver: PrincipalResolverDep,
-) -> DeltaReproject:
+) -> ResolutionOutcome:
     """Phase 7 Stage 6c: a manual link is a `SAME_AS` write that can grow a saved pattern's own
     match set (`06_DECISIONS.md` ADR-037's own change-stream amendment names manual assertion as
     one of its three producers) — evaluated synchronously here, the identical shape and the
     identical `run_studio_recipe`'s own docstring reasoning for why only this principal's own
     hotlists/monitors can fire from it. `split_resolution_route` below does not call evaluation at
     all — a `NOT_SAME_AS` write can only shrink a match set, never grow one."""
-    delta, entry = await resolution_module.link(working_set, investigation.id, body, principal)
-    await publish_delta(valkey, investigation.id, delta)
+    outcome, entry = await resolution_module.link(working_set, investigation.id, body, principal)
+    await publish_delta(valkey, investigation.id, outcome.delta)
     if entry is not None:
         await _evaluate_watches_best_effort(
             entry,
@@ -2983,10 +3400,10 @@ async def link_resolution_route(
         action="manual_link",
         investigation_id=investigation.id,
         resolved_query={"node_a": body.node_a, "node_b": body.node_b},
-        result_cardinality=delta.affected,
+        result_cardinality=outcome.affected,
         justification=_clean_reason(body.reason),
     )
-    return delta
+    return outcome
 
 
 @app.post(
@@ -3000,18 +3417,18 @@ async def split_resolution_route(
     working_set: WorkingSetDep,
     audit: AuditDep,
     valkey: Annotated[Valkey, Depends(get_valkey)],
-) -> DeltaReproject:
-    delta, _entry = await resolution_module.split(working_set, investigation.id, body, principal)
-    await publish_delta(valkey, investigation.id, delta)
+) -> ResolutionOutcome:
+    outcome, _entry = await resolution_module.split(working_set, investigation.id, body, principal)
+    await publish_delta(valkey, investigation.id, outcome.delta)
     await audit.record(
         principal=principal,
         action="manual_split",
         investigation_id=investigation.id,
         resolved_query={"node_a": body.node_a, "node_b": body.node_b},
-        result_cardinality=delta.affected,
+        result_cardinality=outcome.affected,
         justification=_clean_reason(body.reason),
     )
-    return delta
+    return outcome
 
 
 @app.get(
@@ -3414,11 +3831,17 @@ async def restore_history_step(
     valkey: Annotated[Valkey, Depends(get_valkey)],
 ) -> DeltaSnapshot:
     step = await history.get_step(investigation.id, step_id)
+    if step.label in NOT_RESTORABLE:
+        # ADR-128: a brief edit holds no canvas snapshot; restoring it would empty the canvas.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail={"error": "step_not_restorable"}
+        )
     # `WorkingSetService.restore` re-projects `step`'s stored (unfiltered)
     # bodies against `principal` fresh — never the visibility `step` was
     # recorded with (`history.py`'s module docstring).
-    snapshot = await working_set.restore(investigation.id, step.nodes, step.edges, principal)
-    await publish_delta(valkey, investigation.id, snapshot)
+    restored = await working_set.restore(investigation.id, step.nodes, step.edges, principal)
+    snapshot = restored.response
+    await publish_delta(valkey, investigation.id, restored.published)
     await audit.record(
         principal=principal,
         action="restore_history_step",
@@ -3723,7 +4146,7 @@ async def explore_starter_run_route(
         history,
         investigation.id,
         seq=outcome.delta.seq,
-        label=f"Ran a starter question: {len(outcome.delta.nodes)} node(s)",
+        label=STARTER_QUESTION,
         principal=principal,
     )
     await audit.record(
@@ -3808,7 +4231,7 @@ async def shared_pair_canvas_route(
         history,
         investigation.id,
         seq=outcome.delta.seq,
-        label=f"Showed two who share contacts: {len(outcome.delta.nodes)} node(s)",
+        label=SHARED_CONTACTS,
         principal=principal,
     )
     await audit.record(
@@ -3854,7 +4277,9 @@ async def patterns_preview_route(
     principal: PrincipalDep,
     graph: GraphDep,
     audit: AuditDep,
+    ontology: OntologyDep,
 ) -> PatternPreview:
+    check_pattern_conditions(pattern, ontology)
     preview = await preview_pattern(pattern, graph=graph, principal=principal)
     await audit.record(
         principal=principal,
@@ -3876,7 +4301,9 @@ async def patterns_run_route(
     graph: GraphDep,
     jobs: JobsDep,
     audit: AuditDep,
+    ontology: OntologyDep,
 ) -> PatternRunAccepted:
+    check_pattern_conditions(pattern, ontology)
     accepted = await run_pattern(pattern, graph=graph, principal=principal, jobs=jobs)
     await audit.record(
         principal=principal,
@@ -3885,6 +4312,43 @@ async def patterns_run_route(
         result_cardinality=accepted.matched_count or 0,
     )
     return accepted
+
+
+@app.post(
+    "/v1/investigations/{investigation_id}/patterns/ask",
+    dependencies=[Depends(require_right(Right.ASK_MODEL))],
+)
+async def ask_to_search_route(
+    investigation: InvestigationViewerDep,
+    body: AskToSearchRequest,
+    principal: PrincipalDep,
+    pattern_ask: PatternAskDep,
+    audit: AuditDep,
+    ontology: OntologyDep,
+) -> PatternProposal:
+    """ADR-129 decision 2: the model is given the case's vocabulary and the question and proposes a
+    pattern, validated against the ontology and ADR-121; the response is the pattern, a one-line
+    explanation and the preview's own count. Viewer, as the preview is: it writes nothing, and
+    running the pattern is the existing run route's, counted first (rules 3 and 4)."""
+    try:
+        proposal = await pattern_ask.ask(investigation.id, body, principal, ontology)
+    except CouldNotExpress as refused:
+        await audit.record(
+            principal=principal,
+            action="patterns_ask",
+            investigation_id=investigation.id,
+            resolved_query={"refused": refused.reason},
+            result_cardinality=0,
+        )
+        raise
+    await audit.record(
+        principal=principal,
+        action="patterns_ask",
+        investigation_id=investigation.id,
+        resolved_query=proposal.pattern.model_dump(mode="json"),
+        result_cardinality=proposal.estimated_count,
+    )
+    return proposal
 
 
 # --- saved patterns (Phase 7 Stage 4, 06_DECISIONS.md ADR-032/036/040) --------
@@ -3905,11 +4369,16 @@ async def patterns_save_route(
     principal: PrincipalDep,
     patterns_store: PatternsStoreDep,
     audit: AuditDep,
+    ontology: OntologyDep,
 ) -> SavedPattern:
-    """A `pattern_id` the caller does not own raises `PatternStore`'s own `PatternNotFoundError`
+    """A condition the ontology refuses is refused here, before it is stored (ADR-121): a rule that
+    replays the saved pattern later must not hold what no route would run.
+
+    A `pattern_id` the caller does not own raises `PatternStore`'s own `PatternNotFoundError`
     (mapped to 404 by `_pattern_not_found_handler`) — the same existence-leak collapse
     `get_authorized_investigation` already uses, here inside `PatternStore.save` itself rather
     than a separate route-level gate, since save and the ownership check are one operation."""
+    check_pattern_conditions(body.definition, ontology)
     saved = await patterns_store.save(
         principal,
         pattern_id=body.pattern_id,
@@ -4067,7 +4536,7 @@ async def change_link_route(
     investigations: InvestigationsDep,
     audit: AuditDep,
     valkey: Annotated[Valkey, Depends(get_valkey)],
-) -> LinkChangeResult:
+) -> LinkChangeResponse:
     """Change a link's type or details (ADR-080): a supersede, with a required reason, kept in the
     link's history and in the audit stream with the old and new values. The old link is kept in
     the store and replaced in the working set; its notes move to the new one.
@@ -4096,7 +4565,7 @@ async def change_link_route(
         result_cardinality=1,
         justification=result.change.reason,
     )
-    return result
+    return result.to_response(principal)
 
 
 # --- relationship types proposed by analysts (ADR-090) ------------------------------------
@@ -4508,13 +4977,12 @@ async def set_entity_picture_route(
     request: Request,
     principal: PrincipalDep,
     pictures: EntityPicturesDep,
-    audit: AuditDep,
     valkey: Annotated[Valkey, Depends(get_valkey)],
     name: str = Query(min_length=1),
     classification: str = Query(min_length=1),
     legal_basis: str = Query(min_length=1),
     handling_code: str = Query(default="P", min_length=1),
-) -> PictureSetResult:
+) -> PictureSetResponse:
     """One entity's own picture (ADR-105): an image Document that `DEPICTS` it, added as any file
     is (a marking the person could read and a legal basis), replacing the picture they could see
     before, which is kept. Audited with the name, size, marking and legal basis."""
@@ -4541,26 +5009,21 @@ async def set_entity_picture_route(
         originator=principal.org_unit,
         owning_unit=principal.org_unit,
     )
+    # The service audits `set_entity_picture` itself (ADR-127 Amendment 23), so the seed's path
+    # writes the same entry.
     result = await pictures.set(
-        investigation.id, node_id, principal, name=filename, data=bytes(data), handling=handling
+        investigation.id,
+        node_id,
+        principal,
+        name=filename,
+        data=bytes(data),
+        handling=handling,
+        legal_basis=legal_basis,
     )
     for delta in result.deltas:
         await publish_delta(valkey, investigation.id, delta)
-    await audit.record(
-        principal=principal,
-        action="set_entity_picture",
-        investigation_id=investigation.id,
-        resolved_query={
-            "node_id": node_id,
-            "document_id": result.document_id,
-            "name": filename,
-            "size": len(data),
-            "classification": classification,
-            "legal_basis": legal_basis,
-        },
-        result_cardinality=1,
-    )
-    return result
+    response = result.to_response(principal)
+    return response
 
 
 @app.delete(
@@ -4574,7 +5037,7 @@ async def remove_entity_picture_route(
     pictures: EntityPicturesDep,
     audit: AuditDep,
     valkey: Annotated[Valkey, Depends(get_valkey)],
-) -> DeltaReplaceEdge:
+) -> DeltaReplaceEdgeSent:
     """The entity goes back to its type's picture (ADR-105); its own is kept, no longer shown."""
     delta = await pictures.remove(investigation.id, node_id, principal)
     await publish_delta(valkey, investigation.id, delta)
@@ -4585,7 +5048,7 @@ async def remove_entity_picture_route(
         resolved_query={"node_id": node_id},
         result_cardinality=1,
     )
-    return delta
+    return delta.to_sent(principal)
 
 
 @app.post(
@@ -4762,9 +5225,17 @@ async def ask_question_route(
     questions: QuestionsDep,
     audit: AuditDep,
 ) -> QuestionAnswer:
-    """Asks the model about the case's Documents the analyst can see (ADR-098 decision 4). What it
-    proposes is pending until a person accepts it."""
-    answer = await questions.ask(investigation.id, body.question, principal)
+    """Asks the model about the case's Documents and graph facts the analyst can see (ADR-098
+    decision 4, ADR-129 decision 1): the selection and one link around it, or the whole view. What
+    it proposes is pending until a person accepts it."""
+    answer = await questions.ask(
+        investigation.id,
+        body.question,
+        principal,
+        selected_node_ids=body.selected_node_ids,
+        selected_link_ids=body.selected_link_ids,
+        window=body.window,
+    )
     await audit.record(
         principal=principal,
         action="ask_question",
@@ -4930,6 +5401,207 @@ async def reject_email_candidate_route(
         result_cardinality=1,
     )
     return RejectedResponse()
+
+
+# --- the case brief (ADR-128 decision 3) --------------------------------------------------------
+#
+# Read at Viewer, every edit at Author (the case's own level, and the `share_case` right the Author
+# role holds, as the case's datasets and domain models are). The service's own docstring has the
+# rules: rule 3 (an attachment the reader may not read is not there at all), rule 5 (only
+# `set_brief_requirement_status_route` sets a status), rule 2 (a limit is refused by name).
+# Each edit is audited by id, never by text, and is a History step except an attach or a detach: a
+# step is shown to every reader, and one for an attachment they may not read would be a trace of it.
+
+
+@app.get(
+    "/v1/investigations/{investigation_id}/brief",
+    dependencies=[Depends(require_right(Right.INVESTIGATE))],
+)
+async def get_case_brief_route(
+    investigation: InvestigationViewerDep,
+    principal: PrincipalDep,
+    case_brief: CaseBriefDep,
+) -> CaseBrief:
+    """The brief as this reader may read it. Not audited, like the other case reads here."""
+    return await case_brief.read(investigation.id, principal)
+
+
+@app.put(
+    "/v1/investigations/{investigation_id}/brief/priority",
+    dependencies=[Depends(require_right(Right.SHARE_CASE))],
+)
+async def set_brief_priority_route(
+    investigation: InvestigationAuthorDep,
+    body: BriefTextBody,
+    principal: PrincipalDep,
+    case_brief: CaseBriefDep,
+    history: HistoryDep,
+    audit: AuditDep,
+) -> CaseBrief:
+    brief = await case_brief.set_priority(investigation.id, principal, body.text)
+    await audit.record(
+        principal=principal,
+        action="case_brief_set_priority",
+        investigation_id=investigation.id,
+        resolved_query={},
+        result_cardinality=1,
+    )
+    await _record_brief_edit(history, investigation.id, principal)
+    return brief
+
+
+@app.post(
+    "/v1/investigations/{investigation_id}/brief/requirements",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_right(Right.SHARE_CASE))],
+)
+async def add_brief_requirement_route(
+    investigation: InvestigationAuthorDep,
+    body: BriefTextBody,
+    principal: PrincipalDep,
+    case_brief: CaseBriefDep,
+    history: HistoryDep,
+    audit: AuditDep,
+) -> CaseBrief:
+    brief = await case_brief.add_requirement(investigation.id, principal, body.text)
+    await audit.record(
+        principal=principal,
+        action="case_brief_add_requirement",
+        investigation_id=investigation.id,
+        resolved_query={"requirement_id": brief.requirements[-1].id},
+        result_cardinality=1,
+    )
+    await _record_brief_edit(history, investigation.id, principal)
+    return brief
+
+
+@app.put(
+    "/v1/investigations/{investigation_id}/brief/requirements/{requirement_id}",
+    dependencies=[Depends(require_right(Right.SHARE_CASE))],
+)
+async def edit_brief_requirement_route(
+    investigation: InvestigationAuthorDep,
+    requirement_id: str,
+    body: BriefTextBody,
+    principal: PrincipalDep,
+    case_brief: CaseBriefDep,
+    history: HistoryDep,
+    audit: AuditDep,
+) -> CaseBrief:
+    brief = await case_brief.edit_requirement(
+        investigation.id, requirement_id, principal, body.text
+    )
+    await audit.record(
+        principal=principal,
+        action="case_brief_edit_requirement",
+        investigation_id=investigation.id,
+        resolved_query={"requirement_id": requirement_id},
+        result_cardinality=1,
+    )
+    await _record_brief_edit(history, investigation.id, principal)
+    return brief
+
+
+@app.delete(
+    "/v1/investigations/{investigation_id}/brief/requirements/{requirement_id}",
+    dependencies=[Depends(require_right(Right.SHARE_CASE))],
+)
+async def remove_brief_requirement_route(
+    investigation: InvestigationAuthorDep,
+    requirement_id: str,
+    principal: PrincipalDep,
+    case_brief: CaseBriefDep,
+    history: HistoryDep,
+    audit: AuditDep,
+) -> CaseBrief:
+    brief = await case_brief.remove_requirement(investigation.id, requirement_id, principal)
+    await audit.record(
+        principal=principal,
+        action="case_brief_remove_requirement",
+        investigation_id=investigation.id,
+        resolved_query={"requirement_id": requirement_id},
+        result_cardinality=1,
+    )
+    await _record_brief_edit(history, investigation.id, principal)
+    return brief
+
+
+@app.put(
+    "/v1/investigations/{investigation_id}/brief/requirements/{requirement_id}/status",
+    dependencies=[Depends(require_right(Right.SHARE_CASE))],
+)
+async def set_brief_requirement_status_route(
+    investigation: InvestigationAuthorDep,
+    requirement_id: str,
+    body: BriefStatusBody,
+    principal: PrincipalDep,
+    case_brief: CaseBriefDep,
+    history: HistoryDep,
+    audit: AuditDep,
+) -> CaseBrief:
+    """Rule 5: the one route that marks a requirement answered, and it is a person's request. No
+    model path reaches it or the transition under it (`test_case_brief_status.py`)."""
+    brief = await case_brief.set_status(investigation.id, requirement_id, principal, body.status)
+    await audit.record(
+        principal=principal,
+        action="case_brief_set_status",
+        investigation_id=investigation.id,
+        resolved_query={"requirement_id": requirement_id, "status": body.status},
+        result_cardinality=1,
+    )
+    await _record_brief_edit(history, investigation.id, principal)
+    return brief
+
+
+@app.post(
+    "/v1/investigations/{investigation_id}/brief/requirements/{requirement_id}/attachments",
+    dependencies=[Depends(require_right(Right.SHARE_CASE))],
+)
+async def attach_to_brief_requirement_route(
+    investigation: InvestigationAuthorDep,
+    requirement_id: str,
+    body: BriefAttachmentBody,
+    principal: PrincipalDep,
+    case_brief: CaseBriefDep,
+    audit: AuditDep,
+) -> CaseBrief:
+    """No History step (see above): the audit records it, which no reader sees."""
+    brief = await case_brief.attach(investigation.id, requirement_id, principal, body.kind, body.id)
+    await audit.record(
+        principal=principal,
+        action="case_brief_attach",
+        investigation_id=investigation.id,
+        resolved_query={"requirement_id": requirement_id, "kind": body.kind, "id": body.id},
+        result_cardinality=1,
+    )
+    return brief
+
+
+@app.delete(
+    "/v1/investigations/{investigation_id}/brief/requirements/{requirement_id}"
+    "/attachments/{kind}/{attachment_id}",
+    dependencies=[Depends(require_right(Right.SHARE_CASE))],
+)
+async def detach_from_brief_requirement_route(
+    investigation: InvestigationAuthorDep,
+    requirement_id: str,
+    kind: AttachmentKind,
+    attachment_id: str,
+    principal: PrincipalDep,
+    case_brief: CaseBriefDep,
+    audit: AuditDep,
+) -> CaseBrief:
+    brief = await case_brief.detach(
+        investigation.id, requirement_id, principal, kind, attachment_id
+    )
+    await audit.record(
+        principal=principal,
+        action="case_brief_detach",
+        investigation_id=investigation.id,
+        resolved_query={"requirement_id": requirement_id, "kind": kind, "id": attachment_id},
+        result_cardinality=1,
+    )
+    return brief
 
 
 @app.get(
@@ -5134,7 +5806,7 @@ async def submit_export_route(
     Phase 8 Stage 4d. `ExportBlockedError`/`OverrideRequiredError`/`ComplianceRoleRequiredError`
     propagate to their own handlers above; a raised exception here means nothing was written to
     the ledger and no `ExportResult` — with its required `mark` — was ever constructed
-    (`services/api/export.py::submit_export`'s own docstring). `body` carries no `withheld_count`
+    (`services/api/export.py::submit_export`'s own docstring). `body` carries no `withheld`
     field at all — `submit_export` obtains it from `working_set` itself, never from the client."""
     result = await submit_export(
         investigation_id=investigation.id,
@@ -5226,10 +5898,13 @@ async def list_alerts_route(
     principal: PrincipalDep,
     alerts_store: AlertsStoreDep,
     graph: GraphDep,
+    hotlists_store: HotlistsStoreDep,
 ) -> AlertList:
     """ADR-099 Amendment 3: the alerts of the case's datasets, read as the case reads."""
     rows = await alerts_store.list_authorized(principal)
-    return AlertList(alerts=[await alert_to_view(a, principal, graph) for a in rows])
+    return AlertList(
+        alerts=[await alert_to_view(a, principal, graph, hotlists_store) for a in rows]
+    )
 
 
 @app.get(
@@ -5242,9 +5917,10 @@ async def get_alert_route(
     principal: PrincipalDep,
     alerts_store: AlertsStoreDep,
     graph: GraphDep,
+    hotlists_store: HotlistsStoreDep,
 ) -> AlertView:
     alert = await alerts_store.get_authorized(alert_id, principal)
-    return await alert_to_view(alert, principal, graph)
+    return await alert_to_view(alert, principal, graph, hotlists_store)
 
 
 @app.post(
@@ -5273,8 +5949,13 @@ async def jump_alert_route(
     branch still succeeds, simply unlinked, disclosed via `Investigation.branched_from` being
     `None` rather than silently pointed at a wrong investigation."""
     alert = await alerts_store.get_authorized(alert_id, principal)
+    # ADR-126: the packs are those of the route's own authorised case, never of
+    # `alert.investigation_id`, which the jumper is not authorised against and which may be None.
     branch = await investigations.create(
-        principal, name=f"Opened from alert {alert.id}", branched_from=alert.investigation_id
+        principal,
+        name=f"Opened from alert {alert.id}",
+        branched_from=alert.investigation_id,
+        domains=investigation.domains_to_inherit(),
     )
     # ADR-099: the new case reads the alert's dataset; with none, what the alert's case reads; with
     # neither, a dataset of its own.
@@ -5286,7 +5967,7 @@ async def jump_alert_route(
         own = await datasets.create(principal, branch.name, suffix_if_taken=True)
         await datasets.set_for_case(branch.id, [own.id], principal)
     principal = await scope_to_case(principal, branch.id, datasets)
-    nodes, unreadable = await fetch_jumpable_referents(alert, principal=principal, graph=graph)
+    nodes = await fetch_jumpable_referents(alert, principal=principal, graph=graph)
     outcome = await working_set.seed(branch.id, nodes, [], principal)
     await publish_delta(valkey, branch.id, outcome.delta)
     await _record_history_step(
@@ -5294,7 +5975,7 @@ async def jump_alert_route(
         history,
         branch.id,
         seq=outcome.delta.seq,
-        label=f"Opened from alert {alert.id}",
+        label=OPENED_FROM_ALERT,
         principal=principal,
     )
     await audit.record(
@@ -5304,9 +5985,7 @@ async def jump_alert_route(
         resolved_query={"alert_id": alert.id, "from_investigation_id": alert.investigation_id},
         result_cardinality=len(nodes),
     )
-    return AlertJumpResult(
-        investigation=branch, seeded_count=len(nodes), unreadable_count=unreadable
-    )
+    return AlertJumpResult(investigation=branch, seeded_count=len(nodes))
 
 
 # --- the pathfinder (Phase 7 Stage 5) -----------------------------------------
@@ -5762,9 +6441,11 @@ async def _case_event_filter(
     )
     ancestors = await visible_ancestors(investigations, case, principal)
     if not ancestors:
-        return with_inherited(event_filter, [], [])
+        return with_inherited(event_filter, [], [], window=None)
     _nodes, edges = await working_set.current_membership(case.id)
-    return with_inherited(event_filter, ancestors, [e.id for e in edges])
+    return with_inherited(
+        event_filter, ancestors, [e.id for e in edges], window=case.branch_window
+    )
 
 
 class GeometriesRequest(BaseModel):
@@ -5981,7 +6662,7 @@ _SITE_GRID_GEOMETRY_VERSION = 1
 #: fix looked applied, returned 200, and still wrote the record into the image's own code
 #: directory where the next rebuild discards it. Exactly the defect this round exists to remove,
 #: found one layer further in than the grep that started it.
-_RECIPES_REPO_ROOT = _PUBLISH_REPO_ROOT
+_RECIPES_REPO_ROOT = RECIPES_REPO_ROOT
 
 
 class ControlPointsRequest(BaseModel):
@@ -6493,6 +7174,8 @@ async def create_studio_recipe_draft(
     Connect's "pick a connector, point at the data" plus the three
     mandatory gate answers, which may still be incomplete
     (`StudioRecipeDraft.ready_for_profile` reports that, §2)."""
+    # ADR-127 decision 5: judged by shape at creation (no draft to read the source through yet).
+    _check_deduplicate(body.deduplicate, None)
     draft = await studio_recipes.create_draft(
         principal,
         label=body.label,
@@ -6500,6 +7183,7 @@ async def create_studio_recipe_draft(
         source_location=body.source_location,
         handling=_with_default_classification(body.handling, scheme),
         legal_basis=body.legal_basis,
+        deduplicate=body.deduplicate,
     )
     await audit.record(
         principal=principal,
@@ -6508,6 +7192,17 @@ async def create_studio_recipe_draft(
         result_cardinality=1,
     )
     return draft
+
+
+def _check_deduplicate(config: DeduplicateConfig | None, columns: list[str] | None) -> None:
+    """A `deduplicate` the source cannot support is refused at save, in words (422): see
+    `recipe_rules.deduplicate_problems`. An absent one, and one with an empty `key` (which clears
+    it), need no judging."""
+    if config is None or not config.key:
+        return
+    problems = deduplicate_problems(config, columns)
+    if problems:
+        raise RecipeRuleError(problems)
 
 
 @app.patch(
@@ -6526,7 +7221,26 @@ async def update_studio_recipe_draft(
     """Edits Connect's own fields on a draft still in progress — changing
     connector, source location, handling marking or legal basis before
     moving on. Rejects (409, via `StudioRecipeNotADraftError`) once the
-    recipe has left `draft` status."""
+    recipe has left `draft` status.
+
+    `deduplicate` (ADR-127 decision 5) is judged against the columns of the source it will be read
+    from (the body's location, else the draft's): each key names a source column, as a run reads
+    it. Absent leaves the draft's own; an empty `key` clears it."""
+    if body.deduplicate is not None and body.deduplicate.key:
+        location = body.source_location or recipe.source_location
+        _check_deduplicate(
+            body.deduplicate,
+            source_column_names(
+                recipe.model_copy(
+                    update={
+                        "source_location": location,
+                        "connector_profile": body.connector_profile,
+                    }
+                )
+            )
+            if location
+            else None,
+        )
     updated = await studio_recipes.update_draft(
         recipe.recipe_id,
         principal,
@@ -6535,6 +7249,7 @@ async def update_studio_recipe_draft(
         source_location=body.source_location,
         handling=_with_default_classification(body.handling, scheme),
         legal_basis=body.legal_basis,
+        deduplicate=body.deduplicate,
     )
     await audit.record(
         principal=principal,
@@ -6720,7 +7435,28 @@ async def update_studio_recipe_row_template(
     for edge in body.row_template.edges:
         validate_handling_tightens(baseline, edge.handling, scheme)
     # ADR-081 step D: refused at save, naming each problem; refused again when it runs.
-    check_recipe_rules(body.row_template, ontology)
+    # ADR-127 decision 3: a marking bound to a column names a column the source has, and a bound
+    # unit needs the source's declared units.
+    binds_handling = any(
+        handling_bindings(e.handling) for e in template_elements(body.row_template)
+    )
+    check_recipe_rules(
+        body.row_template,
+        ontology,
+        source_columns=(
+            source_column_names(recipe)
+            if binds_handling or draft_handling_columns(recipe)
+            else None
+        ),
+        units=draft_units(recipe),
+        defaults_handling=baseline.model_dump(exclude_none=True),
+        scheme=scheme,
+        handling_columns=draft_handling_columns(recipe),
+        declared_columns=draft_handling_columns(recipe),
+        # A Map save may hold a half-built template; Verify and publish judge it complete
+        # (ADR-127 Amendment 38).
+        complete=False,
+    )
     updated = await studio_recipes.update_row_template(
         recipe.recipe_id,
         principal,
@@ -6807,6 +7543,7 @@ async def verify_studio_recipe(
     ontology: OntologyDep,
     studio_recipes: StudioRecipesDep,
     audit: AuditDep,
+    recipe_runs: RecipeRunsDep,
 ) -> VerifyReport:
     """§5: the dry run. No persistent write of any kind happens here — no
     Parquet staging, no `GraphPort` write, no transaction — but an
@@ -6817,7 +7554,18 @@ async def verify_studio_recipe(
     material they could not otherwise see": an access-filtered miss reads
     as `None`, exactly like any other read, so it shows as "would create"
     rather than leaking that a higher-classification match exists."""
-    report = await run_verify(recipe, principal, scheme, graph, ontology)
+    # ADR-127 decision 5: the dry run counts the rows the case already kept as the run would count
+    # them, by the draft's own `deduplicate`, asking the store of loaded rows (this case's keys
+    # only) and writing nothing.
+    report = await run_verify(
+        recipe,
+        principal,
+        scheme,
+        graph,
+        ontology,
+        row_keys=recipe_runs,
+        investigation_id=investigation.id,
+    )
     # §5: "Verify must pass before publish" — recorded here, against a
     # *completed* run (rejections included, per §5's own "a run with
     # rejections can be published"), so `publish` below can gate on this
@@ -6894,9 +7642,20 @@ async def publish_studio_recipe(
                 status_code=422,
                 content={"error": "pipeline_not_runnable", "problems": unrunnable},
             )
+    # ADR-120 D10, Amendment 1: the pins come from the live ontology, for the packs the recipe
+    # names and the packs whose types it writes.
+    assert recipe.row_template is not None
+    check_before_publish(recipe, ontology)
+    try:
+        pins = pack_versions_for(recipe.pipeline, recipe.row_template, ontology)
+    except ValueError as error:
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=422, content={"error": "pack_not_composed", "message": str(error)}
+        )
     built = build_recipe(
         recipe,
         ontology_version=ontology.version,
+        pack_versions=pins,
         schedule_cron=body.schedule_cron,
         schedule_watch=body.schedule_watch,
     )
@@ -6909,6 +7668,7 @@ async def publish_studio_recipe(
         recipe.recipe_id,
         principal,
         ontology_version=ontology.version,
+        pack_versions=pins,
         git_path=git_path,
         schedule_cron=body.schedule_cron,
         schedule_watch=body.schedule_watch,
@@ -6934,7 +7694,6 @@ async def update_studio_recipe_schedule(
     recipe: AuthorizedStudioRecipeDep,
     principal: Annotated[Principal, Depends(require_studio_role(StudioRole.SOURCE_APPROVER))],
     studio_recipes: StudioRecipesDep,
-    ontology: OntologyDep,
     repo_root: RecipesRepoRootDep,
     audit: AuditDep,
     body: ScheduleUpdateInput,
@@ -6946,7 +7705,9 @@ async def update_studio_recipe_schedule(
     mapping itself is unchanged.
 
     ADR-110 decision 7: a schedule it could not keep is refused in words before anything is saved,
-    and whoever sets it becomes its owner (decision 3)."""
+    and whoever sets it becomes its owner (decision 3). ADR-120 Amendment 2, decision 2: the
+    re-commit carries the row's pins as stored, none included, and a mapped row with no core
+    version is saved without one, as the administrator's route does."""
     if body.schedule_cron is not None:
         validate_schedule(body.schedule_cron, body.schedule_timezone or DEFAULT_TIMEZONE)
     if body.schedule_watch is not None:
@@ -6959,14 +7720,7 @@ async def update_studio_recipe_schedule(
         schedule_timezone=body.schedule_timezone,
         schedule_case=investigation.id,
     )
-    assert updated.row_template is not None and updated.ontology_version is not None
-    built = build_recipe(
-        updated,
-        ontology_version=updated.ontology_version,
-        schedule_cron=body.schedule_cron,
-        schedule_watch=body.schedule_watch,
-    )
-    await write_and_commit_recipe(built, repo_root=repo_root)
+    await _commit_schedule(updated, repo_root)
     await audit.record(
         principal=principal,
         action="update_studio_recipe_schedule",
@@ -7120,7 +7874,7 @@ async def run_studio_recipe(
     compute: ComputeDep,
     kyc_expiries: KycExpiriesDep,
     recipe_runs: RecipeRunsDep,
-) -> LoadReport | PipelineRunReport:
+) -> LoadReportView | PipelineRunReportView:
     """§8: "Loader: run a published recipe against a file at or below
     their own clearance" — `body.source_location`, when given, is that
     file; omitted, this repeats against the recipe's own recorded location
@@ -7159,7 +7913,7 @@ async def run_studio_recipe(
     ingest response itself — the load already happened; a failure to also check watches against it
     is a narrower, disclosed problem, not a reason to tell the caller their load failed when it
     didn't."""
-    return await run_recipe_as(
+    report = await run_recipe_as(
         RecipeRunDeps(
             graph=graph,
             ontology=ontology,
@@ -7192,53 +7946,9 @@ async def run_studio_recipe(
         source_location=body.source_location,
         trigger="manual",
     )
-
-
-@dataclass(frozen=True)
-class RecipeRunDeps:
-    """What a recipe run needs, the same whichever path started it (ADR-110 decision 1)."""
-
-    graph: GraphPort
-    ontology: OntologySchema
-    analytics: AnalyticsPort
-    media: MediaStore
-    recipe_repo_root: Path
-    audit: AuditWriter
-    jobs: JobQueue
-    valkey: Valkey
-    handling_scheme: HandlingScheme
-    config: ApiConfig
-    hotlists_store: HotlistStore
-    monitors_store: MonitorStore
-    patterns_store: PatternStore
-    alerts_store: AlertStore
-    principal_resolver: PrincipalResolver
-    extraction_candidates: ExtractionCandidateStore
-    recogniser_for: RecogniserFor
-    online_geocode: OnlineGeocode | None
-    typology_rules: TypologyRuleStore
-    held_rows: HeldRowStore
-    screening_lists: ScreeningListStore
-    compute: ComputePort
-    kyc_expiries: KycExpiryStore
-    recipe_runs: RecipeRunStore
-
-    @classmethod
-    def from_state(cls, state: Any) -> RecipeRunDeps:
-        """The scheduler's way in: the application's state, read where the route's getters read
-        it, so the two paths cannot be handed different stores."""
-        return cls(
-            **{
-                f.name: getattr(state, _RUN_DEP_STATE_NAMES.get(f.name, f.name))
-                for f in dataclass_fields(cls)
-            }
-        )
-
-
-_RUN_DEP_STATE_NAMES = {
-    "recipe_repo_root": "recipes_repo_root",
-    "recogniser_for": "pipeline_recogniser_for",
-}
+    # Rules 3 and 7: counts and words, never the load's id lists, and no count at all where the
+    # loader may not view every marking the rows were written at (`report_view`).
+    return report_view(report, principal, handling_scheme)
 
 
 def _schedule_executor(application: FastAPI) -> ScheduleExecutor:
@@ -7284,214 +7994,6 @@ def _schedule_executor(application: FastAPI) -> ScheduleExecutor:
         run=run,
         notify=notify,
         watch_files=watch_files,
-    )
-
-
-async def run_recipe_as(
-    deps: RecipeRunDeps,
-    *,
-    principal: Principal,
-    recipe: StudioRecipeDraft,
-    investigation_id: str,
-    source_location: str | None,
-    trigger: RunTrigger,
-    slot: datetime | None = None,
-    source_file: str | None = None,
-) -> LoadReport | PipelineRunReport:
-    """One run of a published recipe as `principal` (ADR-110 decision 1): the route's *Run now* and
-    the scheduler both come here, so a scheduled load is judged, published, watched and resolved
-    exactly as a manual one, and every run is in the ledger (decision 6) — started before it
-    loads, so one that dies with its Conduit shows as never finished rather than as nothing."""
-    run_id = await deps.recipe_runs.start(
-        recipe_id=recipe.recipe_id,
-        recipe_version=recipe.version,
-        investigation_id=investigation_id,
-        trigger=trigger,
-        slot=slot,
-        run_as=principal.id,
-        source=resolve_source_handling(recipe),
-        now=datetime.now(UTC),
-        source_file=source_file,
-    )
-    try:
-        report = await _execute_recipe_run(
-            deps,
-            principal=principal,
-            recipe=recipe,
-            investigation_id=investigation_id,
-            source_location=source_location,
-            trigger=trigger,
-        )
-    except Exception as error:
-        await deps.recipe_runs.fail(
-            run_id, failure=f"{type(error).__name__}: {error}"[:1000], now=datetime.now(UTC)
-        )
-        raise
-    await deps.recipe_runs.finish(run_id, report=report, now=datetime.now(UTC))
-    return report
-
-
-async def _execute_recipe_run(
-    deps: RecipeRunDeps,
-    *,
-    principal: Principal,
-    recipe: StudioRecipeDraft,
-    investigation_id: str,
-    source_location: str | None,
-    trigger: RunTrigger,
-) -> LoadReport | PipelineRunReport:
-    """The load itself, `run_studio_recipe`'s docstring has what each step is for."""
-    load_id = new_id()
-    # ADR-109 ruling 1: the case's typology rules judge this load, at the point each declares.
-    rules = await _rule_gate(
-        investigation_id,
-        loader=principal,
-        graph=deps.graph,
-        analytics=deps.analytics,
-        scheme=deps.handling_scheme,
-        typology_rules=deps.typology_rules,
-        held_rows=deps.held_rows,
-        alerts_store=deps.alerts_store,
-        audit=deps.audit,
-        valkey=deps.valkey,
-        principal_resolver=deps.principal_resolver,
-        screening=deps.screening_lists,
-        compute=deps.compute,
-        expiries=deps.kyc_expiries,
-        patterns=deps.patterns_store,
-    )
-    report: LoadReport | PipelineRunReport
-    if recipe.pipeline is not None:
-        # ADR-108 phase C: a recipe holding a pipeline graph runs through the pipeline runner —
-        # branches, extract stages, enrich stages — never silently as its first branch alone.
-        report = await run_published_pipeline(
-            recipe,
-            principal,
-            graph=deps.graph,
-            ontology=deps.ontology,
-            scheme=deps.handling_scheme,
-            load_id=load_id,
-            investigation_scope=investigation_id,
-            repo_root=deps.recipe_repo_root,
-            recogniser_for=deps.recogniser_for,
-            candidates=deps.extraction_candidates,
-            analytics=deps.analytics,
-            media=deps.media,
-            source_location=source_location,
-            online_geocode=deps.online_geocode,
-            rules=rules,
-        )
-        for branch in report.branches:
-            await resolution_trigger_module.submit_post_ingest_resolution_jobs(
-                branch.report, recipe.row_template, ontology=deps.ontology, jobs=deps.jobs
-            )
-    else:
-        report = await run_published_recipe(
-            recipe,
-            principal,
-            graph=deps.graph,
-            ontology=deps.ontology,
-            load_id=load_id,
-            investigation_scope=investigation_id,
-            source_location=source_location,
-            repo_root=deps.recipe_repo_root,
-            analytics=deps.analytics,
-            media=deps.media,
-            rules=rules,
-        )
-        await resolution_trigger_module.submit_post_ingest_resolution_jobs(
-            report, recipe.row_template, ontology=deps.ontology, jobs=deps.jobs
-        )
-    entry = await ChangeStreamWriter(deps.valkey).publish(
-        "ingest",
-        node_ids=report.created_node_ids,
-        edge_ids=report.touched_edge_ids,
-        investigation_id=investigation_id,
-    )
-    if entry is not None:
-        await _evaluate_watches_best_effort(
-            entry,
-            principal=principal,
-            graph=deps.graph,
-            handling_scheme=deps.handling_scheme,
-            config=deps.config,
-            hotlists_store=deps.hotlists_store,
-            monitors_store=deps.monitors_store,
-            patterns_store=deps.patterns_store,
-            alerts_store=deps.alerts_store,
-            audit=deps.audit,
-            valkey=deps.valkey,
-            investigation_id=investigation_id,
-            action_on_failure="watch_evaluation_failed",
-            error_context={"load_id": load_id},
-            principal_resolver=deps.principal_resolver,
-        )
-    await deps.audit.record(
-        principal=principal,
-        action="run_studio_recipe",
-        investigation_id=investigation_id,
-        resolved_query={"recipe_id": recipe.recipe_id, "load_id": load_id, "trigger": trigger},
-        result_cardinality=report.nodes_created + report.edges_created,
-    )
-    return report
-
-
-def _owner_resolver(
-    principal: Principal, principal_resolver: PrincipalResolver
-) -> Callable[[str], Awaitable[Principal | None]]:
-    """An owner's principal, resolved fresh (ADR-036, ADR-043): the requester's own at once, any
-    other through Token Exchange, never cached."""
-
-    async def resolve(owner_id: str) -> Principal | None:
-        if owner_id == principal.id:
-            return principal
-        return await principal_resolver.resolve_for_owner(owner_id)
-
-    return resolve
-
-
-async def _rule_gate(
-    investigation_id: str,
-    *,
-    loader: Principal,
-    graph: GraphPort,
-    analytics: AnalyticsPort,
-    scheme: HandlingScheme,
-    typology_rules: TypologyRuleStore,
-    held_rows: HeldRowStore,
-    alerts_store: AlertStore,
-    audit: AuditWriter,
-    valkey: Valkey,
-    principal_resolver: PrincipalResolver,
-    screening: ScreeningListStore,
-    compute: ComputePort,
-    expiries: KycExpiryStore | None,
-    patterns: PatternStore,
-    fail_closed: bool = True,
-) -> RuleGate | None:
-    """The case's active typology rules for one load (ADR-109), or `None` when it has none.
-    What the KYC and pattern typologies read is required, never defaulted: a route that left it
-    out once held every row it loaded, failing closed on a store the deployment had."""
-    rules = await typology_rules.list_active_for_case(investigation_id)
-    if not rules:
-        return None
-    return RuleGate(
-        rules=rules,
-        investigation_id=investigation_id,
-        graph=graph,
-        analytics=analytics,
-        scheme=scheme,
-        alert_store=alerts_store,
-        audit=audit,
-        valkey=valkey,
-        principal_for_owner=_owner_resolver(loader, principal_resolver),
-        loader=loader,
-        held_store=held_rows,
-        fail_closed=fail_closed,
-        screening=screening,
-        compute=compute,
-        expiries=expiries,
-        patterns=patterns,
     )
 
 
@@ -7550,7 +8052,7 @@ async def ownership_canvas(
         history,
         investigation.id,
         seq=outcome.delta.seq,
-        label=f"Showed an ownership structure: {len(outcome.delta.nodes)} node(s)",
+        label=OWNERSHIP,
         principal=principal,
     )
     await audit.record(
@@ -7666,6 +8168,8 @@ async def _case_report(
     alerts_store: AlertStore,
     held_rows: HeldRowStore,
     compute: ComputePort,
+    explore: ExploreService,
+    ontology: OntologySchema,
     period_weeks: int,
 ) -> ReportFigures:
     level = await investigations.effective_level(investigation.id, principal)
@@ -7674,6 +8178,9 @@ async def _case_report(
         graph=graph,
         held=held_rows,
         compute=compute,
+        explore=explore,
+        ontology=ontology,
+        domains=investigation.domains,
         investigation_id=investigation.id,
         reader=principal,
         today=datetime.now(UTC).date(),
@@ -7694,6 +8201,8 @@ async def read_case_report(
     alerts_store: AlertsStoreDep,
     held_rows: HeldRowsDep,
     compute: ComputeDep,
+    explore: ExploreDep,
+    ontology: OntologyDep,
     audit: AuditDep,
     weeks: Annotated[int, Query(ge=1, le=52)] = 12,
 ) -> ReportFigures:
@@ -7701,7 +8210,8 @@ async def read_case_report(
     held rows only for Editors and above; past its bound, `limit_exceeded` (rule 2)."""
     figures = await _case_report(
         investigation, principal, investigations=investigations, graph=graph,
-        alerts_store=alerts_store, held_rows=held_rows, compute=compute, period_weeks=weeks,
+        alerts_store=alerts_store, held_rows=held_rows, compute=compute, explore=explore,
+        ontology=ontology, period_weeks=weeks,
     )  # fmt: skip
     await audit.record(
         principal=principal,
@@ -7726,6 +8236,8 @@ async def read_report_feed(
     alerts_store: AlertsStoreDep,
     held_rows: HeldRowsDep,
     compute: ComputeDep,
+    explore: ExploreDep,
+    ontology: OntologyDep,
     audit: AuditDep,
     export_ledger: ExportLedgerDep,
     weeks: Annotated[int, Query(ge=1, le=52)] = 12,
@@ -7736,7 +8248,8 @@ async def read_report_feed(
     ledger as metadata (who, which case, when), since the figures leave the Glass."""
     figures = await _case_report(
         investigation, principal, investigations=investigations, graph=graph,
-        alerts_store=alerts_store, held_rows=held_rows, compute=compute, period_weeks=weeks,
+        alerts_store=alerts_store, held_rows=held_rows, compute=compute, explore=explore,
+        ontology=ontology, period_weeks=weeks,
     )  # fmt: skip
     rows = reports_module.feed_rows(figures)
     await export_ledger.record(
@@ -7748,7 +8261,7 @@ async def read_report_feed(
             handling_level=principal.clearance,
             exported_at=datetime.now(UTC),
             item_count=len(rows),
-            withheld_count=0,
+            withheld=False,
             manifest_policy="omit",
         )
     )
@@ -7939,7 +8452,7 @@ async def alert_canvas(
         history,
         investigation.id,
         seq=outcome.delta.seq,
-        label=f"Opened an alert: {alert.typology or 'alert'}",
+        label=ALERT_CANVAS,
         principal=principal,
     )
     await audit.record(
@@ -8121,7 +8634,8 @@ async def release_held_rows_route(
     compute: ComputeDep,
     kyc_expiries: KycExpiriesDep,
     patterns_store: PatternsStoreDep,
-) -> LoadReport:
+    recipe_runs: RecipeRunsDep,
+) -> LoadReportView:
     """A reviewer releases named held rows of one load: they are loaded now, under a new load
     id, with their provenance as it would have been. The case's rules judge them again, but a
     failing rule no longer holds them (ruling 1: the release is the human judgement)."""
@@ -8164,17 +8678,52 @@ async def release_held_rows_route(
     )
     assert recipe.git_path is not None
     load_id = new_id()
-    report = await release_held_rows(
-        held,
-        load_recipe(repo_root / recipe.git_path),
-        principal,
-        graph=graph,
-        ontology=ontology,
-        analytics=analytics,
-        media=media,
-        rules=rules,
-        load_id=load_id,
+    # ADR-127 decision 6 and Amendment 5: a release is a load of its own. Its ledger run starts
+    # before the release, as any run does, and its record is written when the release's graph
+    # transaction commits, kept with the load its rows were held by so that reverting that load can
+    # revert this one first.
+    released_from = released_from_of(held)
+    released_at = datetime.now(UTC)
+    run_id = await recipe_runs.start(
+        recipe_id=recipe.recipe_id,
+        recipe_version=recipe.version,
+        investigation_id=investigation.id,
+        trigger="release",
+        slot=None,
+        run_as=principal.id,
+        source=resolve_source_handling(recipe),
+        now=released_at,
     )
+    sink = LedgerSink(
+        recipe_runs,
+        run_id,
+        created_by=principal.id,
+        investigation_id=investigation.id,
+        started_at=released_at,
+        released_from=released_from,
+    )
+    try:
+        report = await release_held_rows(
+            held,
+            load_published_recipe(recipe, repo_root),
+            principal,
+            graph=graph,
+            ontology=ontology,
+            analytics=analytics,
+            media=media,
+            rules=rules,
+            load_id=load_id,
+            sink=sink,
+        )
+    except Exception as error:
+        await recipe_runs.fail(
+            run_id,
+            failure=f"{type(error).__name__}: {error}"[:1000],
+            now=datetime.now(UTC),
+            markings=sink.markings,
+        )
+        raise
+    await recipe_runs.finish(run_id, report=report, now=datetime.now(UTC))
     decided = await held_rows.decide_for_reader(
         [h.id for h in held], investigation.id, principal, status="released", reason=body.reason
     )
@@ -8190,7 +8739,7 @@ async def release_held_rows_route(
         },
         result_cardinality=len(decided),
     )
-    return report
+    return report_view(report, principal, handling_scheme)
 
 
 @app.post(
@@ -8223,74 +8772,6 @@ async def reject_held_rows(
         result_cardinality=len(decided),
     )
     return decided
-
-
-async def _evaluate_watches_best_effort(
-    entry: ChangeStreamEntry,
-    *,
-    principal: Principal,
-    graph: GraphPort,
-    handling_scheme: HandlingScheme,
-    config: ApiConfig,
-    hotlists_store: HotlistStore,
-    monitors_store: MonitorStore,
-    patterns_store: PatternStore,
-    alerts_store: AlertStore,
-    audit: AuditWriter,
-    valkey: Valkey,
-    investigation_id: str,
-    action_on_failure: str,
-    principal_resolver: PrincipalResolver,
-    error_context: dict[str, Any] | None = None,
-) -> None:
-    """Shared by every producer route wired to synchronous evaluation this stage
-    (`run_studio_recipe`, `link_resolution_route`) — the identical `principal_for_owner` and the
-    identical best-effort failure containment, factored out rather than duplicated a second time
-    verbatim. A failure here is caught and audited, never allowed to fail the caller's own
-    already-succeeded primary operation.
-
-    **`principal_for_owner`, `06_DECISIONS.md` ADR-043 (Phase 8 Stage 1).** The requester's own id
-    resolves instantly, with no network call — no exchange is needed to learn what this route
-    already knows. Any other owner goes through `principal_resolver.resolve_for_owner` (OAuth2
-    Token Exchange) — a real, live, per-call resolution, never cached (ADR-036's own "resolved
-    fresh" requirement, ADR-043's own freshness argument): a revoked or otherwise-unreachable
-    owner resolves to `None` on this call and the next, with nothing here holding onto whatever a
-    prior call once returned."""
-
-    _principal_for_owner = _owner_resolver(principal, principal_resolver)
-
-    try:
-        await evaluate_hotlists_for_entry(
-            entry,
-            graph=graph,
-            scheme=handling_scheme,
-            hotlist_store=hotlists_store,
-            alert_store=alerts_store,
-            audit=audit,
-            valkey=valkey,
-            principal_for_owner=_principal_for_owner,
-            policy=config.hotlist_alert_policy,
-        )
-        await evaluate_monitors_for_entry(
-            entry,
-            graph=graph,
-            monitor_store=monitors_store,
-            pattern_store=patterns_store,
-            alert_store=alerts_store,
-            audit=audit,
-            valkey=valkey,
-            principal_for_owner=_principal_for_owner,
-        )
-    except Exception as exc:  # noqa: BLE001 - a best-effort side channel, see this function's
-        # own docstring: must never fail the caller's own already-succeeded primary operation.
-        # Audited, not silently swallowed.
-        await audit.record(
-            principal=principal,
-            action=action_on_failure,
-            investigation_id=investigation_id,
-            resolved_query={**(error_context or {}), "error": str(exc)},
-            result_cardinality=0,
-        )
 
 
 # --- the delta stream --------------------------------------------------------
@@ -8566,7 +9047,10 @@ def _schedule_run_view(
         run_as=run.run_as,
         failure=run.failure if run.outcome not in ("failed", "succeeded", "running") else None,
     )
-    if not principal_may_view(run.source, reader, scheme):
+    # Rule 3, ADR-127 Amendment 23: the counts include every row the run wrote, at every marking it
+    # recorded, so each is judged beside the source's own (a run written before the column records
+    # the source alone).
+    if not may_see_counts([run.source, *run.markings], reader, scheme):
         return view.model_copy(update={"withheld": True})
     return view.model_copy(
         update={
@@ -8769,12 +9253,14 @@ async def run_schedule_now_route(
 
 async def _commit_schedule(recipe: StudioRecipeDraft, repo_root: Path) -> None:
     """The recipe repository stays the record of a schedule too (`update_studio_recipe_schedule`):
-    the recipe's YAML re-committed at its own path, the mapping and version unchanged."""
+    the recipe's YAML re-committed at its own path, the mapping and version unchanged, and the pins
+    the row holds exactly as stored, none included (ADR-120 Amendment 2, decision 2)."""
     if recipe.row_template is None or recipe.ontology_version is None:
         return
     built = build_recipe(
         recipe,
         ontology_version=recipe.ontology_version,
+        pack_versions=recipe.pack_versions,
         schedule_cron=recipe.schedule_cron,
         schedule_watch=recipe.schedule_watch,
     )
@@ -8923,8 +9409,9 @@ async def case_event_holders_route(
 async def trend_options_route(
     investigation: InvestigationViewerDep, ontology: OntologyDep
 ) -> TrendOptions:
-    """The event types and properties a trend may use, from this deployment's ontology."""
-    return trend_options(ontology)
+    """The event types and properties a trend may use: this deployment's ontology, narrowed to
+    the core types and the case's own domain packs (ADR-126 decision 6)."""
+    return trend_options(ontology, investigation.domains)
 
 
 async def _trend_figures(
@@ -8972,6 +9459,7 @@ async def preview_trend(
     working_set: WorkingSetDep,
     handling_scheme: HandlingSchemeDep,
 ) -> TrendFigures:
+    check_in_case_domains(body, ontology, investigation.domains)
     figures = await _trend_figures(body, investigation, principal, ontology, analytics,
                                    investigations, audit, working_set, handling_scheme)  # fmt: skip
     await audit.record(principal=principal, action="preview_trend",
@@ -8996,6 +9484,7 @@ async def save_trend(
 ) -> TrendDefinition:
     """Saving writes to the case, so it needs Editor; the definition is checked first."""
     validate_definition(body, ontology)
+    check_in_case_domains(body, ontology, investigation.domains)
     saved = await trends.create(investigation.id, body, principal)
     await audit.record(principal=principal, action="save_trend", investigation_id=investigation.id,
                        resolved_query={"trend": saved.id, "title": saved.title},
@@ -9008,9 +9497,14 @@ async def save_trend(
     dependencies=[Depends(require_right(Right.RUN_ANALYSIS))],
 )
 async def list_trends(
-    investigation: InvestigationViewerDep, trends: TrendStoreDep
+    investigation: InvestigationViewerDep, trends: TrendStoreDep, ontology: OntologyDep
 ) -> list[TrendDefinition]:
-    return await trends.list_for_case(investigation.id)
+    """The case's trends, each marked when it uses a link type outside the case's domain packs as
+    they stand now (ADR-126 decision 6)."""
+    return [
+        mark_outside_case_domains(t, ontology, investigation.domains)
+        for t in await trends.list_for_case(investigation.id)
+    ]
 
 
 @app.get(
@@ -9177,7 +9671,7 @@ async def read_pack(
     )
     (named,) = await _named_packs([pack], principal_names)
     return PackDraft(
-        pack=named, items=served, withheld=withheld, marking=highest_marking(served, scheme)
+        pack=named, items=served, withheld=withheld > 0, marking=highest_marking(served, scheme)
     )
 
 
@@ -9343,7 +9837,7 @@ async def reorder_pack(
     return PackDraft(
         pack=named,
         items=served,
-        withheld=withheld,
+        withheld=withheld > 0,
         marking=highest_marking(served, scheme),
     )
 
@@ -9423,7 +9917,7 @@ async def pack_history(
     earlier = await packs.earlier_snapshots(pack.id)
     shown, withheld = await readable(earlier, principal, scheme, graph, investigation.id)
     return PackHistory(
-        earlier_snapshots=[i.served() for i in shown], withheld=withheld, versions=pack.versions
+        earlier_snapshots=[i.served() for i in shown], withheld=withheld > 0, versions=pack.versions
     )
 
 
@@ -9451,7 +9945,7 @@ async def publish_pack(
     if not items:
         raise PackItemRefused("an empty pack has nothing to publish")
     if withheld:
-        raise PackHasWithheldItems(withheld)
+        raise PackHasWithheldItems()
     version = await packs.publish(pack.id, principal)
     await audit.record(
         principal=principal,
@@ -9472,7 +9966,7 @@ async def publish_pack(
             version.published_by
         ),
         items=served,
-        withheld=0,
+        withheld=False,
         marking=highest_marking(served, scheme),
     )
 
@@ -9580,7 +10074,7 @@ async def read_published_pack(
             version.published_by
         ),
         items=served,
-        withheld=withheld,
+        withheld=withheld > 0,
         marking=highest_marking(served, scheme),
     )
 
@@ -9610,14 +10104,26 @@ async def export_pack_route(
     if version is None:
         raise HTTPException(status_code=404, detail="this pack has no publication to export")
     result = await export_pack(
-        pack=pack, version=version, request=body, exporter=principal, scheme=scheme, graph=graph,
-        ledger=export_ledger, policy=config.export_manifest_policy,
+        pack=pack,
+        version=version,
+        request=body,
+        exporter=principal,
+        scheme=scheme,
+        graph=graph,
+        ledger=export_ledger,
+        policy=config.export_manifest_policy,
     )
     await audit.record(
-        principal=principal, action="export_pack", investigation_id=investigation.id,
-        resolved_query={"pack": pack.id, "version": version.version,
-                        "ledger_entry": result.ledger_entry_id},
-        result_cardinality=len(result.items), justification=body.justification,
+        principal=principal,
+        action="export_pack",
+        investigation_id=investigation.id,
+        resolved_query={
+            "pack": pack.id,
+            "version": version.version,
+            "ledger_entry": result.ledger_entry_id,
+        },
+        result_cardinality=len(result.items),
+        justification=body.justification,
     )
     # ADR-106: the two people the manifest prints, named; nobody else is looked up.
     names = await principal_names.display_names([result.published_by, result.mark.exported_by])
@@ -9636,9 +10142,7 @@ async def _pack_export_refused(request: Request, exc: PackExportRefused) -> JSON
 
 @app.exception_handler(PackHasWithheldItems)
 async def _pack_withheld(request: Request, exc: PackHasWithheldItems) -> JSONResponse:
-    return JSONResponse(
-        status_code=409, content=PackWithheldBody(withheld=exc.withheld).model_dump()
-    )
+    return JSONResponse(status_code=409, content=PackWithheldBody().model_dump())
 
 
 @app.exception_handler(PackItemRefused)
@@ -9817,12 +10321,66 @@ async def _authenticate_websocket(websocket: WebSocket) -> Principal:
     return principal
 
 
+@dataclass
+class _SocketState:
+    """What one connected socket remembers, in memory and for as long as it is open (ADR-124
+    decision 2): whether its reader has been sent `DeltaViewOverCap` and so is sent nothing more
+    until a resync with no last sequence runs the full-snapshot path again. The server keeps no
+    state for a stuck reader beyond this; a new connection starts clear.
+
+    **During a try-again only**, the forward does not drop what it is holding back: `buffering` is
+    set from the moment the resync starts until it has sent its answer, and the raw messages go to
+    `buffer`, at most `DELTA_STREAM_MAXLEN` of them. Past that `overflowed` is set and the buffer is
+    emptied; the resync then falls back to a fresh catch-up. In the ordinary stuck period nothing is
+    buffered: a try-again snapshot covers it, and a reader who stays stuck holds no memory."""
+
+    stuck: bool = False
+    buffering: bool = False
+    buffer: list[str] = field(default_factory=list)
+    overflowed: bool = False
+
+
+async def _send_all(
+    websocket: WebSocket, state: _SocketState, deltas: Sequence[WorkingSetDeltaSent]
+) -> None:
+    """Sends `deltas`, and marks the socket stuck if one of them is `DeltaViewOverCap`."""
+    for delta in deltas:
+        await websocket.send_text(delta.model_dump_json())
+        if isinstance(delta, DeltaViewOverCap):
+            state.stuck = True
+
+
+async def _forward_one(
+    data: bytes | str,
+    websocket: WebSocket,
+    working_set: WorkingSetService,
+    investigation_id: str,
+    principal: Principal,
+    state: _SocketState,
+) -> bool:
+    """Projects one published message for this socket's reader and sends it, as the live forward
+    does. True if what was sent was `DeltaViewOverCap`."""
+    raw = decode_delta(json.loads(data.decode() if isinstance(data, bytes) else data))
+    if lacks_record(raw):
+        # A removal or replacement from before it carried the record of what it removed: nothing
+        # can be projected from it, and an empty step would leave this canvas unlike a snapshot's.
+        # The reader is sent their own full view, as a reconnect with none is.
+        sent = await working_set.sync(investigation_id, principal, last_acknowledged_seq=None)
+        await _send_all(websocket, state, sent)
+        return any(isinstance(delta, DeltaViewOverCap) for delta in sent)
+    delta = await working_set.project_live(investigation_id, raw, principal)
+    over = await working_set.over_cap_after(investigation_id, delta, principal)
+    await _send_all(websocket, state, [over or delta])
+    return over is not None
+
+
 async def _forward_notifications(
     pubsub: Any,
     websocket: WebSocket,
     working_set: WorkingSetService,
     investigation_id: str,
     principal: Principal,
+    state: _SocketState | None = None,
 ) -> None:
     """Relays a live mutation from `notify.py`'s Pub/Sub channel to this
     one connected principal — re-projected via `WorkingSetService.
@@ -9830,20 +10388,98 @@ async def _forward_notifications(
     principal caused the mutation, who may not be this socket's principal
     (`03_CONDUIT_MIDDLEWARE.md` §4's read-time handling filter applies to
     the live push exactly as much as to reconnect replay)."""
+    state = state or _SocketState()
     async for message in pubsub.listen():
         if message["type"] != "message":
             continue
-        data = message["data"]
-        raw = decode_delta(json.loads(data.decode() if isinstance(data, bytes) else data))
-        delta, hidden = await working_set.project_live(investigation_id, raw, principal)
-        await websocket.send_text(delta.model_dump_json())
-        if hidden > 0:
-            notice = DeltaNotice(
-                seq=delta.seq,
-                message=f"{hidden} item(s) withheld by handling policy",
-                count=hidden,
+        if state.stuck:
+            # The reader was told their view is over the cap and is sent nothing more until a
+            # resync with no last sequence (ADR-124 decision 2). During that try-again, and only
+            # then, what arrives is kept (bounded) for the resync to replay after its answer.
+            if state.buffering and not state.overflowed:
+                if len(state.buffer) >= DELTA_STREAM_MAXLEN:
+                    state.overflowed = True
+                    state.buffer.clear()
+                else:
+                    state.buffer.append(message["data"])
+            continue
+        await _forward_one(
+            message["data"], websocket, working_set, investigation_id, principal, state
+        )
+
+
+def _last_seq(deltas: Sequence[WorkingSetDeltaSent], so_far: int) -> int:
+    return max([so_far, *(d.seq for d in deltas if not isinstance(d, DeltaViewOverCap))])
+
+
+async def _try_again(
+    websocket: WebSocket,
+    working_set: WorkingSetService,
+    investigation_id: str,
+    principal: Principal,
+    state: _SocketState,
+) -> None:
+    """A resync with no last sequence ("try again"), in this order:
+
+    1. the socket is held stuck and the forward starts buffering what it would send;
+    2. the full-snapshot path runs (it checks the cap);
+    3. if that gave a snapshot, the catch-up from the snapshot's own sequence runs (it checks the
+       cap too);
+    4. the snapshot and the catch-up are sent;
+    5. if either was `DeltaViewOverCap` the socket stays stuck and the buffer is discarded;
+       otherwise the buffered messages whose sequence is above the last one sent are replayed in
+       order, each projected and recounted as the forward does it, until the buffer is empty (what
+       arrives during the replay is replayed too), and an overflow is answered by a fresh catch-up
+       from the last sequence sent instead;
+    6. only with the buffer empty, in the same step, the socket is freed.
+
+    Nothing the forward would send overtakes the snapshot, and nothing published during the window
+    is lost; a duplicate of what the snapshot already holds is skipped by sequence or harmless."""
+    state.stuck = True
+    state.buffering = True
+    state.overflowed = False
+    state.buffer.clear()
+    deltas = await working_set.sync(investigation_id, principal, last_acknowledged_seq=None)
+    snapshot = deltas[0] if deltas else None
+    if isinstance(snapshot, DeltaSnapshot):
+        caught_up = await working_set.sync(
+            investigation_id, principal, last_acknowledged_seq=snapshot.seq
+        )
+        deltas = [*deltas, *caught_up]
+    await _send_all(websocket, state, deltas)
+    if any(isinstance(delta, DeltaViewOverCap) for delta in deltas):
+        state.buffer.clear()
+        state.buffering = False
+        state.overflowed = False
+        return
+    sent_seq = _last_seq(deltas, -1)
+    while True:
+        if state.overflowed:
+            state.overflowed = False
+            state.buffer.clear()
+            fresh = await working_set.sync(
+                investigation_id, principal, last_acknowledged_seq=sent_seq
             )
-            await websocket.send_text(notice.model_dump_json())
+            await _send_all(websocket, state, fresh)
+            if any(isinstance(delta, DeltaViewOverCap) for delta in fresh):
+                state.buffer.clear()
+                state.buffering = False
+                return
+            sent_seq = _last_seq(fresh, sent_seq)
+            continue
+        if not state.buffer:
+            break
+        data = state.buffer.pop(0)
+        seq = json.loads(data.decode() if isinstance(data, bytes) else data).get("seq", -1)
+        if seq <= sent_seq:
+            continue
+        if await _forward_one(data, websocket, working_set, investigation_id, principal, state):
+            state.buffer.clear()
+            state.buffering = False
+            return
+        sent_seq = max(sent_seq, seq)
+    state.stuck = False
+    state.buffering = False
 
 
 async def _handle_resync_requests(
@@ -9851,13 +10487,19 @@ async def _handle_resync_requests(
     working_set: WorkingSetService,
     investigation_id: str,
     principal: Principal,
+    state: _SocketState | None = None,
 ) -> None:
+    state = state or _SocketState()
     while True:
         payload = await websocket.receive_json()
         last_ack = payload.get("last_acknowledged_seq")
+        if last_ack is None:
+            await _try_again(websocket, working_set, investigation_id, principal, state)
+            continue
+        if state.stuck:
+            continue
         deltas = await working_set.sync(investigation_id, principal, last_acknowledged_seq=last_ack)
-        for delta in deltas:
-            await websocket.send_text(delta.model_dump_json())
+        await _send_all(websocket, state, deltas)
 
 
 @app.websocket("/v1/investigations/{investigation_id}/stream")
@@ -9913,21 +10555,23 @@ async def stream(websocket: WebSocket, investigation_id: str) -> None:
         init = await websocket.receive_json()
     except WebSocketDisconnect:
         return
-    initial_deltas: list[WorkingSetDelta] = await working_set.sync(
+    initial_deltas: list[WorkingSetDeltaSent] = await working_set.sync(
         investigation_id, principal, last_acknowledged_seq=init.get("last_acknowledged_seq")
     )
-    for delta in initial_deltas:
-        await websocket.send_text(delta.model_dump_json())
+    state = _SocketState()
+    await _send_all(websocket, state, initial_deltas)
 
     pubsub = valkey.pubsub()
     channel = notify_channel(investigation_id)
     await pubsub.subscribe(channel)
     try:
         forward_task = asyncio.create_task(
-            _forward_notifications(pubsub, websocket, working_set, investigation_id, principal)
+            _forward_notifications(
+                pubsub, websocket, working_set, investigation_id, principal, state
+            )
         )
         resync_task = asyncio.create_task(
-            _handle_resync_requests(websocket, working_set, investigation_id, principal)
+            _handle_resync_requests(websocket, working_set, investigation_id, principal, state)
         )
         try:
             await asyncio.wait({forward_task, resync_task}, return_when=asyncio.FIRST_COMPLETED)

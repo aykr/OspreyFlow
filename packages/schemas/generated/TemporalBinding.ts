@@ -6,9 +6,17 @@ export type Transform = string | null;
 export type Map = {
   [k: string]: string;
 } | null;
+export type Optional = boolean | null;
 
+/**
+ * A link's time. `at` is its start, or its only instant; `valid_to`, when bound, makes it a
+ * span (ADR-127 decision 11): the end, read from a column of its own. An empty end cell is a span
+ * still open (`Interval.valid_to` of `None`). Without `valid_to` the link is one instant, as
+ * before: its end is its start.
+ */
 export interface TemporalBinding {
   at: FieldBinding;
+  valid_to?: FieldBinding | null;
   [k: string]: unknown;
 }
 /**
@@ -32,5 +40,6 @@ export interface FieldBinding {
   literal?: unknown;
   transform?: Transform;
   map?: Map;
+  optional?: Optional;
   [k: string]: unknown;
 }

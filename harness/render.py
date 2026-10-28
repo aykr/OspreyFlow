@@ -664,6 +664,10 @@ _SERVICE_EXTRAS: dict[str, dict[str, object]] = {
         },
     },
     "valkey": {
+        # ADR-124 Amendment 4: the working set's access index is a few keys beside the bodies, and
+        # what a reader is shown is computed from them, so no key may be evicted on its own under
+        # memory pressure; a full Valkey refuses a write instead, which an operator can see.
+        "command": ["valkey-server", "--maxmemory-policy", "noeviction"],
         "healthcheck": {
             "test": ["CMD", "valkey-cli", "ping"],
             "interval": "10s",
@@ -1162,6 +1166,9 @@ def _render_env(config: OspreyConfig) -> str:
         f"OSPREY_STATE_DIR={STATE_CONTAINER_PATH}",
         f"OSPREY_GRAPH_STORE={config.components.graph_store.value}",
         f"OSPREY_ANALYTICS_ENGINE={config.components.analytics_engine.value}",
+        # ADR-127 Amendment 33: whether a load queues entity resolution afterwards.
+        "OSPREY_POST_INGEST_RESOLUTION="
+        + ("on" if config.components.post_ingest_resolution else "off"),
         f"OSPREY_SEARCH_BACKEND={config.components.search.value}",
         f"OSPREY_DATA_ROOT={config.components.storage.data}",
         f"OSPREY_STAGING_ROOT={config.components.storage.staging}",

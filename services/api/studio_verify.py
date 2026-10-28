@@ -19,12 +19,13 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 
-from services.ingest.engine import dry_run_recipe
+from services.ingest.engine import RowKeys, dry_run_recipe
 from services.ingest.profiler import DEFAULT_SAMPLE_SIZE, _shape_mask
+from services.ingest.recipe_rules import check_reference_matches
 
 from ontology.handling import HandlingScheme, principal_may_view
 from ports.graph import GraphPort
-from schemas.domain import OntologySchema, Principal
+from schemas.domain import Edge, Handling, Node, OntologySchema, Principal
 from schemas.ingest import (
     Recipe,
     RecipeDefaults,
@@ -40,6 +41,7 @@ from .studio_map import resolve_source_handling
 from .studio_profile import (
     RecipeNotReadyForProfileError,
     connector_for,
+    row_markings,
 )
 from .studio_profile import _read_rows as _read_recipe_rows
 
@@ -65,7 +67,13 @@ def _group_rejections(rejections: list[RejectionRecord]) -> list[RejectionGroup]
     for rejection in rejections:
         by_reason[rejection.reason].append(rejection)
     return [
-        RejectionGroup(reason=reason, count=len(records), samples=records[:_MAX_SAMPLES_PER_REASON])
+        RejectionGroup(
+            reason=reason,
+            count=len(records),
+            samples=[
+                r.model_copy(update={"marking": None}) for r in records[:_MAX_SAMPLES_PER_REASON]
+            ],
+        )
         for reason, records in by_reason.items()
     ]
 
@@ -87,11 +95,20 @@ async def run_verify(
     scheme: HandlingScheme,
     graph: GraphPort,
     ontology: OntologySchema,
+    *,
+    row_keys: RowKeys | None = None,
+    investigation_id: str | None = None,
 ) -> VerifyReport:
+    """`row_keys` and `investigation_id` (ADR-127 decision 5): given the store of loaded rows and
+    the case, the dry run counts the rows the run would skip by the draft's own `deduplicate`, as
+    the run counts them, and writes nothing (it only asks the store which keys the case kept)."""
     if not draft.ready_for_profile:
         raise RecipeNotReadyForProfileError(draft.recipe_id)
     if draft.row_template is None:
         raise RowTemplateMissingError(draft.recipe_id)
+    # ADR-127 Amendment 37: a reference the store cannot find would show here as "would create"
+    # for every row, which is a mistake the author should be told, not a result.
+    check_reference_matches(draft.row_template, ontology)
 
     source_handling = resolve_source_handling(draft)
     all_rows = _read_recipe_rows(draft)
@@ -112,10 +129,9 @@ async def run_verify(
         # the same non-issue `studio_map.py`'s own recipe stub sidesteps,
         # not a claim this draft targets that version permanently.
         ontology_version=ontology.version,
-        defaults=RecipeDefaults(
-            handling=draft.handling, provenance={}, legal_basis=draft.legal_basis
-        ),
+        defaults=RecipeDefaults.for_source(draft.handling, draft.legal_basis),
         row_template=draft.row_template,
+        deduplicate=draft.deduplicate,
     )
 
     result = await dry_run_recipe(
@@ -125,41 +141,63 @@ async def run_verify(
         ontology=ontology,
         principal=principal,
         source=draft.source_location or draft.recipe_id,
+        scheme=scheme,
+        row_keys=row_keys,
+        investigation_scope=investigation_id,
     )
 
-    values_masked = not principal_may_view(source_handling, principal, scheme)
-    nodes = result.nodes
-    edges = result.edges
-    if values_masked:
-        nodes = [
-            node.model_copy(
-                update={"properties": {k: _mask_value(v) for k, v in node.properties.items()}}
-            )
-            if node.id in result.created_node_ids
-            else node
-            for node in nodes
-        ]
-        # Every edge is this run's own creation (§5: an edge has no
-        # `match_on`/`on_match` to reference by) — masked unconditionally.
-        edges = [
-            edge.model_copy(
-                update={"properties": {k: _mask_value(v) for k, v in edge.properties.items()}}
-            )
-            for edge in edges
-        ]
+    # Each simulated node and link is masked by its own resolved marking (ADR-127 decision 3: the
+    # source's own is only the lowest a row may carry), and a rejected row, which resolved to none,
+    # by every marking a row of the source may carry (`source_markings`).
+    def may_view(marking: Handling) -> bool:
+        return principal_may_view(marking, principal, scheme)
 
-    rejections = result.rejections
-    if values_masked:
-        # The rejected rows are the source's values too (9 October 2026: they were shown in full
-        # under "every value this run would create is shown shape-masked").
-        rejections = [
-            rejection.model_copy(update={"sample": _masked_sample(sampled, rejection.row_index)})
-            for rejection in rejections
-        ]
+    def masked_by_own_marking(element: Node | Edge) -> bool:
+        return not may_view(element.handling)
+
+    values_masked = not may_view(source_handling)
+    nodes = [
+        node.model_copy(
+            update={"properties": {k: _mask_value(v) for k, v in node.properties.items()}}
+        )
+        if node.id in result.created_node_ids and (values_masked or masked_by_own_marking(node))
+        else node
+        for node in result.nodes
+    ]
+    # Every edge is this run's own creation (§5: an edge has no
+    # `match_on`/`on_match` to reference by).
+    edges = [
+        edge.model_copy(
+            update={"properties": {k: _mask_value(v) for k, v in edge.properties.items()}}
+        )
+        if values_masked or masked_by_own_marking(edge)
+        else edge
+        for edge in result.edges
+    ]
+
+    def rejected_row_unreadable(row_index: int) -> bool:
+        row = sampled[row_index] if 0 <= row_index < len(sampled) else None
+        return not row_markings(draft, scheme, row).readable_by(principal, scheme)
+
+    # A rejected row resolved to no marking: it is masked unless the principal may view every
+    # marking *that row's* declared and bound cells could give (an unreadable one gives them all).
+    rejections = [
+        rejection.model_copy(update={"sample": _masked_sample(sampled, rejection.row_index)})
+        if values_masked or rejected_row_unreadable(rejection.row_index)
+        else rejection
+        for rejection in result.rejections
+    ]
+    values_masked = (
+        values_masked
+        or nodes != result.nodes
+        or edges != result.edges
+        or rejections != result.rejections
+    )
 
     return VerifyReport(
         rows_read=result.rows_read,
         rows_deduplicated=result.rows_deduplicated,
+        rows_already_loaded=result.rows_already_loaded,
         sample_is_whole_source=sample_is_whole_source,
         values_masked=values_masked,
         entities_by_type={

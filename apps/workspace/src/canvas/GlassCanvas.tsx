@@ -30,7 +30,7 @@ import { createNodeBorderProgram } from "@sigma/node-border";
 import { createNodeImageProgram } from "@sigma/node-image";
 import type { StoreApi } from "zustand/vanilla";
 import { useStore } from "zustand/react";
-import { EdgeLineProgram, EdgeRectangleProgram, createNodeCompoundProgram } from "sigma/rendering";
+import { EdgeLineProgram, EdgeRectangleProgram, NodeCircleProgram, createNodeCompoundProgram } from "sigma/rendering";
 import { animateNodes, graphExtent } from "sigma/utils";
 import Sigma from "sigma";
 import {
@@ -76,6 +76,10 @@ import {
   type RadialMenuItem,
 } from "../design/primitives/RadialMenu";
 import { redrawOnBandChange, redrawWhenCameraStops } from "./cameraMoves";
+import { COMMUNITY_LINKS_ABOVE, communityGroupOf, communityLinks, drawsCommunityLinks, drawsNodeDots } from "./communityLinks";
+import { attachCommunityLinkLayer, type CommunityLinkState } from "./communityLinkLayer";
+import { latestOnly, workerAssign } from "./communityAssigner";
+import { zoomBandForRatio } from "./zoomBands";
 import { emailsOutcomeText, showEmailsAsDocuments } from "../inspector/emailDocuments";
 import { eventsEntryLabel, eventsNoun, mayCarryText } from "../inspector/linkEventsApi";
 import { edgeTypesOfferedFor } from "./edgeTypeMenu";
@@ -89,7 +93,7 @@ import {
 import { settledAnchors } from "./settledAnchor";
 import { dragTargets, keepPinned, nudgeFor } from "./nodeDrag";
 import { expansionLinksNotice, linksAmongNotice, showLinksAmong } from "./linksAmong";
-import { CanvasLegend } from "./CanvasLegend";
+import { CanvasLegend, type LegendValueIcon } from "./CanvasLegend";
 import { ZoomControls } from "./ZoomControls";
 
 /** Where the canvas grid's on or off is kept, in this browser only. */
@@ -104,11 +108,15 @@ import {
 import { fetchWouldAdd } from "./expansionPreview";
 import { LargeExpansionPrompt } from "./LargeExpansionPrompt";
 import { branchSelection } from "./branchNodes";
+import { fetchFirstSeen } from "../analytics/api";
+import { litNote, litTabName, UNDATED_NOT_INCLUDED } from "../crossfilter/lit";
+import { LIT_ANSWER_LATE, readLit, selectionChangedSince } from "../crossfilter/selectLit";
+import type { TimeWindow, WeekdayHourCell } from "../crossfilter/store";
 import { removeFromWorkingSet } from "./removeNodes";
 import { ViewActions } from "./ViewActions";
 import { settleLayout, type LayoutNode } from "./forceLayout";
 import { BubbleOverlay, type Bubble } from "./BubbleOverlay";
-import { arrange, enclosingCircle, linkKey, treeLinkKeys, type LayoutMode } from "./layoutModes";
+import { ARRANGE_MAX_NODES, arrange, enclosingCircle, linkKey, packBubbles, treeLinkKeys, type LayoutMode } from "./layoutModes";
 import { LayoutMenu, type BubbleKey } from "./LayoutMenu";
 import { CommunitiesStatus, CommunitiesToggle } from "./CommunitiesControls";
 import { CommunityBoxOverlay } from "./CommunityBoxOverlay";
@@ -122,7 +130,8 @@ import { getLabelChoices, onLabelChoicesChange } from "./labelChoices";
 import { LabelsMenu } from "./LabelsMenu";
 import { IconsMenu } from "./IconsMenu";
 import { forgetEntityPictures, loadEntityPictures, onEntityPicturesChange } from "./entityPictures";
-import { onIconChoicesChange } from "./iconChoices";
+import { onIconChoicesChange, valueIconShownFor } from "./iconChoices";
+import { singleFlight } from "./singleFlight";
 import {
   boxAt,
   collapseView,
@@ -153,7 +162,7 @@ import { PathfinderOverlay } from "./PathfinderOverlay";
 import { PathfinderErrorOverlay } from "./PathfinderErrorOverlay";
 import { ActionErrorOverlay } from "./ActionErrorOverlay";
 import { describeEmptyExpansion } from "./expansionOutcome";
-import type { ClusterExplanation, WorkingSetDelta } from "../workingset/models";
+import type { ClusterExplanation, ResolutionOutcome, WorkingSetDelta } from "../workingset/models";
 
 const NODE_PROGRAM = createNodeCompoundProgram<
   WorkingSetNodeAttributes,
@@ -333,10 +342,18 @@ export interface GlassCanvasHandle {
    * its type being left out from the legend (ADR-117) — or `null` if it is not in `graph` or nothing
    * is mounted. Asked of the renderer, as `labelOf` is. */
   linkDrawn: (edgeId: string) => boolean | null;
+  /** Which program draws a node now: `"dot"` on a large working set zoomed out, `"full"` otherwise
+   * (ADR-119); null for a node not in the view. */
+  nodeDrawnAs: (nodeId: string) => "dot" | "full" | null;
   /** Draws `nodeId` and everything within `depth` links of it, counted first and asked about when
    * large, exactly as a double-click expansion is (ADR-070: choosing a search result draws three
    * steps out). A no-op if `nodeId` is not in the view. */
   expandFrom: (nodeId: string, depth: number) => void;
+  /** ADR-128 decision 2 (B3): replaces the selection with every node `window` lights (a link with an
+   * event inside it, ends included; a node a lit link touches; undated links not included), read
+   * from the view this canvas holds. One undo gives the previous selection back. A window that
+   * lights nothing leaves the selection as it was and says so. */
+  selectLit: (window: TimeWindow, cells?: readonly WeekdayHourCell[] | null) => Promise<void>;
   /** Phase 8 Stage 4h: the chart artefact's own real capture path
    * (`02_GLASS_FRONTEND.md` §10.1/§10.3) — delegates to `captureChartImage`
    * (`export/chartExport.ts`), which renders the live Sigma instance to a PNG via
@@ -588,6 +605,18 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       message: string;
       tone?: "error" | "notice";
     } | null>(null);
+    // ADR-128 decision 2 (B3): what Select what is lit selected, the window it used, and the
+    // selection it replaced. Kept so that Branch selected can send the window, and so that one undo
+    // can give the previous selection back; both lapse the moment the selection is anything else.
+    const [lit, setLit] = useState<{
+      window: TimeWindow;
+      nodeIds: ReadonlySet<string>;
+      previous: readonly string[];
+    } | null>(null);
+    const selectLitRef = useRef<
+      ((window: TimeWindow, cells?: readonly WeekdayHourCell[] | null) => Promise<void>) | null
+    >(null);
+    const litFlightRef = useRef(singleFlight());
     // Read by `refreshNodeVisualState` (called from many unrelated call sites — hover, selection,
     // dimming) without threading a new parameter through every one of them; written only by the
     // effect below, keyed on `pathResult` itself. A ref, not state, because nothing here needs a
@@ -637,6 +666,52 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       });
     // Re-render when the working set changes, so the view's node count stays current.
     const workingSetSeq = useStore(store, (s) => s.seq);
+    // Counts a change of the analyst's icon choice or of a node's own picture, which decide whether a
+    // value icon is drawn and so whether the legend names it.
+    const [iconSeq, setIconSeq] = useState(0);
+    // ADR-119: on a large working set the zoomed-out bands draw links between communities
+    // (`communityLinks.ts`); every node's community comes from a Web Worker.
+    const communityLinksRef = useRef<Omit<CommunityLinkState, "active">>({ assignment: null, links: [] });
+    const askCommunitiesRef = useRef<ReturnType<typeof latestOnly> | null>(null);
+    /** Whether the analyst has chosen a layout: until then a large case is grouped by community. */
+    const layoutChosenRef = useRef(false);
+    /** Whether a link is drawn by itself now, or stands in a link between communities: it is drawn
+     * when the view is not one of community links, or when it is the selected link or on a found path. */
+    const drawnByItself = (edgeId: string, ratio: number): boolean =>
+      !drawsCommunityLinks(zoomBandForRatio(ratio), graph.size) ||
+      edgeId === selectedEdgeRef.current ||
+      graph.getEdgeAttribute(edgeId, "onPath") === true;
+    const drawnByItselfRef = useRef(drawnByItself);
+    drawnByItselfRef.current = drawnByItself;
+    useEffect(() => {
+      if (graph.size <= COMMUNITY_LINKS_ABOVE) {
+        communityLinksRef.current = { assignment: null, links: [] };
+        return;
+      }
+      // Asked again once the working set has stopped changing for a moment, not at every delta.
+      const timer = setTimeout(() => {
+        askCommunitiesRef.current ??= latestOnly(workerAssign());
+        const pairs = graph.mapEdges((_edge, _attrs, source, target) => [source, target] as [string, string]);
+        void askCommunitiesRef.current(graph.nodes(), pairs).then((assignment) => {
+          if (!assignment) return;
+          communityLinksRef.current = { assignment, links: communityLinks(assignment, pairs) };
+          // ADR-119: a large case is grouped by community, so the links between communities run
+          // between real groups, unless the analyst has chosen a layout of their own.
+          if (!layoutChosenRef.current) {
+            layoutModeRef.current = "bubbles";
+            bubbleKeyRef.current = "community";
+            setLayoutMode("bubbles");
+            setBubbleKey("community");
+            arrangeNowRef.current();
+          } else if (layoutModeRef.current === "bubbles" && bubbleKeyRef.current === "community") {
+            arrangeNowRef.current();
+          }
+          sigmaRef.current?.scheduleRender();
+        });
+      }, 400);
+      return () => clearTimeout(timer);
+      // `workingSetSeq` changes whenever nodes or links are added or removed.
+    }, [workingSetSeq, graph]);
 
     // **Communities (ADR-066).** A way of looking at the nodes now in view: groups of closely linked
     // nodes get a box, and a group can be folded into one Group Node and opened again. Nothing here
@@ -882,6 +957,24 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       // `workingSetSeq` changes whenever nodes or links are added or removed.
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [graph, ontology, workingSetSeq]);
+    // The legend's icons by value (ADR-128 Decision 4): each drawing a property's value gives a node in
+    // view, what it stands for and how many nodes carry it.
+    const legendValueIcons = useMemo(() => {
+      const counts = new Map<string, LegendValueIcon>();
+      graph.forEachNode((id, attrs) => {
+        const rule = ontology.visualFor(attrs.data.type)?.iconByValue;
+        // Only a value icon the renderer draws: the node's own picture and the analyst's choice
+        // for the type come first (`valueIconShownFor`, shared with the Inspector).
+        const given = valueIconShownFor(id, attrs.data.type, rule, attrs.data.properties);
+        if (!rule || !given) return;
+        const key = `${attrs.data.type}\u0000${given.value}`;
+        const held = counts.get(key);
+        if (held) held.count += 1;
+        else counts.set(key, { type: attrs.data.type, property: rule.property, value: given.value, glyph: given.glyph, count: 1 });
+      });
+      return [...counts.values()];
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [graph, ontology, workingSetSeq, iconSeq]);
     // The legend's links: each link type in view, its colour and how many, and whether it is shown.
     const legendLinks = useMemo(() => {
       const counts = new Map<string, number>();
@@ -1026,11 +1119,25 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
     useEffect(() => onLabelChoicesChange(() => sigmaRef.current?.refresh()), []);
     // A different icon chosen for a type (ADR-079): it is baked into each node's picture, so the
     // nodes' stored pictures are worked out again, then the canvas is drawn.
-    useEffect(() => onIconChoicesChange(() => redrawForThemeRef.current()), []);
+    useEffect(
+      () =>
+        onIconChoicesChange(() => {
+          setIconSeq((n) => n + 1);
+          redrawForThemeRef.current();
+        }),
+      [],
+    );
     // An entity's own picture (ADR-105) is baked in the same way. The pictures of the nodes in view
     // are asked for whenever the view changes; only types a picture can depict are asked about, and
     // the server answers only for pictures the analyst may see.
-    useEffect(() => onEntityPicturesChange(() => redrawForThemeRef.current()), []);
+    useEffect(
+      () =>
+        onEntityPicturesChange(() => {
+          setIconSeq((n) => n + 1);
+          redrawForThemeRef.current();
+        }),
+      [],
+    );
     useEffect(() => forgetEntityPictures, [investigationId]);
     useEffect(() => {
       if (!bearerToken || !investigationId) return;
@@ -1147,7 +1254,22 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
         // Clustered bubbles: which bubble each node is in, by entity type or by community.
         let groupOf: ((id: string) => string) | undefined;
         let groupLabels = new Map<string, string>();
-        if (mode === "bubbles") {
+        // ADR-119: past the arrangement's size limit, communities come from the worker, and the
+        // bubbles are packed without the limit (`packBubbles`); until the worker has answered, the
+        // positions stay and the answer arranges them (`communityLinksRef`).
+        const large = arrangeInput.nodes.length > ARRANGE_MAX_NODES;
+        const workerAssignment = communityLinksRef.current.assignment;
+        if (mode === "bubbles" && bubbleKeyRef.current === "community" && large) {
+          if (!workerAssignment) return;
+          const ofNode = communityGroupOf(workerAssignment);
+          const names = new Map<string, string>();
+          groupOf = (id) => {
+            const key = ofNode(id);
+            if (!names.has(key)) names.set(key, key === "none" ? "Not in a community" : `Community ${names.size + 1}`);
+            return key;
+          };
+          groupLabels = names;
+        } else if (mode === "bubbles") {
           if (bubbleKeyRef.current === "community") {
             const found = findCommunities(arrangeInput.nodes.map((n) => n.id), edges);
             const ofNode = new Map<string, string>();
@@ -1167,7 +1289,9 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
         const laidOut =
           mode === "organic"
             ? settleLayout(nodes, edges)
-            : arrange(mode, arrangeInput, { centre, groupOf });
+            : mode === "bubbles" && large && groupOf
+              ? packBubbles(arrangeInput, groupOf)
+              : arrange(mode, arrangeInput, { centre, groupOf });
         const settled =
           laidOut && pinnedRef.current.size > 0
             ? keepPinned(laidOut, pinnedRef.current, realPositionOf)
@@ -1223,7 +1347,15 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
           }
         };
         if (Object.keys(targets).length === 0) finish();
-        else if (prefersReducedMotion()) {
+        else if (Object.keys(targets).length > ARRANGE_MAX_NODES) {
+          // Tens of thousands of nodes are moved in one step, not animated: an animation of them
+          // redraws the whole graph every frame for nothing anyone can follow (ADR-119).
+          graph.updateEachNodeAttributes((id, attributes) => {
+            const at = targets[id];
+            return at ? { ...attributes, x: at.x, y: at.y } : attributes;
+          });
+          finish();
+        } else if (prefersReducedMotion()) {
           // `02_GLASS_FRONTEND.md` §3.4: an instant move, and where each node was is kept so the
           // toolbar's Show previous positions can mark it (the animation was the only cue).
           const was: PreviousPosition[] = [];
@@ -1325,7 +1457,9 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
         // 30px framed the outermost nodes under them (found live, 11 October 2026).
         stagePadding: 80,
         defaultNodeType: "glass-node",
-        nodeProgramClasses: { "glass-node": NODE_PROGRAM },
+        // ADR-119: on a large working set zoomed out, an ordinary node is a plain dot in its type's
+        // colour (Sigma's circle program); one that needs its full drawing keeps the picture program.
+        nodeProgramClasses: { "glass-node": NODE_PROGRAM, "glass-dot": NodeCircleProgram },
         defaultEdgeType: "glass-edge",
         edgeProgramClasses: {
           // ADR-097 step 2: a plain link wider than a pixel is drawn by the program that honours width
@@ -1369,7 +1503,15 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
             labelLiteral:
               frame.label !== "" &&
               labelIsLiteral(data.data, (type) => ontology.identifiersFor(type), getLabelChoices()),
-            type: "glass-node",
+            // ADR-119: a dot, unless the node is selected, under the pointer or on a found path
+            // (`emphasised`), or carries a resolution-cluster ring — the rings are the picture
+            // program's, and those are the nodes an analyst is looking at.
+            type:
+              drawsNodeDots(zoomBandForRatio(ratio), graph.order) &&
+              data.emphasised !== true &&
+              !((data.clusterBorderSize ?? 0) > 0)
+                ? "glass-dot"
+                : "glass-node",
           };
           const folded = foldedViewRef.current;
           if (!folded) return drawn;
@@ -1384,6 +1526,7 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
               forceLabel: true,
               borderColor: activePalette().borderStrong,
               borderSize: 0.3,
+              type: "glass-node",
             };
           }
           // The other members sit at the group's centre (their stored position was moved there), too
@@ -1393,6 +1536,9 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
         },
         edgeReducer: (edgeId, data) => {
           const ratio = currentSigma?.getCamera().ratio ?? 1;
+          // ADR-119: a link standing in a link between communities is not drawn, and nothing else
+          // about how it looks is worked out (a large working set has a quarter of a million).
+          if (!drawnByItselfRef.current(edgeId, ratio)) return { ...data, hidden: true };
           const hoveredNode = hoveredRef.current;
           const caption = () => {
             const source = graph.source(edgeId);
@@ -1475,6 +1621,10 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       });
       currentSigma = sigma;
       sigmaRef.current = sigma;
+      const detachCommunityLinks = attachCommunityLinkLayer(sigma as never, () => ({
+        active: drawsCommunityLinks(zoomBandForRatio(sigma.getCamera().ratio), graph.size),
+        ...communityLinksRef.current,
+      }));
       // ADR-115 E4: the zoom group's readout follows the camera (100% at its starting scale).
       const camera = sigma.getCamera();
       setZoomPercent(Math.round(100 / camera.getState().ratio));
@@ -1482,12 +1632,14 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       camera.on("updated", redrawOnBandChange(sigma, camera.getState().ratio));
 
       // The link under a point, within a few pixels of its line: a link that is not drawn (hidden by
-      // the analyst, or inside a folded group) is not under it.
+      // the analyst, inside a folded group, or standing in a link between communities) is not under it.
       const edgeAtViewport = (px: number, py: number): string | null => {
         const segments: ScreenSegment[] = [];
+        const ratio = sigma.getCamera().ratio;
         graph.forEachEdge((edgeId, _attrs, source, target) => {
           if (hiddenEdgesRef.current.has(edgeId)) return;
           if (foldedViewRef.current?.hidesLink(source, target)) return;
+          if (!drawnByItselfRef.current(edgeId, ratio)) return;
           const a = sigma.graphToViewport({
             x: graph.getNodeAttribute(source, "x") ?? 0,
             y: graph.getNodeAttribute(source, "y") ?? 0,
@@ -1720,6 +1872,7 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
         modifierListenersRef.current = null;
         resizeObserverRef.current?.disconnect();
         resizeObserverRef.current = null;
+        detachCommunityLinks();
         sigma.kill();
         sigmaRef.current = null;
       };
@@ -1749,6 +1902,8 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
         },
         highlightNodes: (nodeIds: readonly string[]) => {
           const present = nodeIds.filter((id) => graph.hasNode(id));
+          // None of them in the view: the selection is left as it was, not cleared.
+          if (present.length === 0) return;
           setSelected(new Set(present));
           onSelectionChange?.(present);
         },
@@ -1771,6 +1926,8 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
           const { x, y } = shown;
           redrawWhenCameraStops(sigma, sigma.getCamera().animate({ x, y }, { duration: 200 }));
         },
+        selectLit: (window: TimeWindow, cells?: readonly WeekdayHourCell[] | null) =>
+          selectLitRef.current?.(window, cells ?? null) ?? Promise.resolve(),
         deselect: (nodeId: string) => {
           setSelected((prev) => {
             if (!prev.has(nodeId)) return prev;
@@ -1800,6 +1957,11 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
           const sigma = sigmaRef.current;
           if (!sigma || !graph.hasEdge(edgeId)) return null;
           return !(sigma.getEdgeDisplayData(edgeId)?.hidden ?? false);
+        },
+        nodeDrawnAs: (nodeId: string) => {
+          const sigma = sigmaRef.current;
+          if (!sigma || !graph.hasNode(nodeId)) return null;
+          return sigma.getNodeDisplayData(nodeId)?.type === "glass-dot" ? "dot" : "full";
         },
         cameraState: () => {
           const sigma = sigmaRef.current;
@@ -2306,8 +2468,9 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
         });
         return;
       }
-      const delta = await response.json();
-      store.getState().applyDelta(delta);
+      // ADR-124: the answer is a `ResolutionOutcome`; the delta inside it is what the canvas applies.
+      const outcome = (await response.json()) as ResolutionOutcome;
+      store.getState().applyDelta(outcome.delta);
     }
 
     // `08_ACCEPTANCE_SCENARIOS.md` B10: "per-comparison match
@@ -2907,6 +3070,74 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       selectLink(null);
     }
 
+    // ADR-128 decision 2 (B3): the selection is read from the view this canvas holds, never from ids
+    // the server offered, and replaces whatever was selected (one undo).
+    async function selectWhatIsLit(
+      window: TimeWindow,
+      cells: readonly WeekdayHourCell[] | null = null,
+    ): Promise<void> {
+      // A press while one is being read does nothing: two reads would race, and the later would
+      // record the first's result as the selection to go back to.
+      await litFlightRef.current(async () => {
+        // What is selected at the moment of the press is what an undo goes back to.
+        const previous = Array.from(selected);
+        await selectWhatIsLitOnce(window, previous, cells);
+      });
+    }
+    async function selectWhatIsLitOnce(
+      window: TimeWindow,
+      previous: string[],
+      cells: readonly WeekdayHourCell[] | null,
+    ): Promise<void> {
+      const links = graph.mapEdges((id, _attrs, source, target) => ({ id, source, target }));
+      const read = await readLit(
+        (filter) => fetchFirstSeen(apiBaseUrl, bearerToken, { filter }),
+        investigationId,
+        window,
+        links,
+        cells,
+      );
+      const rect = containerRef.current?.getBoundingClientRect();
+      const at = { x: (rect?.left ?? 0) + 40, y: (rect?.top ?? 0) + 40 };
+      // The analyst changed the selection while the read was in flight: the answer is dropped, so it
+      // neither replaces the newer selection nor records a stale one for Undo to go back to.
+      if (selectionChangedSince(previous, selectedRef.current)) {
+        setActionError({ ...at, message: LIT_ANSWER_LATE, tone: "notice" });
+        return;
+      }
+      if (!read.ok) {
+        setActionError({ ...at, message: read.message });
+        return;
+      }
+      if (read.lit.nodeIds.length === 0) {
+        setActionError({
+          ...at,
+          message: `Nothing is lit in this window (${UNDATED_NOT_INCLUDED}). The selection is unchanged.`,
+          tone: "notice",
+        });
+        return;
+      }
+      const present = read.lit.nodeIds.filter((id) => graph.hasNode(id));
+      setLit({ window: read.window, nodeIds: new Set(present), previous });
+      setSelected(new Set(present));
+      onSelectionChange?.(present);
+    }
+    selectLitRef.current = selectWhatIsLit;
+
+    // The lit selection stands while the selection is exactly what it chose.
+    const litStands =
+      lit !== null &&
+      lit.nodeIds.size === selected.size &&
+      Array.from(selected).every((id) => lit.nodeIds.has(id));
+
+    function undoSelectLit(): void {
+      if (!lit || !litStands) return;
+      const back = lit.previous.filter((id) => graph.hasNode(id));
+      setSelected(new Set(back));
+      onSelectionChange?.(back);
+      setLit(null);
+    }
+
     // Sends the selected nodes to a case of their own (ADR-084). A Group Node stands for every
     // member of its group, so choosing one chooses all of them; the stand-in's own id is not a
     // real node and is never sent. The view is not changed: the original case stays as it was.
@@ -2924,13 +3155,31 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       return Array.from(chosen);
     }
 
-    async function branchSelected(name?: string): Promise<{ id: string; name: string } | null> {
+    async function branchSelected(
+      name?: string,
+      opts: { lit?: boolean } = {},
+    ): Promise<{ id: string; name: string } | null> {
+      const nodeIds = chosenForBranch();
+      // ADR-128 decision 2: right after Select what is lit, with the window still set and the
+      // selection still within what was lit, the window goes with the selection and the server
+      // derives the slice (the lit links and their nodes). Any other branch is as it always was.
+      const now = getEventsWindow?.() ?? null;
+      const withWindow =
+        opts.lit !== false &&
+        lit !== null &&
+        now !== null &&
+        now.validFrom === lit.window.validFrom &&
+        now.validTo === lit.window.validTo &&
+        nodeIds.every((id) => lit.nodeIds.has(id))
+          ? lit.window
+          : undefined;
       const result = await branchSelection(fetch, {
         apiBaseUrl,
         bearerToken,
         investigationId,
-        nodeIds: chosenForBranch(),
-        name,
+        nodeIds,
+        name: name ?? (withWindow ? litTabName(withWindow) : undefined),
+        window: withWindow,
       });
       if (!result.ok) {
         const rect = containerRef.current?.getBoundingClientRect();
@@ -2959,7 +3208,9 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
 
     async function askAboutSelected(): Promise<void> {
       const n = selectedDocumentCount;
-      const made = await branchSelected(`Questions on ${n} document${n === 1 ? "" : "s"}`);
+      const made = await branchSelected(`Questions on ${n} document${n === 1 ? "" : "s"}`, {
+        lit: false,
+      });
       if (made) onAskAboutDocuments?.(made.id, made.name);
     }
 
@@ -3048,12 +3299,14 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
             <LayoutMenu
               mode={layoutMode}
               onChange={(mode) => {
+                layoutChosenRef.current = true;
                 layoutModeRef.current = mode;
                 setLayoutMode(mode);
                 arrangeNowRef.current();
               }}
               bubbleKey={bubbleKey}
               onBubbleKeyChange={(key) => {
+                layoutChosenRef.current = true;
                 bubbleKeyRef.current = key;
                 setBubbleKey(key);
                 arrangeNowRef.current();
@@ -3304,6 +3557,10 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
           }
           onAsk={onAskAboutDocuments ? () => void askAboutSelected() : undefined}
           documentCount={selectedDocumentCount}
+          litNote={
+            litStands && lit ? litNote(lit.window) : undefined
+          }
+          onUndoLit={litStands ? undoSelectLit : undefined}
           onLinksAmong={(degree) => void linksAmongOnCanvas(Array.from(selected), degree)}
           onRemove={() => void removeNodeIds(Array.from(selected))}
           onClear={() => {
@@ -3326,7 +3583,7 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
           className="canvas-corner"
           style={toolbarHeight ? ({ "--canvas-toolbar-height": `${toolbarHeight}px` } as CSSProperties) : undefined}
         >
-          <CanvasLegend types={legendTypes} links={legendLinks} onToggleLink={toggleLinkType} />
+          <CanvasLegend types={legendTypes} links={legendLinks} valueIcons={legendValueIcons} onToggleLink={toggleLinkType} />
           <ZoomControls onZoomIn={() => zoomBy("in")} onZoomOut={() => zoomBy("out")} onFit={fitToView} percent={zoomPercent} />
         </div>
         {addingFiles && bearerToken && investigationId && (

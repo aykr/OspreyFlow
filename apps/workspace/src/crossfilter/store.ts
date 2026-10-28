@@ -3,11 +3,11 @@
 // rule 2 ("Filters dim, they do not remove"), `08_ACCEPTANCE_SCENARIOS.md` A3.
 //
 // Mirrors `workingset/store.ts`'s vanilla-store split deliberately: this
-// module holds only the filter *inputs* (`window`, `selectedNodeIds`) and
+// module holds only the filter *inputs* (`window`, `cells`, `selectedNodeIds`) and
 // their *derived* dimming result as plain reactive state, never the working
 // set's own graphology instance — `GlassCanvas.tsx` reads `dimmedNodeIds`
 // from here to feed its own `refreshNodeVisualState`, the same way it reads
-// `filteredCount` from the working-set store, rather than this module
+// the working-set store, rather than this module
 // reaching into the graph itself.
 //
 // **The dimming mechanism reuses existing `AnalyticsPort` machinery rather
@@ -29,10 +29,17 @@ export interface TimeWindow {
   validTo: string | null;
 }
 
+/** One cell of the weekly view: the weekday (0 = Monday) and the hour (0-23), in UTC, as the
+ * weekly histogram buckets by (ADR-130 decision 2). */
+export type WeekdayHourCell = NonNullable<EventFilter["weekday_hours"]>[number];
+
 export interface CrossFilterStoreState {
   /** Set by the timeline's brush (`08_ACCEPTANCE_SCENARIOS.md` A5) —
    * `null` means no temporal restriction. */
   window: TimeWindow | null;
+  /** Set by the weekly view's cell brush or its "Choose cells" control (ADR-130 decision 2) —
+   * `null` means no restriction; an empty list is a choice of nothing, which matches nothing. */
+  cells: WeekdayHourCell[] | null;
   /** Set by a canvas selection, a histogram bar click, or a map cell
    * selection (A3's own "select the hotspot cells") — `null` means no
    * node restriction. */
@@ -52,6 +59,7 @@ export interface CrossFilterStoreState {
   dimmedCount: number;
   setWindow: (window: TimeWindow | null) => void;
   setSelectedNodeIds: (nodeIds: string[] | null) => void;
+  setCells: (cells: WeekdayHourCell[] | null) => void;
   clearFilter: () => void;
 }
 
@@ -63,12 +71,16 @@ export function buildEventFilter(
   investigationScope: string,
   window: TimeWindow | null,
   selectedNodeIds: string[] | null,
+  cells: readonly WeekdayHourCell[] | null = null,
 ): EventFilter {
   return {
     investigation_scope: investigationScope,
     window: window ? { valid_from: window.validFrom, valid_to: window.validTo } : null,
     node_ids: selectedNodeIds ?? [],
     edge_types: [],
+    // No key at all when no cells are chosen (the server reads that as no restriction); an empty
+    // list is sent as such, because it is a choice of nothing.
+    ...(cells === null ? {} : { weekday_hours: cells.map((c) => ({ weekday: c.weekday, hour: c.hour })) }),
   };
 }
 
@@ -89,8 +101,12 @@ export function createCrossFilterStore(
   bearerToken: string,
   investigationScope: string,
 ): CrossFilterStore {
+  // Each refresh takes the next number; an answer applies only if it is still the latest, so an older
+  // read that arrives last cannot overwrite a newer one.
+  let latestRefresh = 0;
   const store = createStore<CrossFilterStoreState>((set) => ({
     window: null,
+    cells: null,
     selectedNodeIds: null,
     dimmedNodeIds: new Set(),
     dimmedEdgeIds: new Set(),
@@ -98,15 +114,20 @@ export function createCrossFilterStore(
     dimmedCount: 0,
     setWindow: (window) => set({ window }),
     setSelectedNodeIds: (selectedNodeIds) => set({ selectedNodeIds }),
-    clearFilter: () =>
+    setCells: (cells) => set({ cells }),
+    clearFilter: () => {
+      // A read still in flight was for a filter that is gone; its answer must not land.
+      latestRefresh += 1;
       set({
         window: null,
+        cells: null,
         selectedNodeIds: null,
         dimmedNodeIds: new Set(),
         dimmedEdgeIds: new Set(),
         firstSeen: null,
         dimmedCount: 0,
-      }),
+      });
+    },
   }));
 
   /** Re-derives what is dimmed for the nodes and links now in the view. One read: when each node
@@ -116,7 +137,9 @@ export function createCrossFilterStore(
     allEdgeIds: readonly string[] = [],
   ): Promise<void> {
     const state = store.getState();
-    if (state.window === null && state.selectedNodeIds === null) {
+    latestRefresh += 1;
+    const mine = latestRefresh;
+    if (state.window === null && state.selectedNodeIds === null && state.cells === null) {
       store.setState({
         dimmedNodeIds: new Set(),
         dimmedEdgeIds: new Set(),
@@ -125,8 +148,15 @@ export function createCrossFilterStore(
       });
       return;
     }
-    const filter = buildEventFilter(investigationScope, state.window, state.selectedNodeIds);
-    const firstSeen = firstSeenFrom(await fetchFirstSeen(apiBaseUrl, bearerToken, { filter }));
+    const filter = buildEventFilter(
+      investigationScope,
+      state.window,
+      state.selectedNodeIds,
+      state.cells,
+    );
+    const answer = await fetchFirstSeen(apiBaseUrl, bearerToken, { filter });
+    if (mine !== latestRefresh) return;
+    const firstSeen = firstSeenFrom(answer);
     const dimming = emergence(firstSeen, null, allNodeIds, allEdgeIds);
     store.setState({
       firstSeen,

@@ -153,6 +153,11 @@ export const CANVAS_ACTIONS = defineActionRegistry("CANVAS_ACTIONS", [
   // row as Remove selected and Clear view, so it is reached by Tab like them.
   "branch-selected-opens-a-new-tab",
   "branch-selected-from-a-selected-nodes-menu",
+  // 26 October 2026 (ADR-128 decision 2, B3): a window set by Set exact dates lights part of the
+  // canvas; Select what is lit replaces the selection with it, Branch selected then opens a tab holding
+  // only that slice, and one undo gives the earlier selection back.
+  "select-what-is-lit-then-branch-selected-by-keyboard",
+  "undo-select-what-is-lit-by-keyboard",
   "layout-menu-chooses-layout",
   "layout-menu-chooses-force-directed-tree",
   "layout-menu-chooses-clustered-bubbles-and-what-they-group-by",
@@ -166,6 +171,9 @@ export const CANVAS_ACTIONS = defineActionRegistry("CANVAS_ACTIONS", [
   // picture can be given from a file.
   "icons-menu-by-keyboard",
   "icon-picture-from-file",
+  // ADR-128 Decision 4 (B7): an icon chosen by a property's value is drawn for its value, the legend
+  // names what it means, and the analyst's own choice for the type takes over from it.
+  "legend-says-which-value-icon-means-what-by-keyboard",
   "large-expansion-add-all-by-keyboard",
   // 3 October 2026 (ADR-066): Communities groups the nodes in view and folds a group into one node.
   // Every way of doing it with the mouse has a keyboard route, each proved by its own case.
@@ -224,6 +232,15 @@ export const QUERY_BUILDER_ACTIONS = defineActionRegistry("QUERY_BUILDER_ACTIONS
   "load-saved-pattern",
   // ADR-096: the panel's parts fold; a folded one opens by Enter on its header.
   "open-a-folded-part-by-keyboard",
+  // ADR-121: a value field on a node adds a condition (equality on an indexed property) that
+  // Preview and Run send, and its own control removes it.
+  "add-condition-to-pattern-node",
+  "remove-condition-from-pattern-node",
+  // ADR-129 decision 2: a question typed in the Ask to search box (and asked by Enter) draws the
+  // model's proposed pattern in the builder, with its count, before anything runs.
+  "ask-to-search-propose-pattern",
+  // A proposal replaces the pattern drawn; one press restores it.
+  "restore-the-previous-pattern-after-ask",
 ] as const);
 
 /**
@@ -298,6 +315,12 @@ export const TIMELINE_PLAYBACK_ACTIONS = defineActionRegistry("TIMELINE_PLAYBACK
   "overlay-another-case-reveals-its-box",
   "cross-case-overlay-loads-second-track",
   "no-dated-events-says-so-and-offers-no-brush-or-playback",
+  // ADR-130 decision 2: the weekly view's "Choose cells" control, the keyboard route to what a drag
+  // across the grid chooses. Proven by the map's request body and the ids the canvas dims.
+  "choose-the-weekend-by-keyboard",
+  // ADR-130 Amendment 1: the day checkboxes and the hour boxes, each proven by the map's request.
+  "tick-a-day-by-keyboard-sends-its-cells",
+  "set-the-hours-by-keyboard-sends-them",
 ] as const);
 
 /**
@@ -399,6 +422,24 @@ export const SELECTION_ACTIONS = defineActionRegistry("SELECTION_ACTIONS", [
 export const CASE_DATASETS_ACTIONS = defineActionRegistry("CASE_DATASETS_ACTIONS", [
   "tick-datasets-and-create-a-case-by-keyboard",
   "change-what-a-case-reads-by-keyboard",
+  // ADR-126: the case's domain models, chosen when it is made and changed by its Author.
+  "choose-a-cases-domain-models-when-creating-it-by-keyboard",
+  "change-a-cases-domain-models-by-keyboard",
+] as const);
+
+/** The case's brief (ADR-128 decision 3): the Cases drawer's Brief section, each edit its Author makes
+ * and the opening of an attachment by anyone who reads the case. `keyboard/case-brief.spec.ts`. */
+export const CASE_BRIEF_ACTIONS = defineActionRegistry("CASE_BRIEF_ACTIONS", [
+  "set-the-priority-requirement-by-keyboard",
+  "add-a-requirement-by-keyboard",
+  "edit-a-requirement-by-keyboard",
+  "escape-cancels-an-edit-and-returns-focus",
+  "mark-a-requirement-answered-and-reopen-it-by-keyboard",
+  "attach-a-trend-by-keyboard",
+  "open-an-attachment-by-keyboard",
+  "detach-an-attachment-by-keyboard",
+  "remove-a-requirement-after-confirming-by-keyboard",
+  "a-reader-reaches-an-attachment-and-is-offered-no-edit",
 ] as const);
 
 /** Who can open a case (ADR-052 §9): its Author gives and removes levels. `keyboard/case-access.spec.ts`. */
@@ -436,6 +477,12 @@ export const EXPLORE_ACTIONS = defineActionRegistry("EXPLORE_ACTIONS", [
   // ADR-100 Amendment 9: the link budget on a ranked node.
   "add-a-node-with-its-busiest-links-by-keyboard",
   "add-a-node-with-all-its-links-by-keyboard",
+  // ADR-128 decision 1 (B2): add many from a pasted or chosen list, counted first, then confirmed.
+  "paste-a-list-count-it-and-confirm-the-add-by-keyboard",
+  "add-a-list-with-all-its-links-by-keyboard",
+  "cancel-a-counted-list-by-keyboard",
+  "escape-cancels-a-pasted-list-by-keyboard",
+  "choose-a-list-file-by-keyboard",
 ] as const);
 
 /** The case's questions to the model (ADR-098 decision 4): asked, answered with what it draws on,
@@ -458,6 +505,40 @@ export const PIPELINE_STUDIO_ACTIONS = defineActionRegistry("PIPELINE_STUDIO_ACT
   "open-the-map-editor-by-keyboard",
   // ADR-108, 10 October 2026: the Connect gate rehosted under the first source node.
   "open-the-source-settings-by-keyboard",
+  // ADR-127 Amendment 2 (B2-2b): the source's declarations in Connect, and a binding in Map.
+  "add-a-source-unit-by-keyboard",
+  "declare-a-marking-column-by-keyboard",
+  "bind-a-handling-part-to-a-column-by-keyboard",
+  // ADR-127 Amendment 10 (B2-5b): the deduplicate key in Connect, and what a second run says.
+  "add-a-deduplicate-key-column-by-keyboard",
+  "move-a-deduplicate-key-column-by-keyboard",
+  "remove-a-deduplicate-key-column-by-keyboard",
+  "save-the-deduplicate-key-by-keyboard",
+  "clear-the-deduplicate-key-by-keyboard",
+  "read-rows-already-loaded-on-a-run-report-by-keyboard",
+  "read-rows-already-loaded-in-verify-by-keyboard",
+  // ADR-127 Amendment 13 (B2-7b): the links of the row template in Map, reached by keys alone.
+  "select-a-map-link-by-keyboard",
+  "create-a-map-link-by-keyboard",
+  "bind-a-map-links-time-by-keyboard",
+  "bind-a-map-links-end-by-keyboard",
+  "mark-a-map-links-text-by-keyboard",
+  "bind-a-map-links-handling-to-a-column-by-keyboard",
+  "delete-a-map-link-by-keyboard",
+  // The entities of the row template, the same way.
+  "select-a-map-entity-by-keyboard",
+  "rename-a-map-entity-by-keyboard",
+  "change-a-map-entitys-binding-by-keyboard",
+  "delete-a-map-entity-by-keyboard",
+  "change-a-map-entitys-pole-class-and-type-by-keyboard",
+  "set-a-map-entitys-match-by-keyboard",
+  "mark-a-map-entitys-content-by-keyboard",
+  "mark-a-map-documents-own-text-by-keyboard",
+  "make-a-map-entity-conditional-by-keyboard",
+  "change-a-map-links-type-by-keyboard",
+  "choose-a-transform-on-a-map-binding-by-keyboard",
+  "set-a-literal-on-a-map-binding-by-keyboard",
+  "split-and-mark-a-map-binding-optional-by-keyboard",
 ] as const);
 
 /** The Alerts place (ADR-109 phase B): the case team's queue, an alert's explanation and its
@@ -500,6 +581,8 @@ export const QUESTIONS_ACTIONS = defineActionRegistry("QUESTIONS_ACTIONS", [
   "reject-a-proposal-by-keyboard",
   // The drawer's visible Close (the owner, 9 October 2026).
   "close-the-questions-drawer-by-keyboard",
+  // ADR-129 decision 1: a cited graph fact selects what it stands for and brings it into view.
+  "select-a-graph-fact-from-an-answer-by-keyboard",
 ] as const);
 
 /** Files added straight to a case (ADR-094 step 3): from the strip over the canvas, standing alone,
@@ -561,6 +644,10 @@ export const INSPECTOR_ACTIONS = defineActionRegistry("INSPECTOR_ACTIONS", [
  * `keyboard/shell.spec.ts`. */
 export const SHELL_ACTIONS = defineActionRegistry("SHELL_ACTIONS", [
   "slash-moves-focus-to-search",
+  // ADR-128 decision 1 (B2): the search box's own "Add many from a list", opened, counted and cancelled.
+  "add-many-from-the-search-box-by-keyboard",
+  // ...and added: the nodes arrive on the real canvas through the shell's `applyStarterDelta` wiring.
+  "add-many-from-the-search-box-adds-to-the-canvas-by-keyboard",
   "rail-entries-by-keyboard",
   "rail-shows-and-hides-names-by-keyboard",
   // ADR-111: the view switch, Reports included — never proved by keyboard before it.
@@ -612,6 +699,14 @@ export const WELCOME_ACTIONS = defineActionRegistry("WELCOME_ACTIONS", [
   "open-the-welcome-panel-with-question-mark",
   "pick-up-a-history-step-from-the-welcome-panel",
   "close-the-welcome-panel",
+] as const);
+
+// ADR-124 decision 2 (U6b): the dialog a reader is shown when their own view of the case is past a cap.
+export const VIEW_OVER_CAP_ACTIONS = defineActionRegistry("VIEW_OVER_CAP_ACTIONS", [
+  "see-the-over-cap-dialog-when-the-server-says-the-view-is-too-large",
+  "try-again-from-the-over-cap-dialog-by-keyboard",
+  "choose-a-type-and-open-a-filtered-branch-by-keyboard",
+  "put-the-over-cap-dialog-away-with-escape-by-keyboard",
 ] as const);
 
 export const REPORTS_ACTIONS = defineActionRegistry("REPORTS_ACTIONS", [

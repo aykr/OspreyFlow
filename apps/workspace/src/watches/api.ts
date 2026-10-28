@@ -28,6 +28,39 @@ export interface AlertView {
   created_at: string;
   /** ADR-110 Amendment 3: the alert in words; a scheduled run's notice is nothing else. */
   words?: string | null;
+  /** ADR-130 decision 1: the hotlist behind a `hotlist:` rule, present only to its owner. */
+  hotlist?: AlertHotlist | null;
+  /** ADR-130 decision 1: what fired it, present only when the evidence is available to the reader. */
+  fired_on?: FiredOn[] | null;
+}
+
+/** Mirrors `services/api/watch_routes.py::AlertHotlist`. */
+export interface AlertHotlist {
+  /** As typed, else as stored. */
+  identifier: string;
+  kept_as_written: boolean;
+  /** An ISO date, `YYYY-MM-DD`. */
+  review_date: string;
+}
+
+/** Mirrors `services/api/watch_routes.py::FiredFile`: one `row`, how many `rows`, or how many
+ * `records` where the locators are not of the form "row N" (ADR-130 Amendment 1). */
+export interface FiredFile {
+  name: string;
+  row?: number | null;
+  rows?: number | null;
+  records?: number | null;
+}
+
+/** Mirrors `services/api/watch_routes.py::FiredOn`: at most five files, `more_files` the rest. */
+export interface FiredOn {
+  type: string;
+  label: string;
+  files: FiredFile[];
+  more_files: number;
+  /** ADR-130 Amendment 1: true when the node's sources are in data the case does not read; its
+   * `files` are then empty and its type and label are all that is said. */
+  sources_withheld?: boolean;
 }
 
 /** ADR-110 decision 10: a notice that a scheduled run failed or was refused, not a match. */
@@ -46,7 +79,6 @@ export interface InvestigationSummary {
 export interface AlertJumpResult {
   investigation: InvestigationSummary;
   seeded_count: number;
-  unreadable_count: number;
 }
 
 /** ADR-099 Amendment 3: watches and their alerts are the dataset's, asked of the case. */

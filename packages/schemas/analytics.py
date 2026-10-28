@@ -21,7 +21,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from schemas.domain import EdgeId, Handling, Interval, NodeId
 
@@ -48,6 +48,10 @@ class EventRecord(BaseModel):
     properties: dict[str, Any] = Field(default_factory=dict)
     investigation_scope: str
     handling: Handling
+    #: The Studio load that wrote this event (ADR-127 decision 6), so a reverted load's events can
+    #: be removed (`AnalyticsPort.retract_load`). `None` for an event from another writer: a seeder,
+    #: a manual edit, or one written before the column existed.
+    load_id: str | None = None
 
     @model_validator(mode="after")
     def _lat_lon_travel_together(self) -> EventRecord:
@@ -164,6 +168,23 @@ class InheritedEvents(BaseModel):
 
     scopes: list[str] = Field(default_factory=list)
     edge_ids: list[EdgeId] = Field(default_factory=list)
+    #: ADR-128 decision 2: a branch made from what is lit records its window, and reads the
+    #: parent's events only inside it, both ends included, so its timeline starts and ends inside
+    #: the window. `None`: every inherited event, as before. Applies to the inherited events only;
+    #: the branch's own are never held to it.
+    window: Interval | None = None
+
+
+#: The weekly view's cells: seven weekdays by twenty-four hours.
+MAX_WEEKDAY_HOURS = 168
+
+
+class WeekdayHour(BaseModel):
+    """One cell of the weekly view (ADR-130 decision 2): the weekday (0 = Monday) and the hour
+    (0-23), read in UTC, the numbering the `weekday_hour` histogram buckets by."""
+
+    weekday: int = Field(ge=0, le=6)
+    hour: int = Field(ge=0, le=23)
 
 
 class EventFilter(BaseModel):
@@ -203,9 +224,33 @@ class EventFilter(BaseModel):
     #: **into** the adapter's `WHERE` clause alongside the access filter, never applied after
     #: retrieval (`03_CONDUIT_MIDDLEWARE.md` §6, `CLAUDE.md` rule 2).
     value_filters: dict[str, list[str]] = Field(default_factory=dict)
+    #: **A brush on the weekly view's cells (ADR-130 decision 2).** Only events whose weekday and
+    #: hour (UTC, weekday 0 = Monday: the weekly histogram's own cells) are one of these count.
+    #: `None` does not restrict; an empty list matches nothing, because "no cells chosen" is a
+    #: deliberate selection of nothing, unlike an expanded facet with nothing ticked.
+    #: A list is de-duplicated, keeping the order of first appearance, and holds at most the 168
+    #: real cells (7 days x 24 hours): a longer one is refused, not thinned (ADR-130 Amendment 1).
+    weekday_hours: list[WeekdayHour] | None = None
     #: A branch's parents' events on the links it holds (ADR-084 Amendment 2). `None` reads the
     #: case's own events only.
     inherited: InheritedEvents | None = None
+
+    @field_validator("weekday_hours")
+    @classmethod
+    def _cells_are_distinct_and_at_most_168(
+        cls, cells: list[WeekdayHour] | None
+    ) -> list[WeekdayHour] | None:
+        if cells is None:
+            return None
+        if len(cells) > MAX_WEEKDAY_HOURS:
+            raise ValueError(
+                f"weekday_hours holds at most {MAX_WEEKDAY_HOURS} cells (7 days x 24 hours); "
+                f"got {len(cells)}"
+            )
+        distinct: dict[tuple[int, int], WeekdayHour] = {}
+        for cell in cells:
+            distinct.setdefault((cell.weekday, cell.hour), cell)
+        return list(distinct.values())
 
 
 class HistogramBucketing(StrEnum):

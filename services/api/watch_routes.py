@@ -18,15 +18,26 @@ nothing left to get wrong.
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
+from typing import Protocol
 
 from pydantic import BaseModel
 
+from ontology.handling import sources_within_case
 from ports.graph import GraphPort
 from schemas.domain import Alert, AlertMode, Hotlist, Monitor, Node, Principal
 
 from .alerts import evidence_available
+from .evidence_brief import display_name
+from .hotlists import HotlistNotFoundError
 from .investigations import Investigation
+
+#: ADR-130 decision 1: the most files named for one matched node. The rest are counted, never cut
+#: silently (rule 2).
+_MAX_FIRED_FILES = 5
+
+_ROW_LOCATOR = re.compile(r"^row (\d+)$")
 
 
 class CreateHotlistRequest(BaseModel):
@@ -55,6 +66,41 @@ class MonitorList(BaseModel):
     monitors: list[Monitor]
 
 
+class AlertHotlist(BaseModel):
+    """ADR-130 decision 1: the hotlist a `hotlist:` alert came from, read at display time and only
+    for the hotlist's owner. The identifier is as typed (else as stored)."""
+
+    identifier: str
+    kept_as_written: bool
+    review_date: date
+
+
+class FiredFile(BaseModel):
+    """One source file of a matched node: its name (the final path segment of the document id; two
+    loads' `calls.csv` are two entries), and what is cited in it. `row` is the single row when
+    exactly one `row N` is cited and nothing else; otherwise `rows` counts the distinct `row N`
+    locators and `records` the distinct locators of any other form (ADR-130 Amendment 1)."""
+
+    name: str
+    row: int | None = None
+    rows: int | None = None
+    records: int | None = None
+
+
+class FiredOn(BaseModel):
+    """ADR-130 decision 1: what a matched node is, and where it was read from. `files` are in the
+    order of first appearance, at most five; `more_files` counts the rest.
+
+    ADR-130 Amendment 1: when the node belongs to a dataset the reader's case does not read, its
+    sources are not said at all: `sources_withheld` is true, `files` is empty and `more_files` 0."""
+
+    type: str
+    label: str
+    files: list[FiredFile]
+    more_files: int
+    sources_withheld: bool = False
+
+
 class AlertView(BaseModel):
     """The wire shape for an alert — see this module's own docstring for why `referent_node_ids`
     is redacted here rather than left alongside a separate `evidence_available` flag."""
@@ -70,6 +116,10 @@ class AlertView(BaseModel):
     #: ADR-110 Amendment 3: what the alert says in words — a scheduled run's notice is nothing
     #: but its words (a typology finding has them too); `None` for a hotlist or monitor match.
     words: str | None = None
+    #: ADR-130 decision 1: present for a `hotlist:` rule, only to the hotlist's owner.
+    hotlist: AlertHotlist | None = None
+    #: ADR-130 decision 1: present only when the evidence is available to the reader (rule 3).
+    fired_on: list[FiredOn] | None = None
 
 
 class AlertList(BaseModel):
@@ -79,18 +129,84 @@ class AlertList(BaseModel):
 class AlertJumpResult(BaseModel):
     """`POST /v1/alerts/{alert_id}/jump`'s response — `08_ACCEPTANCE_SCENARIOS.md` B14: "The new
     working set contains the alert's entities and a link to the originating investigation."
-    `seeded_count`/`unreadable_count` answer the task's own question — what happens when a referent
-    became unreadable between the alert firing and the jump: it is not silently dropped from the
-    count the caller can act on, even though it is silently dropped from the seeded working set
-    itself (the only thing `working_set.seed` can do with a node it cannot fetch)."""
+    `seeded_count` is how many referents the jumper could read and so seeded. There is no count
+    of the rest (ADR-124 decision 1): a referent that became unreadable between the alert firing
+    and the jump is left out of the new case, and how many were left out is a figure that points at
+    what the jumper may not read."""
 
     investigation: Investigation
     seeded_count: int
-    unreadable_count: int
 
 
-async def alert_to_view(alert: Alert, principal: Principal, graph: GraphPort) -> AlertView:
+class HotlistReader(Protocol):
+    """The one read of `HotlistStore` the view needs, owner-checked by the store."""
+
+    async def get_authorized(self, hotlist_id: str, principal: Principal) -> Hotlist: ...
+
+
+def _file_name(document_id: str) -> str:
+    return document_id.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or document_id
+
+
+def _fired_on(node: Node, principal: Principal) -> FiredOn:
+    """Group the node's sources by whole document, in the order each first appears. A file with one
+    distinct `row N` locator and nothing else says that row; otherwise it says how many `row N`
+    rows and how many records of any other locator form."""
+    label = display_name(node)
+    if not sources_within_case(node.datasets, principal):
+        return FiredOn(type=node.type, label=label, files=[], more_files=0, sources_withheld=True)
+    locators: dict[str, list[str]] = {}
+    for source in node.provenance.sources:
+        seen = locators.setdefault(source.document_id, [])
+        if source.locator not in seen:
+            seen.append(source.locator)
+    files: list[FiredFile] = []
+    for document_id, cited in locators.items():
+        name = _file_name(document_id)
+        rows = [m for m in (_ROW_LOCATOR.match(c) for c in cited) if m]
+        records = len(cited) - len(rows)
+        if len(rows) == 1 and records == 0:
+            files.append(FiredFile(name=name, row=int(rows[0].group(1))))
+        else:
+            files.append(FiredFile(name=name, rows=len(rows) or None, records=records or None))
+    return FiredOn(
+        type=node.type,
+        label=label,
+        files=files[:_MAX_FIRED_FILES],
+        more_files=max(0, len(files) - _MAX_FIRED_FILES),
+    )
+
+
+async def _alert_hotlist(
+    alert: Alert, principal: Principal, hotlists_store: HotlistReader | None
+) -> AlertHotlist | None:
+    if hotlists_store is None or not alert.rule_id.startswith("hotlist:"):
+        return None
+    try:
+        hotlist_id = alert.rule_id.removeprefix("hotlist:")
+        hotlist = await hotlists_store.get_authorized(hotlist_id, principal)
+    except HotlistNotFoundError:
+        return None
+    return AlertHotlist(
+        identifier=hotlist.identifier_typed or hotlist.identifier,
+        kept_as_written=hotlist.identifier_canonical is False,
+        review_date=hotlist.review_date,
+    )
+
+
+async def alert_to_view(
+    alert: Alert,
+    principal: Principal,
+    graph: GraphPort,
+    hotlists_store: HotlistReader | None = None,
+) -> AlertView:
     available = await evidence_available(alert, principal, graph)
+    fired_on: list[FiredOn] | None = None
+    if available and alert.mode is AlertMode.FULL and alert.referent_node_ids:
+        nodes = [await graph.get_node(node_id, principal) for node_id in alert.referent_node_ids]
+        # `evidence_available` read these a moment ago; one that has gone since is withdrawn whole.
+        if all(node is not None for node in nodes):
+            fired_on = [_fired_on(node, principal) for node in nodes if node is not None]
     return AlertView(
         id=alert.id,
         rule_id=alert.rule_id,
@@ -101,12 +217,14 @@ async def alert_to_view(alert: Alert, principal: Principal, graph: GraphPort) ->
         investigation_id=alert.investigation_id,
         created_at=alert.created_at,
         words=alert.words,
+        hotlist=await _alert_hotlist(alert, principal, hotlists_store),
+        fired_on=fired_on,
     )
 
 
 async def fetch_jumpable_referents(
     alert: Alert, *, principal: Principal, graph: GraphPort
-) -> tuple[list[Node], int]:
+) -> list[Node]:
     """The node-fetch half of the jump — `app.py`'s own route does the investigation-branch and
     working-set-seed calls, since both are already-established app.py-local orchestration
     (`branch_investigation`'s own `investigations.create`/`working_set.seed`/`publish_delta`/
@@ -115,26 +233,25 @@ async def fetch_jumpable_referents(
     jump time, never trusted from whatever `evidence_available` found true when the alert was
     listed moments earlier, the same "re-verify from the authoritative source" discipline every
     other read in this codebase already follows. A referent that no longer resolves is not an
-    error (the jump still proceeds with whatever is readable) and is not silently absorbed either —
-    counted and returned so the caller can surface a partial-success notice, never a call that
-    looks fully successful when it wasn't."""
+    error: the jump proceeds with whatever is readable, and says nothing of how many were not
+    (ADR-124 decision 1)."""
     readable: list[Node] = []
-    unreadable = 0
     for node_id in alert.referent_node_ids:
         node = await graph.get_node(node_id, principal)
-        if node is None:
-            unreadable += 1
-            continue
-        readable.append(node)
-    return readable, unreadable
+        if node is not None:
+            readable.append(node)
+    return readable
 
 
 __all__ = [
+    "AlertHotlist",
     "AlertJumpResult",
     "AlertList",
     "AlertView",
     "CreateHotlistRequest",
     "CreateMonitorRequest",
+    "FiredFile",
+    "FiredOn",
     "HotlistList",
     "MonitorList",
     "alert_to_view",

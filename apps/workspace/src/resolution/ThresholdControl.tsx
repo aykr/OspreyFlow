@@ -10,6 +10,7 @@ import { useEffect, useState } from "react";
 import type { StoreApi } from "zustand/vanilla";
 
 import { Slider } from "../design/primitives/Slider";
+import type { ResolutionOutcome, WorkingSetDelta } from "../workingset/models";
 import type { WorkingSetStoreState } from "../workingset/store";
 
 // `services/resolve/projection.py`'s three named constants, checked directly rather than assumed
@@ -30,10 +31,9 @@ export interface ResolutionThresholdControlProps {
   bearerToken: string;
   investigationId: string;
   store: StoreApi<WorkingSetStoreState>;
-  /** Bubbles the change summary up to the App-level Toast slot — `merged`/`split`/`affected` are
-   * `DeltaReproject`'s own counts, the same ones the picture (cluster co-location/border, in
-   * `GlassCanvas`) is driven from, so the number and the picture agree by construction: both read
-   * off the one delta this control's own `PUT` response returns. */
+  /** Bubbles the change summary up to the App-level Toast slot — `merged`/`split`/`affected` are the
+   * `ResolutionOutcome`'s own figures, read off
+   * the one answer this control's own `PUT` returns; the delta inside it drives the picture. */
   onChangeSummary?: (message: string) => void;
 }
 
@@ -93,11 +93,11 @@ export function ResolutionThresholdControl({
       },
     );
     if (!response.ok) return; // surfaces via a future notice/Toast at the App layer, same as GlassCanvas's own fetches
-    const delta = await response.json();
-    store.getState().applyDelta(delta);
+    const outcome = (await response.json()) as ResolutionOutcome;
+    store.getState().applyDelta(outcome.delta as WorkingSetDelta);
     setThreshold(detent.value);
     onChangeSummary?.(
-      `Match strictness: ${detent.label} — ${delta.merged} merged, ${delta.split} split, ${delta.affected} affected`,
+      `Match strictness: ${detent.label} — ${outcome.merged} merged, ${outcome.split} split, ${outcome.affected} affected`,
     );
   }
 

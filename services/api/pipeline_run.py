@@ -48,11 +48,12 @@ from services.api.review import (
     text_windows,
 )
 from services.api.rule_evaluation import RuleGate
-from services.api.studio_publish import run_published_recipe
+from services.api.studio_publish import LoadSink, load_published_recipe, run_published_recipe
 from services.extract.candidates import ExtractionCandidate
 from services.extract.recognised import recognised_candidates
 from services.extract.writer import write_candidate
 from services.geocoder.match import match_place_mention
+from services.ingest.engine import distinct_markings
 from services.ingest.geometries import POINT_GEOMETRY_VERSION
 from services.ingest.pipeline import (
     SUPPORTED_EXTRACT_LIBRARIES,
@@ -60,11 +61,10 @@ from services.ingest.pipeline import (
     SUPPORTED_GEOCODERS,
     pipeline_from_recipe,
 )
-from services.ingest.recipe_loader import load_recipe
 
 from conduit_common.identity import new_node_id
 from knowledge_adapters import REGISTRY
-from ontology.handling import HandlingScheme
+from ontology.handling import HandlingScheme, sources_in_full
 from ports.analytics import AnalyticsPort
 from ports.graph import GraphPort
 from ports.media import MediaStore
@@ -185,6 +185,19 @@ def _upstream_sources(graph: PipelineGraph, node_id: str) -> list[str]:
     return sorted(sources)
 
 
+async def _mark_uncovered(
+    sink: LoadSink | None, branches: list[BranchRunReport], source_ids: list[str]
+) -> None:
+    """Each branch a stage that wrote something was fed by has a record that does not cover it
+    (ADR-127 decision 6, Amendment 6): said on the record, so a revert refuses the load."""
+    if sink is None:
+        return
+    wanted = set(source_ids)
+    for branch in branches:
+        if branch.source_id in wanted:
+            await sink.uncovered(branch.report.load_id)
+
+
 async def _created_nodes_of_type(
     graph: GraphPort,
     branches: list[BranchRunReport],
@@ -290,6 +303,9 @@ async def _run_extract_stage(
             continue
         text = (await media.get(document.properties["object_ref"])).decode("utf-8")
         handling = override if override is not None else document.handling
+        # Rule 3, ADR-127 Amendment 26: what the stage read is at the document's marking and what
+        # it wrote at `handling` (the override where there is one): the counts include both.
+        report.markings = distinct_markings(report.markings, [document.handling, handling])
         try:
             if output == "inferred_graph":
                 found: list[ExtractionCandidate] = []
@@ -310,9 +326,7 @@ async def _run_extract_stage(
                 try:
                     for candidate in found:
                         written_ids.append(
-                            await write_candidate(
-                                graph, candidate, created_by=principal.id, tx=tx
-                            )
+                            await write_candidate(graph, candidate, created_by=principal.id, tx=tx)
                         )
                 except Exception:
                     await graph.rollback_transaction(tx)
@@ -379,17 +393,18 @@ async def _run_enrich_stage(
             "only the local gazetteer was consulted"
         )
 
-    locations, withheld = await _created_nodes_of_type(
-        graph, branches, _upstream_sources(pipeline, node.id), "Location", principal
-    )
+    # In full: each mention is superseded with its own provenance (ADR-130 Amendment 2, "a read
+    # that is written back"). Still read for `principal`, so the access filter applies.
+    with sources_in_full():
+        locations, withheld = await _created_nodes_of_type(
+            graph, branches, _upstream_sources(pipeline, node.id), "Location", principal
+        )
     if withheld:
         report.refusals.append(
             f"{withheld} element(s) this run created could not be read back by the running "
             "principal and were not enriched"
         )
-    run_created = {
-        node_id for branch in branches for node_id in branch.report.created_node_ids
-    }
+    run_created = {node_id for branch in branches for node_id in branch.report.created_node_ids}
     to_ref = REGISTRY["geometry_ref"]
 
     tx = await graph.begin_transaction()
@@ -400,9 +415,7 @@ async def _run_enrich_stage(
                 continue
             report.locations_considered += 1
             suggestions = await graph.suggest_locations(str(name), principal)
-            gazetteer = [
-                c for c in suggestions if c.id != mention.id and c.id not in run_created
-            ]
+            gazetteer = [c for c in suggestions if c.id != mention.id and c.id not in run_created]
             edge = await match_place_mention(graph, mention, gazetteer, principal, scheme, tx)
             if edge is not None:
                 report.matched_local += 1
@@ -490,6 +503,7 @@ async def run_published_pipeline(
     source_location: str | None = None,
     online_geocode: OnlineGeocode | None = None,
     rules: RuleGate | None = None,
+    sink: LoadSink | None = None,
 ) -> PipelineRunReport:
     """The whole pipeline, in topological order: branches, then extracts, then enriches.
 
@@ -497,7 +511,7 @@ async def run_published_pipeline(
     carry its own — the same "today's fresh export" override `run_published_recipe` has, applied
     to the sources that read the draft's own recorded location. A source node carrying its own
     `source_location` in its config keeps it."""
-    recipe = load_recipe(repo_root / str(draft.git_path)) if draft.git_path else None
+    recipe = load_published_recipe(draft, repo_root) if draft.git_path else None
     pipeline = (
         recipe.pipeline
         if recipe is not None and recipe.pipeline is not None
@@ -525,6 +539,8 @@ async def run_published_pipeline(
             analytics=analytics,
             media=media,
             rules=rules,
+            scheme=scheme,
+            sink=sink,
         )
         report.branches.append(
             BranchRunReport(
@@ -551,6 +567,8 @@ async def run_published_pipeline(
             report.extracts.append(extract_stage)
             report.created_node_ids.extend(written)
             report.nodes_created += len(written)
+            if written:
+                await _mark_uncovered(sink, report.branches, _upstream_sources(pipeline, node.id))
         elif node.kind is PipelineNodeKind.ENRICH:
             enrich_stage, edges = await _run_enrich_stage(
                 node,
@@ -565,9 +583,14 @@ async def run_published_pipeline(
             report.enriches.append(enrich_stage)
             report.touched_edge_ids.extend(edges)
             report.edges_created += len(edges)
+            # Its `SAME_AS` links, and the points an online geocode inserts and the node revisions
+            # it writes, are in no record.
+            if edges or enrich_stage.matched_online:
+                await _mark_uncovered(sink, report.branches, _upstream_sources(pipeline, node.id))
 
     for branch in report.branches:
         report.rows_read += branch.report.rows_read
+        report.rows_already_loaded += branch.report.rows_already_loaded
         report.nodes_created += branch.report.nodes_created
         report.nodes_referenced += branch.report.nodes_referenced
         report.edges_created += branch.report.edges_created
@@ -575,5 +598,18 @@ async def run_published_pipeline(
         report.rows_held += branch.report.rows_held
         report.rule_notes.extend(branch.report.rule_notes)
         report.created_node_ids.extend(branch.report.created_node_ids)
+        report.referenced_node_ids.extend(branch.report.referenced_node_ids)
         report.touched_edge_ids.extend(branch.report.touched_edge_ids)
+    # Rule 3, ADR-127 Amendment 23: the counts above are the branches' together, so a reader must
+    # be able to view every marking any branch wrote at to be shown them.
+    # An extract stage's counts are in it too, at what it read and what it wrote (its override
+    # included), which may be above every branch's.
+    report.markings = distinct_markings(
+        *(b.report.markings for b in report.branches), *(e.markings for e in report.extracts)
+    )
+    # A node one branch referenced and another created is the second's own: named once, as created.
+    created = set(report.created_node_ids)
+    report.referenced_node_ids = [
+        node_id for node_id in dict.fromkeys(report.referenced_node_ids) if node_id not in created
+    ]
     return report

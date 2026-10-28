@@ -26,6 +26,7 @@ from schemas.domain import (
 from .access_filter import AccessFilter
 from .gremlin_literals import (
     groovy_args_literal,
+    groovy_identifier,
     groovy_string_list_literal,
     groovy_string_literal,
 )
@@ -51,6 +52,11 @@ class FindByIdentifierBuilder:
     entity_type: str
     identifier_field: str
     value: str
+    #: How many nodes sharing the value are read, when the caller picks among them by a further
+    #: property (`find_node(also=...)`). Such a property (an Endpoint's `endpoint_kind`) is not a
+    #: top-level stored field, so it cannot be a `has` step: the nodes are read and chosen from.
+    #: The adapter passes its bound plus one, so that overflowing is knowable.
+    limit: int = 1
 
     def render_gremlin(self, access: AccessFilter, principal: Principal) -> str:
         has_access = access.gremlin_has_step(principal)
@@ -59,7 +65,7 @@ class FindByIdentifierBuilder:
         value_lit = groovy_string_literal(self.value)
         return (
             f"g.V().hasLabel({type_lit}).has({field_lit},{value_lit})"
-            f".{has_access}.limit(1).elementMap()"
+            f".{has_access}.limit({self.limit}).elementMap()"
         )
 
 
@@ -258,6 +264,73 @@ def render_edges_among_gremlin(
     )
 
 
+def render_record_id_lookup_sql(type_name: str) -> str:
+    """The first half of `GraphPort.get_nodes`/`get_edges` (ADR-124 decision 6): the record ids of
+    the elements of one stored type that hold the ids bound to `:ids`. Gremlin's own
+    `has("id", within(...))` scans the whole store (measured on ArcadeDB 26.10.1: 3.6 s for 1,000
+    ids over 200,000 elements), where SQL `WHERE id IN` on one type is answered from that type's
+    unique `id` index. The ids are a bound parameter, never part of the text; the type name is
+    checked as an identifier, since a name cannot be bound, and quoted in backticks: a proposal's
+    storage type, `KNOWN_TO__01JP...`, needs them."""
+    return f"SELECT @rid AS rid FROM `{groovy_identifier(type_name)}` WHERE id IN :ids"
+
+
+def render_existing_ids_sql(type_name: str) -> str:
+    """The ids, of one stored type (a node's or a link's), that an element already holds, from the
+    type's unique `id` index (as `render_record_id_lookup_sql` is): `GraphPort.existing_node_ids`,
+    and the check that a new link's id is free (`upsert_edges`, the bulk loader). No access step and
+    no reverted or superseded filter: it asks what the unique index would refuse."""
+    return f"SELECT id FROM `{groovy_identifier(type_name)}` WHERE id IN :ids"
+
+
+def render_live_node_ids_sql(type_name: str) -> str:
+    """`render_existing_ids_sql` for nodes, leaving out a node that is reverted and nothing else
+    (`existing_node_ids`). A write onto a reverted node is a fresh create (ADR-127 Amendment 6),
+    so for the load about to record what it created, a reverted node is absent. A superseded node
+    is named, reverted or not, because a write to it still merges: it stays superseded, so the
+    load records it as merged. Still the type's unique `id` index."""
+    return (
+        f"SELECT id FROM `{groovy_identifier(type_name)}` WHERE id IN :ids "
+        "AND (reverted = false OR reverted IS NULL OR superseded_by IS NOT NULL)"
+    )
+
+
+def render_get_nodes_gremlin(
+    record_ids: Sequence[str], access: AccessFilter, principal: Principal
+) -> str:
+    """`GraphPort.get_nodes` (ADR-124 decision 6), the second half: the vertices at `record_ids`
+    (resolved from the given ids by `render_record_id_lookup_sql`) read directly, no traversal,
+    with the access step on the vertex itself. The step is the one every other read carries, so a
+    hidden, superseded or reverted node gives no record. For no record ids the query is still
+    rendered, so an absent id costs the same round trips as a hidden one (a hidden id resolves, so
+    its read runs): `g.V([])` may be every vertex, so the empty form is `g.V().limit(0)`, which
+    yields nothing whatever the engine does with an empty id list, and which stops before it reads
+    a vertex."""
+    has_access = access.gremlin_has_step(principal)
+    if not record_ids:
+        return f"g.V().limit(0).{has_access}.elementMap()"
+    rids = groovy_string_list_literal(list(record_ids))
+    return f"g.V({rids}).{has_access}.elementMap()"
+
+
+def render_get_edges_gremlin(
+    record_ids: Sequence[str], access: AccessFilter, principal: Principal
+) -> str:
+    """`GraphPort.get_edges`: as `render_get_nodes_gremlin`, for links, with the access step on the
+    link and on each end. A link whose end the principal may not read is therefore absent, not
+    returned with a hole in it (rule 3), as `render_edges_among_gremlin` refuses it. For no record
+    ids the empty form is `g.E().limit(0)`, as there."""
+    has_access = access.gremlin_has_step(principal)
+    source = (
+        "g.E().limit(0)"
+        if not record_ids
+        else f"g.E({groovy_string_list_literal(list(record_ids))})"
+    )
+    return (
+        f"{source}.{has_access}.where(outV().{has_access}).where(inV().{has_access}).elementMap()"
+    )
+
+
 @dataclass(frozen=True)
 class ExpandBuilder:
     request: ExpandRequest
@@ -345,34 +418,6 @@ class ExpandBuilder:
         return (
             f'g.V().has("id",within({seeds})).{has_access}'
             f".{self._repeat_clause(access, principal)}.select('e').dedup().elementMap()"
-        )
-
-    def render_candidate_count_gremlin(self, structural_step: str) -> str:
-        """The unfiltered half of `Subgraph.filtered_count`'s comparison
-        (`01_DOMAIN_MODEL.md` §8.2): the same seed set, depth, edge-type
-        and temporal scope as `render_nodes_gremlin`, but with neither
-        access axis applied — only `structural_step`
-        (`AccessFilter.gremlin_structural_step`) carries over, since
-        reverted/superseded exclusion isn't principal-dependent and a
-        reverted or superseded element was never real data to begin with,
-        not a handling-filtered one. `union(identity(), repeat(...))`
-        mirrors `expand`'s own seeds-plus-reached union (`adapter.py`
-        currently does that union in Python across two separate queries)
-        in one traversal, since this method returns a bare count, not
-        elements to union in the caller."""
-        seeds = groovy_string_list_literal(self.request.node_ids)
-        edge_step = _EDGE_STEP[self.request.direction]
-        other_step = _OTHER_VERTEX_STEP[self.request.direction]
-        edge_filter = self._edge_label_filter()
-        temporal_filter = self._temporal_filter()
-        repeat = (
-            f"repeat({edge_step}(){edge_filter}.{structural_step}{temporal_filter}.as('e')"
-            f".{other_step}().{structural_step}.simplePath())"
-            f".times({self.request.depth}).emit()"
-        )
-        return (
-            f'g.V().has("id",within({seeds})).{structural_step}'
-            f".union(identity(),{repeat}).dedup().count()"
         )
 
 
@@ -506,6 +551,18 @@ def _pin(node: PatternNode) -> str:
     return f'.has("id",{groovy_string_literal(node.node_id)})' if node.node_id else ""
 
 
+def _where(node: PatternNode) -> str:
+    """ADR-121: each condition of a node as a `has(property, value)` step, in property order so a
+    pattern compiles the same way every time. Placed wherever `_pin` is, beside the node's access
+    step (rule 3): the same traverser the access filter keeps or drops, so a condition on a node
+    the reader cannot see finds nothing and counts nothing. The ontology's say on which properties
+    may be named is `ontology.pattern_where`'s, checked by the adapter before this compiles."""
+    return "".join(
+        f".has({groovy_string_literal(name)},{groovy_string_literal(value)})"
+        for name, value in sorted(node.where.items())
+    )
+
+
 def _could_be_one(a: PatternNode | None, b: PatternNode | None) -> bool:
     """Whether two variables could bind the same node, and so need telling apart: not when both
     name a type and the types differ, which keeps a chain across types exactly as it compiled."""
@@ -599,6 +656,7 @@ class MatchBuilder:
             physical_first = physical_type_name(first.entity_type)
             steps.append(f".hasLabel({groovy_string_literal(physical_first)})")
         steps.append(_pin(first))
+        steps.append(_where(first))
         steps.append(f".{has_access}")
         steps.append(f".as({groovy_string_literal(first.var)})")
 
@@ -614,6 +672,7 @@ class MatchBuilder:
                 )
             if node:
                 steps.append(_pin(node))
+                steps.append(_where(node))
             steps.extend(
                 f".where(neq({groovy_string_literal(earlier)}))"
                 for earlier in bound
@@ -774,6 +833,7 @@ class MatchBuilder:
             )
         if primary.node_id:
             steps.append(f'.has("id",{groovy_string_literal(primary.node_id)})')
+        steps.append(_where(primary))
         steps.append(f".{has_access}")
         steps.append(f".as({groovy_string_literal(primary.var)})")
         for edge in primary_chain:
@@ -788,6 +848,8 @@ class MatchBuilder:
                 steps.append(
                     f".hasLabel({groovy_string_literal(physical_type_name(to_node.entity_type))})"
                 )
+            if to_node:
+                steps.append(_where(to_node))
             steps.append(f".as({groovy_string_literal(edge.to_var)})")
 
         for root in secondary_roots:
@@ -816,6 +878,7 @@ class MatchBuilder:
                 reverse_steps.append(".outV()")
                 reverse_steps.append(f".{has_access}")
             reverse_steps.append(f'.has("id",{groovy_string_literal(root.node_id)})')
+            reverse_steps.append(_where(root))
             steps.append(f".select({groovy_string_literal(join_var)})")
             steps.append(f".where(__{''.join(reverse_steps)})")
 
@@ -903,7 +966,7 @@ class BusiestLinksBuilder:
             )
             label = f".hasLabel({labels})"
         of_node = (
-            f".where(bothV().has(\"id\",{groovy_string_literal(self.node_id)}))"
+            f'.where(bothV().has("id",{groovy_string_literal(self.node_id)}))'
             if self.node_id is not None
             else ""
         )

@@ -6,7 +6,7 @@
 `09_INGEST_STUDIO.md` §6 shows — the studio (Phase 5a) will be an editor for
 this same file, not a second format. `LoadRecord` is the ledger entry one
 execution of a recipe against one source produces: what it created, so
-`services/ingest`'s `revert_load` can supersede a whole load as a unit
+`services/ingest/load_revert.py` can revert a whole load as a unit
 without re-deriving what belongs to it.
 """
 
@@ -18,7 +18,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from schemas.domain import Edge, EdgeId, Handling, Node, NodeId, PrincipalId, Provenance
 
@@ -186,6 +186,7 @@ _UNSTRUCTURED_CATALOGUE: tuple[ConnectorCatalogueEntry, ...] = (
     ),
 )
 
+
 #: Where connector profiles live, relative to the repository root — `09_INGEST_STUDIO.md` §2's
 #: own `connectors/`. Overridable so a deployment can ship its own layouts without a rebuild,
 #: which is the other half of "a file rather than a release".
@@ -298,6 +299,31 @@ class PipelineGraph(BaseModel):
     edges: list[PipelineEdge] = Field(default_factory=list)
 
 
+def check_source_declarations(value: dict[str, Any]) -> dict[str, Any]:
+    """What a source's handling declares beside its marking (ADR-127 decision 3), as Connect and a
+    PATCH's merged result are judged: `units` a list of non-empty unit names (stripped), and
+    `handling_columns` a map of parts to column names, which needs `units` if it names a unit
+    part. Anything else is refused with its cause."""
+    value = dict(value)
+    if "units" in value:
+        units = value["units"]
+        if not isinstance(units, list) or any(
+            not isinstance(u, str) or not u.strip() for u in units
+        ):
+            raise ValueError("handling units must be a list of non-empty unit names")
+        value["units"] = [u.strip() for u in units]
+    if "handling_columns" in value:
+        value["handling_columns"] = check_handling_columns(value["handling_columns"])
+        unit_parts = [p for p in ("originator", "owning_unit") if p in value["handling_columns"]]
+        if unit_parts and not value.get("units"):
+            raise ValueError(
+                f"handling_columns declares a column for {' and '.join(unit_parts)} but the "
+                "source lists no units: a cell may name only a unit the source declares in "
+                "units"
+            )
+    return value
+
+
 class ConnectDraftInput(BaseModel):
     """What Connect (§2) actually collects: a connector choice and the
     three mandatory gate answers. Nothing here is optional except
@@ -317,6 +343,16 @@ class ConnectDraftInput(BaseModel):
     handling: dict[str, Any] = Field(default_factory=dict)
     #: §2: "what the legal basis for processing it is".
     legal_basis: str | None = None
+    #: ADR-127 decision 5: the fields that make a source row the same row again, as a recipe's
+    #: `deduplicate` takes them. Absent leaves the draft's own as it is; an empty `key` clears it.
+    #: Judged at save against the source's columns (`services/ingest/recipe_rules.py`).
+    deduplicate: DeduplicateConfig | None = None
+
+    @field_validator("handling")
+    @classmethod
+    def _units_are_names(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """ADR-127 decision 3: refused here, as a 422, not left for the recipe to fail on."""
+        return check_source_declarations(value)
 
 
 class StudioRecipeDraft(BaseModel):
@@ -359,6 +395,10 @@ class StudioRecipeDraft(BaseModel):
     #: the Glass's own component state.
     row_template: RowTemplate | None = None
     unmapped_fields: list[UnmappedField] = Field(default_factory=list)
+    #: ADR-127 decision 5: what makes a source row the same row again, carried through Publish into
+    #: the committed recipe and kept on a new version. `None` keeps no keys and loads every row
+    #: every time.
+    deduplicate: DeduplicateConfig | None = None
     #: Publish's own state (§6) — every field below is `None` while
     #: `status='draft'`. `verified_at` is set by a *successful* run of
     #: `POST .../verify` (`services/api/studio_verify.py`'s `run_verify`
@@ -370,6 +410,9 @@ class StudioRecipeDraft(BaseModel):
     #: later `PATCH .../schedule` may change without touching anything else.
     verified_at: datetime | None = None
     ontology_version: int | None = None
+    #: ADR-120 D10, Amendment 1: the pack versions it was published against. `None` = not pinned;
+    #: `{}` = pinned, names and writes no pack.
+    pack_versions: dict[str, int] | None = None
     git_path: str | None = None
     published_by: PrincipalId | None = None
     #: Resolved at read time, never stored (ADR-106).
@@ -443,10 +486,109 @@ class RecipeConnector(BaseModel):
     source_crs: str | None = None
 
 
+#: The parts of a marking a column may carry, per element (ADR-127 decision 3,
+#: `09_INGEST_STUDIO.md` §4: "a column can carry either"). `review_date` and `legal_basis` are the
+#: source's, set once at Connect.
+HANDLING_BINDABLE: tuple[str, ...] = (
+    "classification",
+    "handling_code",
+    "action_code",
+    "sanitisation_code",
+    "originator",
+    "owning_unit",
+)
+
+
+class HandlingFieldBinding(BaseModel):
+    """One part of an element's marking read from a source column per row (ADR-127 decision 3):
+    `{field: <column>}`. An empty cell takes the element's default for that part; a cell may only
+    tighten it (`merge_handling`'s order), and a unit must be one the recipe declares."""
+
+    field: str
+
+    model_config = {"extra": "forbid"}
+
+
+def check_handling_override(value: dict[str, Any] | None, *, owner: str) -> dict[str, Any] | None:
+    """An element's `handling` is literal values and, for the six parts a column may carry, a
+    `{field: <column>}` binding. Anything else in a dict's place is refused where the recipe is
+    read, so it cannot reach a run as a pydantic error from `Handling`."""
+    for name, item in (value or {}).items():
+        if not isinstance(item, dict):
+            continue
+        if name not in HANDLING_BINDABLE:
+            raise ValueError(
+                f"{owner} handling {name!r} cannot be bound to a column "
+                f"(a column may carry: {', '.join(HANDLING_BINDABLE)})"
+            )
+        try:
+            HandlingFieldBinding.model_validate(item)
+        except ValidationError as exc:
+            raise ValueError(
+                f"{owner} handling {name!r} is bound as {{field: <column>}} and nothing else"
+            ) from exc
+    return value
+
+
+def check_handling_columns(value: object) -> dict[str, str]:
+    """`handling_columns`: which source column carries each part of a marking, as Connect declares
+    it (ADR-127 decision 3). A part outside the six, or a column that is not a non-empty name, is
+    refused; names are stripped."""
+    if not isinstance(value, dict):
+        raise ValueError("handling_columns must map a handling part to a column name")
+    declared: dict[str, str] = {}
+    for part, column in value.items():
+        if part not in HANDLING_BINDABLE:
+            raise ValueError(
+                f"handling_columns names {part!r}, which a column cannot carry "
+                f"({', '.join(HANDLING_BINDABLE)})"
+            )
+        if not isinstance(column, str) or not column.strip():
+            raise ValueError(f"handling_columns {part!r} must name a non-empty column")
+        declared[part] = column.strip()
+    return declared
+
+
 class RecipeDefaults(BaseModel):
     provenance: dict[str, Any] = Field(default_factory=dict)
     handling: dict[str, Any] = Field(default_factory=dict)
     legal_basis: str | None = None
+    #: ADR-127 decision 3: the units the source's rows may name as `originator` or `owning_unit`
+    #: when an element binds either from a column. Beside the source's handling; empty means none
+    #: may be bound.
+    units: list[str] = Field(default_factory=list)
+    #: Which source column carries each part of a marking, as Connect declares it: a read of the
+    #: source before a template exists (Profile) judges each row by these, and Map save refuses a
+    #: binding to a column not declared for its part.
+    handling_columns: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("handling_columns", mode="before")
+    @classmethod
+    def _columns_are_declared_parts(cls, value: object) -> dict[str, str]:
+        return check_handling_columns(value)
+
+    @classmethod
+    def for_source(cls, handling: dict[str, Any], legal_basis: str | None) -> RecipeDefaults:
+        """The defaults of a draft: its source handling, with the `units` that ride beside it
+        (ADR-127 decision 3) taken out as the recipe's own list, not part of any one marking."""
+        return cls(
+            handling={k: v for k, v in handling.items() if k not in ("units", "handling_columns")},
+            provenance={},
+            legal_basis=legal_basis,
+            units=[str(u) for u in handling.get("units", [])],
+            handling_columns=dict(handling.get("handling_columns") or {}),
+        )
+
+    @field_validator("handling")
+    @classmethod
+    def _defaults_are_not_bound(cls, value: dict[str, Any]) -> dict[str, Any]:
+        for name, item in value.items():
+            if isinstance(item, dict):
+                raise ValueError(
+                    f"defaults handling {name!r} cannot be bound to a column: the defaults are "
+                    "what a bound cell falls back on; bind it on an element's own handling"
+                )
+        return value
 
 
 class FieldBinding(BaseModel):
@@ -469,6 +611,11 @@ class FieldBinding(BaseModel):
     literal: Any | None = None
     transform: str | None = None
     map: dict[str, str] | None = None
+    #: ADR-127 Amendment 15: on a property's binding, an empty cell leaves the property out of the
+    #: node instead of rejecting the row. `None` (and `False`) is the default: an empty bound cell
+    #: rejects the row, as it always has. A property the ontology requires, the one an entity is
+    #: matched on, and a time or key binding cannot be optional (refused where the recipe is saved).
+    optional: bool | None = None
 
 
 class DeduplicateConfig(BaseModel):
@@ -497,7 +644,8 @@ class ContentBinding(BaseModel):
 
     #: On a link: `message_text` or `document_text`. On an entity (content it holds, linked by
     #: `HOLDS`): `document_text`, or a file named by a path relative to the export's own folder,
-    #: `image_file` or `video_file`.
+    #: `image_file` or `video_file`. On a `Document` entity, `document_text` is the Document's own
+    #: text (ADR-127 decision 1): written onto that Document, with no content node and no `HOLDS`.
     kind: Literal["message_text", "document_text", "image_file", "video_file"]
     field: str
 
@@ -520,13 +668,25 @@ class RecipeEntity(BaseModel):
     #: `validate_handling_tightens`), not re-checked per row at run time.
     handling: dict[str, Any] | None = None
     provenance: dict[str, Any] | None = None
+
+    @field_validator("handling")
+    @classmethod
+    def _handling_bindings(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        return check_handling_override(value, owner="entity")
+
     #: ADR-094: content this entity holds (a phone's saved note, photo or video), kept in the media
     #: store and linked to the entity by `HOLDS`.
     content: ContentBinding | None = None
 
 
 class TemporalBinding(BaseModel):
+    """A link's time. `at` is its start, or its only instant; `valid_to`, when bound, makes it a
+    span (ADR-127 decision 11): the end, read from a column of its own. An empty end cell is a span
+    still open (`Interval.valid_to` of `None`). Without `valid_to` the link is one instant, as
+    before: its end is its start."""
+
     at: FieldBinding
+    valid_to: FieldBinding | None = None
 
 
 class RecipeEdge(BaseModel):
@@ -541,6 +701,11 @@ class RecipeEdge(BaseModel):
     #: Same per-element override as `RecipeEntity.handling`/`.provenance` above.
     handling: dict[str, Any] | None = None
     provenance: dict[str, Any] | None = None
+
+    @field_validator("handling")
+    @classmethod
+    def _handling_bindings(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        return check_handling_override(value, owner="link")
 
     model_config = {"populate_by_name": True}
 
@@ -679,6 +844,8 @@ class Recipe(BaseModel):
     label: str
     connector: RecipeConnector
     ontology_version: int
+    #: ADR-120 D10, Amendment 1: `None` = not pinned; `{}` = pinned, names and writes no pack.
+    pack_versions: dict[str, int] | None = None
     defaults: RecipeDefaults = Field(default_factory=RecipeDefaults)
     deduplicate: DeduplicateConfig | None = None
     row_template: RowTemplate
@@ -700,6 +867,14 @@ class RejectionRecord(BaseModel):
     row_index: int
     reason: str
     sample: str
+    #: Rule 3, ADR-127 Amendment 26: the marking of the rejected row, which `sample` (the whole
+    #: row) is held at. A route answers a reader who cannot view it with the sample withheld
+    #: (`load_records.report_view`), and never returns the marking itself. `None` where nothing of
+    #: the row is in `sample`.
+    marking: Handling | None = None
+    #: Set where the row's marking could not be resolved: `sample` is then withheld from every
+    #: reader, whatever their clearance, codes or unit (no unit is one nobody may hold).
+    sample_unreadable: bool = False
 
 
 class LoadReport(BaseModel):
@@ -708,23 +883,89 @@ class LoadReport(BaseModel):
     recipe_version: int
     rows_read: int = 0
     rows_deduplicated: int = 0
+    #: ADR-127 decision 5: of `rows_read`, the rows a recipe with `deduplicate` did not load because
+    #: this case already kept their key (whatever the recipe's version): a count of the loader's
+    #: own source rows, never of anything another case holds. Rows folded into a survivor of the
+    #: same file are `rows_deduplicated`, and not these.
+    rows_already_loaded: int = 0
     nodes_created: int = 0
     nodes_referenced: int = 0
     edges_created: int = 0
     rejections: list[RejectionRecord] = Field(default_factory=list)
+    #: The keys (canonicalised, then hashed) of the groups of rows this load wrote, for a recipe
+    #: with `deduplicate`: kept for the case, with the load, in the transaction that records it
+    #: (`RecipeRunStore.add_record`). A row held, rejected or already loaded has none. Hashes of the
+    #: loader's own source rows, held for the ledger alone: never in `LoadReportView`.
+    kept_row_keys: list[str] = Field(default_factory=list)
+    #: A hash of the `deduplicate` definition the keys above were made under (`dedup_fingerprint`),
+    #: kept with them: a run under another definition is refused while keys under this one are
+    #: kept for the case. `None` for a recipe without `deduplicate`.
+    row_key_fingerprint: str | None = None
     #: Only the nodes THIS load created — never a node it merely
     #: referenced, and never an edge it only extended (§9.1, when this
     #: becomes a `LoadRecord`, records only what revert may safely
     #: supersede without touching another load's contribution).
     created_node_ids: list[NodeId] = Field(default_factory=list)
+    #: ADR-127 decision 7(a): the existing nodes this load matched by reference (`on_match:
+    #: reference`), each once and never one it created itself. For the change-stream entry alone,
+    #: which names what a run touched so a hotlist or a monitor sees it; not in the load's record
+    #: (a revert never takes back what the load did not write) and never in a route's answer.
+    referenced_node_ids: list[NodeId] = Field(default_factory=list)
     touched_edge_ids: list[EdgeId] = Field(default_factory=list)
+    #: ADR-127 decision 6: of `touched_edge_ids`, the links this load wrote new, and the existing
+    #: links it merged occurrences into, kept apart so a revert can tell its own links from another
+    #: load's. A `HOLDS` link from a holder this load did not create is recorded as merged, since
+    #: the port cannot say whether it was new (`engine._write_content`).
+    created_edge_ids: list[EdgeId] = Field(default_factory=list)
+    merged_edge_ids: list[EdgeId] = Field(default_factory=list)
+    #: The nodes this load wrote that already existed (a held content `Document`, whose id is the
+    #: hash of its bytes, may be another load's or a Files-tab upload's), kept out of
+    #: `created_node_ids` so a revert never takes back what another load holds.
+    merged_node_ids: list[NodeId] = Field(default_factory=list)
+    #: What the case's rules wrote into the load (an `Alert`, its `ALERTED_ON` links, what a finding
+    #: writes alongside): the load's, so its record lists them, but held apart from the lists above,
+    #: which the change stream and the enrich stage read as what the recipe wrote. Monitors must not
+    #: see an alert as a new ingest node (ADR-127 decision 6).
+    rule_node_ids: list[NodeId] = Field(default_factory=list)
+    rule_created_edge_ids: list[EdgeId] = Field(default_factory=list)
+    rule_merged_edge_ids: list[EdgeId] = Field(default_factory=list)
     #: ADR-109 ruling 1: rows a pre-commit rule could not judge, held out of the graph for review,
     #: and what the case's pre-commit rules did, in words — never a silent part-load (rule 2).
     rows_held: int = 0
     rule_notes: list[str] = Field(default_factory=list)
+    #: Rule 3, ADR-127 Amendment 23: every distinct marking this load's rows were written at (each
+    #: element the engine resolved for a row, once), in the order first met. A count of what the
+    #: load wrote includes rows at each of them, so a reader who may not view one of them is shown
+    #: none of the counts (`services/api/load_records.report_view`, `_schedule_run_view`). Kept in
+    #: the run ledger beside the run; never in a route's answer.
+    markings: list[Handling] = Field(default_factory=list)
 
 
 # --- The pipeline run report (06_DECISIONS.md ADR-108 phase C) -------------
+
+
+class LoadReportView(BaseModel):
+    """What a route answers for a load: the counts and the words, never the id lists. `LoadReport`
+    keeps `created_node_ids`, `created_edge_ids`, `merged_edge_ids` and the rest for the load's own
+    record; handed to the loader, `merged_edge_ids` would say a link pre-existed whether or not
+    they may read it (rules 3 and 7, ADR-127 decision 6)."""
+
+    load_id: str
+    recipe_id: str
+    recipe_version: int
+    rows_read: int = 0
+    rows_deduplicated: int = 0
+    rows_already_loaded: int = 0
+    nodes_created: int = 0
+    nodes_referenced: int = 0
+    edges_created: int = 0
+    rejections: list[RejectionRecord] = Field(default_factory=list)
+    rows_held: int = 0
+    rule_notes: list[str] = Field(default_factory=list)
+    #: Rule 3, ADR-127 Amendment 23: set where the reader may not view every marking the load's
+    #: rows were written at. Every count above is then zero and the lists empty: a count of what a
+    #: load wrote is a read.
+    withheld: bool = False
 
 
 class BranchRunReport(BaseModel):
@@ -754,6 +995,9 @@ class ExtractStageReport(BaseModel):
     handling_overridden: int = 0
     override_reason: str | None = None
     refusals: list[str] = Field(default_factory=list)
+    #: Rule 3, ADR-127 Amendment 26: the marking of each document the stage read and of what it
+    #: wrote (the `handling_override` where it has one), once each: the counts include them.
+    markings: list[Handling] = Field(default_factory=list)
 
 
 class EnrichStageReport(BaseModel):
@@ -781,15 +1025,52 @@ class PipelineRunReport(BaseModel):
     extracts: list[ExtractStageReport] = Field(default_factory=list)
     enriches: list[EnrichStageReport] = Field(default_factory=list)
     rows_read: int = 0
+    rows_already_loaded: int = 0
     nodes_created: int = 0
     nodes_referenced: int = 0
     edges_created: int = 0
     rejections: list[RejectionRecord] = Field(default_factory=list)
     created_node_ids: list[NodeId] = Field(default_factory=list)
+    #: The branches' `referenced_node_ids`, each once (ADR-127 decision 7(a)).
+    referenced_node_ids: list[NodeId] = Field(default_factory=list)
     touched_edge_ids: list[EdgeId] = Field(default_factory=list)
     #: The branches' held rows and rule notes, summed (ADR-109 ruling 1).
     rows_held: int = 0
     rule_notes: list[str] = Field(default_factory=list)
+    #: The union of the branches' `markings`, each once (rule 3, ADR-127 Amendment 23).
+    markings: list[Handling] = Field(default_factory=list)
+
+
+class BranchRunReportView(BaseModel):
+    """`BranchRunReport` as a route answers it: the branch's `LoadReportView`."""
+
+    source_id: str
+    source_label: str
+    source_location: str | None = None
+    report: LoadReportView
+
+
+class PipelineRunReportView(BaseModel):
+    """`PipelineRunReport` as a route answers it: counts and words, no id lists, each branch a
+    `LoadReportView` (see `LoadReportView`)."""
+
+    load_id: str
+    recipe_id: str
+    recipe_version: int
+    branches: list[BranchRunReportView] = Field(default_factory=list)
+    extracts: list[ExtractStageReport] = Field(default_factory=list)
+    enriches: list[EnrichStageReport] = Field(default_factory=list)
+    rows_read: int = 0
+    rows_already_loaded: int = 0
+    nodes_created: int = 0
+    nodes_referenced: int = 0
+    edges_created: int = 0
+    rejections: list[RejectionRecord] = Field(default_factory=list)
+    rows_held: int = 0
+    rule_notes: list[str] = Field(default_factory=list)
+    #: As `LoadReportView.withheld`: the reader may not view every marking the run's rows were
+    #: written at, so the counts are zero and the branches and stages are left out.
+    withheld: bool = False
 
 
 # --- Verify (09_INGEST_STUDIO.md §5) --------------------------------------
@@ -834,6 +1115,9 @@ class VerifyReport(BaseModel):
 
     rows_read: int
     rows_deduplicated: int
+    #: ADR-127 decision 5: of the sample, the rows a run would skip because the case already kept
+    #: their key. Judged exactly as the run judges, and nothing is written.
+    rows_already_loaded: int = 0
     #: §3's own sample-size rule ("10,000 rows or the whole file, whichever
     #: is smaller"), restated here the same way `SourceProfile` states it —
     #: `False` means the source has more rows than this dry run covered.
@@ -860,12 +1144,11 @@ class LoadRecord(BaseModel):
     """One execution of a recipe against a source — the persisted form of
     a `LoadReport`. `created_node_ids` is only the nodes this load
     created, never one it merely referenced; `touched_edge_ids` is every
-    edge it wrote to, created or merged into. This asymmetry is what makes
-    `revert_load` safe: reverting a node this load created can never
-    affect another load, but an edge is shared the moment two loads touch
-    the same pair, which is why `GraphArcadeDBAdapter.revert_elements`
-    only ever sets a flag rather than deleting — the audit trail (and any
-    other load's claim on the same edge) stays intact regardless. Every
+    edge it wrote to, created or merged into. The revert
+    (`services/ingest/load_revert.py`) reads the created lists only and refuses a load that
+    merged: an element a load created can be taken back without affecting another load, but
+    one it merged into is shared, and `GraphArcadeDBAdapter.revert_elements` only ever sets a
+    flag rather than deleting, so the audit trail stays intact regardless. Every
     element also carries `load_id` on its own `AuditStub`, so filtering
     the graph directly by load or recipe version never needs this ledger
     at all; the ledger is for load-level operations (revert, history) a
@@ -882,7 +1165,31 @@ class LoadRecord(BaseModel):
     touched_edge_ids: list[EdgeId] = Field(default_factory=list)
     rejected_count: int = 0
     superseded_at: datetime | None = None
+    #: ADR-127 decision 6, Amendment 5: what the run ledger keeps beside the run, so a revert needs
+    #: nothing else. The case the load wrote; the links it created, and apart from them the existing
+    #: links it merged occurrences into (a load that merged is refused a revert, naming them); the
+    #: load a release of held rows was released from; and whether its analytics events carry the
+    #: `load_id` (`AnalyticsPort.retract_load` can remove them). A record written before events
+    #: were stamped has none of these keys, and reads as not stamped: a revert refuses it.
+    investigation_id: str | None = None
+    created_edge_ids: list[EdgeId] = Field(default_factory=list)
+    merged_edge_ids: list[EdgeId] = Field(default_factory=list)
+    #: The existing nodes the load wrote again (see `LoadReport.merged_node_ids`), and the geometry
+    #: refs it inserted that were not already present, so a revert can remove exactly those.
+    merged_node_ids: list[NodeId] = Field(default_factory=list)
+    created_geometry_refs: list[str] = Field(default_factory=list)
+    #: True when an extract or enrich stage fed by this load wrote a node, link or point: those are
+    #: in no record, so a revert of the load would leave them, and it refuses (Amendment 6).
+    uncovered_writes: bool = False
+    released_from: str | None = None
+    events_stamped: bool = False
     superseded_by: PrincipalId | None = None
+    #: Who reverted the load and when (ADR-127 decision 6, `services/ingest/load_revert.py`):
+    #: written last by a revert, so a record with `reverted_at` is one whose revert finished. Apart
+    #: from `superseded_*`, which say a record was replaced and which a revert never writes. A
+    #: record from before has neither, and reads as not reverted.
+    reverted_at: datetime | None = None
+    reverted_by: PrincipalId | None = None
 
 
 ALL_MODELS: tuple[type[BaseModel], ...] = (
@@ -897,6 +1204,7 @@ ALL_MODELS: tuple[type[BaseModel], ...] = (
     RecipeDefaults,
     DeduplicateConfig,
     FieldBinding,
+    HandlingFieldBinding,
     RecipeCondition,
     RecipeEntity,
     TemporalBinding,
@@ -921,6 +1229,9 @@ ALL_MODELS: tuple[type[BaseModel], ...] = (
     ExtractStageReport,
     EnrichStageReport,
     PipelineRunReport,
+    LoadReportView,
+    BranchRunReportView,
+    PipelineRunReportView,
     VerifyEntityCount,
     VerifyEdgeCount,
     RejectionGroup,

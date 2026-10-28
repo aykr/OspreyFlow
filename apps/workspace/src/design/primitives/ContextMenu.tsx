@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useLayoutEffect, useRef } from "react";
 
 export interface ContextMenuItem {
   id: string;
@@ -15,20 +15,25 @@ export interface ContextMenuProps {
 
 export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
   const ref = useRef<HTMLUListElement>(null);
+  // The latest `onClose`: keyed on it, the effect below re-ran whenever a parent re-rendered with a
+  // new one and took focus back to the first item (the fault `Popover` had, 20 October 2026).
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
-  useEffect(() => {
+  // A layout effect, so Escape is heard from the moment it can be seen (as `Popover`).
+  useLayoutEffect(() => {
     ref.current?.querySelector<HTMLElement>("[role='menuitem']")?.focus();
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") onCloseRef.current();
     };
-    const onClickAway = () => onClose();
+    const onClickAway = () => onCloseRef.current();
     document.addEventListener("keydown", onKeyDown);
     document.addEventListener("click", onClickAway);
     return () => {
       document.removeEventListener("keydown", onKeyDown);
       document.removeEventListener("click", onClickAway);
     };
-  }, [onClose]);
+  }, []);
 
   return (
     <ul

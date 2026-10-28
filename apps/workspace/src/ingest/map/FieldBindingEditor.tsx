@@ -6,6 +6,7 @@ import type { DragEvent } from "react";
 
 import type { FieldBinding, TransformDescriptor } from "../../../../../packages/schemas/generated";
 import { Button } from "../../design/primitives/Button";
+import { Checkbox } from "../../design/primitives/Checkbox";
 import { Input } from "../../design/primitives/Input";
 import { Select } from "../../design/primitives/Select";
 import { arityForTransform } from "./rowTemplate";
@@ -16,6 +17,9 @@ export interface FieldBindingEditorProps {
   transforms: TransformDescriptor[];
   onChange: (binding: FieldBinding) => void;
   onRemove?: () => void;
+  /** ADR-127 Amendment 15: offer "optional" (leave the property out when its cell is empty). Only
+   * a property's binding has a property to leave out: a time binding does not. */
+  allowOptional?: boolean;
 }
 
 type Kind = "field" | "literal" | "map";
@@ -32,6 +36,7 @@ export function FieldBindingEditor({
   transforms,
   onChange,
   onRemove,
+  allowOptional = false,
 }: FieldBindingEditorProps) {
   const kind = kindOf(binding);
   const arity = arityForTransform(transforms, binding.transform);
@@ -43,13 +48,19 @@ export function FieldBindingEditor({
     else onChange({ field: sourceFieldNames[0] });
   }
 
+  const keptOptional = binding.optional ? { optional: true } : {};
+
   function setTransform(name: string) {
     const nextArity = arityForTransform(transforms, name || null);
     if (nextArity > 1) {
       const nextFields = Array.from({ length: nextArity }, (_, i) => fields[i] ?? sourceFieldNames[0] ?? "");
-      onChange({ fields: nextFields, transform: name || undefined });
+      onChange({ fields: nextFields, transform: name || undefined, ...keptOptional });
     } else {
-      onChange({ field: fields[0] ?? sourceFieldNames[0] ?? "", transform: name || undefined });
+      onChange({
+        field: fields[0] ?? sourceFieldNames[0] ?? "",
+        transform: name || undefined,
+        ...keptOptional,
+      });
     }
   }
 
@@ -77,7 +88,7 @@ export function FieldBindingEditor({
       style={{ display: "flex", flexDirection: "column", gap: "var(--sp-4, 4px)" }}
     >
       <div style={{ display: "flex", gap: "var(--sp-4, 4px)", alignItems: "center" }}>
-        <Select value={kind} onChange={(e) => setKind(e.target.value as Kind)}>
+        <Select aria-label="Binding kind" value={kind} onChange={(e) => setKind(e.target.value as Kind)}>
           <option value="field">Field</option>
           <option value="literal">Literal</option>
           <option value="map">Value map</option>
@@ -91,6 +102,7 @@ export function FieldBindingEditor({
 
       {kind === "literal" && (
         <Input
+          aria-label="Literal value"
           value={typeof binding.literal === "string" ? binding.literal : String(binding.literal ?? "")}
           onChange={(e) => onChange({ literal: e.target.value })}
           placeholder="Literal value"
@@ -101,7 +113,12 @@ export function FieldBindingEditor({
         <>
           <div style={{ display: "flex", gap: "var(--sp-4, 4px)", flexWrap: "wrap" }}>
             {Array.from({ length: Math.max(arity, 1) }, (_, i) => (
-              <Select key={i} value={fields[i] ?? ""} onChange={(e) => setFieldAt(i, e.target.value)}>
+              <Select
+                key={i}
+                aria-label={arity > 1 ? `Source column ${i + 1}` : "Source column"}
+                value={fields[i] ?? ""}
+                onChange={(e) => setFieldAt(i, e.target.value)}
+              >
                 <option value="" disabled>
                   {arity > 1 ? `column ${i + 1} of ${arity}` : "choose a field"}
                 </option>
@@ -113,7 +130,11 @@ export function FieldBindingEditor({
               </Select>
             ))}
           </div>
-          <Select value={binding.transform ?? ""} onChange={(e) => setTransform(e.target.value)}>
+          <Select
+            aria-label="Transform"
+            value={binding.transform ?? ""}
+            onChange={(e) => setTransform(e.target.value)}
+          >
             <option value="">No transform</option>
             {/* ADR-104: a structured transform is offered once per part, never bare. */}
             {transforms.flatMap((t) =>
@@ -132,6 +153,21 @@ export function FieldBindingEditor({
             )}
           </Select>
         </>
+      )}
+
+      {allowOptional && kind !== "literal" && (
+        <label style={{ display: "flex", alignItems: "center", gap: "var(--sp-4, 4px)" }}>
+          <Checkbox
+            checked={binding.optional === true}
+            onChange={(e) => {
+              const next = { ...binding };
+              if (e.target.checked) next.optional = true;
+              else delete next.optional;
+              onChange(next);
+            }}
+          />
+          Optional: leave the property out when its cell is empty
+        </label>
       )}
 
       {kind === "map" && (

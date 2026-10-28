@@ -71,7 +71,9 @@ describe("test_a_notify_mode_alert_renders_with_no_referent_the_viewer_cannot_re
   });
 });
 
-const JUMP_RESULT: AlertJumpResult = {
+// ADR-124 decision 1: the jump summary carries no count of what the reader cannot read. A server
+// that still sends `unreadable_count` has it ignored.
+const JUMP_RESULT = {
   investigation: {
     id: "inv-branch-1",
     created_at: "2026-09-22T00:00:00Z",
@@ -81,37 +83,16 @@ const JUMP_RESULT: AlertJumpResult = {
   },
   seeded_count: 3,
   unreadable_count: 2,
-};
+} as unknown as AlertJumpResult;
 
-describe("test_jump_result_never_frames_unreadable_count_as_newly_visible_content", () => {
-  test("the jump summary frames unreadable_count as lost access, never as newly found content", () => {
-    const { getByTestId } = render(
+describe("test_jump_result_shows_no_unreadable_count", () => {
+  test("the jump summary says how many were added and nothing of what could not be read", () => {
+    const { container, queryByTestId } = render(
       <JumpResultSummary result={JUMP_RESULT} onOpen={() => undefined} />,
     );
-    const unreadableText = getByTestId("jump-unreadable-summary").textContent ?? "";
-
-    expect(unreadableText).toBe("2 referents no longer accessible to you.");
-    // The framing this test exists to pin, scoped to the *unreadable_count* sentence specifically
-    // (not the whole summary — "…added to the new investigation" legitimately uses "new" to
-    // describe the investigation itself, which really is new; that is not the claim under test):
-    // `unreadable_count` can only ever recount referents belonging to an alert this same viewer
-    // already had a standing claim to receive (`AlertStore.get_authorized`/`list_authorized`
-    // filter `WHERE owner_id = $1`, ADR-041) — re-checked fresh as the viewer's own current
-    // principal (`fetch_jumpable_referents`, `watch_routes.py`). Copy implying newly-revealed or
-    // newly-found content would misrepresent that guarantee at the render layer even though the
-    // server-side number itself is safe; asserted as an explicit negative match against that one
-    // sentence, not just an absence noticed by omission.
-    expect(unreadableText).not.toMatch(/new|found|discovered|hidden/i);
-  });
-
-  test("a copy regression that frames the count as newly-found content fails this test", () => {
-    // A minimal stand-in for the same summary with a copy regression — proves the assertion above
-    // is real, not a tautology that would pass against any string.
-    function Regressed({ result }: { result: AlertJumpResult }) {
-      return <p data-testid="jump-unreadable-summary">{result.unreadable_count} new hidden entities found.</p>;
-    }
-    const { getByTestId } = render(<Regressed result={JUMP_RESULT} />);
-    expect(getByTestId("jump-unreadable-summary").textContent ?? "").toMatch(/new|found|hidden/i);
+    expect(queryByTestId("jump-unreadable-summary")).toBeNull();
+    expect(container.textContent ?? "").toContain("3 entities added to the new investigation.");
+    expect(container.textContent ?? "").not.toMatch(/referent|accessible|unreadable|\b2\b/);
   });
 });
 
@@ -137,3 +118,169 @@ describe("a schedule notice", () => {
     expect(queryByRole("button", { name: /Jump/ })).toBeNull();
   });
 });
+
+// ADR-130 decision 1: a hotlist alert explains itself in the words the owner knows, and shows
+// neither the raw rule id nor a node id.
+describe("a hotlist alert that explains itself", () => {
+  const EXPLAINED: AlertView = {
+    id: "alert-9", rule_id: "hotlist:01HZX3Q9K2M5N7P8R0S1T2V3W4", owner_id: "analyst-1", mode: "full",
+    referent_node_ids: ["01HZX3Q9K2M5N7P8R0S1T2V3W5"], evidence_available: true,
+    investigation_id: "case-1", created_at: "2026-10-02T09:00:00Z",
+    hotlist: { identifier: "07700 900918", kept_as_written: false, review_date: "2027-01-31" },
+    fired_on: [
+      {
+        type: "Endpoint", label: "+447700900918", more_files: 0,
+        files: [
+          { name: "pid_seized_comms_batch2.csv", row: 3 },
+          { name: "pid_pin_calls.csv", rows: 2013 },
+        ],
+      },
+    ],
+  };  // prettier-ignore
+
+  function text(alert: AlertView): string {
+    const { container } = render(
+      <ul>
+        <AlertRow alert={alert} onJump={() => undefined} jumping={false} />
+      </ul>,
+    );
+    return container.textContent ?? "";
+  }
+
+  test("reads the hotlist, what matched and where it was read from", () => {
+    const t = text(EXPLAINED);
+    expect(t).toContain("Hotlist: 07700 900918 · review by 31 Jan 2027");
+    expect(t).toContain("Matched: Endpoint +447700900918");
+    expect(t).toContain("From: pid_seized_comms_batch2.csv, row 3; pid_pin_calls.csv, 2,013 rows");
+  });
+
+  test("shows neither the raw rule id nor a node id, and keeps the jump", () => {
+    const { container, getByRole } = render(
+      <ul>
+        <AlertRow alert={EXPLAINED} onJump={() => undefined} jumping={false} />
+      </ul>,
+    );
+    const t = container.textContent ?? "";
+    expect(t).not.toContain("hotlist:");
+    expect(t).not.toContain("01HZX3Q9K2M5N7P8R0S1T2V3W");
+    expect(getByRole("button", { name: "Jump into investigation" })).toBeTruthy();
+  });
+
+  test("says how many more files, never cutting silently", () => {
+    const more: AlertView = {
+      ...EXPLAINED,
+      fired_on: [{ type: "Endpoint", label: "+447700900918", more_files: 3,
+                   files: [{ name: "a.csv", row: 1 }] }],
+    };  // prettier-ignore
+    expect(text(more)).toContain("From: a.csv, row 1; and 3 more files");
+    const first = (more.fired_on ?? [])[0];
+    if (!first) throw new Error("fixture has no fired_on");
+    const one: AlertView = { ...more, fired_on: [{ ...first, more_files: 1 }] };
+    expect(text(one)).toContain("and 1 more file");
+    expect(text(one)).not.toContain("1 more files");
+  });
+
+  test("says a hotlist kept as written, and shows nothing of one it does not have", () => {
+    const kept: AlertView = {
+      ...EXPLAINED,
+      hotlist: { identifier: "ref-A1", kept_as_written: true, review_date: "2027-01-31" },
+    };
+    expect(text(kept)).toContain("Hotlist: ref-A1 (kept as written) · review by 31 Jan 2027");
+    const none: AlertView = { ...EXPLAINED, hotlist: undefined };
+    expect(text(none)).not.toContain("Hotlist:");
+  });
+
+  test("an alert whose evidence is withdrawn names nothing of what matched", () => {
+    const gone: AlertView = {
+      ...EXPLAINED, referent_node_ids: [], evidence_available: false, fired_on: undefined,
+    };  // prettier-ignore
+    const t = text(gone);
+    expect(t).toContain("Evidence no longer available.");
+    expect(t).not.toContain("Matched:");
+    expect(t).not.toContain("From:");
+  });
+});
+
+// ADR-130 Amendment 1: a node the reader cannot read through the case's datasets is named by type
+// and label alone; a file counted by records says so; evidence that went between two reads says so.
+describe("the hotlist alert's fired-on text", () => {
+  const FULL: AlertView = {
+    ...NOTIFY_ALERT,
+    mode: "full",
+    referent_node_ids: ["n1"],
+    evidence_available: true,
+  };
+
+  test("withheld sources are said in words, with no file", () => {
+    const { container } = render(
+      <ul>
+        <AlertRow
+          alert={{
+            ...FULL,
+            fired_on: [
+              { type: "Endpoint", label: "+447700900918", files: [], more_files: 0, sources_withheld: true },
+            ],
+          }}
+          onJump={() => undefined}
+          jumping={false}
+        />
+      </ul>,
+    );
+    const text = container.textContent ?? "";
+    expect(text).toContain(
+      "Matched: Endpoint +447700900918 \u2014 its sources are in data this case does not read",
+    );
+    expect(text).not.toContain("From:");
+  });
+
+  test("a file counted by records reads as records, and by rows as rows", () => {
+    const { container } = render(
+      <ul>
+        <AlertRow
+          alert={{
+            ...FULL,
+            fired_on: [
+              {
+                type: "Endpoint",
+                label: "x",
+                files: [
+                  { name: "a.csv", records: 4 },
+                  { name: "b.csv", rows: 2 },
+                  { name: "c.csv", row: 3 },
+                ],
+                more_files: 0,
+              },
+            ],
+          }}
+          onJump={() => undefined}
+          jumping={false}
+        />
+      </ul>,
+    );
+    expect(container.textContent ?? "").toContain("a.csv, 4 records; b.csv, 2 rows; c.csv, row 3");
+  });
+
+  test("evidence available but nothing fired on says it is no longer available and disables Jump", () => {
+    const { container, getByRole } = render(
+      <ul>
+        <AlertRow alert={{ ...FULL, fired_on: null }} onJump={() => undefined} jumping={false} />
+      </ul>,
+    );
+    expect(container.textContent ?? "").toContain("Evidence no longer available");
+    expect((getByRole("button", { name: "Jump into investigation" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  test("an available alert with something fired on keeps Jump enabled", () => {
+    const { getByRole } = render(
+      <ul>
+        <AlertRow
+          alert={{ ...FULL, fired_on: [{ type: "Endpoint", label: "x", files: [], more_files: 0 }] }}
+          onJump={() => undefined}
+          jumping={false}
+        />
+      </ul>,
+    );
+    expect((getByRole("button", { name: "Jump into investigation" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+});
+

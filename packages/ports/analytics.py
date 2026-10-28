@@ -111,7 +111,34 @@ class AnalyticsPort(Protocol):
 
     async def load_events(self, records: Sequence[EventRecord]) -> None: ...
 
+    async def retract_load(self, load_id: str) -> int:
+        """Removes every event a load wrote (ADR-127 decision 6) and returns how many. Removes
+        nothing else: another load's events, and events with no `load_id`, stay. Idempotent: a
+        second call, or one for a load that wrote none, removes nothing, returns 0 and raises
+        nothing. Like `load_events` it is a backend write, not principal-scoped, and counts every
+        event of the load whatever its marking; afterwards no read, for any principal, returns or
+        counts a retracted event."""
+        ...
+
+    async def events_of_load_among(self, load_id: str, event_ids: Sequence[str]) -> set[str]:
+        """Which of `event_ids` are events `load_id` wrote, **whatever the marking and whatever the
+        caller may read**: no principal, no access step. For the revert alone (ADR-127 Amendment 8),
+        to close the alerts that cite an event it is about to retract, asking about the ids the
+        alerts name and never listing a load's events. A route must never call it
+        (`tests/test_unfiltered_node_lookup_confined.py`). An id no event holds, and an event of
+        another load or of none, are absent from the answer; no ids give the empty set."""
+        ...
+
     async def load_geometries(self, records: Sequence[GeometryRecord]) -> None: ...
+
+    async def retract_geometries(self, geometry_refs: Sequence[str], *, version: int) -> int:
+        """Removes the rows of these refs at this partition version (ADR-127 decision 6: a revert
+        takes back the points its load inserted, which its record lists) and returns how many.
+        Removes nothing else: another ref, and the same ref at another version, stay. Idempotent:
+        a ref already gone, or never written, removes nothing and raises nothing; no refs remove
+        nothing. A backend write, not principal-scoped, like `load_geometries`: it counts and
+        removes a row whatever its marking; afterwards no read, for any principal, returns it."""
+        ...
 
     async def get_geometry(
         self, geometry_ref: str, principal: Principal, *, version: int | None = None

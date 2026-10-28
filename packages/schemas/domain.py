@@ -17,7 +17,7 @@ from datetime import date, datetime
 from enum import StrEnum
 from typing import Annotated, Any, Final, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # --- Scalar identifiers -------------------------------------------------
 #
@@ -52,6 +52,15 @@ class PoleClass(StrEnum):
     EVENT = "event"
     ORGANISATION = "organisation"
 
+
+#: The order the POLE summary lists the five classes in (ADR-126 decision 4).
+POLE_CLASS_ORDER: tuple[PoleClass, ...] = (
+    PoleClass.PERSON,
+    PoleClass.OBJECT,
+    PoleClass.LOCATION,
+    PoleClass.EVENT,
+    PoleClass.ORGANISATION,
+)
 
 # The nine categorical data channels the design system defines
 # (`spec/design/tokens.css`), checked for protanopia/deuteranopia
@@ -113,6 +122,16 @@ class ResolutionConfig(BaseModel):
     comparisons: list[str] = Field(default_factory=list)
 
 
+class IconByValue(BaseModel):
+    """ADR-128 Decision 4: an entity type's icon chosen by the value of one of its enum properties.
+    `icons` maps some of the property's values to glyph names; the loader checks that the property
+    is an enum of the type and that each key is one of its values and each name is on the closed
+    icon list."""
+
+    property: str
+    icons: dict[str, str]
+
+
 class EntityTypeDef(BaseModel):
     name: str
     pole_class: PoleClass
@@ -121,6 +140,9 @@ class EntityTypeDef(BaseModel):
     #: The drawing inside the shape on the canvas (ADR-079). One of the names in the ontology JSON
     #: Schema's closed list, checked there at load; `None` draws the shape alone.
     icon: str | None = None
+    #: ADR-128 Decision 4: the icon by the value of one enum property, which takes the place of
+    #: `icon` for a node whose value is mapped; any other node draws `icon`.
+    icon_by_value: IconByValue | None = None
     identifiers: list[str] = Field(default_factory=list)
     properties: list[PropertyDef] = Field(default_factory=list)
     resolution: ResolutionConfig | None = None
@@ -184,6 +206,12 @@ class OntologySchema(BaseModel):
     storage_aliases: dict[str, str] = Field(default_factory=dict)
     #: ADR-090 decision 2: rises by one at every promotion and retirement; the version does not.
     overlay_revision: int = 0
+    #: Each composed domain pack's name and `pack_version` (ADR-120 D10), so a recipe can pin the
+    #: pack versions it was published against; empty for the core alone.
+    packs: dict[str, int] = Field(default_factory=dict)
+    #: Each entity and link type a composed pack defines (not widens) → that pack's name
+    #: (ADR-120 Amendment 1), so a recipe pins the packs whose types it writes.
+    type_packs: dict[str, str] = Field(default_factory=dict)
 
     def entity_type(self, name: str) -> EntityTypeDef | None:
         return next((e for e in self.entity_types if e.name == name), None)
@@ -232,6 +260,10 @@ class SourceRef(BaseModel):
 class Provenance(BaseModel):
     state: ProvenanceState
     sources: list[SourceRef]
+    #: ADR-130 Amendment 2: the element belongs to a dataset its reader's case does not read, so
+    #: its sources are not sent. Set only on a read, for a scoped principal; `sources` is empty
+    #: then, and only then.
+    sources_withheld: bool = False
     extracted_by: str | None = None
     extraction_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     first_seen: datetime
@@ -240,8 +272,10 @@ class Provenance(BaseModel):
 
     @model_validator(mode="after")
     def _invariants(self) -> Provenance:
-        if not self.sources:
+        if not self.sources and not self.sources_withheld:
             raise ValueError("provenance.sources must never be empty")
+        if self.sources and self.sources_withheld:
+            raise ValueError("provenance.sources must be empty when sources_withheld is set")
         if self.state is ProvenanceState.ASSERTED and self.extraction_confidence is not None:
             raise ValueError("extraction_confidence must be null for asserted provenance")
         return self
@@ -289,8 +323,8 @@ class AuditStub(BaseModel):
     recipe_version: int | None = None
     #: A universal axis, not principal-dependent: a reverted element is
     #: invisible to every read, any clearance, the same way a `SECRET`
-    #: record is invisible to an unauthorised one — `services/ingest`'s
-    #: `revert_load` is the only writer, via `GraphPort.revert_elements`
+    #: record is invisible to an unauthorised one — `services/ingest/load_revert.py`
+    #: is the only writer, via `GraphPort.revert_elements`
     #: (Phase 2; `01_DOMAIN_MODEL.md` §2.4).
     reverted: bool = False
 
@@ -352,6 +386,11 @@ class WeightComponents(BaseModel):
     corpus_source_degree: int = Field(ge=0)  # source's occurrences of this edge type, corpus-wide
     corpus_target_degree: int = Field(ge=0)
     corpus_total_occurrences: int = Field(ge=0)  # every edge of this type, corpus-wide
+    #: ADR-120 D3: the weights-file version and rule this weight was computed under,
+    #: `"<version>/<rule name>"`. `None` on a component stored before then (computed under the
+    #: uncalibrated curve that preceded it); ADR-120 does not recompute those weights (`GraphPort`
+    #: has no in-place edge update, and a recompute is its own record).
+    parameter_set: str | None = None
     computed_at: datetime  # when the corpus-wide counts above were taken
 
 
@@ -364,7 +403,9 @@ class Edge(BaseModel):
     interval: Interval | None = None
     occurrences: int = 1
     weight: float = 0.0
-    weight_components: WeightComponents | None = None
+    #: ADR-122 (Amendment 1): corpus-wide counts, never serialised. Readable in Python, where the
+    #: weight is computed and recomputed; excluded from every dump, so no response can carry them.
+    weight_components: WeightComponents | None = Field(default=None, exclude=True)
     #: ADR-081 step B. The link's own basis, where one was written: `probabilistic` on a link of a
     #: Direct type that is statistically derived or that an analyst declared so (with a reason,
     #: kept in the link's change history). `None` means the link takes its type's basis, which is
@@ -415,6 +456,12 @@ class EdgeWrite(BaseModel):
     properties: dict[str, Any] = Field(default_factory=dict)
     interval: Interval | None = None
     occurrences: int = 1
+    #: ADR-127 Amendment 19: how many writes this one stands for. A run that combines its own writes
+    #: to one per link says how many it folded, so `audit.revision` (which counts the writes merged
+    #: into a link) is what one write at a time leaves. `upsert_edges` stores a new link at this
+    #: revision and adds it to a stored link's; `supersede_edge` and every other writer refuse a
+    #: value but 1. At least 1 (Amendment 21).
+    writes: int = Field(default=1, ge=1)
     #: The link's own basis (see `Edge.basis`); `None`, the usual case, means its type's.
     basis: Literal["direct", "probabilistic"] | None = None
     provenance: Provenance
@@ -542,6 +589,10 @@ class Connections(BaseModel):
     searched_to: int
 
 
+#: ADR-121: the most conditions one pattern node may carry.
+PATTERN_WHERE_MAX = 3
+
+
 class PatternNode(BaseModel):
     var: str
     entity_type: str | None = None
@@ -554,6 +605,23 @@ class PatternNode(BaseModel):
     #: cannot introduce a genuinely independent second enumeration, so there is no general join to
     #: fall back to.
     node_id: str | None = None
+    #: ADR-121: a condition on the node's own properties — each entry a property of `entity_type`
+    #: and the one text value it must equal. Equality only, at most three entries; the property
+    #: must be one the ontology marks `indexed` and not `sensitivity: high` (checked against the
+    #: ontology by `ontology.pattern_where.check_pattern_conditions`, at the route and again in the
+    #: adapter, since an ontology is not something this model can see). A value is one string: a
+    #: range, several values or a negation are not shapes it can take. Compiled by the adapter into
+    #: a `has(property, value)` step beside the node's access steps (rule 3).
+    where: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("where")
+    @classmethod
+    def _at_most_three_conditions(cls, value: dict[str, str]) -> dict[str, str]:
+        if len(value) > PATTERN_WHERE_MAX:
+            raise ValueError(
+                f"a pattern node may carry at most {PATTERN_WHERE_MAX} conditions, got {len(value)}"
+            )
+        return value
 
 
 class PatternEdge(BaseModel):
@@ -655,6 +723,11 @@ class Alert(BaseModel):
     decided_at: datetime | None = None
 
 
+#: ADR-126 decision 1: the domain packs a case can carry, defined once here. `ontology.packs`
+#: sets `PACK_NAMES = get_args(DomainPack)`, so the values live in one place and `ontology` keeps
+#: importing `schemas`, never the other way. Empty means the POLE core model alone.
+DomainPack = Literal["fibo", "niem", "stix"]
+
 #: `Hotlist.status`/`Monitor.status` — ADR-036's own "the monitor stops" (extended in Stage 6b to
 #: a hotlist's identical owner-principal-unresolvable case) must be surfaced somewhere the analyst
 #: or another owner can see it, not left as a silent skip with no visible state change. Written by
@@ -678,7 +751,16 @@ class Hotlist(BaseModel):
     outlives any one investigation it happened to be set from."""
 
     id: str
+    #: The canonical form (ADR-127 decision 7(b)), which a node's `value_normalised` is compared
+    #: with: `+447700900310` for a number typed `07700 900310`. A text no adapter accepts is kept
+    #: as written.
     identifier: str
+    #: What the analyst typed, kept for display (`identifier` is what is matched). `None` only for a
+    #: row from before the identifier was canonicalised and not yet read by the store.
+    identifier_typed: str | None = None
+    #: Whether `identifier` is canonical: `False` for a text no adapter would accept, kept as
+    #: written and matched only on that exact text. `None` for a row not yet read by the store.
+    identifier_canonical: bool | None = None
     owner_id: str
     review_date: date
     status: WatchStatus = "active"
@@ -937,6 +1019,50 @@ class KycFigures(BaseModel):
     by_band: list[ReportCount] = Field(default_factory=list)
 
 
+class PoleTypeCount(BaseModel):
+    """How many nodes of one entity type the reader can see (ADR-126 decision 4). `entity_type` is
+    a closed ontology type name, never an entity's own text."""
+
+    entity_type: str
+    count: int = Field(ge=1)
+
+
+class PoleClassCount(BaseModel):
+    """One POLE class: its total, and its types largest first, then by name, with no zero rows."""
+
+    pole_class: PoleClass
+    total: int = Field(ge=0)
+    types: list[PoleTypeCount] = Field(default_factory=list)
+
+
+class PoleFigures(BaseModel):
+    """The POLE summary of a case (ADR-126 decision 4), from the kept per-access-class counts the
+    Explore page reads: the reader's own, for the case's datasets, never a second count.
+
+    `classes` is always the five classes in the order person, object, location, event,
+    organisation. `other` holds stored types the current ontology does not know, so no node
+    vanishes from the figures. `links` counts links of every type that is not `system`, a type the
+    ontology does not know included. `Alert` is in no figure: alerts are the Figures tab's own
+    subject. `counted_at` is when the kept counts were computed."""
+
+    classes: list[PoleClassCount]
+    other: list[PoleTypeCount] = Field(default_factory=list)
+    links: int = Field(ge=0)
+    counted_at: datetime
+
+    @model_validator(mode="after")
+    def _the_five_classes_in_order(self) -> PoleFigures:
+        held = [c.pole_class for c in self.classes]
+        if sorted(held, key=str) != sorted(POLE_CLASS_ORDER, key=str):
+            raise ValueError("the POLE figures hold exactly the five classes, each once")
+        if held != list(POLE_CLASS_ORDER):
+            raise ValueError(
+                "the POLE figures list the classes in the order "
+                + ", ".join(c.value for c in POLE_CLASS_ORDER)
+            )
+        return self
+
+
 class ReportFigures(BaseModel):
     """A case's report (`06_DECISIONS.md` ADR-111): the Reports view and the dashboards' feed are
     both this, from one computation, so they cannot disagree. Every figure is counted as its
@@ -951,7 +1077,11 @@ class ReportFigures(BaseModel):
     open_by_age: list[ReportCount] = Field(default_factory=list)
     outcomes: list[OutcomeCount] = Field(default_factory=list)
     held: HeldFigures | None = None
-    kyc: KycFigures
+    #: ADR-126 decision 3: set when `fibo` is among the case's packs; `None` is "this case has no
+    #: KYC card", not zero customers.
+    kyc: KycFigures | None = None
+    #: Set when the case's packs are anything other than exactly `[fibo]`.
+    pole: PoleFigures | None = None
 
 
 ReportOption = Literal["shorter_period", "fewer_typologies"]
@@ -1104,9 +1234,9 @@ class Judgement(BaseModel):
     default this codebase already applies everywhere else it cannot positively confirm access.
 
     `flagged_for_review`/`flag_reason` are not in `01_DOMAIN_MODEL.md` §5's own illustrative
-    Pydantic snippet — grown past it the same way `GraphPort`, `SAME_AS`'s own properties and
-    `Subgraph.filtered_count` each already grew past their own doc's illustrative sketch
-    (`00_ARCHITECTURE.md` §2.1, `01_DOMAIN_MODEL.md` §4, §8.2's own precedent) — the review-flag
+    Pydantic snippet — grown past it the same way `GraphPort` and `SAME_AS`'s own properties
+    each already grew past their own doc's illustrative sketch
+    (`00_ARCHITECTURE.md` §2.1, `01_DOMAIN_MODEL.md` §4) — the review-flag
     loop (§5: "every judgement resting on it is flagged for review") needs somewhere to persist
     that state, and the spec names the behaviour without naming a field for it."""
 
@@ -1189,9 +1319,12 @@ class NeighbourhoodStats(BaseModel):
 
 
 class Subgraph(BaseModel):
+    """Nodes and links a read returned. It carries no count of what was left out (ADR-124
+    Amendment 4, item 2): `filtered_count` was on it and was 0 on every read the adapter made, a
+    field that claims completeness and is sent wherever a `Subgraph` is a response."""
+
     nodes: list[Node]
     edges: list[Edge]
-    filtered_count: int = 0
 
 
 class ListNodesPage(BaseModel):
@@ -1261,6 +1394,9 @@ ALL_MODELS: tuple[type[BaseModel], ...] = (
     OutcomeCount,
     HeldFigures,
     KycFigures,
+    PoleTypeCount,
+    PoleClassCount,
+    PoleFigures,
     ReportFigures,
     ReportLimitExceeded,
     QueuedAlert,

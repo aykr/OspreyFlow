@@ -1,4 +1,6 @@
 import type { Edge } from "../../../../packages/schemas/generated";
+import { intervalText } from "../inspector/intervalText";
+import { SOURCES_WITHHELD_TEXT } from "../inspector/sourcesWithheld";
 import { Popover } from "../design/primitives/Popover";
 import { linkTypeName } from "./linkLabel";
 
@@ -31,21 +33,22 @@ export function EdgeInspectionOverlay({ x, y, edge, onClose }: EdgeInspectionOve
         </div>
         <div>Occurrences: <span className="value">{edge.occurrences ?? 1}</span></div>
         {edge.interval && (
-          <div className="value">
-            {edge.interval.valid_from}
-            {edge.interval.valid_to ? ` – ${edge.interval.valid_to}` : " – present"}
-          </div>
+          <div className="value">{intervalText(edge.interval)}</div>
         )}
         <div>Provenance: {edge.provenance.state}</div>
         <div>
           <div style={{ color: "var(--text-secondary)", fontSize: "var(--fs-12)" }}>Sources</div>
-          <ul style={{ margin: 0, paddingLeft: "var(--sp-16)" }}>
-            {edge.provenance.sources.map((source, i) => (
-              <li key={i} className="value">
-                {source.document_id} · {source.locator}
-              </li>
-            ))}
-          </ul>
+          {edge.provenance.sources_withheld ? (
+            <div>{SOURCES_WITHHELD_TEXT}</div>
+          ) : (
+            <ul style={{ margin: 0, paddingLeft: "var(--sp-16)" }}>
+              {edge.provenance.sources.map((source, i) => (
+                <li key={i} className="value">
+                  {source.document_id} · {source.locator}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       </div>
     </Popover>

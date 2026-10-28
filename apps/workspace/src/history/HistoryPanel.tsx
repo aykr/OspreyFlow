@@ -56,18 +56,15 @@ export function HistoryPanel({
         columns={[
           { key: "label", header: "Step", render: (s: HistoryStepSummary) => s.label },
           {
-            key: "counts",
-            header: "Nodes / edges",
-            render: (s: HistoryStepSummary) => `${s.node_count} / ${s.edge_count}`,
-          },
-          {
             key: "restore",
             header: "",
-            render: (s: HistoryStepSummary) => (
-              <button type="button" className="btn" onClick={() => void restore(s.id)}>
-                Restore
-              </button>
-            ),
+            // A step with no canvas snapshot (a brief edit, ADR-128) is listed and has no Restore.
+            render: (s: HistoryStepSummary) =>
+              s.restorable === false ? null : (
+                <button type="button" className="btn" onClick={() => void restore(s.id)}>
+                  Restore
+                </button>
+              ),
           },
         ]}
         rows={steps}

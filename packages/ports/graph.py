@@ -9,7 +9,7 @@ above this port may see it.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, runtime_checkable
 
@@ -56,6 +56,50 @@ class SubgraphTooLarge(Exception):
         self.edges = edges
 
 
+@dataclass(frozen=True)
+class StoredNode:
+    """What `GraphPort.stored_writes` says of one node: the load that last wrote it (`None` for a
+    write outside a load, a Files-tab upload for one) and whether it is reverted."""
+
+    load_id: str | None
+    reverted: bool
+    #: Replaced by a correction (`supersede_node`): the successor is a node of its own.
+    superseded: bool = False
+
+
+@dataclass(frozen=True)
+class StoredLink:
+    """What `GraphPort.stored_link_states` says of one link: whether it is reverted, and whether it
+    is superseded (an analyst's link change replaced it; the replacement is a link of its own)."""
+
+    reverted: bool
+    superseded: bool
+
+
+class FindLimitExceeded(Exception):
+    """`find_node(also=...)` read its bound of visible nodes sharing the identifier's value, found
+    none carrying the `also` values, and there were more (rule 2: refused, never a silent miss). The
+    nodes counted are only those the principal may see, so the refusal discloses nothing."""
+
+    def __init__(self, entity_type: str, identifier_field: str, bound: int) -> None:
+        super().__init__(
+            f"more than {bound} visible {entity_type} nodes share one {identifier_field}; "
+            "the lookup cannot choose among them"
+        )
+        self.entity_type, self.identifier_field, self.bound = entity_type, identifier_field, bound
+
+
+class AmbiguousElementId(Exception):
+    """`GraphPort.revert_elements` was given an id that two stored types of one kind both hold.
+    Ids are unique per type, not across the store, and a load's record keeps no types, so the call
+    cannot tell which element it meant; it is refused whole and changes nothing."""
+
+    def __init__(self, kind: str, count: int) -> None:
+        super().__init__(f"{count} {kind} id(s) are held by more than one stored type")
+        self.kind = kind
+        self.count = count
+
+
 class GraphPort(Protocol):
     #: Query dialects this adapter can render — `{"gremlin"}`,
     #: `{"gremlin", "opencypher"}`, `{"gql"}` — ADR-003's amendment. The
@@ -73,7 +117,13 @@ class GraphPort(Protocol):
     async def rollback_transaction(self, tx: TxId) -> None: ...
 
     async def upsert_nodes(self, nodes: Sequence[NodeWrite], tx: TxId) -> list[NodeId]: ...
-    async def upsert_edges(self, edges: Sequence[EdgeWrite], tx: TxId) -> list[EdgeId]: ...
+    async def upsert_edges(self, edges: Sequence[EdgeWrite], tx: TxId) -> list[EdgeId]:
+        """Write each link, merging into the stored link of its own audience (ADR-102 Amendment 3).
+        `EdgeWrite.writes` is how many writes one stands for (ADR-127 Amendment 19): a new link is
+        stored at revision `writes`, and a merge adds `writes` to the stored revision, so a caller
+        that combined its writes first leaves the revision one-at-a-time would. A `writes` below
+        one is refused. Every other writer (`supersede_edge`) refuses a `writes` that is not 1."""
+        ...
 
     async def get_node(
         self, node_id: NodeId, principal: Principal, *, include_superseded: bool = False
@@ -84,6 +134,42 @@ class GraphPort(Protocol):
         exclusion: classification and `handling_code` still apply
         underneath, so a principal who could not see the record cannot see
         its history either."""
+        ...
+
+    async def get_nodes(self, node_ids: Sequence[NodeId], principal: Principal) -> list[Node]:
+        """ADR-124 decision 6: the given ids looked up alone, with no traversal and no neighbour
+        read: resolved through each stored type's unique `id` index, then read through the access
+        step, per 1,000 ids (ADR-124 Amendment 2). Access-filtered in the adapter (rule 3), by the
+        same step as every other read: `principal`'s clearance, a restricted `handling_code`, the
+        case's datasets, and the structural exclusion of a reverted or superseded node. A hidden,
+        superseded, reverted or absent id is left out identically: nothing in the result, and no
+        error, says which. Each node comes back once however often its id is given, ordered by id.
+        No ids give `[]`. `node_ids` is a sequence of ids: a bare `str` is a `TypeError`, since it
+        is a sequence of characters and would be read as one-character ids."""
+        ...
+
+    async def existing_node_ids(self, node_ids: Sequence[NodeId]) -> set[NodeId]:
+        """ADR-127 decision 6. Which of `node_ids` name a node already in the store, **whatever the
+        caller may read**: no principal, no access step. For the recipe engine's write path alone,
+        to tell a node an upsert merges into from one it creates (a content `Document`'s id is the
+        hash of its bytes, so the same text from another load, holder or upload names the same
+        node). It answers what `upsert_nodes` would do: a write to a superseded node's id merges
+        into it, so it is named; a write to a reverted node's id is a fresh create (ADR-127
+        Amendment 6), so a reverted node is not, unless it is also superseded: it stays superseded,
+        a write merges, and it is named. A
+        route must never call it, or any caller could ask whether an id exists
+        (`tests/test_unfiltered_node_lookup_confined.py`). Each id once however often given; no ids
+        give the empty set; a bare `str` is a `TypeError`, as for `get_nodes`."""
+        ...
+
+    async def get_edges(self, edge_ids: Sequence[EdgeId], principal: Principal) -> list[Edge]:
+        """`get_nodes`, for links. A link comes back only when the link *and both its ends* pass
+        the access step (rule 3): a readable link to a hidden end is left out as a hidden link is,
+        so the result for a list is the result for the list without those ids. A superseded,
+        reverted or absent id is left out the same way. Each link comes back once, ordered by id.
+        No ids give `[]`. A bare `str` for `edge_ids` is a `TypeError`, as for `get_nodes`. If the
+        store holds two copies of one link id (ADR-056 Amendments 15 and 19), the one that comes
+        back is whichever the store answered last: the port does not choose between them."""
         ...
 
     async def supersede_node(self, node_id: NodeId, replacement: NodeWrite, tx: TxId) -> NodeId:
@@ -121,9 +207,26 @@ class GraphPort(Protocol):
         ...
 
     async def find_node(
-        self, entity_type: str, identifier_field: str, value: str, principal: Principal
+        self,
+        entity_type: str,
+        identifier_field: str,
+        value: str,
+        principal: Principal,
+        *,
+        also: Mapping[str, str] | None = None,
     ) -> Node | None:
-        """`01_DOMAIN_MODEL.md` §7's `match_on`/`on_match` needs this: the
+        """**`also`** names further properties that must equal: where two visible nodes share the
+        identifier's value (an Endpoint's `value_normalised` is shared by a handle and an account
+        holding the same text) a caller that wants one kind asks for it here, since the lookup
+        returns one node and a check made afterwards on whichever came back first would be a coin
+        toss. It is not answered "in the same query": a property such as an Endpoint's kind is not
+        a field a query can test, so the adapter reads the visible nodes sharing the value, one
+        past its bound, and takes the first carrying every `also` value. If none of those does and
+        there were more than the bound, it raises `FindLimitExceeded` (rule 2) and never answers
+        `None`, since `None` means no visible node matches and an unread one might. The filter is
+        applied before the bound, so only nodes the principal may see count towards it.
+
+        `01_DOMAIN_MODEL.md` §7's `match_on`/`on_match` needs this: the
         recipe engine's `on_match: reference` looks an entity up by its
         declared identifier before deciding whether to create a new node,
         and there is no other way to express that query — `match()`'s
@@ -164,8 +267,7 @@ class GraphPort(Protocol):
         predicates) this adapter has never needed and is not proven to
         support. This method is the v1 scope: it is a genuine capability
         gap `find_node` alone could not close (one caller-named field is not
-        a search box), added the same way `find_node` and
-        `expand_candidate_count` themselves grew `GraphPort` past its own
+        a search box), added the same way `find_node` grew `GraphPort` past its own
         illustrative sketch (`00_ARCHITECTURE.md` §2.1) — not a reason to
         also reach for fuzzy matching in the same change.
 
@@ -242,30 +344,6 @@ class GraphPort(Protocol):
         those logical types. An empty or one-node set has none."""
         ...
 
-    async def expand_candidate_count(
-        self, req: ExpandRequest, *, datasets: list[str] | None = None
-    ) -> int:
-        """`datasets` (ADR-099) limits the count to the case's datasets, as its `expand` is: what
-        lies outside them is not "hidden" from the case, so it is not counted.
-
-        The unfiltered half of `Subgraph.filtered_count`'s comparison
-        (`01_DOMAIN_MODEL.md` §8.2): how many
-        nodes the *same* seed set, depth, edge-type and temporal scope as
-        `expand(req, principal)` would reach with neither access axis
-        applied. No `Principal` argument, matching `revert_elements` — not
-        a principal-scoped read, and it returns only a bare count, never a
-        node, an id or a property, so it cannot itself disclose which
-        nodes are hidden or why. `services/api`'s Working-Set Service is
-        the only sanctioned caller: it already holds the properly-filtered
-        result of the matching `expand()` call under its own authority,
-        and `expand_candidate_count(req) - len(filtered.nodes)` is
-        `filtered_count` — the comparison `GraphPort` alone cannot make
-        from inside one filtered call, since a single `expand()` only ever
-        sees the already-filtered result (`01_DOMAIN_MODEL.md` §8.2's own
-        reasoning for why this couldn't be computed before this port grew
-        this method)."""
-        ...
-
     async def paths(self, req: PathRequest, principal: Principal) -> list[Path]: ...
 
     async def paths_at_length(
@@ -293,12 +371,9 @@ class GraphPort(Protocol):
     ) -> int:
         """`spec/02_GLASS_FRONTEND.md` §3.3's "estimated result count" for the visual query
         builder, and `08_ACCEPTANCE_SCENARIOS.md` B19's own "estimated count shown before
-        running". **Principal-filtered — deliberately not `expand_candidate_count`'s shape.**
-        That method exists to compute the *unfiltered* half of a comparison an authorised caller
-        (`WorkingSetService`) reconciles against its own already-filtered result; it is never
-        itself shown to an analyst. A pattern's estimate has no such reconciling caller and is
-        shown directly, so it must be filtered by this same call, the same way `match()` itself
-        is — an unfiltered count here is exactly what the Glass must never see, and the same
+        running". **Principal-filtered.** A pattern's estimate is shown directly to the analyst, so
+        it must be filtered by this same call, the same way `match()` itself is — an unfiltered
+        count here is exactly what the Glass must never see, and the same
         existence-leak-by-aggregate access control must prevent, not a shortcut.
 
         Compiles the identical access-filtered traversal `match()` does (same `has_access`
@@ -462,8 +537,8 @@ class GraphPort(Protocol):
         authorisation, never the scope). The overview's read.
 
         **Access control is in the read itself,** like every other (`CLAUDE.md` rule 3): a hidden
-        node is absent, is not counted, and its edges are absent. `Subgraph.filtered_count` is 0
-        here; a count of hidden elements is what the Conduit must never pass on.
+        node is absent, is not counted, and its edges are absent. A count of hidden elements is
+        what the Conduit must never pass on, and `Subgraph` has no field for one.
 
         **Never a slice (rule 2).** Over `max_nodes` or `max_edges` this raises `SubgraphTooLarge`
         carrying the counts of what the principal can see; it never returns a subset. The adapter
@@ -480,14 +555,74 @@ class GraphPort(Protocol):
         self, node_ids: Sequence[NodeId], edge_ids: Sequence[EdgeId], tx: TxId
     ) -> None:
         """Marks existing elements reverted (`AuditStub.reverted`,
-        `01_DOMAIN_MODEL.md` §2.4) — `services/ingest`'s `revert_load` is
+        `01_DOMAIN_MODEL.md` §2.4) — `services/ingest/load_revert.py` is
         the only caller. A reverted element is invisible to every read
         method afterwards, any principal, the same way a hidden record is
         invisible to an unauthorised one; it is never actually deleted, so
         the audit trail stays intact. No `principal` argument, matching
         `upsert_nodes`/`upsert_edges` — this is a backend write attributed
         by the caller's own audit trail (the load ledger), not a
-        principal-scoped read."""
+        principal-scoped read.
+
+        Each id is resolved to its stored type through that type's unique `id` index, nodes among
+        the vertex types and links among the edge types only, and set reverted by SQL on that
+        type, in chunks. An id held by two types of one kind raises `AmbiguousElementId` before
+        anything is written. Setting the flag again changes nothing, so a rerun is safe."""
+        ...
+
+    async def live_edges_touching(self, node_ids: Sequence[NodeId]) -> set[EdgeId]:
+        """ADR-127 Amendment 6. The ids of the live links (neither reverted nor superseded) with
+        one of `node_ids` at either end, **whatever the caller may read**: no principal, no access
+        step. For the revert alone, to tell whether a link outside the load being reverted rests on
+        a node the load created (a later load may only have referenced the node, which its record
+        keeps as a count). A route must never call it
+        (`tests/test_unfiltered_node_lookup_confined.py`). Each id once however often given; no ids
+        give the empty set; a bare `str` is a `TypeError`."""
+        ...
+
+    async def live_nodes_naming_geometry(
+        self, geometry_refs: Sequence[str]
+    ) -> dict[str, set[NodeId]]:
+        """As `live_edges_touching`, for the geometry partition: for each of `geometry_refs` that a
+        live node (neither reverted nor superseded) names in its `geometry_ref`, the ids of those
+        nodes, whatever the caller may read. A ref no live node names is absent from the answer.
+        For the revert alone, so a point a later load's `Location` still names is not removed. No
+        refs give `{}`; a bare `str` is a `TypeError`."""
+        ...
+
+    async def stored_writes(self, node_ids: Sequence[NodeId]) -> dict[NodeId, StoredNode]:
+        """As `live_edges_touching`, for the last write to each node: its stored `audit.load_id`
+        (`None` for a write outside a load) and whether it is reverted, whatever the caller may
+        read and whatever the node's state (a superseded node is answered too). An id no node
+        holds is absent. A write onto an existing node rewrites the load (a merge, even one by
+        another load or by an upload, and a fresh create over a reverted node), so this is how the
+        revert tells that a node it created has since been written by someone else, and whether an
+        earlier attempt already reverted it, and whether a correction has superseded it (its
+        successor is in no load's record). For the revert alone. No ids give `{}`; a bare `str` is
+        a `TypeError`."""
+        ...
+
+    async def stored_link_states(self, edge_ids: Sequence[EdgeId]) -> dict[EdgeId, StoredLink]:
+        """As `stored_writes`, for links: each stored link's `reverted` and `superseded` flags,
+        whatever the caller may read, each id found through its type's unique `id` index, over every
+        edge type. An id no link holds is absent. An id two types hold is answered as the worst of
+        them (superseded if either is, reverted only if both are). For the revert alone, which
+        refuses a load whose created link an analyst has changed. No ids give `{}`; a bare `str`
+        is a `TypeError`."""
+        ...
+
+    async def strip_provenance_references(self, prefix: str) -> int:
+        """Removes every provenance entry whose `document_id` starts with `prefix` from every link
+        in the Vault, superseded and reverted ones included, and returns how many links changed
+        (ADR-124 decision 11). `scripts/strip_change_provenance.py` is the only caller: it removes
+        the `manual:change:<old id>` and `manual:remove-picture:<old id>` entries that successors
+        written before U10 carry, naming a link a reader of the successor may not be able to read.
+
+        No `principal` argument, like `revert_elements`: it is an operator's one-off write on the
+        stored body, not a read. It changes no claim, only a reference, which is the named
+        exception to ADR-080's "every change is a supersede": nothing is superseded, `audit` is
+        untouched, and the link keeps its other sources. Idempotent: a second call with the same
+        prefix changes nothing and returns 0."""
         ...
 
 

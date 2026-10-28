@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
+from urllib.parse import quote
 
 import httpx
 import jwt
@@ -88,7 +89,7 @@ class OidcResolverSettings:
 # "OIDC via Keycloak (Apache-2.0). The session token resolves to a
 # `Principal` carrying identity, unit, roles, clearance, and the handling
 # codes the principal may receive."
-# 
+#
 # **The JWKS source is a config point, not a hardcoded key.** `ApiConfig.
 # oidc_jwks_url` names the endpoint `PyJWKClient` fetches and caches keys
 # from — a Keycloak realm's `.../protocol/openid-connect/certs` in a real
@@ -105,14 +106,14 @@ class OidcResolverSettings:
 # special-cases the fixture path, so the exact same code runs against the
 # test fixture's URL as against a real IdP later; only the config value
 # changes.
-# 
+#
 # **Claim names are this deployment's mapping, not a standard.** OIDC has no
 # standard claim for `clearance`, `org_unit` or `receivable_handling_codes`
 # — those come from `01_DOMAIN_MODEL.md` §2.2's handling model, which no IdP
 # knows about natively. A real deployment maps its IdP's actual claims (a
 # Keycloak protocol mapper, typically) onto the names below; this module
 # does not invent a mapping convention beyond naming what it expects.
-# 
+#
 # **`resolve_for_owner` — OAuth2 Token Exchange (RFC 8693), `06_DECISIONS.md` ADR-043's own
 # accepted mechanism for a stored `owner_id` with no live bearer token.** Exchanges this Conduit's
 # own client credentials for a token minted *as* the target owner, then decodes that token through
@@ -183,6 +184,23 @@ class PrincipalExchangeUnavailable(PrincipalExchangeError):
     about the target subject."""
 
 
+def _access_token_of(response: httpx.Response, what: str) -> str:
+    """The `access_token` of a token endpoint's 200, or `PrincipalExchangeUnavailable`. A body that
+    is not JSON, is not an object, or carries no non-empty string token is a malformed answer, not
+    a refusal and not an exception of its own: left alone they escaped `resolve_for_owner` as
+    `JSONDecodeError`, `AttributeError` and `KeyError`, none a `PrincipalExchangeError`."""
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise PrincipalExchangeUnavailable(
+            f"{what} answered 200 with a body that is not JSON"
+        ) from exc
+    token = body.get("access_token") if isinstance(body, dict) else None
+    if not isinstance(token, str) or not token:
+        raise PrincipalExchangeUnavailable(f"{what} answered 200 with no access_token")
+    return token
+
+
 class PrincipalResolver:
     """One `PyJWKClient` per configured JWKS URL, built once at process
     start and reused for the process lifetime — `resolve()` itself makes
@@ -216,7 +234,7 @@ class PrincipalResolver:
         except PrincipalExchangeError:
             return None
 
-    async def _refuse_if_revoked(self, owner_id: str) -> None:
+    async def _refuse_if_revoked(self, owner_id: str) -> str | None:
         """Refuses, before any exchange, if the target principal is disabled at the IdP.
 
         **The finding this closes, measured rather than assumed** (ADR-043's amendment, 24
@@ -236,16 +254,33 @@ class PrincipalResolver:
         IdP outage never marks a live analyst's watches as revoked.
 
         **Off when unconfigured.** No `oidc_admin_users_url` means no pre-check and the previous
-        behaviour exactly, which is what keeps existing deployments working.
+        behaviour exactly, which is what keeps existing deployments working; it answers `None`.
+
+        **Returns the subject id the pre-check judged**, which the exchange then asks for, so the
+        two never judge different subjects (an owner recorded by username is exchanged by the id
+        that username resolved to). **A 200 is accepted only in the shape the read promises**: the
+        by-id read answers the one user, whose `id` is the id asked for, and the username read
+        answers a list. Anything else (a URL left at the realm root answers 200 with an object
+        whose `enabled` is true) is `PrincipalExchangeUnavailable`, never a pass.
         """
         if not self._config.oidc_admin_users_url:
-            return
+            return None
+        # An owner is recorded by Keycloak's subject id (the token's `sub`, ADR-127 Amendment 34),
+        # so it is read as `users/{id}`; a name is read as `users?username=` only when no user has
+        # that id, which keeps an owner recorded by username (before that amendment) working.
+        # Measured on Keycloak 26.0: the username query for a subject id answers 200 with no users.
+        base = self._config.oidc_admin_users_url.rstrip("/")
         try:
-            response = await self._exchange_http.get(
-                self._config.oidc_admin_users_url,
-                params={"username": owner_id, "exact": "true"},
-                headers={"Authorization": f"Bearer {await self._client_credentials_token()}"},
+            headers = {"Authorization": f"Bearer {await self._client_credentials_token()}"}
+            by_id = await self._exchange_http.get(
+                f"{base}/{quote(owner_id, safe='')}", headers=headers
             )
+            response = by_id
+            by_username = by_id.status_code == 404
+            if by_username:
+                response = await self._exchange_http.get(
+                    base, params={"username": owner_id, "exact": "true"}, headers=headers
+                )
         except httpx.HTTPError as exc:
             raise PrincipalExchangeUnavailable(
                 f"could not read enabled status for owner {owner_id!r}: {exc}"
@@ -255,10 +290,51 @@ class PrincipalResolver:
                 f"enabled-status read for owner {owner_id!r} returned "
                 f"{response.status_code} {response.text}"
             )
-        users = response.json()
+        try:
+            found = response.json()
+        except ValueError as exc:
+            raise PrincipalExchangeUnavailable(
+                f"the read of owner {owner_id!r} answered 200 with a body that is not JSON: "
+                "OIDC_ADMIN_USERS_URL may not be the realm's users endpoint"
+            ) from exc
+        if by_username:
+            if not isinstance(found, list):
+                raise PrincipalExchangeUnavailable(
+                    f"the username read for owner {owner_id!r} did not answer a list of users: "
+                    "OIDC_ADMIN_USERS_URL may not be the realm's users endpoint"
+                )
+            users = found
+        else:
+            if not isinstance(found, dict) or found.get("id") != owner_id:
+                raise PrincipalExchangeUnavailable(
+                    f"the read of owner {owner_id!r} by id did not answer that user: "
+                    "OIDC_ADMIN_USERS_URL may not be the realm's users endpoint"
+                )
+            users = [found]
         if not users:
             raise PrincipalExchangeRefused(
                 f"owner {owner_id!r} is not known to the identity provider"
+            )
+        if by_username:
+            # `exact=true` asks for the whole username; a realm, proxy or version that drops it
+            # answers every name that starts with the text. Exactly one user, and the one asked
+            # for, or nothing is exchanged: the first of several is a coin toss and a prefix match
+            # is somebody else. Keycloak stores usernames in lower case, so the comparison is
+            # case-folded.
+            if len(users) != 1:
+                raise PrincipalExchangeUnavailable(
+                    f"the username read for owner {owner_id!r} answered {len(users)} users, "
+                    "where exactly one was asked for"
+                )
+            named = users[0].get("username") if isinstance(users[0], dict) else None
+            if not isinstance(named, str) or named.casefold() != owner_id.casefold():
+                raise PrincipalExchangeUnavailable(
+                    f"the username read for owner {owner_id!r} answered a different user"
+                )
+        resolved = users[0].get("id") if isinstance(users[0], dict) else None
+        if not isinstance(resolved, str) or not resolved:
+            raise PrincipalExchangeUnavailable(
+                f"the identity provider's answer for owner {owner_id!r} carried no user id"
             )
         if not users[0].get("enabled", False):
             raise PrincipalRevoked(
@@ -266,6 +342,7 @@ class PrincipalResolver:
                 "Conduit's own pre-check, because the realm will issue a token for a disabled "
                 "subject (06_DECISIONS.md ADR-043's amendment)"
             )
+        return resolved
 
     async def _client_credentials_token(self) -> str:
         """This client's own token — used both as the `subject_token` of an exchange and as the
@@ -282,8 +359,7 @@ class PrincipalResolver:
             },
         )
         response.raise_for_status()
-        token: str = response.json()["access_token"]
-        return token
+        return _access_token_of(response, "this client's own token")
 
     async def resolve_for_owner_detailed(self, owner_id: str) -> Principal:
         """Raises rather than collapses — see the two exception classes above. Never caches
@@ -296,7 +372,7 @@ class PrincipalResolver:
                 "OIDC_TOKEN_EXCHANGE_URL is not set — this deployment has not configured "
                 "token exchange (06_DECISIONS.md ADR-043)"
             )
-        await self._refuse_if_revoked(owner_id)
+        resolved = await self._refuse_if_revoked(owner_id)
         try:
             subject_token = await self._client_credentials_token()
         except httpx.HTTPError as exc:
@@ -322,7 +398,7 @@ class PrincipalResolver:
                     # `requested_subject` below identifies the party acted for.
                     "subject_token": subject_token,
                     "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
-                    "requested_subject": owner_id,
+                    "requested_subject": resolved or owner_id,
                     "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
                 },
             )
@@ -335,11 +411,7 @@ class PrincipalResolver:
                 f"token exchange refused for owner {owner_id!r}: "
                 f"{response.status_code} {response.text}"
             )
-        exchanged_token = response.json().get("access_token")
-        if not exchanged_token:
-            raise PrincipalExchangeRefused(
-                f"token exchange for owner {owner_id!r} returned no access_token"
-            )
+        exchanged_token = _access_token_of(response, f"the exchange for owner {owner_id!r}")
         try:
             return self.resolve(exchanged_token)
         except PrincipalResolutionError as exc:

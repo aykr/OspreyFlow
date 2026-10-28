@@ -8,7 +8,7 @@
 // worth naming rather than leaving implicit (the "invariant stated
 // in prose that no test exercises" failure mode,
 // applied to a cross-language contract instead of a domain invariant).
-// `deltaClient.test.ts` exercises this file against the *real* Python
+// `deltaClient.integration.test.ts` exercises this file against the *real* Python
 // WebSocket route, which is what actually proves the two sides still
 // agree — not a hope that no one edits one side alone.
 
@@ -18,11 +18,6 @@ import type { Edge, Node } from "../../../../packages/schemas/generated";
 // output too (`Node.ts`/`Edge.ts`) and aren't re-exported from the
 // generated `index.ts` — using `string` directly here avoids depending on
 // an identifier the drift gate doesn't actually promise to keep exported.
-export interface NodePropertyUpdate {
-  id: string;
-  properties: Record<string, unknown>;
-}
-
 export interface DeltaAdd {
   seq: number;
   op: "add";
@@ -30,16 +25,15 @@ export interface DeltaAdd {
   edges: Edge[];
 }
 
-export interface DeltaUpdate {
-  seq: number;
-  op: "update";
-  nodes: NodePropertyUpdate[];
-}
-
+/** What a removal looks like on the wire (`DeltaRemoveSent` in `models.py`, ADR-124 decision 4):
+ * only the ids this reader may read, never the record the server keeps of what each was.
+ * `edge_ids` takes a link off the canvas and leaves its ends; a node's removal still takes its
+ * links with it. Absent from an older server's message, which means none. */
 export interface DeltaRemove {
   seq: number;
   op: "remove";
   node_ids: string[];
+  edge_ids?: string[];
 }
 
 /** One link stands in for another (ADR-080): a link was changed, so the old one leaves the view
@@ -55,21 +49,21 @@ export interface DeltaReproject {
   seq: number;
   op: "reproject";
   reason: string;
-  merged: number;
-  split: number;
-  affected: number;
   /** Phase 6a Stage 2 — every node whose cluster membership moved, mapped to its new cluster
    * id, mirroring `services/api/working_set/models.py`'s own field. Bounded by `affected`, never
    * the full working set. */
   affected_cluster_ids: Record<string, string>;
 }
 
-export interface DeltaNotice {
-  seq: number;
-  op: "notice";
-  level: "info" | "warning";
-  message: string;
-  count: number;
+/** ADR-124 decision 1: the answer to each of the three resolution routes (a change of match
+ * strictness, a manual same-as, a manual split): the delta every reader receives, and the figures
+ * the change made, as the acting analyst's own view counts them. The figures are on this answer
+ * only, never on the delta. Mirrors `ResolutionOutcome` in `models.py`. */
+export interface ResolutionOutcome {
+  delta: DeltaReproject;
+  merged: number;
+  split: number;
+  affected: number;
 }
 
 export interface DeltaSnapshot {
@@ -77,24 +71,47 @@ export interface DeltaSnapshot {
   op: "snapshot";
   nodes: Node[];
   edges: Edge[];
-  filtered_count: number;
+  /** ADR-124 decision 5: `true` when the case holds anything this reader may not view. Set only in
+   * the full snapshot `sync` returns; `null` or absent everywhere else, and then the Glass keeps
+   * what it last had. Never a number. */
+  withheld?: boolean | null;
+}
+
+/** `LimitExceeded` in `models.py`: a refused request's own answer, and what `DeltaViewOverCap`
+ * carries (ADR-124 decision 2). `would_be` is the reader's own figure for the cap named, never
+ * anyone else's. */
+export interface LimitExceeded {
+  error: "limit_exceeded";
+  cap_kind: "nodes" | "edges";
+  cap: number;
+  would_be: number;
+  options: ["branch", "filter", "promote_to_batch"];
+}
+
+/** Sent in place of a snapshot or a delta when the reader's own view of the case is past a cap
+ * (ADR-124 decision 2, Amendment 9). `seq` is the sequence number of what it replaces: it neither
+ * advances the client's sequence nor trips its gap check. Mirrors `DeltaViewOverCap` in
+ * `models.py`; not part of `WorkingSetDelta`, which is what changes the graph. */
+export interface DeltaViewOverCap {
+  seq: number;
+  op: "view_over_cap";
+  would_be: LimitExceeded;
 }
 
 export type WorkingSetDelta =
   | DeltaAdd
-  | DeltaUpdate
   | DeltaRemove
   | DeltaReplaceEdge
   | DeltaReproject
-  | DeltaNotice
   | DeltaSnapshot;
 
 export interface HistoryStepSummary {
   id: string;
   label: string;
   created_at: string;
-  node_count: number;
-  edge_count: number;
+  /** `false` for a step that holds no canvas snapshot (ADR-128: an edit to the case brief): it is
+   * listed and never restored. Absent is restorable, as every step was before the field. */
+  restorable?: boolean;
 }
 
 // `services/api/working_set/models.py`'s `PairwiseExplanation`/`ClusterExplanation` — the

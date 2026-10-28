@@ -85,6 +85,34 @@ def apply_transform(
     return chosen
 
 
+#: The adapters whose output is a list of text, not one value (`split`, ADR-127 Amendment 15): fit
+#: for a `string[]` property and for no key, which is one value.
+LIST_VALUED_TRANSFORMS = frozenset({"split"})
+
+
+def gives_a_list(spec: str | None) -> bool:
+    """Whether a transform string names an adapter whose output is a list."""
+    parsed = transform_name_and_part(spec) if spec else None
+    return parsed is not None and parsed[0] in LIST_VALUED_TRANSFORMS
+
+
+def connector_params_in_use(spec: str) -> tuple[str, ...]:
+    """The connector-level defaults (`date_order`, `source_crs`) a transform string takes from its
+    connector: those its adapter accepts that the string does not name itself (an explicit argument
+    overrides the default, so the connector's value then feeds nothing). A string that is not a
+    transform expression uses none."""
+    match = _CALL.match(spec.strip())
+    if match is None:
+        return ()
+    named = {
+        chunk.partition("=")[0].strip()
+        for chunk in (match.group("args") or "").split(",")
+        if "=" in chunk
+    }
+    accepted = _CONNECTOR_DEFAULT_PARAMS.get(match.group("name"), ())
+    return tuple(param for param in accepted if param not in named)
+
+
 def transform_name_and_part(spec: str) -> tuple[str, str | None] | None:
     """A transform string's adapter name and its `part=` argument, if it has one; `None` when the
     string is not a transform expression at all."""

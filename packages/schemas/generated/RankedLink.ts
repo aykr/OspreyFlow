@@ -12,6 +12,7 @@ export type CorpusPairCount = number;
 export type CorpusSourceDegree = number;
 export type CorpusTargetDegree = number;
 export type CorpusTotalOccurrences = number;
+export type ParameterSet = string | null;
 export type ComputedAt = string;
 export type Basis = ("direct" | "probabilistic") | null;
 export type ProvenanceState = "asserted" | "inferred" | "unresolved";
@@ -19,6 +20,7 @@ export type DocumentId = string;
 export type Locator = string;
 export type ExcerptHash = string;
 export type Sources = SourceRef[];
+export type SourcesWithheld = boolean;
 export type ExtractedBy = string | null;
 export type ExtractionConfidence = number | null;
 export type FirstSeen = string;
@@ -92,12 +94,14 @@ export interface WeightComponents {
   corpus_source_degree: CorpusSourceDegree;
   corpus_target_degree: CorpusTargetDegree;
   corpus_total_occurrences: CorpusTotalOccurrences;
+  parameter_set?: ParameterSet;
   computed_at: ComputedAt;
   [k: string]: unknown;
 }
 export interface Provenance {
   state: ProvenanceState;
   sources: Sources;
+  sources_withheld?: SourcesWithheld;
   extracted_by?: ExtractedBy;
   extraction_confidence?: ExtractionConfidence;
   first_seen: FirstSeen;

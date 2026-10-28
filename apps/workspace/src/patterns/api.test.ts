@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { SavedPattern } from "../../../../packages/schemas/generated";
-import { listPatterns, loadPattern, savePattern } from "./api";
+import { askToSearch, fetchPatternPreview, listPatterns, loadPattern, runPattern, savePattern } from "./api";
 
 // `savePattern`/`listPatterns`/`loadPattern` are otherwise-thin `fetch` wrappers (`site/api.ts`'s
 // own `api.test.ts` leaves those untested elsewhere in this codebase) — but their `!response.ok`
@@ -103,3 +103,79 @@ describe("ADR-099 Amendment 3: saved patterns are asked of the case", () => {
   });
 });
 
+
+// ADR-121: a condition the ontology refuses comes back typed (422, `pattern_condition_refused`);
+// the analyst is shown the words, not "failed: 422".
+describe("a refused pattern condition", () => {
+  const REFUSAL = {
+    error: "pattern_condition_refused",
+    detail: "Person.date_of_birth is marked sensitivity: high, so a pattern cannot match on it",
+    var: "a",
+    property: "date_of_birth",
+    reason: "sensitive",
+  };
+  const PATTERN = { nodes: [], edges: [], limit: 1000 };
+
+  it.each([
+    ["preview", () => fetchPatternPreview("http://x", "tok", "inv-1", PATTERN)],
+    ["run", () => runPattern("http://x", "tok", "inv-1", PATTERN)],
+    [
+      "save",
+      () => savePattern("http://x", "tok", "inv-1", { pattern_id: null, name: "n", definition: PATTERN }),
+    ],
+  ])("is shown by its own words on %s", async (_route, call) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 422, json: async () => REFUSAL }));
+    await expect(call()).rejects.toThrow(REFUSAL.detail);
+  });
+
+  it("falls back to the status when the body is not a typed refusal", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: false, status: 422, json: async () => ({ detail: [{ msg: "x" }] }) }),
+    );
+    await expect(fetchPatternPreview("http://x", "tok", "inv-1", PATTERN)).rejects.toThrow(
+      "POST /v1/patterns/preview failed: 422",
+    );
+  });
+});
+
+// ADR-129 decision 2: ask to search. The analyst's question and what they have selected go to the
+// case's own route; what comes back is a pattern to draw, a line in words and the preview's count.
+describe("askToSearch", () => {
+  const PROPOSAL = {
+    pattern: { nodes: [{ var: "a", entity_type: "Person" }], edges: [], limit: 1000 },
+    explanation: "Finds people.",
+    estimated_count: 7,
+    is_floor: false,
+  };
+
+  it("posts the question and the selection to the case's route and returns the proposal", async () => {
+    const fetcher = vi.fn().mockResolvedValue({ ok: true, json: async () => PROPOSAL });
+    vi.stubGlobal("fetch", fetcher);
+    const result = await askToSearch("http://api", "tok", "inv 1", "Who is it?", ["n1", "n2"]);
+    expect(result).toEqual(PROPOSAL);
+    const [url, init] = fetcher.mock.calls[0] as [string, { method: string; body: string }];
+    expect(url).toBe("http://api/v1/investigations/inv%201/patterns/ask");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toEqual({ question: "Who is it?", selected_node_ids: ["n1", "n2"] });
+  });
+
+  it("says it could not express the question, in the server's own words, on the typed refusal", async () => {
+    const refusal = {
+      error: "could_not_express",
+      reason: "unknown_type",
+      detail: "The pattern names a type that is not in this case's vocabulary.",
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 422, json: async () => refusal }));
+    await expect(askToSearch("http://x", "tok", "inv-1", "q", [])).rejects.toThrow(
+      "Could not express the question as a pattern. The pattern names a type that is not in this case's vocabulary.",
+    );
+  });
+
+  it("falls back to the status for any other failure", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 403, json: async () => ({}) }));
+    await expect(askToSearch("http://x", "tok", "inv-1", "q", [])).rejects.toThrow(
+      "POST .../patterns/ask failed: 403",
+    );
+  });
+});

@@ -272,7 +272,6 @@ test("Enter expands the focused node — a real network call, not a stub", async
       contentType: "application/json",
       body: JSON.stringify({
         delta: { seq: 2, op: "add", nodes: [], edges: [] },
-        filtered_count: 0,
       }),
     });
   });
@@ -323,7 +322,6 @@ test("an expansion leaves the view and the settled nodes where they were (ADR-06
           nodes: [person("x1"), person("x2")],
           edges: [link("ex1", "n1", "x1"), link("ex2", "n1", "x2")],
         },
-        filtered_count: 0,
       }),
     });
   });
@@ -406,7 +404,15 @@ test("Space, then the radial list, reaches manual link — a real POST, not a st
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ seq: 2, op: "reproject", merged: 1, split: 0, affected: 2 }),
+      body: JSON.stringify({
+        delta: {
+          seq: 2,
+          op: "reproject",
+          reason: "manual link",
+          affected_cluster_ids: { n0: "c-linked", n1: "c-linked" },
+        },
+        merged: 1, split: 0, affected: 2,
+      }),
     });
   });
 
@@ -437,6 +443,11 @@ test("Space, then the radial list, reaches manual link — a real POST, not a st
   await expect.poll(() => linkRequestBody !== null).toBe(true);
   expect(linkRequestBody).toMatchObject({ node_a: "n1", node_b: "n0" });
   await expect(menu).toBeHidden(); // RadialMenu closes on select, same as a mouse click
+  // ADR-124: the answer is a `ResolutionOutcome`; the canvas applies the delta inside it, so the
+  // clusters it names are what the working set now holds (applying the whole answer would not).
+  await expect
+    .poll(() => page.evaluate(() => [window.__CANVAS__?.clusterOf("n0"), window.__CANVAS__?.clusterOf("n1")]))
+    .toEqual(["c-linked", "c-linked"]);
   registerCovered("CANVAS_ACTIONS", "menu-item-manual-link");
 });
 
@@ -451,7 +462,15 @@ test("the radial list also reaches Split, not only Link", async ({ page }) => {
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ seq: 2, op: "reproject", merged: 0, split: 1, affected: 2 }),
+      body: JSON.stringify({
+        delta: {
+          seq: 2,
+          op: "reproject",
+          reason: "manual split",
+          affected_cluster_ids: { n0: "c-apart-0", n1: "c-apart-1" },
+        },
+        merged: 0, split: 1, affected: 2,
+      }),
     });
   });
 
@@ -473,6 +492,11 @@ test("the radial list also reaches Split, not only Link", async ({ page }) => {
   await expect.poll(() => splitRequestBody !== null).toBe(true);
   expect(splitRequestBody).toMatchObject({ node_a: "n1", node_b: "n0" });
   await expect(menu).toBeHidden();
+  // ADR-124: the canvas applies the delta inside the `ResolutionOutcome`, so the clusters it names
+  // are what the working set now holds.
+  await expect
+    .poll(() => page.evaluate(() => [window.__CANVAS__?.clusterOf("n0"), window.__CANVAS__?.clusterOf("n1")]))
+    .toEqual(["c-apart-0", "c-apart-1"]);
   registerCovered("CANVAS_ACTIONS", "menu-item-manual-split");
 });
 
@@ -492,7 +516,7 @@ test("the radial list's own auto-focused first item is itself reachable and acti
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ delta: { seq: 2, op: "add", nodes: [], edges: [] }, filtered_count: 0 }),
+      body: JSON.stringify({ delta: { seq: 2, op: "add", nodes: [], edges: [] } }),
     });
   });
 
@@ -1116,6 +1140,180 @@ test("a selected node's own menu offers Branch selected for the whole selection 
   registerCovered("CANVAS_ACTIONS", "branch-selected-from-a-selected-nodes-menu");
 });
 
+// --- Select what is lit (ADR-128 decision 2, B3) ----------------------------------------------
+//
+// `harness.tsx?fixture=lit` puts the real timeline under the chain n0—n1—n2—n3—n4. The spec answers
+// the timeline's two reads: the density strip, and which links have an event in the window (e0 and
+// e1 do; e2 and e3 have none, as an undated link has none). Every step is a key: the window by Set
+// exact dates, the selection by Select what is lit, the branch by Branch selected.
+
+const LIT_HISTOGRAM = {
+  bucketing: "fixed_interval",
+  buckets: [{ start: "2026-01-01T00:00:00Z", end: "2026-01-02T00:00:00Z", count: 1 }],
+  total: 1,
+};
+
+async function stubTheTimelineReads(page: Page, lit: Record<string, string>): Promise<void> {
+  await page.route("**/*/v1/analytics/histogram", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(LIT_HISTOGRAM) });
+  });
+  await page.route("**/*/v1/analytics/first-seen", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ nodes: {}, edges: lit }),
+    });
+  });
+}
+
+async function shiftTabTo(page: Page, control: Locator, limit = 24): Promise<void> {
+  for (let presses = 0; presses < limit; presses++) {
+    if (await control.evaluate((el) => el === document.activeElement).catch(() => false)) return;
+    await page.keyboard.press("Shift+Tab");
+  }
+  await expect(control).toBeFocused();
+}
+
+/** Sets the window by keyboard alone: the timeline's overflow menu, Set exact dates, then the two
+ * boxes, each committed by leaving it. Leaves focus on the end box. */
+async function setExactDatesByKeyboard(page: Page, from: string, to: string): Promise<void> {
+  await expect(page.getByRole("button", { name: "More timeline options" })).toBeVisible();
+  await tabTo(page, page.getByRole("button", { name: "More timeline options" }), 60);
+  await page.keyboard.press("Enter");
+  await tabTo(page, page.getByRole("button", { name: "Set exact dates" }), 6);
+  await page.keyboard.press("Enter");
+  await tabTo(page, page.getByLabel("Brush window start"), 6);
+  await page.keyboard.type(from);
+  await page.keyboard.press("Tab"); // leaving the box commits it
+  await page.keyboard.type(to);
+  await expect(page.getByLabel("Brush window end")).toBeFocused();
+}
+
+async function selectWhatIsLitByKeyboard(page: Page): Promise<void> {
+  await page.keyboard.press("Tab"); // leaving the end box commits the window
+  await shiftTabTo(page, page.getByRole("button", { name: "Select what is lit" }), 12);
+  await page.keyboard.press("Enter");
+}
+
+const LIT_LINKS = { e0: "2026-02-01T10:00:00Z", e1: "2026-03-01T10:00:00Z" };
+
+test("Set exact dates, Select what is lit, then Branch selected opens a tab holding the lit slice", async ({
+  page,
+}) => {
+  await stubTheTimelineReads(page, LIT_LINKS);
+  let body: { node_ids: string[]; name?: string; window?: unknown } | null = null;
+  await page.route("**/*/investigations/*/branch", async (route) => {
+    body = route.request().postDataJSON();
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({ id: "branch-lit-1", name: "5 Jan – 1 May 2026, selected" }),
+    });
+  });
+  await page.goto("/keyboard/harness.html?fixture=lit");
+  await setExactDatesByKeyboard(page, "2026-01-05T00:00:00Z", "2026-05-01T00:00:00Z");
+  await selectWhatIsLitByKeyboard(page);
+
+  // The lit nodes are the ones a lit link touches; n3 and n4 are joined only by links with no event
+  // in the window, and n5 by none, so they are not selected.
+  await expect
+    .poll(() => page.evaluate(() => window.__KEYBOARD__?.selection.slice().sort()))
+    .toEqual(["n0", "n1", "n2"]);
+  await expect(page.getByRole("toolbar", { name: "Selection" })).toContainText(
+    "undated links are not included",
+  );
+  // The window's end is lit, so the note names the day it falls on.
+  await expect(page.getByRole("toolbar", { name: "Selection" })).toContainText("Lit in 5 Jan – 1 May 2026");
+
+  await page.getByRole("application", { name: "Network canvas" }).focus();
+  await tabTo(page, page.getByRole("button", { name: "Branch to a new case" }));
+  await page.keyboard.press("Enter");
+
+  await expect.poll(() => body).not.toBeNull();
+  expect(body!.node_ids.slice().sort()).toEqual(["n0", "n1", "n2"]);
+  expect(body!.name).toBe("5 Jan – 1 May 2026, selected");
+  expect(body!.window).toEqual({
+    valid_from: "2026-01-05T00:00:00Z",
+    valid_to: "2026-05-01T00:00:00Z",
+  });
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { __KEYBOARD__?: { branchedTo?: string | null } }).__KEYBOARD__
+            ?.branchedTo,
+      ),
+    )
+    .toBe("branch-lit-1");
+  registerCovered("CANVAS_ACTIONS", "select-what-is-lit-then-branch-selected-by-keyboard");
+});
+
+test("Undo select what is lit gives back the selection that was there before, once", async ({ page }) => {
+  await stubTheTimelineReads(page, LIT_LINKS);
+  await page.goto("/keyboard/harness.html?fixture=lit");
+  await page.getByRole("application", { name: "Network canvas" }).focus(); // n0 selected
+  await expect.poll(() => page.evaluate(() => window.__KEYBOARD__?.selection)).toEqual(["n0"]);
+  await setExactDatesByKeyboard(page, "2026-01-05T00:00:00Z", "2026-05-01T00:00:00Z");
+  await selectWhatIsLitByKeyboard(page);
+  await expect
+    .poll(() => page.evaluate(() => window.__KEYBOARD__?.selection.slice().sort()))
+    .toEqual(["n0", "n1", "n2"]);
+
+  await page.getByRole("application", { name: "Network canvas" }).focus();
+  await tabTo(page, page.getByRole("button", { name: "Undo select what is lit" }));
+  await page.keyboard.press("Enter");
+
+  await expect.poll(() => page.evaluate(() => window.__KEYBOARD__?.selection)).toEqual(["n0"]);
+  // One level: with the earlier selection back, there is nothing further to undo.
+  await expect(page.getByRole("button", { name: "Undo select what is lit" })).toHaveCount(0);
+  registerCovered("CANVAS_ACTIONS", "undo-select-what-is-lit-by-keyboard");
+});
+
+test("a window that lights nothing says so and leaves the selection as it was", async ({ page }) => {
+  await stubTheTimelineReads(page, {});
+  await page.goto("/keyboard/harness.html?fixture=lit");
+  await page.getByRole("application", { name: "Network canvas" }).focus(); // n0 selected
+  await setExactDatesByKeyboard(page, "2026-01-05T00:00:00Z", "2026-05-01T00:00:00Z");
+  await selectWhatIsLitByKeyboard(page);
+
+  await expect(page.getByRole("dialog")).toContainText("Nothing is lit in this window");
+  await expect(page.getByRole("dialog")).toContainText("undated links are not included");
+  expect(await page.evaluate(() => window.__KEYBOARD__?.selection)).toEqual(["n0"]);
+});
+
+test("a window changed after Select what is lit is not sent: the branch is a plain one", async ({ page }) => {
+  await stubTheTimelineReads(page, LIT_LINKS);
+  let body: { node_ids: string[]; name?: string; window?: unknown } | null = null;
+  await page.route("**/*/investigations/*/branch", async (route) => {
+    body = route.request().postDataJSON();
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({ id: "branch-lit-2", name: "Branch" }),
+    });
+  });
+  await page.goto("/keyboard/harness.html?fixture=lit");
+  await setExactDatesByKeyboard(page, "2026-01-05T00:00:00Z", "2026-05-01T00:00:00Z");
+  await selectWhatIsLitByKeyboard(page);
+  await expect
+    .poll(() => page.evaluate(() => window.__KEYBOARD__?.selection.slice().sort()))
+    .toEqual(["n0", "n1", "n2"]);
+  // The window moves on, so what was lit no longer describes it.
+  await page.getByLabel("Brush window end").focus();
+  await page.keyboard.press("ControlOrMeta+A");
+  await page.keyboard.type("2026-04-01T00:00:00Z");
+  await page.keyboard.press("Tab");
+
+  await page.getByRole("application", { name: "Network canvas" }).focus();
+  await tabTo(page, page.getByRole("button", { name: "Branch to a new case" }));
+  await page.keyboard.press("Enter");
+
+  await expect.poll(() => body).not.toBeNull();
+  expect(body!.node_ids.slice().sort()).toEqual(["n0", "n1", "n2"]);
+  expect(body!.window).toBeUndefined();
+  expect(body!.name).toBeUndefined();
+});
+
 test("Branch selected says so when nothing could be branched, and opens no tab", async ({ page }) => {
   await page.goto("/keyboard/harness.html");
   await page.route("**/*/investigations/*/branch", async (route) => {
@@ -1249,7 +1447,7 @@ test("a very large expansion asks first; Escape cancels it and nothing is added"
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ delta: { seq: 2, op: "add", nodes: [], edges: [] }, filtered_count: 0 }),
+      body: JSON.stringify({ delta: { seq: 2, op: "add", nodes: [], edges: [] } }),
     });
   });
   const canvas = page.getByRole("application", { name: "Network canvas" });
@@ -1279,7 +1477,7 @@ test("a very large expansion can be accepted by keyboard, and only then does it 
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ delta: { seq: 2, op: "add", nodes: [], edges: [] }, filtered_count: 0 }),
+      body: JSON.stringify({ delta: { seq: 2, op: "add", nodes: [], edges: [] } }),
     });
   });
   const canvas = page.getByRole("application", { name: "Network canvas" });
@@ -1405,6 +1603,42 @@ test("the Icons control is reached by Tab, and a drawing chosen with the arrow k
   await expect(picker).toHaveCount(0);
   await expect(button).toBeFocused();
   registerCovered("CANVAS_ACTIONS", "icons-menu-by-keyboard");
+});
+
+// ADR-128 Decision 4 (B7). n4 is an Endpoint whose endpoint_kind is `handle`, which the ontology maps
+// to the keypad (ten dots), where the type's own drawing is a device (no dots).
+test("the legend says which value icon means what, reached by Tab, and the analyst's choice for the type takes over", async ({ page }) => {
+  await page.goto("/keyboard/harness.html");
+  await settle(page, "n0");
+  const dots = (uri: string | null | undefined) => (svgOf(uri).match(/<g [\s\S]*<\/g>/)?.[0].match(/<circle/g) ?? []).length;
+  await expect.poll(async () => dots(await nodeImage(page, "n4"))).toBe(10); // the keypad, not the device
+
+  const canvas = page.getByRole("application", { name: "Network canvas" });
+  await canvas.focus();
+  const toggle = page.getByRole("button", { name: "Legend", exact: true });
+  await tabTo(page, toggle);
+  const entries = page.locator('ul[aria-label="Icons by value"]');
+  const entry = entries.getByRole("listitem").filter({ hasText: "Keypad: Endpoint, endpoint kind handle" });
+  await expect(entry).toBeVisible();
+  await expect(entry).toContainText("1");
+  // Folded with the legend by the keyboard, and open again.
+  await page.keyboard.press("Enter");
+  await expect(entries).toBeHidden();
+  await page.keyboard.press("Enter");
+  await expect(entry).toBeVisible();
+
+  // The analyst's choice for the type comes before the value icon: the node draws it instead.
+  const button = page.getByRole("button", { name: "Icons" });
+  await canvas.focus();
+  await tabTo(page, button);
+  await page.keyboard.press("Enter");
+  const picker = page.getByRole("combobox", { name: "Icon for Endpoint" });
+  await tabTo(page, picker);
+  await chooseOption(page, picker, "glyph:shield");
+  await expect.poll(async () => dots(await nodeImage(page, "n4"))).toBe(0);
+  // ...so the legend, which names only an icon the canvas draws, no longer lists the value icon.
+  await expect(entry).toBeHidden();
+  registerCovered("CANVAS_ACTIONS", "legend-says-which-value-icon-means-what-by-keyboard");
 });
 
 test("a picture given from a file is drawn in the shape, and is still there after a reload", async ({ page }) => {
@@ -1643,7 +1877,7 @@ test("choosing a search result draws three steps out from it, counted first, in 
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ delta: { seq: 2, op: "add", nodes: [], edges: [] }, filtered_count: 0 }),
+      body: JSON.stringify({ delta: { seq: 2, op: "add", nodes: [], edges: [] } }),
     });
   });
   await page.evaluate(() => (window as unknown as { __CANVAS__: { expandFrom: (id: string, depth: number) => void } }).__CANVAS__.expandFrom("n5", 3));
@@ -1667,7 +1901,7 @@ test("a three-step draw that is very large asks first, and the answer keeps its 
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ delta: { seq: 2, op: "add", nodes: [], edges: [] }, filtered_count: 0 }),
+      body: JSON.stringify({ delta: { seq: 2, op: "add", nodes: [], edges: [] } }),
     });
   });
   await page.evaluate(() => (window as unknown as { __CANVAS__: { expandFrom: (id: string, depth: number) => void } }).__CANVAS__.expandFrom("n5", 3));
@@ -1703,7 +1937,6 @@ test("an expansion that adds nothing says so, and Escape dismisses the message",
         delta: alreadyDrawn
           ? { seq: 2, op: "add", nodes: [{ id: "n0" }, { id: "n1" }], edges: [{ id: "e0" }] }
           : { seq: 2, op: "add", nodes: [], edges: [] },
-        filtered_count: 0,
       }),
     });
   });

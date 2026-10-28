@@ -9,10 +9,10 @@
 // node/edge write through a second layer's draft/copy cycle would fight
 // the exact library ADR-002 chose Sigma to pair with. Zustand here tracks
 // only the handful of primitive fields a React component actually needs to
-// *react* to — `seq`, `filteredCount`, `notices` — never graph membership
+// *react* to — `seq`, `withheld` — never graph membership
 // itself. That split is the other half of the zoom/filter separation this
 // phase's exit criterion tests: `canvas/zoomBands.ts`'s reducers may read
-// graph attributes and this store's `filteredCount`, but neither may
+// graph attributes and this store's `withheld`, but neither may
 // mutate the graph, and this module is the *only* place that does.
 import Graph from "graphology";
 import { createStore, type StoreApi } from "zustand/vanilla";
@@ -20,12 +20,11 @@ import { createStore, type StoreApi } from "zustand/vanilla";
 import type { Edge, Node } from "../../../../packages/schemas/generated";
 import type {
   DeltaAdd,
-  DeltaNotice,
   DeltaRemove,
   DeltaReplaceEdge,
   DeltaReproject,
   DeltaSnapshot,
-  DeltaUpdate,
+  LimitExceeded,
   WorkingSetDelta,
 } from "./models";
 
@@ -81,15 +80,25 @@ export type WorkingSetGraph = Graph<WorkingSetNodeAttributes, WorkingSetEdgeAttr
 
 export interface WorkingSetStoreState {
   seq: number;
-  filteredCount: number;
-  notices: DeltaNotice[];
+  /** ADR-124 decision 5: the last non-null `DeltaSnapshot.withheld` for the open case; `false`
+   * until one says `true`. Never a number. */
+  withheld: boolean;
   /** The most recent `reproject` delta, `null` until the first one arrives — a narrower signal
    * than `seq` itself (which changes on every delta) for a consumer that only cares about
    * resolution-cluster changes: `GlassCanvas`'s own cluster-collapse rendering sweep keys off this
-   * changing rather than re-scanning the whole working set on every unrelated `add`/`update`, and
-   * the change-summary Toast (`App.tsx`) reads its `merged`/`split`/`affected` counts directly. */
+   * changing rather than re-scanning the whole working set on every unrelated `add`/`update`. The
+   * cluster-collapse sweep reads its `affected_cluster_ids`. The change summary no longer reads
+   * it: `ThresholdControl` takes its figures from the answer to its own request. */
   lastReproject: DeltaReproject | null;
+  /** ADR-124 decision 2: the reader's own figure when the server has said their view of the open
+   * case is past a cap, else `null`. Set by `setViewOverCap`; cleared by the next snapshot and
+   * when the case changes. Nothing is applied to the graph while it is set: the server sends no
+   * further delta until the reader tries again. */
+  viewOverCap: LimitExceeded | null;
+  setViewOverCap: (wouldBe: LimitExceeded) => void;
   applyDelta: (delta: WorkingSetDelta) => void;
+  /** The open case changed: nothing is known of what the next one withholds. */
+  resetCase: () => void;
 }
 
 export interface WorkingSet {
@@ -116,22 +125,15 @@ function applyAdd(graph: WorkingSetGraph, delta: DeltaAdd): void {
   }
 }
 
-function applyUpdate(graph: WorkingSetGraph, delta: DeltaUpdate): void {
-  for (const update of delta.nodes) {
-    if (!graph.hasNode(update.id)) continue;
-    const current = graph.getNodeAttribute(update.id, "data");
-    graph.setNodeAttribute(update.id, "data", {
-      ...current,
-      properties: { ...current.properties, ...update.properties },
-    });
-  }
-}
-
 function applyRemove(graph: WorkingSetGraph, delta: DeltaRemove): void {
   for (const nodeId of delta.node_ids) {
     // graphology drops every incident edge along with the node itself —
     // no separate edge bookkeeping needed here.
     if (graph.hasNode(nodeId)) graph.dropNode(nodeId);
+  }
+  // A link removed on its own (ADR-124 decision 4): the link goes, its ends stay.
+  for (const edgeId of delta.edge_ids ?? []) {
+    if (graph.hasEdge(edgeId)) graph.dropEdge(edgeId);
   }
 }
 
@@ -175,9 +177,6 @@ function applyDeltaToGraph(graph: WorkingSetGraph, delta: WorkingSetDelta): void
     case "add":
       applyAdd(graph, delta);
       return;
-    case "update":
-      applyUpdate(graph, delta);
-      return;
     case "remove":
       applyRemove(graph, delta);
       return;
@@ -192,56 +191,27 @@ function applyDeltaToGraph(graph: WorkingSetGraph, delta: WorkingSetDelta): void
       // or removed), only which cluster each affected node currently belongs to.
       applyReproject(graph, delta);
       return;
-    case "notice":
-      // Never carries content to apply at all (`models.py`'s own docstring: "a count... never
-      // the withheld content").
+    default:
+      // A step this client does not know — the retired `notice` among them — touches nothing.
       return;
   }
 }
 
 /**
- * `filteredCount`'s running total: `DeltaSnapshot.filtered_count` is the
- * authoritative baseline (freshly computed server-side, per
- * `WorkingSetService.sync`/`restore`); a later `DeltaNotice` on a live
- * connection reports items withheld *by that one push*, on top of
- * whatever was already known hidden, so it accumulates rather than
- * replaces. `spec/03_CONDUIT_MIDDLEWARE.md` §3.2 does not state this
- * client-side accumulation rule explicitly — named here as this client's
- * own resolution of that silence, not asserted as spec.
+ * The store's own fields after one delta. `withheld` keeps the last non-null value a snapshot
+ * carried (ADR-124 decision 5): a `null` or absent field, and every other kind of delta, leave it
+ * as it was. A stale server's `filtered_count` and `notice` are never read.
  */
 function nextStoreState(
   state: WorkingSetStoreState,
   delta: WorkingSetDelta,
-): Pick<WorkingSetStoreState, "seq" | "filteredCount" | "notices" | "lastReproject"> {
-  if (delta.op === "snapshot") {
-    return {
-      seq: delta.seq,
-      filteredCount: delta.filtered_count,
-      notices: [],
-      lastReproject: state.lastReproject,
-    };
-  }
-  if (delta.op === "notice") {
-    return {
-      seq: delta.seq,
-      filteredCount: state.filteredCount + delta.count,
-      notices: [...state.notices, delta],
-      lastReproject: state.lastReproject,
-    };
-  }
-  if (delta.op === "reproject") {
-    return {
-      seq: delta.seq,
-      filteredCount: state.filteredCount,
-      notices: state.notices,
-      lastReproject: delta,
-    };
-  }
+): Pick<WorkingSetStoreState, "seq" | "withheld" | "lastReproject"> {
+  const withheld =
+    delta.op === "snapshot" && typeof delta.withheld === "boolean" ? delta.withheld : state.withheld;
   return {
     seq: delta.seq,
-    filteredCount: state.filteredCount,
-    notices: state.notices,
-    lastReproject: state.lastReproject,
+    withheld,
+    lastReproject: delta.op === "reproject" ? delta : state.lastReproject,
   };
 }
 
@@ -250,13 +220,19 @@ export function createWorkingSet(): WorkingSet {
 
   const store = createStore<WorkingSetStoreState>((set) => ({
     seq: 0,
-    filteredCount: 0,
-    notices: [],
+    withheld: false,
     lastReproject: null,
+    viewOverCap: null,
+    setViewOverCap: (wouldBe) => set({ viewOverCap: wouldBe }),
     applyDelta: (delta: WorkingSetDelta) => {
       applyDeltaToGraph(graph, delta);
-      set((state) => nextStoreState(state, delta));
+      set((state) => ({
+        ...nextStoreState(state, delta),
+        // A snapshot is the answer to trying again: the view is under the cap now.
+        viewOverCap: delta.op === "snapshot" ? null : state.viewOverCap,
+      }));
     },
+    resetCase: () => set({ withheld: false, viewOverCap: null }),
   }));
 
   return { graph, store };
