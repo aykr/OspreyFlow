@@ -30,7 +30,7 @@ from ports.analytics import AnalyticsPort
 from ports.compute import ComputePort
 from ports.graph import GraphPort
 from ports.media import MediaStore
-from schemas.domain import OntologySchema, Principal
+from schemas.domain import OntologySchema, Principal, TypologyRule
 from schemas.ingest import LoadReport, PipelineRunReport, StudioRecipeDraft
 
 from . import resolution_trigger as resolution_trigger_module
@@ -52,6 +52,7 @@ from .recipe_runs import RecipeRunStore, RunTrigger
 from .review import ExtractionCandidateStore
 from .rule_evaluation import RuleGate
 from .screening import ScreeningListStore
+from .strength_influencers import InfluencerStore
 from .studio_map import resolve_source_handling
 from .studio_publish import LoadSink, run_published_recipe
 from .typology_rules import TypologyRuleStore
@@ -85,20 +86,25 @@ class RecipeRunDeps:
     compute: ComputePort
     kyc_expiries: KycExpiryStore
     recipe_runs: RecipeRunStore
+    #: ADR-139: the installation's and each case's link-strength influencers, which a sentence's
+    #: strength condition judges by. None: the weights file's defaults alone.
+    influencers: InfluencerStore | None = None
 
     @classmethod
     def from_state(cls, state: Any) -> RecipeRunDeps:
         """The scheduler's way in: the application's state, read where the route's getters read
         it, so the two paths cannot be handed different stores."""
-        return cls(
-            **{
-                f.name: getattr(state, _RUN_DEP_STATE_NAMES.get(f.name, f.name))
-                for f in dataclass_fields(cls)
-            }
-        )
+        values: dict[str, Any] = {}
+        for f in dataclass_fields(cls):
+            name = _RUN_DEP_STATE_NAMES.get(f.name, f.name)
+            # An optional dependency (default None) the state does not hold is left None.
+            optional = f.default is None
+            values[f.name] = getattr(state, name, None) if optional else getattr(state, name)
+        return cls(**values)
 
 
 _RUN_DEP_STATE_NAMES = {
+    "influencers": "strength_influencers",
     "recipe_repo_root": "recipes_repo_root",
     "recogniser_for": "pipeline_recogniser_for",
 }
@@ -191,6 +197,10 @@ async def _execute_recipe_run(
         compute=deps.compute,
         expiries=deps.kyc_expiries,
         patterns=deps.patterns_store,
+        hotlists=deps.hotlists_store,
+        ontology=deps.ontology,
+        recipe_id=recipe.recipe_id,
+        influencers=deps.influencers,
     )
     report: LoadReport | PipelineRunReport
     if recipe.pipeline is not None:
@@ -311,12 +321,27 @@ async def _rule_gate(
     compute: ComputePort,
     expiries: KycExpiryStore | None,
     patterns: PatternStore,
+    hotlists: HotlistStore | None = None,
+    ontology: OntologySchema | None = None,
     fail_closed: bool = True,
+    recipe_id: str | None = None,
+    influencers: InfluencerStore | None = None,
 ) -> RuleGate | None:
     """The case's active typology rules for one load (ADR-109), or `None` when it has none.
     What the KYC and pattern typologies read is required, never defaulted: a route that left it
-    out once held every row it loaded, failing closed on a store the deployment had."""
+    out once held every row it loaded, failing closed on a store the deployment had.
+
+    ADR-133 decision 6, stage (d): when the pipeline's "Checks on load" step has been chosen, its
+    case rules are the ones attached there, each doing what was chosen for a hit; a
+    whole-deployment rule and a rule just for its author judge every load whatever was chosen.
+    Until someone chooses, every case rule judges the load, as before the step existed."""
     rules = await typology_rules.list_active_for_case(investigation_id)
+    on_hit: dict[str, str] = {}
+    if recipe_id is not None:
+        chosen = await typology_rules.load_checks(recipe_id)
+        if chosen is not None:
+            on_hit = {c.rule_id: c.on_hit for c in chosen.checks}
+            rules = [r for r in rules if r.id in on_hit or always_judges(r)]
     if not rules:
         return None
     return RuleGate(
@@ -336,7 +361,19 @@ async def _rule_gate(
         compute=compute,
         expiries=expiries,
         patterns=patterns,
+        hotlists=hotlists,
+        ontology=ontology,
+        on_hit=on_hit,
+        influencers=influencers,
     )
+
+
+def always_judges(rule: TypologyRule) -> bool:
+    """A rule no pipeline's checks leave out: a whole-deployment rule (compliance's, the
+    administrator's), and a rule just for its author (their own watch, not a check on the load)."""
+    from .sentence_rules import is_deployment_wide, is_just_me
+
+    return is_deployment_wide(rule) or is_just_me(rule)
 
 
 async def _evaluate_watches_best_effort(

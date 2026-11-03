@@ -16,6 +16,13 @@ afterEach(() => {
 
 const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status });
 
+/** A queue row's name: "Open alert: High severity, Hotlist — <what it found>", whatever spacing the
+ * accessible-name computation gives the hidden joining words. */
+function alertName(severity: string, title: string, summary = ""): RegExp {
+  const words = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s*");
+  return new RegExp(`Open alert:\\s*${words(severity)}\\s*severity,\\s*${words(title)}\\s*—\\s*${words(summary)}`);
+}
+
 function account(id: string, name: string) {
   return {
     id,
@@ -72,7 +79,7 @@ describe("the Alerts place", () => {
   it("lists the queue by name and explains an alert with its transactions", async () => {
     serve("viewer");
     place();
-    const row = await screen.findByRole("button", { name: /Open alert: Structuring — 4 movements from GB-MULE to GB-HUB/ });
+    const row = await screen.findByRole("button", { name: alertName("Medium", "Structuring", "4 movements from GB-MULE to GB-HUB") });
     expect(screen.queryByText(/n1/)).toBeNull();
     fireEvent.click(row);
     expect(await screen.findByRole("table", { name: "Transactions this alert cites" })).toBeTruthy();
@@ -102,27 +109,34 @@ describe("the Alerts place", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Open alert/ }));
     await screen.findByRole("table", { name: "Transactions this alert cites" });
     expect(screen.queryByRole("button", { name: "Claim" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Close as true positive" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Close the alert" })).toBeNull();
   });
 
-  it("closes an alert only with a reason, and sends the reason", async () => {
+  it("closes an alert only with one of the five closing reasons and words, and sends both", async () => {
     const bodies: string[] = [];
     serve("editor", (path, init) => {
       if (path === "alert-queue/a1/disposition") {
         bodies.push(String(init?.body));
-        return json(200, { ...ALERT, status: "closed", disposition: "true_positive" });
+        return json(200, { ...ALERT, status: "closed", disposition: "referred" });
       }
       return null;
     });
     place();
     fireEvent.click(await screen.findByRole("button", { name: /Open alert/ }));
-    const close = await screen.findByRole("button", { name: "Close as true positive" });
+    // The owner's closed list (1 November 2026), in this order, and nothing else.
+    const reasons = await screen.findByRole("radiogroup", { name: "Closing reason" });
+    expect(Array.from(reasons.querySelectorAll("label")).map((l) => l.textContent)).toEqual([
+      "True match", "False positive", "Duplicate", "No further action", "Referred",
+    ]);  // prettier-ignore
+    const close = screen.getByRole("button", { name: "Close the alert" });
     expect((close as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.change(screen.getByLabelText("Reason for closing"), { target: { value: "Matches the SAR" } });
+    fireEvent.change(screen.getByLabelText("Why, in words: the reason for closing"), { target: { value: "Passed to the NCA" } });
+    expect((close as HTMLButtonElement).disabled).toBe(true); // words alone are not a closing reason
+    fireEvent.click(screen.getByRole("radio", { name: "Referred" }));
     expect((close as HTMLButtonElement).disabled).toBe(false);
     fireEvent.click(close);
     await waitFor(() => expect(bodies).toHaveLength(1));
-    expect(JSON.parse(bodies[0] ?? "{}")).toEqual({ disposition: "true_positive", reason: "Matches the SAR" });
+    expect(JSON.parse(bodies[0] ?? "{}")).toEqual({ disposition: "referred", reason: "Passed to the NCA" });
   });
 
   it("puts an alert on the canvas and hands over its nodes to highlight", async () => {
@@ -203,7 +217,10 @@ describe("where an alert stands", () => {
     expect(statusSentence({ ...a, status: "claimed", assignee: "pat" }, false)).toBe("Claimed by pat");
     expect(
       statusSentence({ ...a, status: "closed", assignee: "me", disposition: "true_positive", disposition_reason: "Matches" }, true),
-    ).toBe("Closed as a true positive: Matches");
+    ).toBe("Closed as True match: Matches");
+    expect(
+      statusSentence({ ...a, status: "closed", assignee: "me", disposition: "no_further_action", disposition_reason: "Known" }, true),
+    ).toBe("Closed as No further action: Known");
     expect(statusSentence(a, false)).toBe("Open");
   });
 });

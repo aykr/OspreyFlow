@@ -30,7 +30,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -101,6 +101,7 @@ from geo.wkb import polygon_wkb
 from knowledge_adapters import ARITY, REGISTRY
 from ontology.errors import OntologyError
 from ontology.handling import HandlingScheme, principal_may_view
+from ontology.influencers import StrengthDefaults, as_the_reader_sees, load_strength_defaults
 from ontology.packs import pack_catalogue
 from ontology.pattern_where import PatternConditionRefused, check_pattern_conditions
 from ontology.yardstick import Yardstick, load_phia_yardstick
@@ -112,6 +113,7 @@ from ports.model import ModelPort
 from ports.recognise import RecogniserRefusedError, RecogniserUnavailableError
 from schemas.admin import (
     AccessInput,
+    AdminDataset,
     AdminSchedule,
     ChangeScheduleInput,
     ComponentHealth,
@@ -119,6 +121,7 @@ from schemas.admin import (
     DashboardIdentity,
     DashboardInput,
     DataFeed,
+    DatasetEgressInput,
     DemoPackStatus,
     EmbeddedDashboard,
     InviteInput,
@@ -151,9 +154,14 @@ from schemas.analytics import (
 from schemas.compute import OwnershipTooComplex, OwnershipView
 from schemas.domain import (
     Alert,
+    AlertAssignee,
+    AlertAssignInput,
     AlertDispositionInput,
     AlertExplanation,
+    AlertKind,
+    AlertSeverity,
     Assumption,
+    CompiledSentence,
     Connections,
     ConnectionsRequest,
     DomainPack,
@@ -164,6 +172,7 @@ from schemas.domain import (
     HeldRow,
     HeldRowDecision,
     Hotlist,
+    HotlistAudienceInput,
     IntelligenceGap,
     Interval,
     Judgement,
@@ -184,6 +193,7 @@ from schemas.domain import (
     ReportFigures,
     RuleAuditPage,
     SavedPattern,
+    SentenceReadRequest,
     SourceRef,
     TypologyRule,
     TypologyRuleInput,
@@ -227,6 +237,17 @@ from schemas.ingest import (
     VerifyReport,
 )
 from schemas.mapconfig import MapConfig, PublicMapConfig
+from schemas.model import OfferedEngines
+from schemas.monitoring import (
+    CheckNotJudged,
+    ListScheduleInput,
+    LoadChecksInput,
+    LoadChecksView,
+    RuleChangeRejection,
+    RuleScheduleView,
+    RuleVersion,
+    WouldRaise,
+)
 from schemas.packs import (
     AddPackItem,
     PackDraft,
@@ -245,6 +266,33 @@ from schemas.packs import (
 )
 from schemas.profile import SourceProfile
 from schemas.rights import Right, RightsResponse, rights_for
+from schemas.screening import (
+    ScreeningLists,
+    ScreeningListsOverview,
+    ScreeningListStatus,
+    ScreeningListUpdate,
+    ScreeningSubscriptionInput,
+)
+from schemas.sentences import (
+    RulePreview,
+    RulePreviewRequest,
+    RuleSentence,
+    SentenceRuleInput,
+    SentenceRuleParams,
+)
+from schemas.strength import (
+    ActiveInfluencer,
+    CaseInfluencers,
+    CaseInfluencersInput,
+    ConnectionStrengthRequest,
+    ConnectionStrengths,
+    InfluencerDecision,
+    InfluencerSetHistory,
+    InfluencerSetInput,
+    InfluencerSetVersion,
+    RarityRequest,
+    RarityResult,
+)
 from schemas.trends import (
     TrendDefinition,
     TrendDefinitionInput,
@@ -315,7 +363,8 @@ from .compute_routes import (
     ComputeMetricRequest,
     run_compute_metric_job,
 )
-from .config import ApiConfig, DeploymentModels
+from .config import ApiConfig, DeploymentModels, MonitoringSettings
+from .connection_strength import case_connection_strengths, case_legend, case_rarity
 from .dataset_scope import (
     UnknownDatasetError,
     made_in,
@@ -329,6 +378,7 @@ from .datasets import (
     DatasetRefusedError,
     DatasetStore,
     InMemoryDatasetStore,
+    UnknownDatasetEgressError,
 )
 from .document_content import (
     UPLOAD_CONTENT_EXTENSIONS,
@@ -472,9 +522,18 @@ from .link_types import (
     RetireLinkTypeRequest,
     public_ontology,
 )
+from .list_schedule import ListRefreshExecutor, ListScheduleRefused
+from .load_checks import READ_ONLY, ChecksRefused, check_choice, checks_view, would_raise
 from .load_records import LedgerSink, may_see_counts, released_from_of, report_view
 from .mapconfig_loader import load_map_config, public_view
-from .model_routing import ModelEgressRefused, RoutedModel, model_status, routes_from_env
+from .model_routing import (
+    EngineRefused,
+    ModelEgressRefused,
+    ModelRoutes,
+    RoutedModel,
+    model_status,
+    routes_from_env,
+)
 from .monitors import MonitorNotFoundError, MonitorStore
 from .notify import notify_channel, publish_delta
 from .packs import (
@@ -483,13 +542,13 @@ from .packs import (
     PackItemRefused,
     PackStore,
     StoredPackItem,
+    alert_item,
     assessment_item,
     entity_item,
     export_pack,
     highest_marking,
     note_item,
     readable,
-    reorder_visible,
     trend_item,
 )
 from .pattern_ask import (
@@ -532,6 +591,7 @@ from .recipe_run import (
 )
 from .recipe_runs import RecipeRun, RecipeRunStore
 from .release_notice import read_update_notice
+from .release_version import deployment_version, release_version
 from .report_freshness import ReportFreshness
 from .reports import ReportLimitExceededError
 from .resolution import ManualAssertionRequest, SetThresholdRequest, ThresholdResponse
@@ -550,6 +610,17 @@ from .review import (
 from .risk import NeighbourhoodTooLarge
 from .rule_evaluation import RULE_AUDIT_ACTIONS, RuleGate
 from .rule_holds import ReleaseRefused, readable_rule_audit, release_held_rows
+from .rule_schedule import RuleScheduleExecutor, schedule_view
+from .rule_sentences import (
+    SentenceContext,
+    SentenceRefused,
+    check_sentence,
+    compile_pattern,
+    compile_sentence,
+    normalised,
+    preview_sentence,
+    sentence_of,
+)
 from .run_resources import RECIPES_REPO_ROOT, build_run_resources
 from .scheduler import (
     DEFAULT_TIMEZONE,
@@ -564,7 +635,15 @@ from .scheduler import (
     validate_schedule,
 )
 from .screening import ScreeningListStore
+from .screening_refresh import (
+    ListNotSubscribed,
+    ListRefused,
+    Rescreener,
+    check_location,
+)
+from .screening_refresh import refresh as refresh_screening_list
 from .search import SearchRequest, SearchResponse, SuggestRequest, SuggestResponse
+from .sentence_rules import is_deployment_wide, run_scheduled_rule, strength_context
 from .site_images import (
     object_key_for,
     read_site_image,
@@ -572,6 +651,13 @@ from .site_images import (
     write_site_image,
 )
 from .sites import ControlPointQuad, Site, SiteNotFoundError, SiteStore
+from .strength_influencers import (
+    InfluencerChangeRefused,
+    InfluencerRefused,
+    InfluencerStore,
+    OwnInfluencerChangeRefused,
+    check_influencers,
+)
 from .studio_map import (
     HandlingLoosenedError,
     RowIndexOutOfRangeError,
@@ -634,12 +720,19 @@ from .trends import (
     check_in_case_domains,
     highest,
     mark_outside_case_domains,
+    name_alert_series,
     name_series,
+    to_alert_request,
     to_request,
     trend_options,
     validate_definition,
 )
-from .typology_rules import TypologyRuleNotFoundError, TypologyRuleStore
+from .typology_rules import (
+    OwnChangeRefused,
+    RuleChangeRefused,
+    TypologyRuleNotFoundError,
+    TypologyRuleStore,
+)
 from .watch_routes import (
     AlertJumpResult,
     AlertList,
@@ -738,13 +831,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # own opinion (`services/api/review.py`'s own docstring on `RunExtractionRequest.model`).
     # ADR-095: the deployment's own models, never the conformance suite's.
     models = DeploymentModels.from_env()
-    # ADR-114 Amendment 6: every model call goes through the routes, so a client's own provider
-    # sees only material whose handling code the deployment declared sendable.
-    routes, sendable = routes_from_env(models, os.environ)
+    # ADR-114 Amendment 6, ADR-135, ADR-136: every model call goes through the routes, so a
+    # client's provider sees only material whose handling code the deployment declared sendable
+    # and whose every dataset allows that provider, and an engine an analyst names is used only
+    # when it is enabled and has a key.
     model: ModelPort = RoutedModel(
         ModelLiteLLMAdapter(litellm_client, embed_model=models.embedding),
-        routes=routes,
-        sendable_handling_codes=sendable,
+        routes=routes_from_env(models, os.environ),
+        # ADR-136: and only from datasets whose egress allows the engine.
+        egress=datasets_store,
     )
     # `spec/09_INGEST_STUDIO.md` §6's reverse index: "an ontology edit flags
     # every recipe that depends on the changed version". This deployment's
@@ -766,6 +861,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
 
     app.state.config = config
+    # ADR-133 ruling 3: `osprey.yaml`'s `monitoring` section, read once.
+    app.state.monitoring = MonitoringSettings.from_env()
     app.state.graph = graph
     app.state.ontology = ontology
     app.state.valkey = valkey
@@ -783,7 +880,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.hotlists_store = hotlists_store
     app.state.monitors_store = monitors_store
     app.state.alerts_store = alerts_store
+    # ADR-134 decision 3: the analytics store's alert facts brought into line with the alert store
+    # at every start, so alert trends recover from any write the analytics store missed.
+    await alerts_store.publish_all_facts()
     app.state.typology_rules = typology_rules
+    # ADR-139: link-strength influencers (installation-wide by maker–checker, per case by its
+    # Author) and the weights file's shipped defaults.
+    app.state.strength_influencers = resources.influencers
+    app.state.strength_defaults = load_strength_defaults()
     app.state.held_rows = held_rows
     app.state.screening_lists = screening_lists
     app.state.kyc_expiries = kyc_expiries
@@ -867,10 +971,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         datasets=datasets_store,
         investigations=investigations,
     )
-    # ADR-129 decision 2: ask to search, a question turned into a pattern that nothing runs.
+    # ADR-129 decision 2: ask to search, a question turned into a pattern that nothing runs. ADR-135
+    # Amendment 1: it carries the case's handling and datasets, so the engine choice applies.
     app.state.pattern_ask = PatternAskService(
-        app.state.working_set, graph, model, default_model=models.extraction
-    )
+        app.state.working_set, graph, model, default_model=models.extraction,
+        datasets=datasets_store,
+    )  # fmt: skip
     app.state.suppression_marks = suppression_marks
     app.state.gaps_store = gaps_store
     app.state.assumptions_store = assumptions_store
@@ -954,12 +1060,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # run by the one that claims it, as the schedule's owner through the one run path.
     app.state.schedule_executor = _schedule_executor(app)
     schedule_task = asyncio.create_task(run_every_minute(app.state.schedule_executor))
+    # ADR-133 stage (d): scheduled rules, each slot as the rule's author, and screening lists'
+    # refresh schedules, each slot as the person who set it — ticking each minute, one replica per
+    # slot.
+    app.state.monitoring_schedules = _MonitoringSchedules(
+        rules=_rule_schedule_executor(app), lists=_list_schedule_executor(app)
+    )
+    monitoring_task = asyncio.create_task(run_every_minute(app.state.monitoring_schedules))
 
     try:
         yield
     finally:
         sweep_task.cancel()
         schedule_task.cancel()
+        monitoring_task.cancel()
         await investigations.close()
         await history.close()
         await sites.close()
@@ -982,11 +1096,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await app.state.superset_embedder.aclose()
         # A closed store must not outlive the app that held it (a test app is started again).
         app.state.datasets = None
+        # ADR-139: a route that judges rules reads this store when the app holds one, so a closed
+        # one left here would fail them; without it they judge with the weights file's influencers.
+        app.state.strength_influencers = None
         await litellm_client.aclose()
         await resources.close()
 
 
-app = FastAPI(title="OspreyFlow Conduit", lifespan=lifespan)
+# The OpenAPI document is published at `GET /v1/openapi.json` behind sign-in (the owner's answer of
+# 1 November 2026; `03_CONDUIT_MIDDLEWARE.md` §3.0a), versioned with the release. FastAPI's own
+# unauthenticated copies (`/openapi.json`, `/docs`, `/redoc`) are switched off.
+app = FastAPI(
+    title="OspreyFlow Conduit",
+    version=release_version(),
+    lifespan=lifespan,
+    openapi_url=None,
+    docs_url=None,
+    redoc_url=None,
+)
 
 # The Glass is served from its own origin (`apps/workspace`'s Vite dev
 # server locally; a separately-hosted static build in a real deployment)
@@ -1071,6 +1198,11 @@ def get_valkey(request: Request) -> Valkey:
     return request.app.state.valkey  # type: ignore[no-any-return]
 
 
+def get_model_routes() -> ModelRoutes:
+    """ADR-135: the engines, read from the Conduit's own environment as the routing reads them."""
+    return routes_from_env(DeploymentModels.from_env(), os.environ)
+
+
 def get_jobs(request: Request) -> JobQueue:
     return request.app.state.jobs  # type: ignore[no-any-return]
 
@@ -1091,6 +1223,11 @@ def get_hotlists_store(request: Request) -> HotlistStore:
     return request.app.state.hotlists_store  # type: ignore[no-any-return]
 
 
+def get_monitoring_settings(request: Request) -> MonitoringSettings:
+    """ADR-133 ruling 3. A test app with no lifespan reads the schema's defaults."""
+    return getattr(request.app.state, "monitoring", None) or MonitoringSettings()
+
+
 def get_monitors_store(request: Request) -> MonitorStore:
     return request.app.state.monitors_store  # type: ignore[no-any-return]
 
@@ -1101,6 +1238,21 @@ def get_alerts_store(request: Request) -> AlertStore:
 
 def get_typology_rules(request: Request) -> TypologyRuleStore:
     return request.app.state.typology_rules  # type: ignore[no-any-return]
+
+
+def get_strength_influencers(request: Request) -> InfluencerStore:
+    return request.app.state.strength_influencers  # type: ignore[no-any-return]
+
+
+def get_optional_strength_influencers(request: Request) -> InfluencerStore | None:
+    """For a route that judges rules (a run, Verify, a release, a preview): the store when the
+    application holds one; without it, a strength condition judges with the weights file's
+    influencers alone (`sentence_rules.strength_context`)."""
+    return getattr(request.app.state, "strength_influencers", None)
+
+
+def get_strength_defaults(request: Request) -> StrengthDefaults:
+    return request.app.state.strength_defaults  # type: ignore[no-any-return]
 
 
 def get_held_rows(request: Request) -> HeldRowStore:
@@ -1231,9 +1383,15 @@ SitesDep = Annotated[SiteStore, Depends(get_sites)]
 PatternsStoreDep = Annotated[PatternStore, Depends(get_patterns_store)]
 ConfigDep = Annotated[ApiConfig, Depends(get_config)]
 HotlistsStoreDep = Annotated[HotlistStore, Depends(get_hotlists_store)]
+MonitoringSettingsDep = Annotated[MonitoringSettings, Depends(get_monitoring_settings)]
 MonitorsStoreDep = Annotated[MonitorStore, Depends(get_monitors_store)]
 AlertsStoreDep = Annotated[AlertStore, Depends(get_alerts_store)]
 TypologyRulesDep = Annotated[TypologyRuleStore, Depends(get_typology_rules)]
+StrengthInfluencersDep = Annotated[InfluencerStore, Depends(get_strength_influencers)]
+OptionalStrengthInfluencersDep = Annotated[
+    InfluencerStore | None, Depends(get_optional_strength_influencers)
+]
+StrengthDefaultsDep = Annotated[StrengthDefaults, Depends(get_strength_defaults)]
 HeldRowsDep = Annotated[HeldRowStore, Depends(get_held_rows)]
 ScreeningListsDep = Annotated[ScreeningListStore, Depends(get_screening_lists)]
 KycExpiriesDep = Annotated[KycExpiryStore, Depends(get_kyc_expiries)]
@@ -1360,6 +1518,7 @@ HandlingSchemeDep = Annotated[HandlingScheme, Depends(get_handling_scheme)]
 YardstickDep = Annotated[Yardstick, Depends(get_yardstick)]
 JobsDep = Annotated[JobQueue, Depends(get_jobs)]
 ValkeyDep = Annotated[Valkey, Depends(get_valkey)]
+ModelRoutesDep = Annotated[ModelRoutes, Depends(get_model_routes)]
 SiteImageStorageDep = Annotated[ObjectStorageConfig, Depends(get_site_image_storage)]
 TileCacheStorageDep = Annotated[ObjectStorageConfig, Depends(get_tile_cache_storage)]
 AnalyticsDep = Annotated[AnalyticsPort, Depends(get_analytics)]
@@ -1666,6 +1825,52 @@ async def _typology_rule_not_found_handler(
     request: Request, exc: TypologyRuleNotFoundError
 ) -> JSONResponse:
     return JSONResponse(status_code=404, content={"error": "rule_not_found"})
+
+
+@app.exception_handler(InfluencerChangeRefused)
+async def _influencer_change_refused_handler(
+    request: Request, exc: InfluencerChangeRefused
+) -> JSONResponse:
+    """ADR-139 decision 3: a proposal, approval or sending back that cannot be made, in words."""
+    said = str(exc)
+    return JSONResponse(
+        status_code=409,
+        content={"error": "influencer_change_refused", "message": f"{said[0].upper()}{said[1:]}."},
+    )
+
+
+@app.exception_handler(OwnInfluencerChangeRefused)
+async def _own_influencer_change_handler(
+    request: Request, exc: OwnInfluencerChangeRefused
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=403, content={"detail": {"error": "own_change", "message": str(exc)}}
+    )
+
+
+@app.exception_handler(InfluencerRefused)
+async def _influencer_refused_handler(request: Request, exc: InfluencerRefused) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"error": "influencer_refused", "influencer": exc.influencer,
+                 "reason": exc.reason},
+    )  # fmt: skip
+
+
+@app.exception_handler(RuleChangeRefused)
+async def _rule_change_refused_handler(request: Request, exc: RuleChangeRefused) -> JSONResponse:
+    """ADR-133 decision 7: a change, approval or rejection that cannot be made, in words."""
+    said = str(exc)
+    return JSONResponse(
+        status_code=409,
+        content={"error": "rule_change_refused", "message": f"{said[0].upper()}{said[1:]}."},
+    )
+
+
+@app.exception_handler(alert_queue.CloseRefused)
+async def _close_refused_handler(request: Request, exc: alert_queue.CloseRefused) -> JSONResponse:
+    return JSONResponse(status_code=403, content={"detail": {"error": "own_change",
+                                                             "message": str(exc)}})  # fmt: skip
 
 
 @app.exception_handler(HeldRowNotFoundError)
@@ -2175,6 +2380,16 @@ async def _model_egress_refused_handler(request: Request, exc: ModelEgressRefuse
     )
 
 
+@app.exception_handler(EngineRefused)
+async def _engine_refused_handler(request: Request, exc: EngineRefused) -> JSONResponse:
+    """ADR-135 decision 4: a named engine not enabled, with no key, or with no model for the role.
+    Nothing was sent."""
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"error": "engine_refused", "detail": str(exc)},
+    )
+
+
 @app.exception_handler(ScheduleRefused)
 async def _schedule_refused_handler(request: Request, exc: ScheduleRefused) -> JSONResponse:
     return JSONResponse(
@@ -2292,6 +2507,15 @@ async def _ontology_error_handler(request: Request, exc: OntologyError) -> JSONR
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={"error": "ontology_violation", "detail": str(exc)},
+    )
+
+
+@app.exception_handler(SentenceRefused)
+async def _sentence_refused_handler(request: Request, exc: SentenceRefused) -> JSONResponse:
+    """ADR-133 decision 1: a sentence naming what the ontology does not declare, or a choice that
+    does not fit what it names, is refused at validation by its blank, typed, in words."""
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, content=exc.refusal.model_dump()
     )
 
 
@@ -3526,6 +3750,8 @@ async def run_extraction_route(
         handling=body.handling,
         principal=principal,
         extraction_model=body.model,
+        # ADR-136: text extracted in a case is of the case's datasets.
+        datasets=principal.datasets,
     )
     await audit.record(
         principal=principal,
@@ -4440,10 +4666,16 @@ async def create_hotlist_route(
     body: CreateHotlistRequest,
     principal: PrincipalDep,
     hotlists_store: HotlistsStoreDep,
+    monitoring: MonitoringSettingsDep,
     audit: AuditDep,
 ) -> Hotlist:
+    """ADR-133 ruling 3: a new hotlist takes the deployment's audience, or its owner's choice where
+    the deployment allows one."""
+    audience = body.audience or monitoring.hotlist_audience
+    if audience != monitoring.hotlist_audience and not monitoring.hotlist_audience_editable:
+        raise HotlistAudienceFixed(monitoring.hotlist_audience)
     hotlist = await hotlists_store.create(
-        principal, identifier=body.identifier, review_date=body.review_date
+        principal, identifier=body.identifier, review_date=body.review_date, audience=audience
     )
     await audit.record(
         principal=principal,
@@ -4459,9 +4691,75 @@ async def create_hotlist_route(
     dependencies=[Depends(require_right(Right.KEEP_WATCHES))],
 )
 async def list_hotlists_route(
-    investigation: InvestigationViewerDep, principal: PrincipalDep, hotlists_store: HotlistsStoreDep
+    investigation: InvestigationViewerDep,
+    principal: PrincipalDep,
+    hotlists_store: HotlistsStoreDep,
+    monitoring: MonitoringSettingsDep,
 ) -> HotlistList:
-    return HotlistList(hotlists=await hotlists_store.list_authorized(principal))
+    return HotlistList(
+        hotlists=await hotlists_store.list_authorized(principal),
+        audience_default=monitoring.hotlist_audience,
+        audience_editable=monitoring.hotlist_audience_editable,
+    )
+
+
+_AUDIENCE_WORDS = {"only_me": "only its owner", "team": "its owner's team"}
+
+
+class HotlistAudienceFixed(Exception):
+    """The deployment does not let a hotlist's owner choose its audience (ADR-133 ruling 3)."""
+
+    def __init__(self, audience: str) -> None:
+        super().__init__(audience)
+        self.audience = audience
+
+
+@app.exception_handler(HotlistAudienceFixed)
+async def _audience_fixed_handler(request: Request, exc: HotlistAudienceFixed) -> JSONResponse:
+    """ADR-133 ruling 3: with editing off, the choice is refused in words."""
+    return JSONResponse(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content={
+            "error": "hotlist_audience_fixed",
+            "detail": (
+                "This deployment sends every hotlist's alerts to "
+                f"{_AUDIENCE_WORDS[exc.audience]}; the audience cannot be changed here. An "
+                "administrator sets it (monitoring.hotlist_audience_editable)."
+            ),
+        },
+    )
+
+
+@app.put(
+    "/v1/investigations/{investigation_id}/hotlists/{hotlist_id}/audience",
+    dependencies=[Depends(require_right(Right.KEEP_WATCHES))],
+)
+async def set_hotlist_audience_route(
+    hotlist_id: str,
+    body: HotlistAudienceInput,
+    investigation: InvestigationEditorDep,
+    principal: PrincipalDep,
+    hotlists_store: HotlistsStoreDep,
+    monitoring: MonitoringSettingsDep,
+    audit: AuditDep,
+    alerts_store: AlertsStoreDep,
+) -> Hotlist:
+    """ADR-133 ruling 3: the owner chooses whom their hotlist's alerts reach — only them, or their
+    team too. Another's hotlist is not found (the store's owner check, in the statement). Refused in
+    words when the deployment does not let owners choose. Its alerts are kept again for alert
+    trends (ADR-134 decision 3), so the team's trends follow the choice at once."""
+    if not monitoring.hotlist_audience_editable:
+        raise HotlistAudienceFixed(monitoring.hotlist_audience)
+    hotlist = await hotlists_store.set_audience(hotlist_id, principal, body.audience)
+    await alerts_store.publish_rule_facts(f"hotlist:{hotlist.id}")
+    await audit.record(
+        principal=principal,
+        action="hotlist_audience_changed",
+        investigation_id=investigation.id,
+        resolved_query={"hotlist_id": hotlist.id, "audience": hotlist.audience},
+        result_cardinality=1,
+    )
+    return hotlist
 
 
 @app.post(
@@ -5235,6 +5533,7 @@ async def ask_question_route(
         selected_node_ids=body.selected_node_ids,
         selected_link_ids=body.selected_link_ids,
         window=body.window,
+        engine=body.engine,
     )
     await audit.record(
         principal=principal,
@@ -5900,7 +6199,11 @@ async def list_alerts_route(
     graph: GraphDep,
     hotlists_store: HotlistsStoreDep,
 ) -> AlertList:
-    """ADR-099 Amendment 3: the alerts of the case's datasets, read as the case reads."""
+    """The reader's own alerts — those raised to them, by their hotlists, monitors and rules
+    (`owner_id`, in the store's query) — within the case's datasets (ADR-099 Amendment 3, the reach
+    clause), newest first. Not the case's alerts: another member's are not listed here; the case's
+    rule-raised alerts are the one queue's (`/alert-queue`). Corrected by ADR-134 decision 5: this
+    said "the alerts of the case's datasets", which the store never read."""
     rows = await alerts_store.list_authorized(principal)
     return AlertList(
         alerts=[await alert_to_view(a, principal, graph, hotlists_store) for a in rows]
@@ -6125,6 +6428,18 @@ async def liveness_route() -> dict[str, str]:
     **Readiness is a different question and stays authenticated.** Nothing here should grow into it.
     """
     return LIVENESS_BODY
+
+
+@app.get("/v1/openapi.json", include_in_schema=False)
+async def openapi_document_route(principal: PrincipalDep) -> JSONResponse:
+    """The API's OpenAPI document (`03_CONDUIT_MIDDLEWARE.md` §3.0a; the owner's answer of 1
+    November 2026; GDS remediation O1). Under `/v1/`, so the workspace's proxy carries it to the
+    deployment's address with every other route, and signed in as every other `/v1` route is. Its
+    `info.version` is the release the deployment was rendered from (`release_version.py`), read
+    when it is asked for, so it always says what Admin → System says."""
+    document = dict(app.openapi())
+    document["info"] = {**document["info"], "version": release_version()}
+    return JSONResponse(document)
 
 
 @app.get("/v1/ontology")
@@ -7544,6 +7859,14 @@ async def verify_studio_recipe(
     studio_recipes: StudioRecipesDep,
     audit: AuditDep,
     recipe_runs: RecipeRunsDep,
+    typology_rules: TypologyRulesDep,
+    analytics: AnalyticsDep,
+    principal_resolver: PrincipalResolverDep,
+    patterns_store: PatternsStoreDep,
+    hotlists_store: HotlistsStoreDep,
+    screening_lists: ScreeningListsDep,
+    compute: ComputeDep,
+    influencers_store: OptionalStrengthInfluencersDep = None,
 ) -> VerifyReport:
     """§5: the dry run. No persistent write of any kind happens here — no
     Parquet staging, no `GraphPort` write, no transaction — but an
@@ -7557,6 +7880,22 @@ async def verify_studio_recipe(
     # ADR-127 decision 5: the dry run counts the rows the case already kept as the run would count
     # them, by the draft's own `deduplicate`, asking the store of loaded rows (this case's keys
     # only) and writing nothing.
+    # ADR-133 decision 6, stage (d): the pipeline's checks on load judge the sample as at its
+    # load, each as its author, through a gate whose alert store, quarantine and signature set
+    # refuse every call — Verify writes nothing.
+    gate = await _rule_gate(
+        investigation.id, loader=principal, graph=graph, analytics=analytics, scheme=scheme,
+        typology_rules=typology_rules, principal_resolver=principal_resolver,
+        screening=screening_lists, compute=compute, patterns=patterns_store,
+        hotlists=hotlists_store, ontology=ontology, recipe_id=recipe.recipe_id,
+        influencers=influencers_store, **READ_ONLY,  # type: ignore[arg-type]
+    )  # fmt: skip
+
+    async def judge_checks(
+        written: Sequence[NodeWrite | EdgeWrite], shown: Mapping[str, Node]
+    ) -> tuple[list[WouldRaise], list[CheckNotJudged], int]:
+        return await would_raise(gate, written, shown)
+
     report = await run_verify(
         recipe,
         principal,
@@ -7565,6 +7904,7 @@ async def verify_studio_recipe(
         ontology,
         row_keys=recipe_runs,
         investigation_id=investigation.id,
+        checks=judge_checks,
     )
     # §5: "Verify must pass before publish" — recorded here, against a
     # *completed* run (rejections included, per §5's own "a run with
@@ -7574,10 +7914,70 @@ async def verify_studio_recipe(
     await audit.record(
         principal=principal,
         action="verify_studio_recipe",
-        resolved_query={"recipe_id": recipe.recipe_id},
+        resolved_query={"recipe_id": recipe.recipe_id, "would_raise": len(report.would_raise)},
         result_cardinality=len(report.nodes) + len(report.edges),
     )
     return report
+
+
+# --- ingest studio: checks on load (ADR-133 decision 6, stage (d)) ------------------------------
+
+
+@app.get(
+    "/v1/investigations/{investigation_id}/ingest/recipes/{recipe_id}/checks",
+    dependencies=[Depends(require_right(Right.EDIT_PIPELINES))],
+)
+async def read_load_checks(
+    investigation: InvestigationEditorDep,
+    recipe: AuthorizedStudioRecipeDep,
+    principal: PrincipalDep,
+    typology_rules: TypologyRulesDep,
+    ontology: OntologyDep,
+    audit: AuditDep,
+) -> LoadChecksView:
+    """The pipeline's "Checks on load" step: the case's and the deployment's load-time rules the
+    engineer may attach, read within their reach, and what has been chosen."""
+    rules = await typology_rules.list_for_case(investigation.id, principal)
+    record = await typology_rules.load_checks(recipe.recipe_id)
+    view = checks_view(recipe.recipe_id, rules, record, ontology)
+    await audit.record(principal=principal, action="read_load_checks",
+                       investigation_id=investigation.id,
+                       resolved_query={"recipe_id": recipe.recipe_id},
+                       result_cardinality=len(view.available))  # fmt: skip
+    return view
+
+
+@app.put(
+    "/v1/investigations/{investigation_id}/ingest/recipes/{recipe_id}/checks",
+    dependencies=[Depends(require_right(Right.EDIT_PIPELINES))],
+)
+async def set_load_checks(
+    investigation: InvestigationEditorDep,
+    recipe: AuthorizedStudioRecipeDep,
+    principal: PrincipalDep,
+    typology_rules: TypologyRulesDep,
+    ontology: OntologyDep,
+    audit: AuditDep,
+    body: LoadChecksInput,
+) -> LoadChecksView:
+    """The engineer's choice: which offered rules apply to this pipeline and what a hit does here.
+    It names rules, never carries one — engineers attach rules, they do not author analyst rules
+    (decision 6). A rule not offered, or a hold on a rule that runs after commit, is refused in
+    words. Audited."""
+    rules = await typology_rules.list_for_case(investigation.id, principal)
+    try:
+        checks = check_choice(body.checks, rules)
+    except ChecksRefused as refused:
+        raise HTTPException(
+            status_code=422, detail={"error": "checks_refused", "message": str(refused)}
+        ) from refused
+    record = await typology_rules.set_load_checks(recipe.recipe_id, checks, principal)
+    await audit.record(principal=principal, action="load_checks_set",
+                       investigation_id=investigation.id,
+                       resolved_query={"recipe_id": recipe.recipe_id,
+                                       "checks": [c.model_dump() for c in checks]},
+                       result_cardinality=len(checks))  # fmt: skip
+    return checks_view(recipe.recipe_id, rules, record, ontology)
 
 
 # --- ingest studio: publish (09_INGEST_STUDIO.md §6) --------------------------
@@ -7642,9 +8042,20 @@ async def publish_studio_recipe(
                 status_code=422,
                 content={"error": "pipeline_not_runnable", "problems": unrunnable},
             )
+    # A draft Map has not been done on has nothing to load: refused in words, not by an `assert`
+    # (a 500, found 31 October 2026 on the Prison Intelligence demo's reports recipe, which is
+    # seeded unmapped for the presenter to map live).
+    if recipe.row_template is None:
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=422,
+            content={
+                "error": "recipe_not_mapped",
+                "detail": "Map has not been done on this recipe yet: map its fields to the "
+                "domain model, run Verify, then publish.",
+            },
+        )
     # ADR-120 D10, Amendment 1: the pins come from the live ontology, for the packs the recipe
     # names and the packs whose types it writes.
-    assert recipe.row_template is not None
     check_before_publish(recipe, ontology)
     try:
         pins = pack_versions_for(recipe.pipeline, recipe.row_template, ontology)
@@ -7874,6 +8285,7 @@ async def run_studio_recipe(
     compute: ComputeDep,
     kyc_expiries: KycExpiriesDep,
     recipe_runs: RecipeRunsDep,
+    influencers: OptionalStrengthInfluencersDep = None,
 ) -> LoadReportView | PipelineRunReportView:
     """§8: "Loader: run a published recipe against a file at or below
     their own clearance" — `body.source_location`, when given, is that
@@ -7939,6 +8351,7 @@ async def run_studio_recipe(
             compute=compute,
             kyc_expiries=kyc_expiries,
             recipe_runs=recipe_runs,
+            influencers=influencers,
         ),
         principal=principal,
         recipe=recipe,
@@ -7994,6 +8407,82 @@ def _schedule_executor(application: FastAPI) -> ScheduleExecutor:
         run=run,
         notify=notify,
         watch_files=watch_files,
+    )
+
+
+@dataclass
+class _MonitoringSchedules:
+    """Both of ADR-133 stage (d)'s schedules on the one minute tick."""
+
+    rules: RuleScheduleExecutor
+    lists: ListRefreshExecutor
+
+    async def tick(self, now: datetime) -> None:
+        await self.rules.tick(now)
+        await self.lists.tick(now)
+
+
+def _rule_schedule_executor(application: FastAPI) -> RuleScheduleExecutor:
+    """Scheduled rules over the running Conduit's own stores, each slot judged as the rule's author
+    resolved afresh, through the same gate a load uses (ADR-133 decision 1, stage (d))."""
+    state = application.state
+
+    async def check_case(author: Principal, case: str, level: AccessLevel) -> Principal:
+        await state.investigations.get_authorized(case, author, need=level)
+        return await scope_to_case(author, case, state.datasets)
+
+    async def judge(rule: TypologyRule, author: Principal, slot: datetime) -> int:
+        async def as_author(owner_id: str) -> Principal | None:
+            return author if owner_id == author.id else None
+
+        gate = RuleGate(
+            rules=[rule], investigation_id=rule.investigation_id, graph=state.graph,
+            analytics=state.analytics, scheme=state.handling_scheme, alert_store=state.alerts_store,
+            audit=state.audit, valkey=state.valkey, principal_for_owner=as_author, loader=author,
+            screening=state.screening_lists, compute=state.compute, patterns=state.patterns_store,
+            hotlists=state.hotlists_store, ontology=state.ontology,
+            influencers=state.strength_influencers,
+        )  # fmt: skip
+        return await run_scheduled_rule(rule, author, gate, now=slot)
+
+    return RuleScheduleExecutor(
+        rules=state.typology_rules,
+        valkey=state.valkey,
+        resolve_owner=state.principal_resolver.resolve_for_owner_detailed,
+        check_case=check_case,
+        judge=judge,
+    )
+
+
+def _list_schedule_executor(application: FastAPI) -> ListRefreshExecutor:
+    """Screening lists' refresh schedules (ADR-133 Amendment 3 item 4), each slot run as the person
+    who set it, through the one refresh and re-screening."""
+    state = application.state
+
+    async def refresh(list_name: str, owner: Principal, slot: datetime) -> ScreeningListUpdate:
+        rescreen = Rescreener(
+            rules=state.typology_rules, datasets=state.datasets, graph=state.graph,
+            scheme=state.handling_scheme, alert_store=state.alerts_store, audit=state.audit,
+            valkey=state.valkey, principal_for_owner=state.principal_resolver.resolve_for_owner,
+            runner=owner,
+        )  # fmt: skip
+        update = await refresh_screening_list(
+            list_name, store=state.screening_lists, rescreen=rescreen, trigger="schedule"
+        )
+        await state.audit.record(
+            principal=owner, action="screening_list_refreshed", investigation_id=None,
+            resolved_query={"list_name": list_name, "outcome": update.outcome,
+                            "version": update.version, "alerts": update.alerts,
+                            "trigger": "schedule", "slot": slot.isoformat()},
+            result_cardinality=update.alerts,
+        )  # fmt: skip
+        return update
+
+    return ListRefreshExecutor(
+        lists=state.screening_lists,
+        valkey=state.valkey,
+        resolve_owner=state.principal_resolver.resolve_for_owner_detailed,
+        refresh=refresh,
     )
 
 
@@ -8295,28 +8784,72 @@ async def read_alert_queue(
     principal: PrincipalDep,
     graph: GraphDep,
     alerts_store: AlertsStoreDep,
+    principal_names: PrincipalNamesDep,
     audit: AuditDep,
     status_filter: Annotated[
-        Literal["open", "claimed", "closed", "active", "all"], Query(alias="status")
+        Literal["open", "claimed", "closing", "closed", "active", "all"], Query(alias="status")
     ] = "active",
+    kind: Annotated[list[AlertKind] | None, Query()] = None,
+    severity: Annotated[list[AlertSeverity] | None, Query()] = None,
 ) -> list[QueuedAlert]:
-    """The case's rule-raised alerts, the case team's (ruling 3). `active` is open and claimed.
-    An alert any of whose entities the reader cannot see is left out, and not counted (rule 3)."""
+    """The one alert queue (ADR-133 decision 5 and stage (a)): the case's typology alerts (the case
+    team's, ADR-109 ruling 3) and the hotlist and monitor alerts the reader owns or that are shared
+    with their team, each with its kind, severity and audience. `active` is open and claimed; `kind`
+    and `severity` may each be given more than once. Who sees which alert is decided in the query;
+    an alert any of whose entities the reader cannot see is then left out, and not counted (rule 3).
+    """
     statuses = {
-        "active": ["open", "claimed"],
+        "active": ["open", "claimed", "closing"],
         "all": None,
     }.get(status_filter, [status_filter])
-    rows = await alert_queue.queue(
-        alerts_store, graph, investigation.id, principal, statuses=statuses
-    )
+    rows = await alert_queue.monitoring_queue(
+        alerts_store, graph, investigation.id, principal, statuses=statuses, kinds=kind,
+        severities=severity,
+    )  # fmt: skip
     await audit.record(
         principal=principal,
         action="read_alert_queue",
         investigation_id=investigation.id,
-        resolved_query={"status": status_filter},
+        resolved_query={"status": status_filter, "kind": kind, "severity": severity},
         result_cardinality=len(rows),
     )
-    return rows
+    # ADR-106 Amendment 1: each claimed row's assignee by name, asked for only the assignees of
+    # the rows served (step 9e: "Claimed by" named an identity-provider id).
+    assignees = sorted({r.alert.assignee for r in rows if r.alert.assignee})
+    if not assignees:
+        return rows
+    names = await principal_names.display_names(assignees)
+    return [
+        r.model_copy(update={"assignee_name": names.get(r.alert.assignee)})
+        if r.alert.assignee
+        else r
+        for r in rows
+    ]
+
+
+@app.get(
+    "/v1/investigations/{investigation_id}/alert-assignees",
+    dependencies=[Depends(require_right(Right.TRIAGE_ALERTS))],
+)
+async def read_alert_assignees(
+    investigation: InvestigationEditorDep,
+    principal: PrincipalDep,
+    investigations: InvestigationsDep,
+    principal_names: PrincipalNamesDep,
+) -> list[AlertAssignee]:
+    """ADR-133 stage (a): whom an alert may be given to — the case's Editors and Authors by grant,
+    by name. Read at Editor, by those who triage; a Viewer is not shown the case's member list."""
+    ids = await _alert_assignee_ids(investigations, investigation.id, principal)
+    names = await principal_names.display_names(sorted(ids))
+    return [AlertAssignee(id=i, name=names.get(i)) for i in sorted(ids)]
+
+
+async def _alert_assignee_ids(
+    investigations: InvestigationStore, investigation_id: str, principal: Principal
+) -> set[str]:
+    grants = await investigations.list_grants(investigation_id)
+    ids = {i for i, level in grants.items() if level.rank >= AccessLevel.EDITOR.rank}
+    return ids | {principal.id}
 
 
 @app.get(
@@ -8330,12 +8863,27 @@ async def explain_alert(
     graph: GraphDep,
     analytics: AnalyticsDep,
     alerts_store: AlertsStoreDep,
+    principal_names: PrincipalNamesDep,
     audit: AuditDep,
 ) -> AlertExplanation:
-    """What fired the alert: its entities and node, the links and each transaction it cites."""
+    """What fired the alert: its entities and node, the links and each transaction it cites; and,
+    for a close waiting for a second person, who proposed it, and for a claimed alert, who holds
+    it, by name (ADR-106: resolved for those ids, once the reader has been served the alert)."""
     explanation = await alert_queue.explain(
         alerts_store, graph, analytics, investigation.id, alert_id, principal
     )
+    proposer = explanation.alert.close_proposed_by
+    assignee = explanation.alert.assignee
+    people = sorted({p for p in (proposer, assignee) if p})
+    if people:
+        # ADR-106 Amendment 1: the proposer and the assignee by name, asked for those ids alone.
+        names = await principal_names.display_names(people)
+        explanation = explanation.model_copy(
+            update={
+                "close_proposed_by_name": names.get(proposer) if proposer else None,
+                "assignee_name": names.get(assignee) if assignee else None,
+            }
+        )
     await audit.record(
         principal=principal,
         action="explain_alert",
@@ -8421,8 +8969,99 @@ async def dispose_alert(
         disposition=body.disposition,
         reason=body.reason,
     )
-    await _triage_audit(audit, principal, investigation.id, "alert_disposed", alert)
+    action = "alert_close_proposed" if alert.status == "closing" else "alert_disposed"
+    await _triage_audit(audit, principal, investigation.id, action, alert)
     return alert
+
+
+@app.post(
+    "/v1/investigations/{investigation_id}/alert-queue/{alert_id}/approve-close",
+    dependencies=[Depends(require_right(Right.TRIAGE_ALERTS))],
+)
+async def approve_alert_close(
+    alert_id: str,
+    investigation: InvestigationEditorDep,
+    principal: PrincipalDep,
+    graph: GraphDep,
+    alerts_store: AlertsStoreDep,
+    audit: AuditDep,
+) -> Alert:
+    """ADR-133 decision 7, stage (d): a second member approves a proposed close of a high-severity
+    alert — never the member who proposed it."""
+    try:
+        alert = await alert_queue.approve_close(
+            alerts_store, graph, investigation.id, alert_id, principal
+        )
+    except alert_queue.CloseRefused as refused:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "own_change", "message": str(refused)},
+        ) from refused
+    await _triage_audit(audit, principal, investigation.id, "alert_close_approved", alert)
+    return alert
+
+
+@app.post(
+    "/v1/investigations/{investigation_id}/alert-queue/{alert_id}/send-back",
+    dependencies=[Depends(require_right(Right.TRIAGE_ALERTS))],
+)
+async def send_back_alert_close(
+    alert_id: str,
+    body: RuleChangeRejection,
+    investigation: InvestigationEditorDep,
+    principal: PrincipalDep,
+    graph: GraphDep,
+    alerts_store: AlertsStoreDep,
+    audit: AuditDep,
+) -> Alert:
+    """A proposed close sent back to its proposer with the reason, or withdrawn by them."""
+    alert = await alert_queue.send_back(alerts_store, graph, investigation.id, alert_id, principal)
+    await audit.record(
+        principal=principal,
+        action="alert_close_sent_back",
+        investigation_id=investigation.id,
+        resolved_query={
+            "alert_id": alert.id,
+            "reason": body.reason,
+            "node_ids": alert.referent_node_ids,
+        },  # fmt: skip
+        result_cardinality=1,
+    )
+    return alert
+
+
+@app.post(
+    "/v1/investigations/{investigation_id}/alert-queue/{alert_id}/assign",
+    dependencies=[Depends(require_right(Right.TRIAGE_ALERTS))],
+)
+async def assign_alert(
+    alert_id: str,
+    body: AlertAssignInput,
+    investigation: InvestigationEditorDep,
+    principal: PrincipalDep,
+    investigations: InvestigationsDep,
+    graph: GraphDep,
+    alerts_store: AlertsStoreDep,
+    audit: AuditDep,
+) -> Alert:
+    """ADR-133 stage (a): give an open or claimed alert to an Editor or Author of the case. Only a
+    case (typology) alert is given to someone else; one shared with a team is claimed."""
+    allowed = await _alert_assignee_ids(investigations, investigation.id, principal)
+    alert = await alert_queue.assign(
+        alerts_store, graph, investigation.id, alert_id, principal, assignee=body.assignee,
+        allowed=allowed,
+    )  # fmt: skip
+    await _triage_audit(audit, principal, investigation.id, "alert_assigned", alert)
+    return alert
+
+
+@app.exception_handler(alert_queue.AssignmentRefused)
+async def _assignment_refused_handler(
+    request: Request, exc: alert_queue.AssignmentRefused
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422, content={"error": "assignment_refused", "detail": str(exc)}
+    )
 
 
 @app.post(
@@ -8477,6 +9116,242 @@ async def _alert_triage_conflict_handler(
     return JSONResponse(status_code=409, content={"error": "alert_moved_on"})
 
 
+# --- connection strength (ADR-139) -----------------------------------------------------------
+
+
+async def _with_names(
+    versions: list[InfluencerSetVersion], names: PrincipalNameDirectory
+) -> list[InfluencerSetVersion]:
+    """ADR-106: who proposed and who decided each version, by name, resolved for the versions
+    served here and never stored."""
+    ids = sorted({i for v in versions for i in (v.proposed_by, v.decided_by) if i})
+    if not ids:
+        return versions
+    named = await names.display_names(ids)
+    return [
+        v.model_copy(
+            update={
+                "proposed_by_name": named.get(v.proposed_by),
+                "decided_by_name": named.get(v.decided_by) if v.decided_by else None,
+            }
+        )
+        for v in versions
+    ]
+
+
+@app.get(
+    "/v1/strength-influencers",
+    dependencies=[Depends(require_right(Right.MANAGE_STRENGTH_INFLUENCERS))],
+)
+async def list_strength_influencers_route(
+    store: StrengthInfluencersDep,
+    defaults: StrengthDefaultsDep,
+    principal_names: PrincipalNamesDep,
+) -> InfluencerSetHistory:
+    """ADR-139 decision 3: every installation-wide version, newest first, with the one in force,
+    and the weights file's defaults beneath them."""
+    history = await store.history(defaults.influencers, defaults)
+    return history.model_copy(
+        update={"versions": await _with_names(history.versions, principal_names)}
+    )
+
+
+@app.post(
+    "/v1/strength-influencers",
+    status_code=201,
+    dependencies=[Depends(require_right(Right.MANAGE_STRENGTH_INFLUENCERS))],
+)
+async def propose_strength_influencers_route(
+    body: InfluencerSetInput,
+    principal: PrincipalDep,
+    store: StrengthInfluencersDep,
+    ontology: OntologyDep,
+    audit: AuditDep,
+) -> InfluencerSetVersion:
+    """A new installation-wide version, waiting for a second person: it changes no strength until
+    approved (maker–checker, ADR-133 stage (d)'s pattern)."""
+    check_influencers(body.influencers, ontology)
+    version = await store.propose(
+        body.influencers, body.words, principal, composition=body.composition,
+        rarity_measure=body.rarity_measure,
+    )  # fmt: skip
+    await audit.record(
+        principal=principal,
+        action="strength_influencers_proposed",
+        resolved_query={
+            "version": version.version,
+            "influencers": [i.id for i in body.influencers],
+            "composition": body.composition,
+            "rarity_measure": body.rarity_measure,
+        },
+        result_cardinality=len(body.influencers),
+    )
+    return version
+
+
+@app.post(
+    "/v1/strength-influencers/{version}/approve",
+    dependencies=[Depends(require_right(Right.MANAGE_STRENGTH_INFLUENCERS))],
+)
+async def approve_strength_influencers_route(
+    version: int,
+    principal: PrincipalDep,
+    store: StrengthInfluencersDep,
+    audit: AuditDep,
+) -> InfluencerSetVersion:
+    """A second holder of the right puts the waiting version in force; its proposer cannot (403
+    `own_change`)."""
+    approved = await store.approve(version, principal)
+    await audit.record(
+        principal=principal,
+        action="strength_influencers_approved",
+        resolved_query={"version": version, "proposed_by": approved.proposed_by},
+        result_cardinality=len(approved.influencers),
+    )
+    return approved
+
+
+@app.post(
+    "/v1/strength-influencers/{version}/send-back",
+    dependencies=[Depends(require_right(Right.MANAGE_STRENGTH_INFLUENCERS))],
+)
+async def send_back_strength_influencers_route(
+    version: int,
+    body: InfluencerDecision,
+    principal: PrincipalDep,
+    store: StrengthInfluencersDep,
+    audit: AuditDep,
+) -> InfluencerSetVersion:
+    """The waiting version is sent back with words (or withdrawn by its proposer); the set in force
+    stays as it was."""
+    sent = await store.send_back(version, body.words, principal)
+    await audit.record(
+        principal=principal,
+        action="strength_influencers_sent_back",
+        resolved_query={"version": version, "words": body.words},
+        result_cardinality=0,
+    )
+    return sent
+
+
+@app.get(
+    "/v1/investigations/{investigation_id}/strength-influencers",
+    dependencies=[Depends(require_right(Right.INVESTIGATE))],
+)
+async def case_strength_influencers_route(
+    investigation: InvestigationViewerDep,
+    principal: PrincipalDep,
+    store: StrengthInfluencersDep,
+    defaults: StrengthDefaultsDep,
+    principal_names: PrincipalNamesDep,
+    investigations: InvestigationsDep,
+) -> CaseInfluencers:
+    """ADR-139 decision 7: the case's legend (exactly the influencers in force, a case override
+    marked), and its override, which its Author may change."""
+    legend = await case_legend(
+        investigation.id, store=store, defaults=defaults, names=principal_names,
+        readable=principal.datasets,
+    )  # fmt: skip
+    case = await store.case_override(investigation.id)
+    try:
+        await investigations.get_authorized(investigation.id, principal, need=AccessLevel.AUTHOR)
+        can_override = True
+    except InsufficientAccessError:
+        can_override = False
+    override = case.override if case else None
+    if override is not None and not can_override:
+        # Amendment 2, ruling 3: a dataset trigger is told only by the datasets the reader reads.
+        shown = as_the_reader_sees(
+            [ActiveInfluencer(influencer=i, layer="case") for i in override.added],
+            principal.datasets,
+        )
+        override = override.model_copy(update={"added": [a.influencer for a in shown]})
+    return CaseInfluencers(legend=legend, override=override, can_override=can_override)
+
+
+@app.put(
+    "/v1/investigations/{investigation_id}/strength-influencers",
+    dependencies=[Depends(require_right(Right.INVESTIGATE))],
+)
+async def set_case_strength_influencers_route(
+    body: CaseInfluencersInput,
+    investigation: InvestigationAuthorDep,
+    principal: PrincipalDep,
+    store: StrengthInfluencersDep,
+    defaults: StrengthDefaultsDep,
+    ontology: OntologyDep,
+    audit: AuditDep,
+    principal_names: PrincipalNamesDep,
+    investigations: InvestigationsDep,
+) -> CaseInfluencers:
+    """ADR-139 decision 3: the case's Author adds influencers for this case or switches off
+    installation-wide ones in it. No second person (it changes only this case); every version is
+    kept and the change is audited."""
+    check_influencers(body.added, ontology)
+    saved = await store.set_case(investigation.id, body, principal)
+    await audit.record(
+        principal=principal,
+        action="case_strength_influencers_set",
+        investigation_id=investigation.id,
+        resolved_query={
+            "version": saved.version,
+            "added": [i.id for i in body.added],
+            "switched_off": body.switched_off,
+            "composition": body.composition,
+        },
+        result_cardinality=len(body.added) + len(body.switched_off),
+    )
+    return await case_strength_influencers_route(
+        investigation, principal, store, defaults, principal_names, investigations
+    )
+
+
+@app.post(
+    "/v1/investigations/{investigation_id}/connection-strength",
+    dependencies=[Depends(require_right(Right.INVESTIGATE))],
+)
+async def connection_strength_route(
+    body: ConnectionStrengthRequest,
+    investigation: InvestigationViewerDep,
+    principal: PrincipalDep,
+    working_set: WorkingSetDep,
+    graph: GraphDep,
+    store: StrengthInfluencersDep,
+    defaults: StrengthDefaultsDep,
+) -> ConnectionStrengths:
+    """ADR-139 decisions 5, 6 and 9: each working-set link's connection strength as the reader
+    may see it, with what changed it, and the legend. Worked out in the graph adapter under the
+    reader's access (rule 3); never a count from beyond the filter (rule 7)."""
+    return await case_connection_strengths(
+        investigation.id, body, working_set=working_set, graph=graph, principal=principal,
+        store=store, defaults=defaults,
+    )  # fmt: skip
+
+
+@app.post(
+    "/v1/investigations/{investigation_id}/rarity",
+    dependencies=[Depends(require_right(Right.INVESTIGATE))],
+)
+async def rarity_route(
+    body: RarityRequest,
+    investigation: InvestigationViewerDep,
+    principal: PrincipalDep,
+    working_set: WorkingSetDep,
+    graph: GraphDep,
+    defaults: StrengthDefaultsDep,
+    store: OptionalStrengthInfluencersDep = None,
+) -> RarityResult:
+    """ADR-139 decisions 4 and 6: each working-set entity's highest shared-attribute rarity with
+    another of its kind there, and each pair asked for with its shared attributes ranked. Scores
+    and the reader's visible attributes only, never N or df (rule 7); past its cap,
+    `limit_exceeded` (rule 2). Amendment 2: in the case's rarity measure, and under client parity
+    each pair with its parity score."""
+    return await case_rarity(
+        investigation.id, body, working_set=working_set, graph=graph, principal=principal,
+        defaults=defaults, store=store,
+    )  # fmt: skip
+
+
 # --- typology rules, their audit, and held rows (ADR-109 phase A) -------------
 
 
@@ -8488,10 +9363,20 @@ async def list_typology_rules(
     investigation: InvestigationViewerDep,
     principal: PrincipalDep,
     typology_rules: TypologyRulesDep,
+    principal_names: PrincipalNamesDep,
 ) -> list[TypologyRule]:
     """The case's rules, retired ones included — what watches this case's loads is the case
-    team's to know (ruling 3)."""
-    return await typology_rules.list_for_case(investigation.id, principal)
+    team's to know (ruling 3). A change waiting for a second person names who proposed it
+    (ADR-106: asked for only the proposers of the rules served here)."""
+    rules = await typology_rules.list_for_case(investigation.id, principal)
+    proposers = sorted({r.pending_by for r in rules if r.pending_by})
+    if not proposers:
+        return rules
+    names = await principal_names.display_names(proposers)
+    return [
+        r.model_copy(update={"pending_by_name": names.get(r.pending_by)}) if r.pending_by else r
+        for r in rules
+    ]
 
 
 @app.post(
@@ -8508,7 +9393,11 @@ async def deploy_typology_rule(
     body: TypologyRuleInput,
 ) -> TypologyRule:
     """A case Author deploys, with no second approver (ADR-109 ruling 4); audited. A drawn
-    pattern (phase D) must be one the Author saved: it is read as theirs at every evaluation."""
+    pattern (phase D) must be one the Author saved: it is read as theirs at every evaluation. A
+    sentence (ADR-133) is deployed through `…/rules/sentence`, which checks it against the ontology
+    and its scope against the author's level and rights; it is refused here."""
+    if body.params.typology == "sentence":
+        raise ReleaseRefused("a rule written as a sentence is deployed from the sentence builder")
     if body.params.typology == "pattern":
         try:
             await patterns_store.get_authorized(body.params.pattern_id, principal)
@@ -8536,15 +9425,370 @@ async def retire_typology_rule(
     typology_rules: TypologyRulesDep,
     audit: AuditDep,
 ) -> TypologyRule:
-    rule = await typology_rules.retire(rule_id, investigation.id, principal)
+    """Retires a case rule at once. A whole-deployment rule's retirement waits for a second person
+    with the administrator's right (ADR-133 decision 7), and needs that right to propose."""
+    listed = await typology_rules.get_listed(rule_id, investigation.id, principal)
+    if is_deployment_wide(listed):
+        _require_administrator(principal)
+    rule = await typology_rules.propose_retire(rule_id, investigation.id, principal)
+    action = "rule_change_proposed" if rule.pending_action == "retire" else "rule_retired"
     await audit.record(
         principal=principal,
-        action="rule_retired",
+        action=action,
         investigation_id=investigation.id,
-        resolved_query={"rule_id": rule.id},
+        resolved_query={"rule_id": rule.id, "change": "retire", "version": rule.pending_version},
         result_cardinality=1,
     )
     return rule
+
+
+def _require_administrator(principal: Principal) -> None:
+    """A whole-deployment rule is the administrator's (ADR-133 decision 1): deploying, changing,
+    retiring, approving or rejecting one needs that right as well as the case's Author level."""
+    if Right.ADMINISTER_SYSTEM not in rights_for(principal.roles):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "right_required", "right": Right.ADMINISTER_SYSTEM.value},
+        )
+
+
+def _require_rule_author(principal: Principal) -> None:
+    """ADR-133 decision 6: engineers attach rules; they do not author analyst rules. A rule written
+    as a sentence is a saved pattern watching the case's data, so writing one needs the analyst's
+    right to keep watches and saved-pattern monitors (ADR-112 L8) as well as `deploy_rules`."""
+    if Right.KEEP_WATCHES not in rights_for(principal.roles):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "right_required", "right": Right.KEEP_WATCHES.value},
+        )
+
+
+@app.post(
+    "/v1/investigations/{investigation_id}/rules/{rule_id}/approve",
+    dependencies=[Depends(require_right(Right.DEPLOY_RULES))],
+)
+async def approve_rule_change(
+    rule_id: str,
+    investigation: InvestigationAuthorDep,
+    principal: PrincipalDep,
+    typology_rules: TypologyRulesDep,
+    audit: AuditDep,
+) -> TypologyRule:
+    """ADR-133 decision 7, stage (d): a second person with the right approves the change waiting
+    on a whole-deployment rule — its deployment, a new version, or its retirement. The person who
+    proposed it cannot."""
+    _require_administrator(principal)
+    try:
+        rule = await typology_rules.approve(rule_id, investigation.id, principal)
+    except OwnChangeRefused as refused:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "own_change",
+                "message": f"{str(refused)[0].upper()}{str(refused)[1:]}.",
+            },
+        ) from refused
+    await audit.record(
+        principal=principal,
+        action="rule_change_approved",
+        investigation_id=investigation.id,
+        resolved_query={"rule_id": rule.id, "version": rule.version, "status": rule.status},
+        result_cardinality=1,
+    )
+    return rule
+
+
+@app.post(
+    "/v1/investigations/{investigation_id}/rules/{rule_id}/reject",
+    dependencies=[Depends(require_right(Right.DEPLOY_RULES))],
+)
+async def reject_rule_change(
+    rule_id: str,
+    body: RuleChangeRejection,
+    investigation: InvestigationAuthorDep,
+    principal: PrincipalDep,
+    typology_rules: TypologyRulesDep,
+    audit: AuditDep,
+) -> TypologyRule:
+    """The change waiting on a whole-deployment rule turned down, with the reason — or withdrawn
+    by the person who proposed it. The rule stays as it was; a rejected deployment never runs."""
+    _require_administrator(principal)
+    rule = await typology_rules.reject(rule_id, investigation.id, principal, body.reason)
+    await audit.record(
+        principal=principal,
+        action="rule_change_rejected",
+        investigation_id=investigation.id,
+        resolved_query={"rule_id": rule.id, "reason": body.reason},
+        result_cardinality=1,
+    )
+    return rule
+
+
+@app.post(
+    "/v1/investigations/{investigation_id}/rules/{rule_id}/change",
+    dependencies=[Depends(require_right(Right.DEPLOY_RULES))],
+)
+async def change_rule_sentence(
+    rule_id: str,
+    investigation: InvestigationEditorDep,
+    principal: PrincipalDep,
+    investigations: InvestigationsDep,
+    typology_rules: TypologyRulesDep,
+    patterns_store: PatternsStoreDep,
+    ontology: OntologyDep,
+    audit: AuditDep,
+    body: SentenceRuleInput,
+) -> TypologyRule:
+    """A new version of a rule written as a sentence, checked as a deployment is. Its drawn
+    pattern is saved as the person changing it, who the rule then runs as. A change to (or into) a
+    whole-deployment rule waits for a second person (decision 7); any other applies at once. Every
+    version is kept with who made it."""
+    _require_rule_author(principal)
+    current = await typology_rules.get_listed(rule_id, investigation.id, principal)
+    if not isinstance(current.params, SentenceRuleParams):
+        raise ReleaseRefused("only a rule written as a sentence is changed here")
+    sentence = normalised(body.sentence)
+    await _authorize_sentence_scope(sentence, investigation.id, principal, investigations, audit)
+    if is_deployment_wide(current):
+        _require_administrator(principal)
+    spec = await _compiled_rule(body, sentence, principal, patterns_store, ontology)
+    rule = await typology_rules.propose_change(rule_id, investigation.id, principal, spec)
+    await audit.record(
+        principal=principal,
+        action="rule_change_proposed" if rule.pending_action == "change" else "rule_changed",
+        investigation_id=investigation.id,
+        resolved_query={"rule_id": rule.id, "rule": body.model_dump(mode="json")},
+        result_cardinality=1,
+    )
+    return rule
+
+
+@app.get(
+    "/v1/investigations/{investigation_id}/rules/{rule_id}/versions",
+    dependencies=[Depends(require_right(Right.READ_ALERT_QUEUE))],
+)
+async def read_rule_versions(
+    rule_id: str,
+    investigation: InvestigationViewerDep,
+    principal: PrincipalDep,
+    typology_rules: TypologyRulesDep,
+    principal_names: PrincipalNamesDep,
+    audit: AuditDep,
+) -> list[RuleVersion]:
+    """Every version of the rule, oldest first, with who proposed and who decided each, by name
+    (decision 7: "rules keep their versions, and each change records who made it")."""
+    versions = await typology_rules.versions(rule_id, investigation.id, principal)
+    ids = {v.proposed_by for v in versions} | {v.decided_by for v in versions if v.decided_by}
+    names = await principal_names.display_names(sorted(ids))
+    named = [
+        v.model_copy(
+            update={
+                "proposed_by_name": names.get(v.proposed_by),
+                "decided_by_name": names.get(v.decided_by or ""),
+            }
+        )  # fmt: skip
+        for v in versions
+    ]
+    await audit.record(principal=principal, action="read_rule_versions",
+                       investigation_id=investigation.id, resolved_query={"rule_id": rule_id},
+                       result_cardinality=len(named))  # fmt: skip
+    return named
+
+
+@app.get(
+    "/v1/investigations/{investigation_id}/rules/{rule_id}/runs",
+    dependencies=[Depends(require_right(Right.READ_ALERT_QUEUE))],
+)
+async def read_rule_schedule(
+    rule_id: str,
+    investigation: InvestigationViewerDep,
+    principal: PrincipalDep,
+    typology_rules: TypologyRulesDep,
+    audit: AuditDep,
+) -> RuleScheduleView:
+    """A scheduled rule's schedule in words, its next run (or why it will not run), and its latest
+    runs (ADR-133 decision 1, stage (d)). A rule that runs as data loads is refused in words."""
+    rule = await typology_rules.get_listed(rule_id, investigation.id, principal)
+    if rule.trigger != "schedule":
+        raise ReleaseRefused("this rule runs as data loads, not on a schedule")
+    runs = await typology_rules.rule_runs(rule.id)
+    await audit.record(principal=principal, action="read_rule_runs",
+                       investigation_id=investigation.id, resolved_query={"rule_id": rule_id},
+                       result_cardinality=len(runs))  # fmt: skip
+    return schedule_view(rule, runs, now=datetime.now(UTC))
+
+
+# --- rules written as sentences, and their preview (ADR-133 decisions 1 and 3, stage (b)) -------
+
+
+@app.post(
+    "/v1/investigations/{investigation_id}/rules/sentence/compile",
+    dependencies=[Depends(require_right(Right.INVESTIGATE))],
+)
+async def compile_rule_sentence(
+    investigation: InvestigationViewerDep,
+    principal: PrincipalDep,
+    ontology: OntologyDep,
+    body: RuleSentence,
+) -> CompiledSentence:
+    """The sentence checked against the ontology and compiled to its drawn pattern — its
+    "advanced" view, to open in the query builder. Reads nothing from a store."""
+    return compile_sentence(body, ontology)
+
+
+@app.post(
+    "/v1/investigations/{investigation_id}/rules/sentence/read",
+    dependencies=[Depends(require_right(Right.INVESTIGATE))],
+)
+async def read_rule_sentence(
+    investigation: InvestigationViewerDep,
+    principal: PrincipalDep,
+    ontology: OntologyDep,
+    body: SentenceReadRequest,
+) -> RuleSentence:
+    """A drawn pattern read back as the sentence, its other blanks kept; one a sentence cannot say
+    is refused in words. Reads nothing from a store."""
+    check_pattern_conditions(body.pattern, ontology)
+    return sentence_of(body.pattern, body.sentence, ontology)
+
+
+@app.post(
+    "/v1/investigations/{investigation_id}/rules/preview",
+    dependencies=[Depends(require_right(Right.INVESTIGATE))],
+)
+async def preview_rule_sentence(
+    investigation: InvestigationViewerDep,
+    principal: PrincipalDep,
+    graph: GraphDep,
+    analytics: AnalyticsDep,
+    ontology: OntologyDep,
+    hotlists_store: HotlistsStoreDep,
+    screening_lists: ScreeningListsDep,
+    audit: AuditDep,
+    body: RulePreviewRequest,
+    influencers_store: OptionalStrengthInfluencersDep = None,
+) -> RulePreview:
+    """Decision 3: "Preview on the last 90 days" — the rule run as the caller over the case's stored
+    data, counted only over what they may see (rules 3 and 7). It raises no alert and writes no
+    rule, pattern or graph element; the read is audited as every read is. Past the working-set
+    limit it is refused with `limit_exceeded` (rule 2)."""
+    sentence = body.sentence
+    check_sentence(sentence, ontology)
+    relationship = sentence.relationship
+    hotlisted = None
+    if relationship is not None and relationship.kind == "on_hotlist":
+        hotlisted = frozenset(
+            h.identifier
+            for h in await hotlists_store.list_authorized(principal)
+            if h.status == "active"
+        )
+    entries: dict[str, list[Any]] = {}
+    if relationship is not None and relationship.kind == "on_screening_list":
+        entries[sentence.subject] = list(await screening_lists.entries(sentence.subject))
+    # ADR-139 decision 8: a strength condition previews with the case's influencers in force.
+    influencers, rarity_exclude, strength_settings = await strength_context(
+        influencers_store, investigation.id
+    )
+    preview = await preview_sentence(
+        sentence,
+        principal,
+        SentenceContext(
+            graph=graph,
+            analytics=analytics,
+            investigation_scope=investigation.id,
+            ontology=ontology,
+            hotlisted=hotlisted,
+            screening_entries=entries,
+            influencers=influencers,
+            rarity_exclude_types=rarity_exclude,
+            composition=strength_settings.composition,
+            rarity_measure=strength_settings.rarity_measure,
+        ),
+    )
+    await audit.record(
+        principal=principal,
+        action="rule_previewed",
+        investigation_id=investigation.id,
+        resolved_query={"sentence": sentence.model_dump(mode="json")},
+        result_cardinality=preview.would_raise,
+    )
+    return preview
+
+
+@app.post(
+    "/v1/investigations/{investigation_id}/rules/sentence",
+    status_code=201,
+    dependencies=[Depends(require_right(Right.DEPLOY_RULES))],
+)
+async def deploy_rule_sentence(
+    investigation: InvestigationEditorDep,
+    principal: PrincipalDep,
+    investigations: InvestigationsDep,
+    typology_rules: TypologyRulesDep,
+    patterns_store: PatternsStoreDep,
+    ontology: OntologyDep,
+    audit: AuditDep,
+    body: SentenceRuleInput,
+) -> TypologyRule:
+    """A sentence deployed: checked against the ontology, its drawn pattern saved as the author's
+    (the rule's "advanced" view, read afresh as them at each evaluation) and the rule deployed.
+    "Just me" needs the case's Editor level; "this case" its Author level (ADR-109 ruling 4);
+    "the whole deployment" its Author level and the administrator's right too, and waits for a
+    second person's approval (ADR-133 decision 7). Writing one is an analyst's: it needs
+    `keep_watches` (decision 6: engineers attach rules, they do not author analyst rules)."""
+    _require_rule_author(principal)
+    sentence = normalised(body.sentence)
+    await _authorize_sentence_scope(sentence, investigation.id, principal, investigations, audit)
+    spec = await _compiled_rule(body, sentence, principal, patterns_store, ontology)
+    rule = await typology_rules.create(principal, investigation.id, spec)
+    await audit.record(
+        principal=principal,
+        # ADR-133 decision 7, stage (d): a whole-deployment rule waits for a second person.
+        action="rule_change_proposed" if rule.status == "pending" else "rule_deployed",
+        investigation_id=investigation.id,
+        resolved_query={"rule_id": rule.id, "rule": body.model_dump(mode="json")},
+        result_cardinality=1,
+    )
+    return rule
+
+
+async def _authorize_sentence_scope(
+    sentence: RuleSentence,
+    investigation_id: str,
+    principal: Principal,
+    investigations: InvestigationStore,
+    audit: AuditWriter,
+) -> None:
+    """ "Just me" needs the case's Editor level; "this case" its Author level (ADR-109 ruling 4);
+    "the whole deployment" its Author level and the administrator's right too."""
+    if sentence.scope != "just_me":
+        await _authorize(investigation_id, principal, investigations, audit, AccessLevel.AUTHOR)
+    if sentence.scope == "deployment":
+        _require_administrator(principal)
+
+
+async def _compiled_rule(
+    body: SentenceRuleInput,
+    sentence: RuleSentence,
+    principal: Principal,
+    patterns_store: PatternStore,
+    ontology: OntologySchema,
+) -> TypologyRuleInput:
+    """The sentence checked against the ontology, its drawn pattern saved as `principal`'s (the
+    rule's "advanced" view, read afresh as them at each evaluation), and the rule it deploys as."""
+    pattern = compile_pattern(sentence, ontology)
+    check_pattern_conditions(pattern, ontology)
+    saved = await patterns_store.save(
+        principal, pattern_id=None, name=f"Rule: {body.name}", definition=pattern
+    )
+    return TypologyRuleInput(
+        name=body.name,
+        params=SentenceRuleParams(
+            pattern_id=saved.pattern_id, sentence=sentence, max_matches=body.max_matches
+        ),
+        trigger=sentence.runs,
+        budget_ms=body.budget_ms,
+    )
 
 
 @app.get(
@@ -8635,6 +9879,7 @@ async def release_held_rows_route(
     kyc_expiries: KycExpiriesDep,
     patterns_store: PatternsStoreDep,
     recipe_runs: RecipeRunsDep,
+    influencers_store: OptionalStrengthInfluencersDep = None,
 ) -> LoadReportView:
     """A reviewer releases named held rows of one load: they are loaded now, under a new load
     id, with their provenance as it would have been. The case's rules judge them again, but a
@@ -8662,6 +9907,8 @@ async def release_held_rows_route(
         compute=compute,
         expiries=kyc_expiries,
         patterns=patterns_store,
+        recipe_id=recipe.recipe_id,
+        influencers=influencers_store,
     ) or RuleGate(
         rules=[],
         investigation_id=investigation.id,
@@ -9149,6 +10396,157 @@ async def data_feeds_route(
     return feeds
 
 
+# --- screening lists as managed sources (ADR-133 decision 4, stage (c)) --------------------------
+
+
+@app.get("/v1/screening-lists", dependencies=[Depends(require_right(Right.READ_ALERT_QUEUE))])
+async def list_screening_lists(
+    principal: PrincipalDep, screening_lists: ScreeningListsDep, audit: AuditDep
+) -> ScreeningListsOverview:
+    """The Lists screen for a reader of the alert queue: each list's version, entries, last update
+    and failure, in words. Not its refreshes: their counts of customers re-screened and alerts
+    raised are taken across every case in the deployment (rule 7: no unfiltered count), and the
+    model has no field to hold them."""
+    # Who a list's schedule runs as is for whoever manages lists to know.
+    found = [s.model_copy(update={"schedule_owner": None})
+             for s in await screening_lists.subscriptions()]  # fmt: skip
+    await audit.record(principal=principal, action="list_screening_lists", investigation_id=None,
+                       resolved_query={}, result_cardinality=len(found))  # fmt: skip
+    return ScreeningListsOverview(lists=found)
+
+
+@app.get(
+    "/v1/admin/screening-lists",
+    dependencies=[Depends(require_right(Right.LOAD_SCREENING_LISTS))],
+)
+async def manage_screening_lists(
+    principal: PrincipalDep, screening_lists: ScreeningListsDep, audit: AuditDep
+) -> ScreeningLists:
+    """The Lists screen for whoever may load screening lists: the lists and their latest
+    refreshes, with what each changed, and what each re-screened and raised **in the reader's own
+    unit** (the owner's answer of 1 November 2026; rule 7). The store's query joins that unit's
+    counts alone; another unit's customers, alerts and rule names never reach the Conduit."""
+    found = await screening_lists.subscriptions()
+    updates = await screening_lists.updates(org_unit=principal.org_unit, limit=20)
+    await audit.record(principal=principal, action="list_screening_lists", investigation_id=None,
+                       resolved_query={"manage": True}, result_cardinality=len(found))  # fmt: skip
+    return ScreeningLists(lists=found, updates=updates, can_manage=True)
+
+
+@app.post(
+    "/v1/admin/screening-lists",
+    status_code=201,
+    dependencies=[Depends(require_right(Right.LOAD_SCREENING_LISTS))],
+)
+async def subscribe_screening_list(
+    principal: PrincipalDep,
+    screening_lists: ScreeningListsDep,
+    audit: AuditDep,
+    body: ScreeningSubscriptionInput,
+) -> ScreeningListStatus:
+    """A list subscribed (or its subscription changed): its connector and its file in the ingest
+    folder. Nothing is read until it is refreshed; a location outside the folder is refused now."""
+    try:
+        check_location(body.location)
+    except ListRefused as refused:
+        raise HTTPException(
+            status_code=422, detail={"error": "list_refused", "message": str(refused)}
+        ) from refused
+    status_ = await screening_lists.subscribe(body, principal.id, synthetic=False)
+    await audit.record(principal=principal, action="screening_list_subscribed",
+                       investigation_id=None, resolved_query=body.model_dump(mode="json"),
+                       result_cardinality=1)  # fmt: skip
+    return status_
+
+
+@app.put(
+    "/v1/admin/screening-lists/{list_name}/schedule",
+    dependencies=[Depends(require_right(Right.LOAD_SCREENING_LISTS))],
+)
+async def set_screening_list_schedule(
+    list_name: str,
+    principal: PrincipalDep,
+    screening_lists: ScreeningListsDep,
+    audit: AuditDep,
+    body: ListScheduleInput,
+) -> ScreeningListStatus:
+    """ADR-133 Amendment 3 item 4, stage (d): the list refreshed every day or every week at an
+    hour, as the person setting it — resolved afresh at each slot, and refused in words if they no
+    longer hold the right. Without a schedule, the list is refreshed by hand only."""
+    try:
+        updated = await screening_lists.set_schedule(list_name, body.schedule, principal.id)
+    except ListScheduleRefused as refused:
+        raise HTTPException(
+            status_code=422, detail={"error": "schedule_refused", "message": str(refused)}
+        ) from refused
+    except LookupError as missing:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"no list is subscribed as “{list_name}”"},
+        ) from missing
+    await audit.record(principal=principal, action="screening_list_schedule_set",
+                       investigation_id=None,
+                       resolved_query={"list_name": list_name, "schedule": (
+                           body.schedule.model_dump() if body.schedule else None)},
+                       result_cardinality=1)  # fmt: skip
+    return updated
+
+
+@app.post(
+    "/v1/admin/screening-lists/{list_name}/refresh",
+    dependencies=[Depends(require_right(Right.LOAD_SCREENING_LISTS))],
+)
+async def refresh_screening_list_route(
+    list_name: str,
+    request: Request,
+    principal: PrincipalDep,
+    screening_lists: ScreeningListsDep,
+    typology_rules: TypologyRulesDep,
+    graph: GraphDep,
+    handling_scheme: HandlingSchemeDep,
+    alerts_store: AlertsStoreDep,
+    audit: AuditDep,
+    valkey: ValkeyDep,
+    principal_resolver: PrincipalResolverDep,
+) -> ScreeningListUpdate:
+    """*Refresh now*: the list read again through its connector, applied as a new version, and
+    every customer of every case with a screening rule re-screened against the changed entries
+    only, as each rule's deployer (rule 3). Refused or failed in words, the list left as it was.
+    The answer counts the administrator's own unit alone, read back through the store's query as
+    the Lists screen reads it (rule 7); the deployment's totals go to the audit only."""
+    rescreen = Rescreener(
+        rules=typology_rules,
+        datasets=get_datasets(request),
+        graph=graph,
+        scheme=handling_scheme,
+        alert_store=alerts_store,
+        audit=audit,
+        valkey=valkey,
+        principal_for_owner=principal_resolver.resolve_for_owner,
+        runner=principal,
+    )
+    try:
+        update = await refresh_screening_list(list_name, store=screening_lists, rescreen=rescreen)
+    except ListNotSubscribed as missing:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"no list is subscribed as “{list_name}”"},
+        ) from missing
+    await audit.record(principal=principal, action="screening_list_refreshed",
+                       investigation_id=None,
+                       resolved_query={"list_name": list_name, "outcome": update.outcome,
+                                       "version": update.version, "alerts": update.alerts},
+                       result_cardinality=update.alerts)  # fmt: skip
+    own = await screening_lists.update_for(update.id, org_unit=principal.org_unit)
+    if own is None:  # recorded a moment ago in the same store
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "not_recorded",
+                    "message": "the refresh ran but its record could not be read back"},
+        )  # fmt: skip
+    return own
+
+
 @app.get("/v1/admin/schedules", dependencies=[Depends(require_right(Right.OPERATE_SCHEDULES))])
 async def list_schedules_route(
     principal: PrincipalDep,
@@ -9323,6 +10721,7 @@ async def system_status_route(
     investigations: InvestigationsDep,
     valkey: ValkeyDep,
     identity_admin: IdentityAdminDep,
+    model_routes: ModelRoutesDep,
 ) -> SystemStatus:
     """Each component of the running deployment, asked now (ADR-110 Amendment 1, the *System*
     screen). The graph is asked as a principal of no datasets, so the check reads nothing."""
@@ -9350,13 +10749,15 @@ async def system_status_route(
         await check("Model server", models),
         await check("Identity provider", identity_admin.reachable),
     ]
-    # ADR-114 decision 11: each role's model and where it runs, from names only — never a key.
-    statuses, notice = model_status(*routes_from_env(DeploymentModels.from_env(), os.environ))
+    # ADR-114 decision 11, ADR-135: each role's model and where it runs, each engine and whether
+    # its key is present, from names only — never a key.
+    statuses, engines, notice = model_status(model_routes)
     return SystemStatus(
         # ADR-114 Amendment 8: the version the deployment was rendered with, and the last check.
-        version=os.environ.get("OSPREY_RELEASE_VERSION") or os.environ.get("OSPREY_VERSION"),
+        version=deployment_version(),
         components=components,
         models=statuses,
+        engines=engines,
         model_notice=notice,
         update=read_update_notice(),
     )
@@ -9407,11 +10808,16 @@ async def case_event_holders_route(
     dependencies=[Depends(require_right(Right.RUN_ANALYSIS))],
 )
 async def trend_options_route(
-    investigation: InvestigationViewerDep, ontology: OntologyDep
+    investigation: InvestigationViewerDep,
+    ontology: OntologyDep,
+    principal: PrincipalDep,
+    typology_rules: TypologyRulesDep,
 ) -> TrendOptions:
     """The event types and properties a trend may use: this deployment's ontology, narrowed to
-    the core types and the case's own domain packs (ADR-126 decision 6)."""
-    return trend_options(ontology, investigation.domains)
+    the core types and the case's own domain packs (ADR-126 decision 6); and what an alert trend
+    may split by, with the case's rules as the reader may read them (ADR-134 decision 3)."""
+    rules = await typology_rules.list_for_case(investigation.id, principal)
+    return trend_options(ontology, investigation.domains, rules)
 
 
 async def _trend_figures(
@@ -9424,15 +10830,28 @@ async def _trend_figures(
     audit: AuditWriter,
     working_set: WorkingSetService,
     handling_scheme: HandlingScheme,
+    typology_rules: TypologyRuleStore,
 ) -> TrendFigures:
     """The trend counted for this reader now (rule 3): the case's own events, a branch's inherited
-    ones with them, nothing the reader may not see."""
+    ones with them, nothing the reader may not see. An alert trend (ADR-134 decision 3) is the
+    analytics port's `alert_trend`, filtered in its query as the reader, its rules named after."""
     validate_definition(defn, ontology)
     now = datetime.now(UTC)
-    request, start = to_request(defn, ontology, case.id, now)
-    scoped = await _case_event_filter(request.filter, principal, investigations, audit, working_set)
-    result = await analytics.trend(request.model_copy(update={"filter": scoped}), principal)
-    result = name_series(result, defn, ontology)
+    if defn.source == "alerts":
+        alert_request, start = to_alert_request(defn, case.id, now)
+        result = await analytics.alert_trend(alert_request, principal)
+        if defn.group_by == "rule":
+            rules = await typology_rules.list_for_case(case.id, principal)
+        else:
+            rules = []
+        result = name_alert_series(result, defn, rules)
+    else:
+        request, start = to_request(defn, ontology, case.id, now)
+        scoped = await _case_event_filter(
+            request.filter, principal, investigations, audit, working_set
+        )
+        result = await analytics.trend(request.model_copy(update={"filter": scoped}), principal)
+        result = name_series(result, defn, ontology)
     return TrendFigures(
         definition=TrendDefinitionInput.model_validate(
             defn.model_dump(include=set(TrendDefinitionInput.model_fields))
@@ -9458,10 +10877,12 @@ async def preview_trend(
     audit: AuditDep,
     working_set: WorkingSetDep,
     handling_scheme: HandlingSchemeDep,
+    typology_rules: TypologyRulesDep,
 ) -> TrendFigures:
     check_in_case_domains(body, ontology, investigation.domains)
     figures = await _trend_figures(body, investigation, principal, ontology, analytics,
-                                   investigations, audit, working_set, handling_scheme)  # fmt: skip
+                                   investigations, audit, working_set, handling_scheme,
+                                   typology_rules)  # fmt: skip
     await audit.record(principal=principal, action="preview_trend",
                        investigation_id=investigation.id,
                        resolved_query=body.model_dump(mode="json"),
@@ -9522,12 +10943,14 @@ async def trend_figures(
     working_set: WorkingSetDep,
     handling_scheme: HandlingSchemeDep,
     trends: TrendStoreDep,
+    typology_rules: TypologyRulesDep,
 ) -> TrendFigures:
     saved = await trends.get(investigation.id, trend_id)
     if saved is None:
         raise HTTPException(status_code=404, detail="no such trend in this case")
     figures = await _trend_figures(saved, investigation, principal, ontology, analytics,
-                                   investigations, audit, working_set, handling_scheme)  # fmt: skip
+                                   investigations, audit, working_set, handling_scheme,
+                                   typology_rules)  # fmt: skip
     await audit.record(principal=principal, action="read_trend", investigation_id=investigation.id,
                        resolved_query={"trend": trend_id},
                        result_cardinality=figures.result.events)  # fmt: skip
@@ -9602,11 +11025,12 @@ async def _readable_draft(
     scheme: HandlingScheme,
     graph: GraphPort,
     case_id: str,
-) -> tuple[list[StoredPackItem], list[StoredPackItem], int]:
-    """The draft's items in order, those this reader may see, and how many they may not."""
-    items = await packs.items(pack_id)
-    shown, withheld = await readable(items, reader, scheme, graph, case_id)
-    return items, shown, withheld
+) -> tuple[list[StoredPackItem], bool]:
+    """The draft's items this reader may see, in order, and whether any are withheld from them:
+    filtered in the store's query as the reader, then checked again against the graph now (ADR-134
+    decision 4). No item withheld from the reader reaches this function."""
+    items, in_store = await packs.readable_items(pack_id, reader, scheme)
+    return await readable(items, reader, scheme, graph, case_id, withheld_in_store=in_store)
 
 
 @app.post(
@@ -9658,7 +11082,7 @@ async def read_pack(
 ) -> PackDraft:
     """The draft as this reader may see it: the items withheld from them are counted, not named."""
     pack = await _pack_or_404(packs, investigation.id, pack_id)
-    _, shown, withheld = await _readable_draft(
+    shown, withheld = await _readable_draft(
         packs, pack.id, principal, scheme, graph, investigation.id
     )
     served = [i.served() for i in shown]
@@ -9671,7 +11095,7 @@ async def read_pack(
     )
     (named,) = await _named_packs([pack], principal_names)
     return PackDraft(
-        pack=named, items=served, withheld=withheld > 0, marking=highest_marking(served, scheme)
+        pack=named, items=served, withheld=withheld, marking=highest_marking(served, scheme)
     )
 
 
@@ -9695,9 +11119,12 @@ async def add_pack_item(
     investigations: InvestigationsDep,
     working_set: WorkingSetDep,
     audit: AuditDep,
+    alerts_store: AlertsStoreDep,
+    typology_rules: TypologyRulesDep,
 ) -> PackItem:
     """The content is read and frozen here, as the adder — never taken from the request, except a
-    caption and a note's own words."""
+    caption and a note's own words. An alert (ADR-134 decision 1) is one of the adder's queue in
+    this case, read whole as them, or not found."""
     pack = await _pack_or_404(packs, investigation.id, pack_id)
     item = await _build_pack_item(
         body,
@@ -9712,6 +11139,8 @@ async def add_pack_item(
         investigations,
         audit,
         working_set,
+        alerts_store,
+        typology_rules,
     )
     await packs.add_item(pack.id, item)
     await audit.record(
@@ -9737,14 +11166,25 @@ async def _build_pack_item(
     investigations: InvestigationStore,
     audit: AuditWriter,
     working_set: WorkingSetService,
+    alerts_store: AlertStore,
+    typology_rules: TypologyRuleStore,
 ) -> StoredPackItem:
+    if body.kind == "alert":
+        try:
+            explained, events = await alert_queue.explain_with_evidence(
+                alerts_store, graph, analytics, case.id, body.alert_id or "", principal
+            )
+        except AlertNotFoundError as missing:
+            raise HTTPException(status_code=404, detail="no such alert in this case") from missing
+        return alert_item(explained, events, principal, scheme)
     if body.kind == "trend":
         saved = await trends.get(case.id, body.trend_id) if body.trend_id else None
         if saved is None:
             raise HTTPException(status_code=404, detail="no such trend in this case")
         figures = await _trend_figures(
-            saved, case, principal, ontology, analytics, investigations, audit, working_set, scheme
-        )
+            saved, case, principal, ontology, analytics, investigations, audit, working_set, scheme,
+            typology_rules,
+        )  # fmt: skip
         return trend_item(saved.id, figures, principal, scheme)
     if body.kind == "assessment":
         try:
@@ -9785,7 +11225,7 @@ async def remove_pack_item(
     audit: AuditDep,
 ) -> None:
     pack = await _pack_or_404(packs, investigation.id, pack_id)
-    _, shown, _ = await _readable_draft(packs, pack.id, principal, scheme, graph, investigation.id)
+    shown, _ = await _readable_draft(packs, pack.id, principal, scheme, graph, investigation.id)
     if item_id not in {i.id for i in shown} or not await packs.remove_item(pack.id, item_id):
         raise HTTPException(status_code=404, detail="no such item in this pack")
     await audit.record(
@@ -9814,20 +11254,22 @@ async def reorder_pack(
 ) -> PackDraft:
     """Only the reader's own items move; each item withheld from them keeps its place."""
     pack = await _pack_or_404(packs, investigation.id, pack_id)
-    items, shown, withheld = await _readable_draft(
+    shown, withheld = await _readable_draft(
         packs, pack.id, principal, scheme, graph, investigation.id
     )
+    if sorted(body.item_ids) != sorted(i.id for i in shown):
+        raise PackItemRefused("the new order must name each item you can see exactly once")
     try:
-        order = reorder_visible([i.id for i in items], {i.id for i in shown}, body.item_ids)
+        # The withheld items' places are worked out in the store, as the reader (rule 3).
+        await packs.reorder_visible(pack.id, principal, scheme, body.item_ids)
     except ValueError as exc:
         raise PackItemRefused(str(exc)) from exc
-    await packs.set_order(pack.id, order)
     await audit.record(
         principal=principal,
         action="reorder_pack",
         investigation_id=investigation.id,
         resolved_query={"pack": pack.id},
-        result_cardinality=len(order),
+        result_cardinality=len(body.item_ids),
     )
     by_id = {i.id: i for i in shown}
     served = [by_id[i].served() for i in body.item_ids]
@@ -9837,7 +11279,7 @@ async def reorder_pack(
     return PackDraft(
         pack=named,
         items=served,
-        withheld=withheld > 0,
+        withheld=withheld,
         marking=highest_marking(served, scheme),
     )
 
@@ -9862,18 +11304,25 @@ async def refresh_pack_item(
     investigations: InvestigationsDep,
     working_set: WorkingSetDep,
     audit: AuditDep,
+    alerts_store: AlertsStoreDep,
+    typology_rules: TypologyRulesDep,
 ) -> PackItem:
-    """A trend snapshot counted again, now, as the refresher; the earlier one stays in the
-    history (decision 4)."""
+    """A trend snapshot counted again, or an alert read again (ADR-134 decision 1: so an alert
+    added while open can say how it was closed), now, as the refresher; the earlier one stays in
+    the history (decision 4)."""
     pack = await _pack_or_404(packs, investigation.id, pack_id)
-    _, shown, _ = await _readable_draft(packs, pack.id, principal, scheme, graph, investigation.id)
+    shown, _ = await _readable_draft(packs, pack.id, principal, scheme, graph, investigation.id)
     old = next((i for i in shown if i.id == item_id), None)
     if old is None:
         raise HTTPException(status_code=404, detail="no such item in this pack")
-    if old.kind != "trend" or old.trend_id is None:
-        raise PackItemRefused("only a trend snapshot is refreshed")
+    if old.kind == "trend" and old.trend_id is not None:
+        again = AddPackItem(kind="trend", trend_id=old.trend_id)
+    elif old.kind == "alert" and old.alert is not None:
+        again = AddPackItem(kind="alert", alert_id=old.alert.alert_id)
+    else:
+        raise PackItemRefused("only a trend snapshot or an alert is refreshed")
     new = await _build_pack_item(
-        AddPackItem(kind="trend", trend_id=old.trend_id),
+        again,
         investigation,
         principal,
         graph,
@@ -9885,6 +11334,8 @@ async def refresh_pack_item(
         investigations,
         audit,
         working_set,
+        alerts_store,
+        typology_rules,
     )
     if not await packs.replace_item(pack.id, old.id, new):
         raise HTTPException(status_code=404, detail="no such item in this pack")
@@ -9914,10 +11365,12 @@ async def pack_history(
     (pack,) = await _named_packs(
         [await _pack_or_404(packs, investigation.id, pack_id)], principal_names
     )
-    earlier = await packs.earlier_snapshots(pack.id)
-    shown, withheld = await readable(earlier, principal, scheme, graph, investigation.id)
+    earlier, in_store = await packs.readable_earlier(pack.id, principal, scheme)
+    shown, withheld = await readable(
+        earlier, principal, scheme, graph, investigation.id, withheld_in_store=in_store
+    )
     return PackHistory(
-        earlier_snapshots=[i.served() for i in shown], withheld=withheld > 0, versions=pack.versions
+        earlier_snapshots=[i.served() for i in shown], withheld=withheld, versions=pack.versions
     )
 
 
@@ -9939,13 +11392,13 @@ async def publish_pack(
     """A new immutable version. Refused while the draft holds an item the publisher may not see:
     nobody publishes what they cannot read (Amendment 1)."""
     pack = await _pack_or_404(packs, investigation.id, pack_id)
-    items, _, withheld = await _readable_draft(
+    shown, withheld = await _readable_draft(
         packs, pack.id, principal, scheme, graph, investigation.id
     )
-    if not items:
-        raise PackItemRefused("an empty pack has nothing to publish")
     if withheld:
         raise PackHasWithheldItems()
+    if not shown:
+        raise PackItemRefused("an empty pack has nothing to publish")
     version = await packs.publish(pack.id, principal)
     await audit.record(
         principal=principal,
@@ -10051,10 +11504,13 @@ async def read_published_pack(
 ) -> PublishedPack:
     """The newest published version as this reader may see it (decision 5): every read audited."""
     pack = await _pack_or_404(packs, investigation.id, pack_id)
-    version = await packs.latest_published(pack.id)
-    if version is None:
+    found = await packs.readable_version(pack.id, principal, scheme)
+    if found is None:
         raise HTTPException(status_code=404, detail="this pack has no publication")
-    shown, withheld = await readable(version.items, principal, scheme, graph, investigation.id)
+    version, items, in_store = found
+    shown, withheld = await readable(
+        items, principal, scheme, graph, investigation.id, withheld_in_store=in_store
+    )
     served = [i.served() for i in shown]
     await audit.record(
         principal=principal,
@@ -10074,7 +11530,7 @@ async def read_published_pack(
             version.published_by
         ),
         items=served,
-        withheld=withheld > 0,
+        withheld=withheld,
         marking=highest_marking(served, scheme),
     )
 
@@ -10100,12 +11556,14 @@ async def export_pack_route(
     approved manifest, from which the Glass renders the PDF. Editor and `export`, as every
     export."""
     pack = await _pack_or_404(packs, investigation.id, pack_id)
-    version = await packs.latest_published(pack.id)
-    if version is None:
+    found = await packs.readable_version(pack.id, principal, scheme)
+    if found is None:
         raise HTTPException(status_code=404, detail="this pack has no publication to export")
+    version, _, in_store = found
     result = await export_pack(
         pack=pack,
         version=version,
+        withheld_in_store=in_store,
         request=body,
         exporter=principal,
         scheme=scheme,
@@ -10271,6 +11729,76 @@ async def my_rights_route(principal: PrincipalDep) -> RightsResponse:
     """ADR-112: what the signed-in person may do, so the Glass and the Studio leave out what they
     would only refuse. Not a gate — every route still checks its own right."""
     return RightsResponse(rights=sorted(rights_for(principal.roles)))
+
+
+@app.get("/v1/models/engines")
+async def model_engines_route(principal: PrincipalDep, routes: ModelRoutesDep) -> OfferedEngines:
+    """ADR-135 decision 5: the engines an analyst may choose for Ask the case and Ask to search —
+    the local engine and each enabled engine that has a key — with each one's label and the roles
+    it is the default for. Any signed-in person; nothing about a key, not even whether one exists
+    (an engine with none is simply not listed). The route still decides each request."""
+    return OfferedEngines(engines=routes.offered())
+
+
+@app.get("/v1/investigations/{investigation_id}/models/engines")
+async def case_model_engines_route(
+    investigation: InvestigationViewerDep, routes: ModelRoutesDep, datasets: DatasetsDep
+) -> OfferedEngines:
+    """ADR-136 decision 3: the engines offered, as for `GET /v1/models/engines`, with each one's
+    contract mark, and an engine the case's data may not reach listed unavailable with the reason in
+    words. The case's datasets are read from the store, as the routing reads them for Ask the case;
+    a Viewer of the case may ask (anyone else is told the case is not there). Each request is still
+    decided by the route, by its own handling code and datasets."""
+    case_datasets = await datasets.ids_of_case(investigation.id)
+    held = await datasets.egress_of(case_datasets)
+    return OfferedEngines(engines=routes.offered(case_datasets, held))
+
+
+@app.get("/v1/admin/datasets", dependencies=[Depends(require_right(Right.ADMINISTER_SYSTEM))])
+async def admin_datasets_route(datasets: DatasetsDep) -> list[AdminDataset]:
+    """ADR-136 decision 2: every dataset of the deployment, with the unit that holds it and its
+    egress, for the administrator who sets where each may go. Names and settings only: nothing of
+    what a dataset holds, and no count."""
+    return [
+        AdminDataset(id=d.id, name=d.name, owning_unit=d.owning_unit, egress=d.egress)
+        for d in await datasets.list_all()
+    ]
+
+
+@app.put(
+    "/v1/admin/datasets/{dataset_id}/egress",
+    dependencies=[Depends(require_right(Right.ADMINISTER_SYSTEM))],
+)
+async def set_dataset_egress_route(
+    dataset_id: str,
+    body: DatasetEgressInput,
+    principal: PrincipalDep,
+    datasets: DatasetsDep,
+    audit: AuditDep,
+) -> AdminDataset:
+    """ADR-136 decision 2: an administrator sets where a dataset's material may go — `none`,
+    `contracted` or `any` — and each change is audited: who (the principal), when (the audit row's
+    own time), and from what to what."""
+    before, changed = await datasets.set_egress(dataset_id, body.egress)
+    await audit.record(
+        principal=principal,
+        action="set_dataset_egress",
+        resolved_query={"dataset_id": dataset_id, "before": before, "after": changed.egress},
+        result_cardinality=1,
+    )
+    return AdminDataset(
+        id=changed.id, name=changed.name, owning_unit=changed.owning_unit, egress=changed.egress
+    )
+
+
+@app.exception_handler(UnknownDatasetEgressError)
+async def _unknown_dataset_egress_handler(
+    request: Request, exc: UnknownDatasetEgressError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content={"error": "dataset_not_found", "detail": "There is no such dataset."},
+    )
 
 
 @app.post("/v1/ws-ticket", response_model=WsTicketResponse)

@@ -1,8 +1,12 @@
 // The case's typology rules (`06_DECISIONS.md` ADR-109 phase A, rulings 1 and 4): what watches this
 // case's loads, where each runs, and — for an Author — deploying one and retiring one. A rule is a
 // typology with its parameters, a closed list per typology (rule 8: no expression language).
-import { useCallback, useEffect, useState } from "react";
+// ADR-133 stage (a): the seven typologies are offered as templates above the form; using one fills it.
+// ADR-133 stage (c): the four new AML templates — a jurisdiction list as two-letter codes the Author
+// enters (data in the rule, never code), cash types, and a measure for a rise in velocity.
+import { useCallback, useEffect, useRef, useState } from "react";
 import type {
+  RuleSentence,
   SavedPattern,
   TypologyRule,
   TypologyRuleInput,
@@ -12,6 +16,10 @@ import type { AccessLevel } from "../investigation/cases";
 import { listPatterns } from "../patterns/api";
 import { deployRule, listRules, retireRule, type AlertsApi } from "./api";
 import { money, ruleTypologyLabel, when } from "./names";
+import { RuleApproval, RuleHistory, RuleSchedule } from "./RuleChanges";
+import { SentenceBuilder } from "./SentenceBuilder";
+import { scheduleWords, sentenceSummary } from "./sentence";
+import { TEMPLATES, type RuleTemplate } from "./templates";
 
 type Typology =
   | "structuring"
@@ -20,7 +28,33 @@ type Typology =
   | "kyc_screening"
   | "shared_attributes"
   | "document_verification"
-  | "pattern";
+  | "pattern"
+  | "sentence"
+  | "high_risk_jurisdiction"
+  | "large_cash"
+  | "dormant_reactivated"
+  | "velocity_rise";
+
+/** ADR-133 stage (c): these compare an account with its own stored past, so run after commit only. */
+export const AFTER_COMMIT_ONLY: ReadonlySet<Typology> = new Set(["pattern", "dormant_reactivated", "velocity_rise"]);
+
+/** The cash movements `large_cash` may watch (the ontology's `transaction_type`). */
+export const CASH_TYPES = [
+  { key: "CASH_IN", label: "Cash paid in (CASH_IN)" },
+  { key: "CASH_OUT", label: "Cash drawn out (CASH_OUT)" },
+] as const;
+
+/** Two-letter codes as typed, separated by commas or spaces, upper-cased; the server checks each. */
+export function jurisdictionCodes(typed: string): string[] {
+  return [...new Set(typed.split(/[\s,;]+/).map((c) => c.trim().toUpperCase()).filter(Boolean))];
+}
+
+/** What a stage (c) template adds to its numbers. */
+export interface AmlExtras {
+  jurisdictions?: string[];
+  cashTypes?: string[];
+  measure?: "count" | "amount";
+}
 
 interface Field {
   key: string;
@@ -116,6 +150,19 @@ export const PARAMETERS: Record<Typology, Field[]> = {
     },
   ],
   document_verification: [],
+  // ADR-133 stage (c): the new AML templates (the jurisdiction list, cash types and the measure are
+  // their own fields, below the numbers).
+  high_risk_jurisdiction: [],
+  large_cash: [{ key: "threshold", label: "Cash at or over", step: "1", fallback: 10000 }],
+  dormant_reactivated: [{ key: "dormant_days", label: "Dormant for at least (days)", step: "1", fallback: 180 }],
+  velocity_rise: [
+    { key: "recent_days", label: "Over the last (days)", step: "1", fallback: 7 },
+    { key: "baseline_days", label: "Against its own rate over the days before (days)", step: "1", fallback: 90 },
+    { key: "factor", label: "At least (times its own rate)", step: "0.5", fallback: 3 },
+    { key: "min_recent", label: "With at least (movements in the last days)", step: "1", fallback: 5 },
+  ],
+  // ADR-133 stage (b): written in the sentence builder, never in this form.
+  sentence: [],
   // ADR-109 phase D: a pattern drawn in the Query builder and saved; it alerts on whole matches.
   pattern: [
     {
@@ -152,6 +199,25 @@ export function describeParams(
     }
     case "document_verification":
       return "a new customer with no valid verifying document (none, expired or marked fraudulent); checked again daily as documents lapse";
+    case "high_risk_jurisdiction": {
+      const codes = ((rule.params as unknown as Record<string, unknown>).jurisdictions as string[] | undefined) ?? [];
+      return `a payment to or from an account held in ${codes.join(", ")} (its IBAN country code)`;
+    }
+    case "large_cash": {
+      const kinds = ((rule.params as unknown as Record<string, unknown>).cash_types as string[] | undefined) ?? [];
+      const words = kinds.map((k) => (k === "CASH_IN" ? "paid in" : "drawn out")).join(" or ");
+      return `cash ${words} of ${money(n("threshold"))} or more in one movement`;
+    }
+    case "dormant_reactivated":
+      return `an account moving money again after ${n("dormant_days")} days or more without a movement; runs after each load commits`;
+    case "velocity_rise": {
+      const measure = (rule.params as unknown as Record<string, unknown>).measure === "amount" ? "amount moved" : "movements";
+      return `an account's ${measure} over the last ${n("recent_days")} day(s) at ${n("factor")} times or more its own daily rate over the ${n("baseline_days")} days before, with ${n("min_recent")} or more movements; runs after each load commits`;
+    }
+    case "sentence": {
+      const sentence = (rule.params as unknown as { sentence: RuleSentence }).sentence;
+      return sentenceSummary(sentence);
+    }
     case "pattern": {
       const id = String(
         (rule.params as unknown as Record<string, unknown>).pattern_id ?? "",
@@ -174,24 +240,51 @@ export function ruleInput(
   choices: Record<string, boolean> = {},
   kinds: string[] = ["msisdn", "email", "ip"],
   patternId = "",
+  extras: AmlExtras = {},
 ): TypologyRuleInput {
   const params: Record<string, unknown> = { typology };
   if (typology === "pattern") params.pattern_id = patternId;
+  if (typology === "high_risk_jurisdiction") params.jurisdictions = extras.jurisdictions ?? [];
   for (const field of PARAMETERS[typology])
     params[field.key] = Number(values[field.key] ?? field.fallback);
   for (const choice of CHOICES[typology] ?? [])
     params[choice.key] = choices[choice.key] ?? choice.fallback;
   if (typology === "shared_attributes") params.kinds = kinds;
+  if (typology === "large_cash") params.cash_types = extras.cashTypes ?? CASH_TYPES.map((c) => c.key);
+  if (typology === "velocity_rise") params.measure = extras.measure ?? "count";
   return {
     name: name.trim(),
     params: params as unknown as TypologyRuleInput["params"],
-    trigger,
+    trigger: AFTER_COMMIT_ONLY.has(typology) ? "post_commit" : trigger,
     budget_ms: budgetMs,
   };
 }
 
 export interface RulesPanelProps extends AlertsApi {
   level: AccessLevel | null;
+  /** ADR-133 decision 1: a rule for the whole deployment is an administrator's. */
+  isAdministrator?: boolean;
+  /** ADR-133 decision 7: who is reading, so their own proposal is not offered to them to approve. */
+  accountId?: string | null;
+}
+
+/** When the rule runs, in words: before or after each load, or on its schedule (stage (d)). */
+export function runsWords(rule: TypologyRule): string {
+  if (rule.trigger === "schedule") {
+    const schedule = (rule.params as unknown as { sentence?: { schedule?: { every: string; hour: number; weekday?: number | null } } })
+      .sentence?.schedule;
+    return `Runs on a schedule, ${scheduleWords(schedule)} (Europe/London), as its author`;
+  }
+  return rule.trigger === "pre_commit"
+    ? `Judges each load before it commits (budget ${(rule.budget_ms ?? 5000).toLocaleString("en-GB")} ms; held if it cannot judge)`
+    : "Runs after each load commits";
+}
+
+/** The rule's status in words; a whole-deployment rule waiting for its first approval runs nowhere. */
+export function statusWords(rule: TypologyRule): string {
+  if (rule.status === "retired") return `retired ${rule.retired_at ? when(rule.retired_at) : ""}`.trim();
+  if (rule.status === "pending") return "not running: waiting for a second person's approval";
+  return `active${(rule.version ?? 1) > 1 ? `, version ${rule.version}` : ""}`;
 }
 
 export function RulesPanel(props: RulesPanelProps) {
@@ -200,6 +293,7 @@ export function RulesPanel(props: RulesPanelProps) {
   const [problem, setProblem] = useState<string | null>(null);
   const [said, setSaid] = useState<string | null>(null);
   const [patterns, setPatterns] = useState<SavedPattern[]>([]);
+  const [preset, setPreset] = useState<{ template: RuleTemplate; nonce: number } | null>(null);
   const author = level === "author";
 
   // ADR-109 phase D: the account's own saved patterns — what a drawn rule may be deployed from,
@@ -264,22 +358,33 @@ export function RulesPanel(props: RulesPanelProps) {
                 {describeParams(rule, patternNames)}
               </span>
               <span className="label">
-                {rule.trigger === "pre_commit"
-                  ? `Judges each load before it commits (budget ${(rule.budget_ms ?? 5000).toLocaleString("en-GB")} ms; held if it cannot judge)`
-                  : "Runs after each load commits"}{" "}
-                ·{" "}
-                {rule.status === "retired"
-                  ? `retired ${rule.retired_at ? when(rule.retired_at) : ""}`
-                  : "active"}
+                {runsWords(rule)} · {statusWords(rule)}
+              </span>
+              <RuleApproval
+                {...props}
+                rule={rule}
+                canApprove={author && (props.isAdministrator ?? false) && rule.pending_by !== props.accountId}
+                onDone={(words) => {
+                  setSaid(words);
+                  reload();
+                }}
+              />
+              <span style={{ display: "flex", gap: "var(--sp-8)", flexWrap: "wrap" }}>
+                <RuleHistory {...props} rule={rule} />
+                {rule.trigger === "schedule" && <RuleSchedule {...props} rule={rule} />}
               </span>
             </span>
-            {author && rule.status === "active" && (
+            {author && rule.status === "active" && !rule.pending_action && (
               <Button
                 aria-label={`Retire ${rule.name}`}
                 onClick={() =>
                   void retireRule(props, rule.id)
-                    .then(() => {
-                      setSaid(`Retired “${rule.name}”.`);
+                    .then((done) => {
+                      setSaid(
+                        done.pending_action === "retire"
+                          ? `Retiring “${rule.name}” waits for a second person's approval.`
+                          : `Retired “${rule.name}”.`,
+                      );
                       reload();
                     })
                     .catch((e: Error) => setProblem(e.message))
@@ -291,9 +396,28 @@ export function RulesPanel(props: RulesPanelProps) {
           </li>
         ))}
       </ul>
+      <SentenceBuilder
+        {...props}
+        isAdministrator={props.isAdministrator ?? false}
+        patterns={patterns}
+        onDeployed={(rule) => {
+          setSaid(
+            rule.status === "pending"
+              ? `“${rule.name}” is deployed for the whole deployment and waits for a second person's approval before it runs.`
+              : `Deployed “${rule.name}”.`,
+          );
+          reload();
+        }}
+      />
+      <Templates
+        canUse={author}
+        onUse={(template) => setPreset({ template, nonce: (preset?.nonce ?? 0) + 1 })}
+      />
       {author ? (
         <DeployForm
+          key={preset?.nonce ?? 0}
           {...props}
+          preset={preset?.template ?? null}
           patterns={patterns}
           onDeployed={(rule) => {
             setSaid(`Deployed “${rule.name}”.`);
@@ -307,14 +431,58 @@ export function RulesPanel(props: RulesPanelProps) {
   );
 }
 
+const SEVERITY_WORDS: Record<string, string> = { high: "high", medium: "medium", low: "low" };
+
+/** ADR-133 decision 2, stage (a): the typologies as named templates, grouped by the work they serve.
+ * Every reader sees them; an Author uses one to fill the form below. */
+function Templates(props: { canUse: boolean; onUse: (template: RuleTemplate) => void }) {
+  return (
+    <section aria-label="Rule templates" style={{ display: "grid", gap: "var(--sp-8)" }}>
+      <h3 className="value" style={{ margin: 0 }}>
+        Templates
+      </h3>
+      <p className="label" style={{ margin: 0 }}>
+        Start a rule from one of these: it fills the form with the template&apos;s defaults, which you can change before deploying.
+      </p>
+      <ul aria-label="Templates" style={{ listStyle: "none", margin: 0, padding: 0, display: "grid", gap: "var(--sp-4)" }}>
+        {TEMPLATES.map((template) => (
+          <li
+            key={template.typology}
+            style={{ display: "flex", justifyContent: "space-between", gap: "var(--sp-12)", alignItems: "center", borderBottom: "1px solid var(--border-subtle)", padding: "var(--sp-4) 0" }}
+          >
+            <span style={{ display: "flex", flexDirection: "column", gap: "var(--sp-4)" }}>
+              <span className="value">
+                {template.name} · <span className="label">{template.group}</span>
+              </span>
+              <span className="label">{template.description}</span>
+              <span className="label">{`Raises ${SEVERITY_WORDS[template.severity]}-severity alerts.`}</span>
+            </span>
+            {props.canUse && (
+              <Button aria-label={`Use the template: ${template.name}`} onClick={() => props.onUse(template)}>
+                Use
+              </Button>
+            )}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 function DeployForm(
   props: RulesPanelProps & {
     patterns: SavedPattern[];
+    preset: RuleTemplate | null;
     onDeployed: (rule: TypologyRule) => void;
   },
 ) {
-  const [name, setName] = useState("");
-  const [typology, setTypology] = useState<Typology>("structuring");
+  const [name, setName] = useState(props.preset?.name ?? "");
+  const [typology, setTypology] = useState<Typology>(props.preset?.typology ?? "structuring");
+  const nameRef = useRef<HTMLInputElement>(null);
+  // A template just used: the form is filled, and the keyboard is put on its first field.
+  useEffect(() => {
+    if (props.preset) nameRef.current?.focus();
+  }, [props.preset]);
   const [values, setValues] = useState<Record<string, string>>({});
   const [trigger, setTrigger] = useState<"pre_commit" | "post_commit">(
     "post_commit",
@@ -323,7 +491,11 @@ function DeployForm(
   const [choices, setChoices] = useState<Record<string, boolean>>({});
   const [kinds, setKinds] = useState<string[]>(["msisdn", "email", "ip"]);
   const [patternId, setPatternId] = useState("");
+  const [codes, setCodes] = useState("");
+  const [cashTypes, setCashTypes] = useState<string[]>(CASH_TYPES.map((c) => c.key));
+  const [measure, setMeasure] = useState<"count" | "amount">("count");
   const [problem, setProblem] = useState<string | null>(null);
+  const afterCommitOnly = AFTER_COMMIT_ONLY.has(typology);
 
   return (
     <form
@@ -337,11 +509,12 @@ function DeployForm(
             name,
             typology,
             values,
-            typology === "pattern" ? "post_commit" : trigger,
+            trigger,
             Number(budget),
             choices,
             kinds,
             patternId,
+            { jurisdictions: jurisdictionCodes(codes), cashTypes, measure },
           ),
         )
           .then((rule) => {
@@ -364,6 +537,7 @@ function DeployForm(
       <label className="label" style={FIELD}>
         Name
         <Input
+          ref={nameRef}
           value={name}
           onChange={(e) => setName(e.target.value)}
           required
@@ -393,6 +567,10 @@ function DeployForm(
           <option value="document_verification">
             KYC: verifying documents
           </option>
+          <option value="high_risk_jurisdiction">AML: high-risk jurisdiction</option>
+          <option value="large_cash">AML: large cash</option>
+          <option value="dormant_reactivated">AML: dormant account reactivated</option>
+          <option value="velocity_rise">AML: sudden rise in velocity</option>
           <option value="pattern">
             Drawn pattern (from the Query builder)
           </option>
@@ -489,10 +667,52 @@ function DeployForm(
           ))}
         </fieldset>
       )}
+      {typology === "high_risk_jurisdiction" && (
+        <label className="label" style={FIELD}>
+          High-risk jurisdictions: two-letter country codes, separated by commas (an account&apos;s is its IBAN&apos;s first two letters)
+          <Input
+            aria-label="High-risk jurisdictions"
+            placeholder="for example XA, XB"
+            value={codes}
+            onChange={(e) => setCodes(e.target.value)}
+          />
+        </label>
+      )}
+      {typology === "large_cash" && (
+        <fieldset style={{ border: "none", padding: 0, display: "flex", gap: "var(--sp-12)" }}>
+          <legend className="label">Which cash movements</legend>
+          {CASH_TYPES.map((cash) => (
+            <label key={cash.key} className="label" style={{ display: "flex", gap: "var(--sp-4)", alignItems: "center" }}>
+              <input
+                type="checkbox"
+                aria-label={cash.label}
+                checked={cashTypes.includes(cash.key)}
+                onChange={(e) =>
+                  setCashTypes(e.target.checked ? [...cashTypes, cash.key] : cashTypes.filter((k) => k !== cash.key))
+                }
+              />
+              {cash.label}
+            </label>
+          ))}
+        </fieldset>
+      )}
+      {typology === "velocity_rise" && (
+        <label className="label" style={FIELD}>
+          Measured by
+          <Select aria-label="Measured by" value={measure} onChange={(e) => setMeasure(e.target.value as "count" | "amount")}>
+            <option value="count">The number of movements</option>
+            <option value="amount">The amount moved</option>
+          </Select>
+        </label>
+      )}
       {typology === "pattern" ? (
         <p className="label" style={{ margin: 0 }}>
           Runs after each load commits: a drawn pattern is matched against the
           stored graph.
+        </p>
+      ) : afterCommitOnly ? (
+        <p className="label" style={{ margin: 0 }}>
+          Runs after each load commits: an account is compared with its own stored past.
         </p>
       ) : (
         <label className="label" style={FIELD}>
@@ -509,7 +729,7 @@ function DeployForm(
           </Select>
         </label>
       )}
-      {trigger === "pre_commit" && typology !== "pattern" && (
+      {trigger === "pre_commit" && !afterCommitOnly && (
         <label className="label" style={FIELD}>
           Time budget (ms) — a load it cannot judge in time is held for review
           <Input
@@ -529,7 +749,12 @@ function DeployForm(
       <Button
         type="submit"
         variant="primary"
-        disabled={!name.trim() || (typology === "pattern" && !patternId)}
+        disabled={
+          !name.trim() ||
+          (typology === "pattern" && !patternId) ||
+          (typology === "high_risk_jurisdiction" && jurisdictionCodes(codes).length === 0) ||
+          (typology === "large_cash" && cashTypes.length === 0)
+        }
       >
         Deploy
       </Button>

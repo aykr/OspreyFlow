@@ -1,10 +1,47 @@
 # OspreyFlow
 
-OspreyFlow is an open-source intelligence analysis and network discovery platform. It ingests
-structured records and unstructured material (text, audio, imagery), resolves entities across
+OspreyFlow is an open source intelligence mapping, anti-money-laundering and fraud detection
+platform, developed by Solirius Reply and released under the Apache License 2.0.
+
+It serves crime analysis, anti-money-laundering, fraud detection, and event monitoring and alerting.
+It ingests structured records and unstructured material (text, audio, imagery), resolves entities across
 sources, persists them in a property graph, and gives an analyst a single workspace in which
 network, social-network, pattern, temporal and geospatial analysis are five views of one working
 set rather than five separate tools.
+
+## What it does
+
+- **Intelligence mapping.** One case, read as a network, a map, a timeline and reports, with a
+  filter in one view applying in all of them; the network also as accessible tables (the Matrix
+  view). Every element keeps where it came from, and anything a model suggests stays *inferred*
+  until a person confirms it.
+- **Monitoring and alerting.** One queue for every alert an analyst may see: hotlists with review
+  dates, rules written as plain sentences and previewed on the last 90 days before they go live,
+  typology and anti-money-laundering templates, and screening lists (connectors for the UK Sanctions
+  List, OFAC, the EU, the UN and OpenSanctions, proven on synthetic files) re-screened when a new
+  version arrives. Rules run on each load, before or after it commits, or on a schedule; the data
+  engineer chooses each pipeline's checks and sees what a sample would raise. Closing an alert
+  takes a reason, and a second person approves a whole-deployment rule or a high-severity close.
+  Alerts go into report packs and alert trends, and their figures reach a monitoring dashboard.
+- **Connection strength.** How strong a link is drawn rests on its own count and recency, on
+  influencers that boost a kind of link (direct contact, or a record or dataset that evidences it),
+  and on how rare a shared value is. All of it is worked out over what each viewer may see, shown
+  in the legend, filtered in Metrics, explained in the Inspector and usable in a rule. An
+  installation can reproduce a client's own scoring (client parity); installation-wide changes need
+  a second person.
+- **Starters.** `ospreyflow install --starter <theme>-<domain>`: the OspreyFlow or GOV.UK theme with
+  a crime, anti-money-laundering, fraud, cyber or blank domain and its synthetic demo data. Several
+  deployments can run side by side (`--name`, `ospreyflow deployments`, `ospreyflow switch`), and
+  `ospreyflow demo add public` loads a public dataset of your choosing (the IEEE VAST Challenge
+  datasets are catalogued; you download them yourself).
+- **GOV.UK.** The GOV.UK theme (header, footer, crown, GDS Transport, phase banner and the service's
+  own name) is a deployment setting, not a fork. OspreyFlow is designed to meet the GDS Service
+  Standard; an independent accessibility audit, a penetration test and a DPIA are planned, and only
+  a service assessment panel can say a service meets the Standard. A gov.uk service is served over
+  HTTPS (Small or Enterprise); Lite answers on its own computer alone.
+- **Model engines.** The local model answers by default. An administrator may enable hosted engines
+  and give each its key (`ospreyflow models key <name>`); material leaves only when both its
+  handling code and its dataset allow it, and each engine shows whether a privacy contract covers it.
 
 ## Start here
 
@@ -50,9 +87,12 @@ architecture each reader needs.
 
 ## Installing and running it
 
-Install the command once, from this repository (`install.ps1` on Windows):
+Install the command once, from a checkout of this repository, `https://github.com/aykr/OspreyFlow`
+(`install.ps1` on Windows):
 
 ```
+git clone https://github.com/aykr/OspreyFlow.git
+cd OspreyFlow
 sh install.sh
 ```
 
@@ -67,7 +107,9 @@ ospreyflow open                        # the Glass in your browser
 Every question `install` asks can be answered in a file instead (`--config install.yaml --yes`), so
 a tester or a CI job installs without prompts. The other verbs: `status`, `start` (`--build` to
 rebuild from this checkout), `stop`, `logs`, `demo list` and `demo add`, `backup`, `restore`,
-`repair-sign-in` (when nobody can sign in) and `uninstall`. Every operator task is an `ospreyflow`
+`repair-sign-in` (when nobody can sign in), `apply` (a changed `osprey.yaml`, keeping every secret),
+`models` (the model engines and their keys), `starters`, `deployments`, `switch` and `uninstall`.
+Every operator task is an `ospreyflow`
 verb; `make` targets are for developers working on OspreyFlow itself.
 
 **Demo packs** load into cases of their own: three synthetic ones generated here, and two you

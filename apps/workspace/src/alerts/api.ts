@@ -4,17 +4,48 @@
 // generated one, so a change on the server is a type error here, never a silent drift.
 import type {
   Alert,
+  AlertAssignee,
   AlertDispositionInput,
   AlertExplanation,
+  CompiledSentence,
   HeldRow,
+  ListSchedule,
+  OntologySchema,
+  PatternQuery,
+  RulePreview,
+  RuleSentence,
   QueuedAlert,
   RuleAuditPage,
+  RuleScheduleView,
+  RuleVersion,
+  ScreeningLists,
+  ScreeningListsOverview,
+  ScreeningListStatus,
+  ScreeningListUpdate,
+  ScreeningSubscriptionInput,
   TypologyRule,
   TypologyRuleInput,
 } from "../../../../packages/schemas/generated";
 import type { WorkingSetDelta } from "../workingset/models";
 
 export type QueueFilter = "active" | "closed" | "all";
+export type KindFilter = "all" | "typology" | "hotlist" | "monitor";
+export type SeverityFilter = "all" | "high" | "medium" | "low";
+
+/** ADR-133 stage (a): what the queue is asked for. The server filters; the Glass never hides a row
+ * it was sent. */
+export interface QueueQuery {
+  status: QueueFilter;
+  kind?: KindFilter;
+  severity?: SeverityFilter;
+}
+
+export function queueSearch(query: QueueQuery): string {
+  const params = new URLSearchParams({ status: query.status });
+  if (query.kind && query.kind !== "all") params.append("kind", query.kind);
+  if (query.severity && query.severity !== "all") params.append("severity", query.severity);
+  return params.toString();
+}
 
 export interface CanvasOutcome {
   delta: WorkingSetDelta;
@@ -39,13 +70,42 @@ async function failure(response: Response, what: string): Promise<Error> {
   if (body.error === "alert_moved_on") {
     return new Error("Someone else has already claimed or closed this alert.");
   }
-  if (body.error === "limit_exceeded") {
+  if (body.error === "limit_exceeded" && what !== "Previewing the rule") {
     return new Error(
       `Too many for the canvas: ${fmt.format(body.would_be ?? 0)} ${body.cap_kind ?? "nodes"} against a limit of ${fmt.format(body.cap ?? 0)}.`,
     );
   }
+  if (body.error === "sentence_refused" && typeof body.detail === "string") {
+    // ADR-133 decision 1: the server names the blank and says why, in words.
+    return new Error(`${body.detail[0]?.toUpperCase() ?? ""}${body.detail.slice(1)}.`);
+  }
+  if (body.error === "limit_exceeded" && what === "Previewing the rule") {
+    return new Error(
+      `Too many to preview: the rule's subjects number ${fmt.format(body.would_be ?? 0)}, past the limit of ${fmt.format(body.cap ?? 0)}. Nothing was counted; narrow the sentence and preview again.`,
+    );
+  }
+  // ADR-133 decision 7: the server says, in words, why a second person is needed.
+  const own = body.detail as { error?: unknown; message?: unknown } | undefined;
+  if (own && typeof own === "object" && own.error === "own_change" && typeof own.message === "string") {
+    return new Error(own.message);
+  }
+  const refusal = body as { error?: string; message?: unknown };
+  if (refusal.error === "rule_change_refused" && typeof refusal.message === "string") {
+    return new Error(refusal.message);
+  }
+  if (body.error === "assignment_refused" && typeof body.detail === "string") {
+    return new Error(body.detail);
+  }
   if (body.error === "release_refused" && typeof body.detail === "string") {
     return new Error(`${body.detail[0]?.toUpperCase() ?? ""}${body.detail.slice(1)}.`);
+  }
+  // ADR-133 stage (c): a screening list refused or not found, in the server's own words.
+  const said = body.detail as { message?: unknown; right?: unknown } | undefined;
+  if (said && typeof said === "object" && typeof said.message === "string") {
+    return new Error(`${said.message[0]?.toUpperCase() ?? ""}${said.message.slice(1)}.`);
+  }
+  if (response.status === 403 && said?.right === "load_screening_lists") {
+    return new Error(`${what} needs the right to load screening lists.`);
   }
   if (response.status === 403) return new Error(`${what} needs a higher level in this case.`);
   if (response.status === 404) return new Error(`${what}: not found, or not yours to see.`);
@@ -82,8 +142,18 @@ export interface AlertsApi {
   investigationId: string;
 }
 
-export const listQueue = (a: AlertsApi, filter: QueueFilter) =>
-  call<QueuedAlert[]>(caseUrl(a.apiBaseUrl, a.investigationId, `alert-queue?status=${filter}`), a.bearerToken, "Reading the alert queue");
+export const listQueue = (a: AlertsApi, query: QueueFilter | QueueQuery) =>
+  call<QueuedAlert[]>(
+    caseUrl(a.apiBaseUrl, a.investigationId, `alert-queue?${queueSearch(typeof query === "string" ? { status: query } : query)}`),
+    a.bearerToken,
+    "Reading the alert queue",
+  );
+
+export const listAssignees = (a: AlertsApi) =>
+  call<AlertAssignee[]>(caseUrl(a.apiBaseUrl, a.investigationId, "alert-assignees"), a.bearerToken, "Reading who alerts may be given to");
+
+export const assignAlert = (a: AlertsApi, alertId: string, assignee: string) =>
+  call<Alert>(caseUrl(a.apiBaseUrl, a.investigationId, `alert-queue/${encodeURIComponent(alertId)}/assign`), a.bearerToken, "Giving the alert", { method: "POST", body: { assignee } });
 
 export const explainAlert = (a: AlertsApi, alertId: string) =>
   call<AlertExplanation>(caseUrl(a.apiBaseUrl, a.investigationId, `alert-queue/${encodeURIComponent(alertId)}`), a.bearerToken, "Opening the alert");
@@ -124,4 +194,79 @@ export const releaseHeldRows = (a: AlertsApi, recipeId: string, ids: string[], r
     a.bearerToken,
     "Releasing the rows",
     { method: "POST", body: { ids, reason } },
+  );
+
+// --- rules written as sentences (ADR-133 decisions 1 and 3, stage (b)) ---------------------------
+
+export const readOntology = (a: AlertsApi) =>
+  call<OntologySchema>(`${a.apiBaseUrl}/v1/ontology`, a.bearerToken, "Reading the ontology");
+
+export const compileSentence = (a: AlertsApi, sentence: RuleSentence) =>
+  call<CompiledSentence>(caseUrl(a.apiBaseUrl, a.investigationId, "rules/sentence/compile"), a.bearerToken, "Checking the sentence", { method: "POST", body: sentence });
+
+export const readSentence = (a: AlertsApi, pattern: PatternQuery, sentence: RuleSentence) =>
+  call<RuleSentence>(caseUrl(a.apiBaseUrl, a.investigationId, "rules/sentence/read"), a.bearerToken, "Reading the pattern as a sentence", { method: "POST", body: { pattern, sentence } });
+
+export const previewRule = (a: AlertsApi, sentence: RuleSentence) =>
+  call<RulePreview>(caseUrl(a.apiBaseUrl, a.investigationId, "rules/preview"), a.bearerToken, "Previewing the rule", { method: "POST", body: { sentence } });
+
+export const deploySentence = (a: AlertsApi, name: string, sentence: RuleSentence) =>
+  call<TypologyRule>(caseUrl(a.apiBaseUrl, a.investigationId, "rules/sentence"), a.bearerToken, "Deploying the rule", { method: "POST", body: { name, sentence } });
+
+// --- screening lists as managed sources (ADR-133 decision 4, stage (c)) ---------------------------
+
+export interface ListsApi {
+  apiBaseUrl: string;
+  bearerToken: string;
+}
+
+/** The Lists screen: whoever may load lists reads the refreshes too; anyone else the lists alone. */
+/** The lists alone, for a reader of the alert queue: no refreshes (rule 7). */
+export const listScreeningLists = (a: ListsApi) =>
+  call<ScreeningListsOverview>(`${a.apiBaseUrl}/v1/screening-lists`, a.bearerToken, "Reading the screening lists");
+
+/** The lists and their latest refreshes, for whoever holds `load_screening_lists`. */
+export const manageScreeningLists = (a: ListsApi) =>
+  call<ScreeningLists>(`${a.apiBaseUrl}/v1/admin/screening-lists`, a.bearerToken, "Reading the screening lists");
+
+export const subscribeScreeningList = (a: ListsApi, body: ScreeningSubscriptionInput) =>
+  call<ScreeningListStatus>(`${a.apiBaseUrl}/v1/admin/screening-lists`, a.bearerToken, "Subscribing to the list", {
+    method: "POST",
+    body,
+  });
+
+export const refreshScreeningList = (a: ListsApi, listName: string) =>
+  call<ScreeningListUpdate>(
+    `${a.apiBaseUrl}/v1/admin/screening-lists/${encodeURIComponent(listName)}/refresh`,
+    a.bearerToken,
+    "Refreshing the list",
+    { method: "POST" },
+  );
+
+// --- stage (d): maker–checker and the scheduled trigger (ADR-133 decisions 1 and 7) --------------
+
+export const approveRule = (a: AlertsApi, ruleId: string) =>
+  call<TypologyRule>(caseUrl(a.apiBaseUrl, a.investigationId, `rules/${encodeURIComponent(ruleId)}/approve`), a.bearerToken, "Approving the change", { method: "POST" });
+
+export const rejectRule = (a: AlertsApi, ruleId: string, reason: string) =>
+  call<TypologyRule>(caseUrl(a.apiBaseUrl, a.investigationId, `rules/${encodeURIComponent(ruleId)}/reject`), a.bearerToken, "Rejecting the change", { method: "POST", body: { reason } });
+
+export const ruleVersions = (a: AlertsApi, ruleId: string) =>
+  call<RuleVersion[]>(caseUrl(a.apiBaseUrl, a.investigationId, `rules/${encodeURIComponent(ruleId)}/versions`), a.bearerToken, "Reading the rule's versions");
+
+export const ruleRuns = (a: AlertsApi, ruleId: string) =>
+  call<RuleScheduleView>(caseUrl(a.apiBaseUrl, a.investigationId, `rules/${encodeURIComponent(ruleId)}/runs`), a.bearerToken, "Reading the rule's schedule");
+
+export const approveClose = (a: AlertsApi, alertId: string) =>
+  call<Alert>(caseUrl(a.apiBaseUrl, a.investigationId, `alert-queue/${encodeURIComponent(alertId)}/approve-close`), a.bearerToken, "Approving the close", { method: "POST" });
+
+export const sendBackClose = (a: AlertsApi, alertId: string, reason: string) =>
+  call<Alert>(caseUrl(a.apiBaseUrl, a.investigationId, `alert-queue/${encodeURIComponent(alertId)}/send-back`), a.bearerToken, "Sending the close back", { method: "POST", body: { reason } });
+
+export const setListSchedule = (a: ListsApi, listName: string, schedule: ListSchedule | null) =>
+  call<ScreeningListStatus>(
+    `${a.apiBaseUrl}/v1/admin/screening-lists/${encodeURIComponent(listName)}/schedule`,
+    a.bearerToken,
+    "Setting the refresh schedule",
+    { method: "PUT", body: { schedule } },
   );

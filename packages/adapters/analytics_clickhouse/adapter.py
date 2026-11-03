@@ -22,13 +22,18 @@ import json
 import math
 import struct
 from collections.abc import Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, cast
 
 from adapters.analytics_duckdb.access_filter import AccessFilter, SqlPredicate
+from adapters.analytics_duckdb.alert_facts import alert_predicate, series_expression
 from ontology.handling import HandlingScheme
 from ports.analytics import TrendLimitExceeded
 from schemas.analytics import (
+    ActivityRequest,
+    ActivityResult,
+    AlertFact,
+    AlertTrendRequest,
     BaselineRequest,
     BaselineResult,
     CountedHandling,
@@ -39,6 +44,8 @@ from schemas.analytics import (
     EventRecord,
     FirstSeenRequest,
     FirstSeenResult,
+    FrequencyRequest,
+    FrequencyResult,
     GeoBin,
     GeoBinRequest,
     GeocodedEvent,
@@ -49,6 +56,8 @@ from schemas.analytics import (
     HistogramBucket,
     HistogramBucketing,
     HistogramRequest,
+    NodeActivity,
+    NodeFrequency,
     Sighting,
     SightingRequest,
     TrendInterval,
@@ -348,6 +357,106 @@ class AnalyticsClickHouseAdapter:
             handlings=handlings,
         )
 
+    # --- alert trends (ADR-134 decision 3) --------------------------------------------------------
+
+    async def alert_trend(self, req: AlertTrendRequest, principal: Principal) -> TrendResult:
+        """The DuckDB adapter's, over the same predicate (`alert_facts.py`)."""
+        predicate = alert_predicate(req, principal, self._access)
+        period = (
+            "toMonday(raised_at)"
+            if req.interval is TrendInterval.WEEK
+            else "toStartOfMonth(raised_at)"
+        )
+        series = series_expression(req)
+        bounds = await self._ch.rows(
+            f"SELECT uniqExact({period}), count(DISTINCT {series}) FROM alert_facts "
+            f"WHERE {predicate.where}",
+            predicate.params,
+        )
+        periods, groups = (int(bounds[0][0]), int(bounds[0][1])) if bounds else (0, 0)
+        if periods > req.max_periods:
+            raise TrendLimitExceeded("periods", req.max_periods, periods)
+        if groups > req.max_series:
+            raise TrendLimitExceeded("series", req.max_series, groups)
+        rows = await self._ch.rows(
+            f"SELECT {period} AS period, {series} AS series, count() AS n FROM alert_facts "
+            f"WHERE {predicate.where} GROUP BY period, series "
+            "ORDER BY period, series ASC NULLS FIRST",
+            predicate.params,
+        )
+        counted = f"alert_id IN (SELECT alert_id FROM alert_facts WHERE {predicate.where})"
+        handlings = [
+            CountedHandling(
+                classification=str(c), handling_code=str(h), owning_unit=str(u), originator=str(o)
+            )
+            for c, h, u, o in await self._ch.rows(
+                "SELECT DISTINCT handling_classification, handling_code, owning_unit, originator "
+                f"FROM alert_fact_handlings WHERE {counted} ORDER BY 1, 2, 3, 4",
+                predicate.params,
+            )
+        ]
+        points = [
+            TrendPoint(period_start=_time(p), series=None if g is None else str(g), value=float(n))
+            for p, g, n in rows
+        ]
+        return TrendResult(
+            interval=req.interval,
+            measure=TrendMeasure.COUNT,
+            points=points,
+            series=sorted({pt.series for pt in points if pt.series is not None}),
+            total=float(sum(pt.value for pt in points)),
+            events=int(sum(int(r[2]) for r in rows)),
+            classifications=sorted({h.classification for h in handlings}),
+            handlings=handlings,
+        )
+
+    async def load_alert_facts(self, facts: Sequence[AlertFact]) -> None:
+        """Each fact replaces what was kept for its alert: its rows deleted (the mutation waited
+        for), then written again. Unproven on a real ClickHouse here: no server ran in this
+        build."""
+        if not facts:
+            return
+        ids = [f.alert_id for f in facts]
+        for table in ("alert_facts", "alert_fact_handlings"):
+            await self._ch.command(
+                f"ALTER TABLE {table} DELETE WHERE has(?, alert_id)" + _SYNC, [ids]
+            )
+        await self._ch.insert(
+            "alert_facts",
+            [
+                {
+                    "alert_id": f.alert_id,
+                    "investigation_scope": f.investigation_scope,
+                    "kind": f.kind,
+                    "rule": f.rule,
+                    "typology": f.typology,
+                    "severity": f.severity,
+                    "outcome": f.outcome,
+                    "raised_at": utc_text(f.raised_at),
+                    "owner_id": f.owner_id,
+                    "audience": f.audience,
+                    "team": f.team,
+                    "dataset_id": f.dataset_id,
+                    "known": 0 if f.handlings is None else 1,
+                }
+                for f in facts
+            ],
+        )
+        await self._ch.insert(
+            "alert_fact_handlings",
+            [
+                {
+                    "alert_id": f.alert_id,
+                    "handling_classification": h.classification,
+                    "handling_code": h.handling_code,
+                    "owning_unit": h.owning_unit,
+                    "originator": h.originator,
+                }
+                for f in facts
+                for h in f.handlings or []
+            ],
+        )
+
     async def _fixed_interval_histogram(
         self, predicate: SqlPredicate, interval_seconds: int | None
     ) -> Histogram:
@@ -633,6 +742,123 @@ class AnalyticsClickHouseAdapter:
             nodes={node_id: _time(first) for node_id, first in node_rows},
             edges={edge_id: _time(first) for edge_id, first in edge_rows},
         )
+
+    # --- event_frequency (ADR-133 decision 1, stage (b)), as the DuckDB adapter's ---------------
+
+    async def event_frequency(
+        self, req: FrequencyRequest, principal: Principal
+    ) -> FrequencyResult:
+        predicate = self._predicate(req.filter, principal)
+        subjects = req.filter.node_ids
+        marks = ",".join("?" for _ in subjects)
+        amount = (
+            "CAST(NULL AS Nullable(Float64))"
+            if req.amount_property is None
+            else f"toFloat64OrNull({_field_expression(req.amount_property)})"
+        )
+        # Each event once per subject it touches: an event to itself is one event, not two.
+        touched = (
+            f"SELECT source_id AS node, toUnixTimestamp64Milli(occurred_at) AS at, "
+            f"{amount} AS amount FROM events WHERE {predicate.where} AND source_id IN ({marks}) "
+            "UNION ALL "
+            f"SELECT target_id AS node, toUnixTimestamp64Milli(occurred_at) AS at, "
+            f"{amount} AS amount FROM events "
+            f"WHERE {predicate.where} AND target_id IN ({marks}) AND target_id != source_id"
+        )
+        span_ms = int(req.span_days) * 86_400_000
+        rows = await self._ch.rows(
+            "SELECT node, max(n), max(total) FROM ("
+            "  SELECT node, count() OVER span AS n, sum(amount) OVER span AS total "
+            f"  FROM ({touched}) "
+            "  WINDOW span AS (PARTITION BY node ORDER BY at "
+            f"  RANGE BETWEEN {span_ms} PRECEDING AND CURRENT ROW)"
+            ") GROUP BY node",
+            [*predicate.params, *subjects, *predicate.params, *subjects],
+        )
+        window = req.filter.window
+        unbounded = self._predicate(req.filter.model_copy(update={"window": None}), principal)
+        upper, upper_params = "", list[object]()
+        if window is not None and window.valid_to is not None:
+            upper, upper_params = " AND occurred_at <= ?", [window.valid_to]
+        firsts = await self._ch.rows(
+            "SELECT node, min(occurred_at) FROM ("
+            f"  SELECT source_id AS node, occurred_at FROM events "
+            f"  WHERE {unbounded.where}{upper} AND source_id IN ({marks}) "
+            "  UNION ALL "
+            f"  SELECT target_id AS node, occurred_at FROM events "
+            f"  WHERE {unbounded.where}{upper} AND target_id IN ({marks})"
+            ") GROUP BY node",
+            [*unbounded.params, *upper_params, *subjects,
+             *unbounded.params, *upper_params, *subjects],
+        )  # fmt: skip
+        found = {
+            str(node): (int(n), None if total is None else float(total)) for node, n, total in rows
+        }
+        return FrequencyResult(
+            nodes={
+                str(node): NodeFrequency(
+                    most_in_span=found.get(str(node), (0, None))[0],
+                    largest_total=found.get(str(node), (0, None))[1],
+                    first_at=_time(first),
+                )
+                for node, first in firsts
+            }
+        )
+
+    # --- account_activity (ADR-133 decision 2, stage (c)) -------------------------------------
+
+    async def account_activity(
+        self, req: ActivityRequest, principal: Principal
+    ) -> ActivityResult:
+        window = req.filter.window
+        assert window is not None and window.valid_from is not None and window.valid_to is not None
+        unbounded = self._predicate(req.filter.model_copy(update={"window": None}), principal)
+        subjects = req.filter.node_ids
+        marks = ",".join("?" for _ in subjects)
+        amount = (
+            "CAST(NULL AS Nullable(Float64))"
+            if req.amount_property is None
+            else f"toFloat64OrNull({_field_expression(req.amount_property)})"
+        )
+        touched = (
+            f"SELECT source_id AS node, occurred_at, {amount} AS amount FROM events "
+            f"WHERE {unbounded.where} AND occurred_at <= ? AND source_id IN ({marks}) "
+            "UNION ALL "
+            f"SELECT target_id AS node, occurred_at, {amount} AS amount FROM events "
+            f"WHERE {unbounded.where} AND occurred_at <= ? AND target_id IN ({marks}) "
+            "AND target_id != source_id"
+        )
+        start = window.valid_from
+        baseline_start = start - timedelta(days=req.baseline_days)
+        recent, before = "occurred_at >= ?", "occurred_at < ? AND occurred_at >= ?"
+        rows = await self._ch.rows(
+            f"SELECT node, countIf({recent}), sumIf(amount, {recent} AND amount IS NOT NULL), "
+            f"countIf({recent} AND amount IS NOT NULL), "
+            f"countIf({before}), sumIf(amount, {before} AND amount IS NOT NULL), "
+            f"countIf({before} AND amount IS NOT NULL), "
+            "minIf(occurred_at, occurred_at >= ?), maxIf(occurred_at, occurred_at < ?), "
+            "countIf(occurred_at < ?) "
+            f"FROM ({touched}) GROUP BY node",
+            [start, start, start,
+             start, baseline_start, start, baseline_start, start, baseline_start,
+             start, start, start,
+             *unbounded.params, window.valid_to, *subjects,
+             *unbounded.params, window.valid_to, *subjects],
+        )  # fmt: skip
+        nodes: dict[str, NodeActivity] = {}
+        for row in rows:
+            node, n_recent, t_recent, a_recent, n_base, t_base, a_base, first, last, n_before = row
+            # ClickHouse's sumIf of nothing is 0, and minIf/maxIf of nothing a zero date: read
+            # through the counts, so an absent total or time is `None` as the contract says.
+            nodes[str(node)] = NodeActivity(
+                recent_count=int(n_recent),
+                recent_total=float(t_recent) if int(a_recent) else None,
+                baseline_count=int(n_base),
+                baseline_total=float(t_base) if int(a_base) else None,
+                first_in_window=_time(first) if int(n_recent) else None,
+                last_before_window=_time(last) if int(n_before) else None,
+            )
+        return ActivityResult(nodes=nodes)
 
     # --- writes -------------------------------------------------------------
 

@@ -1,5 +1,8 @@
 # OspreyFlow — Installation and Administration Guide
 
+OspreyFlow is an open-source intelligence mapping platform for crime analysis, anti-money-laundering,
+fraud detection, and event monitoring and alerting.
+
 For whoever installs OspreyFlow and looks after it: **Lite** (one computer), **Small** (one cloud
 server on the cloud's managed services) and **Enterprise** (a Kubernetes cluster on the cloud's
 managed services). It describes what is built, and says plainly where something is not yet.
@@ -11,10 +14,26 @@ is made from the deployment's own schema, and is checked against it on every cha
 <!-- document-control:begin -->
 ## Document control
 
-**Version 1.10** · 2026-10-29 · For OspreyFlow v0.4.1 · Issued
+**Version 1.26** · 2026-11-02 · For OspreyFlow v0.4.1 · Issued
 
 | Version | Date | What changed |
 | --- | --- | --- |
+| 1.26 | 2026-11-02 | Checked against the code end to end (build order step 10). §10: Ask to search carries the case's handling and datasets, so the analyst's engine choice applies to it as to Ask the case; it no longer always runs on the local engine. |
+| 1.25 | 2026-11-02 | §9.2: the right to manage connection-strength influencers, held by the Analyst and Admin roles. §9.6: approving an installation-wide influencer version, a second person's decision; a case's own influencers need none. |
+| 1.24 | 2026-11-02 | §1, "HTTP or HTTPS": Lite now answers on this computer only — every port it publishes is bound to `127.0.0.1`, the Conduit's own port included — so other machines cannot reach it; Small and Enterprise must have an `https://` address, and `osprey.yaml` refuses a plain-HTTP one; a gov.uk address is refused for Lite. §8.1 says the same. |
+| 1.23 | 2026-11-02 | §1: a note, "HTTP or HTTPS" — Lite is plain HTTP on a `localhost` address and has no HTTPS option, and its port is published on every network interface, so it is never opened to a network; Small and Enterprise are HTTPS with a certificate Caddy obtains and renews, port 80 only for the certificate and the move to HTTPS; the managed services over TLS; a gov.uk service over HTTPS. §8.1 links to it. |
+| 1.22 | 2026-11-02 | New §1a, Choosing a starter: a theme and a domain at install (`--starter`, and the guided page's first screen), the GOV.UK service's name, several deployments side by side (`--name`, `ospreyflow deployments`, `ospreyflow switch <name>`) and how the checkout's own deployment fits in, and a public dataset of your own choosing (`ospreyflow demo add public`) with the VAST Challenge catalogue and its terms. §7: `starter`, `appearance`, `demo_accounts`. §8: `ospreyflow deployments`, `ospreyflow starters`, `--name`. §11: the `cyber-intrusion` pack, and where each starter's demo comes from. Appendix A: `deployment.graph_port`. |
+| 1.21 | 2026-11-01 | §9.5: a sixth connector, the FCDO's UK Sanctions List (the XML file, Open Government Licence v3.0); the OFSI connector marked as reading a closed list, on the Lists tab and in the subscribe form. §12: the `closed` section's labels are the five closing reasons as stored. |
+| 1.20 | 2026-11-01 | §9.5: the UN and OpenSanctions connectors are marked "licence not confirmed" and read OspreyFlow's synthetic lists only, whatever this device's exceptions admit; the refreshes' counts of customers re-screened and alerts raised are your own unit's. |
+| 1.19 | 2026-11-01 | §9.5: a list's refresh schedule, set in Monitoring → Lists and run as the person who set it. §9.6: approval rights — a second person for a rule for the whole deployment and for closing a high-severity alert, and who holds the right to approve; whole-deployment rules live before this version wait for approval after upgrading. |
+| 1.18 | 2026-11-01 | §9.5: screening lists — subscribing to a list through its connector, each list's licence, the rule on real lists, and the refresh (*Refresh now*, `python -m scripts.refresh_screening_list`), which re-screens customers against the changed entries only. |
+| 1.17 | 2026-11-01 | §12: the monitoring board, and the four monitoring sections the feed carries (`raised_by_rule`, `closed`, `time_to_close`, `hotlist_matches`). |
+| 1.16 | 2026-11-01 | §9.4: monitoring, and whom a hotlist's alerts reach (`monitoring.hotlist_audience`, `hotlist_audience_editable`). Appendix A: the `monitoring` settings. |
+| 1.15 | 2026-11-01 | §9.1: the Datasets tab. §10: a provider's privacy-contract mark (`privacy_contract`, `contract_reference`); each dataset's egress (`none`, `contracted`, `any`), set in Admin → Datasets and audited; every dataset is `none` after upgrading, so hosted engines receive nothing until an administrator changes one. Appendix A: the two new provider settings. |
+| 1.14 | 2026-11-01 | §8: `ospreyflow apply`, and a new §8.3, "Changing a setting". `deployment.env` is readable by its owner alone. §10: a provider enabled on a running deployment, and key entry on the guided install's Models screen. |
+| 1.13 | 2026-11-01 | §10 rewritten for several model engines: providers, defaults, labels, keys as `OSPREY_MODEL_KEY_<NAME>`, and what may leave. §8: `ospreyflow models`, `models key` and `models remove-key`. Appendix A: `models.providers`, `models.defaults` and a provider's `label`. |
+| 1.12 | 2026-11-01 | The opening says what OspreyFlow is for: intelligence mapping, for crime analysis, anti-money-laundering, fraud detection, and event monitoring and alerting. |
+| 1.11 | 2026-11-01 | §8: `ospreyflow switch`. Appendix A: `deployment.name`, the `appearance` settings (the GOV.UK look), and relative storage paths. |
 | 1.10 | 2026-10-29 | §11: the Prison Intelligence pack's rehearsal commands are in `DEMO_GUIDE.md`, not the user guide. |
 | 1.9 | 2026-10-29 | §11: the two Prison Intelligence packs, the demonstration case and its scale cohort. |
 | 1.8 | 2026-10-28 | Describes v0.4.0. No change to how it is installed, updated or looked after. |
@@ -84,6 +103,170 @@ All three run the same product: the same containers, the same Glass, Ingest Stud
 Small swaps the deployment's own PostgreSQL and object store for the cloud's, and gets a real
 domain with HTTPS. Enterprise runs the same services as replicas across the cluster's nodes, the
 graph store and the analytics database as clusters of their own.
+
+### HTTP or HTTPS
+
+- **Lite serves plain HTTP** at a `localhost` address: `http://ospreyflow.localhost`, or a named
+  deployment's `http://<name>.localhost:<port>` (section 1a.1). That is deliberate. Lite is for one
+  computer, its traffic is meant to stay on that machine, and browsers treat `localhost` as a secure
+  context, so sign-in works without a certificate.
+- **Lite has no HTTPS option.** The install, the guided page and every starter give it an
+  `http://…localhost` address, and Lite is not built or tested with a certificate.
+- **Lite answers on this computer only.** Every port a Lite deployment publishes — the front proxy's,
+  the graph store's and, when `network.expose_conduit` is on, the Conduit's — is bound to this
+  computer's own address (`127.0.0.1`), so other machines on a network cannot reach it, whatever
+  the firewall allows. A deployment kept by name (section 1a.1) is Lite, so the same holds. Use
+  Small or Enterprise for anything other people reach.
+- **Small and Enterprise serve HTTPS** at `https://<your domain>`, and must: `osprey.yaml` refuses a
+  Small or Enterprise deployment whose `network.public_origin` is not an `https://` address, and
+  `ospreyflow apply`, the guided page and the Set-up console say so and change nothing. The front
+  proxy (Caddy) obtains the certificate for your domain and renews it automatically. Port 80 is
+  open only for the certificate's challenge and to send a request for your domain on to HTTPS
+  (443); any other request on port 80 gets "not found", apart from the proxy's own health check. On
+  Enterprise, the cluster's load balancer passes 80 and 443 to the proxy.
+- **The managed services behind Small and Enterprise are reached over TLS:** PostgreSQL always
+  (`sslmode` is `require` at least), the object store always over HTTPS, and the cache and the
+  mail server over TLS unless you turn it off (`external.*` and `mail.starttls`, Appendix A).
+- **A service on a gov.uk domain must be served over HTTPS,** the GOV.UK theme included, so it is
+  Small or Enterprise, never Lite: `osprey.yaml` refuses a Lite deployment at a gov.uk address. The
+  GOV.UK theme on a `localhost` address stays available for a demonstration on one computer.
+
+## 1a. Choosing a starter
+
+A **starter** is a theme and a domain, chosen at install. It only fills in answers the install
+already asks — the look, the GOV.UK service's name, organisation and phase, the demo packs and
+whether demo accounts are made — and every one can still be changed. The `osprey.yaml` it makes
+records the starter in a comment at the top; nothing at run time reads it. Every domain pack (FIBO,
+NIEM, STIX) stays available to every case whatever the starter: the domain chooses the demo data
+and what its demo cases are set to, never what the ontology offers.
+
+| | `crime` | `aml` | `fraud` | `cyber` | `blank` |
+| --- | --- | --- | --- | --- | --- |
+| **Demo case's domains** | NIEM | FIBO | FIBO | STIX | none chosen |
+| **Demo data** | `prison-intelligence`, `hmp` | `operation-ledger`, with its synthetic screening lists | `fixture-corp`; PaySim offered as your own download, never fetched | `cyber-intrusion` | none, and no demo accounts |
+| **`ospreyflow` theme** (the base look) | `ospreyflow-crime` | `ospreyflow-aml` | `ospreyflow-fraud` | `ospreyflow-cyber` | `ospreyflow-blank` |
+| **`govuk` theme** (GOV.UK, a gov.uk service only) | `govuk-crime` | `govuk-aml` | `govuk-fraud` | `govuk-cyber` | `govuk-blank` |
+
+`ospreyflow starters` (or `ospreyflow install --list-starters`) prints the same table and the
+command for each.
+
+**One command per starter.** Add `--yes` to take every other default; leave it out to be asked.
+
+```
+ospreyflow install --mode lite --starter ospreyflow-crime
+ospreyflow install --mode lite --starter ospreyflow-aml
+ospreyflow install --mode lite --starter ospreyflow-fraud
+ospreyflow install --mode lite --starter ospreyflow-cyber
+ospreyflow install --mode lite --starter ospreyflow-blank
+ospreyflow install --mode lite --starter govuk-crime --service-name "Analyse crime intelligence" --organisation "<your organisation>"
+ospreyflow install --mode lite --starter govuk-aml --service-name "Investigate money laundering" --organisation "<your organisation>"
+ospreyflow install --mode lite --starter govuk-fraud --service-name "Investigate fraud" --organisation "<your organisation>"
+ospreyflow install --mode lite --starter govuk-cyber --service-name "Investigate cyber incidents" --organisation "<your organisation>"
+ospreyflow install --mode lite --starter govuk-blank --service-name "<your service's name>" --organisation "<your organisation>"
+```
+
+**The GOV.UK theme** asks for the service's name, organisation and phase (`--service-name`,
+`--organisation`, `--phase alpha|beta|live|none`; the phase offered first is `beta`). Without a
+service name the install is refused, in words, before anything is changed. **Name the service, not a
+case:** the GOV.UK header shows the name on every page of every case, so the names offered above
+describe the whole deployment; "Prison Intelligence" in the header of the Ledger's case is the
+mistake this avoids. `blank` offers no name: a real service names itself.
+
+**On the guided page** (`ospreyflow install --gui`, section 4.1) the starter is on the first screen,
+Mode, under **Starter (optional)**; a GOV.UK starter shows the service's name (filled in with the
+name above), organisation and phase there. The Demo packs screen then shows the starter's packs
+ticked, to change if you wish.
+
+**In an answers file** (section 7): `starter: govuk-aml`, with `appearance.service_name`,
+`appearance.organisation` and `appearance.phase`.
+
+### 1a.1 Several deployments side by side
+
+`--name` keeps a deployment of its own beside any other on the same computer:
+
+```
+ospreyflow install --mode lite --name crime-demo --starter ospreyflow-crime
+ospreyflow install --mode lite --name aml-govuk --starter govuk-aml --service-name "Investigate money laundering" --organisation "<your organisation>"
+```
+
+Each one has:
+
+- its own folder, `~/.ospreyflow/deployments/<name>/`, holding its `osprey.yaml`, every file
+  rendered from it and its `deployment.env` (readable by your account alone, `600`; the folder is
+  `700`);
+- its own Compose project and volumes, named `<name>`: no case, account or index is shared;
+- its own address — `--address`, by default `http://<name>.localhost:<the next free port>` from 8090
+  — and its own graph-store port on this computer (`deployment.graph_port`, from 2500).
+
+A name that Docker already knows as another folder's Compose project is refused, before anything is
+written: two deployments under one name would share containers. The checkout itself is shared; no
+second checkout or worktree is needed.
+
+**Every command takes `--name`**: `ospreyflow start --name crime-demo`, `ospreyflow status --name
+aml-govuk`, `ospreyflow demo add hmp --name crime-demo`, `ospreyflow backup --name aml-govuk` (whose
+backups are kept in the deployment's own folder). Without `--name`, a command acts on the deployment
+last used, or on the only one there is.
+
+```
+ospreyflow deployments          # each one's name, starter, address and whether it is running
+ospreyflow switch aml-govuk     # stop the running one, start aml-govuk, open it
+ospreyflow switch default       # back to the checkout's own
+```
+
+A Lite computer runs one deployment at a time by default, which is what `ospreyflow switch` is for.
+
+**The deployment installed in the checkout** — every install before this version, with its
+`osprey.yaml` in the checkout and its files in `deploy/generated/` — is listed as `default` and works
+exactly as before: no command moves, renames or changes it. It could later be moved under
+`~/.ospreyflow/deployments/` (install a named deployment, restore a backup of the checkout's into it,
+check it, then uninstall the checkout's with `--keep-data` until you are sure); that is a step for
+the administrator to take deliberately, never something an update does.
+
+### 1a.2 Adding a public dataset
+
+A public dataset you download yourself can be added to any deployment, at install or later:
+
+```
+ospreyflow demo add public --file <the downloaded file> --manifest <its dataset.yaml>
+```
+
+A **manifest** says what the dataset is, its source page, its licence or terms as the source states
+them, the file's SHA-256, whether it holds real people's data, and the Ingest Studio recipe that
+loads it. The file is checked against the checksum before anything else happens; a file that differs
+is refused, and nothing is loaded. It loads into a case of its own, named after the dataset.
+
+**Real personal data** (`real_personal_data: true` in its manifest) is loaded only once you type
+`yes`, accepting that it is real people's data and that your organisation has its own lawful basis
+to process it — as for Enron (section 11); `--accept-real-data` accepts in a scripted run. It never
+belongs in a repository or a test run.
+
+**The VAST Challenge catalogue.** OspreyFlow ships manifests and recipes — never the data — for two
+IEEE VAST Challenge datasets, fictional scenarios published for visual-analytics research:
+
+| Catalogue id | Dataset | Suits | Source |
+| --- | --- | --- | --- |
+| `vast-2012-mc2` | VAST Challenge 2012, Mini-Challenge 2: the fictional Bank of Money's regional network — its firewall log (`Firewall-04072012.csv`) | the `cyber` starter (its case is set to STIX) | the Visual Analytics Benchmark Repository, University of Maryland |
+| `vast-2008-mc3` | VAST Challenge 2008, Mini Challenge 3: cell phone call records on the fictional island of Isla del Sueño (synthetic) | the `crime` starter (its case is set to NIEM) | the same repository |
+
+**Their terms.** Neither the source pages, nor the challenges' task pages, nor the repository's
+mirror at Washington University state any licence or terms of use (checked 2 November 2026). No
+licence means no right to redistribute is granted: download the data yourself, use it on your own
+computer, never pass it on, and do not rely on it for commercial use without the publishers'
+permission. Each manifest says so.
+
+**Their checksums.** OspreyFlow never downloads VAST data, so the catalogue records no checksum, and
+`demo add public` refuses an entry until you record the checksum of the file you downloaded:
+
+```
+python -m scripts.public_dataset --list
+python -m scripts.public_dataset pin --manifest vast-2012-mc2 --file Firewall-04072012.csv --out ~/OspreyFlow/vast-2012-mc2.yaml
+ospreyflow demo add public --file Firewall-04072012.csv --manifest ~/OspreyFlow/vast-2012-mc2.yaml --name crime-demo
+```
+
+`pin` writes your own copy of the manifest, with the recipe beside it; check first that the file
+came from the source page, since what you pin is what every later check holds the file to. The
+column layout each recipe reads is the challenge's published one; check it against your download's
+first line.
 
 ## 2. Before you start
 
@@ -159,7 +342,7 @@ ospreyflow install --mode lite
 ```
 
 asks a few questions — dashboards on or off, the folder the Ingest Studio lists, the folder for a
-basemap, which demo packs — then:
+basemap, which demo packs — then (`--starter <theme>-<domain>` fills these in first: section 1a):
 
 1. writes `osprey.yaml` from the answers (refusing, with nothing changed, if a different
    `osprey.yaml` is already there, unless `--force`);
@@ -177,7 +360,8 @@ builds from the checkout even on a release tag.
 ### 4.1 The guided page: `ospreyflow install --gui`
 
 Opens a page in your browser, on this computer only, behind a one-time link (anyone else, or any
-other link, is refused). It walks through the same answers as screens:
+other link, is refused). It walks through the same answers as screens, with a starter (section 1a)
+offered on the first, Mode:
 
 - **Lite**: Mode, Folders, Profile, Components, Map (register a local basemap, build it, verify
   it), Models, Governance, Demo packs, Review (which runs the doctor), then Install, with the
@@ -339,6 +523,9 @@ Every question `install` asks can be answered in this file; unknown settings are
 | `cluster.namespace`, `cluster.storage_class`, `cluster.shared_storage_class` | Enterprise: the namespace, and onto a cluster you already have its storage classes (section 6) |
 | `external` | The managed services the deployment runs on — written by OpenTofu, or by you for a cluster you already have |
 | `config` | Use this `osprey.yaml` exactly as it is, instead of `components`, `folders` and `models` |
+| `starter` | A starter, `<theme>-<domain>` (section 1a): fills in the answers below that are not given |
+| `appearance.brand`, `appearance.service_name`, `appearance.organisation`, `appearance.phase` | The look (appendix A's `appearance`); `govuk` needs `service_name`, which names the whole service |
+| `demo_accounts` | `true` (default) makes the demo accounts; `false` makes none (the `blank` starter's answer) |
 
 The answers become `osprey.yaml` (appendix A): `mode` sets `profile`, `components.dashboards` sets
 both `reporting.sync` and `reporting.superset`, and the address is `http://ospreyflow.localhost` for
@@ -350,13 +537,22 @@ Lite and `https://<domain>` for Small and Enterprise.
 | --- | --- |
 | `ospreyflow start` | Brings the deployment up and waits for every service; `--build` rebuilds from the checkout first |
 | `ospreyflow stop` | Stops every container; nothing is removed |
+| `ospreyflow switch [<name>]` | Makes this the deployment running: stops any other OspreyFlow deployment on the machine (each with its own settings), then starts and opens the named one (`default` for the checkout's; section 1a.1). `--list` names each deployment, running or stopped, and changes nothing. A deployment in another checkout is still picked with `OSPREYFLOW_HOME=<its product folder> ospreyflow switch` |
+| `ospreyflow deployments` | Lists this computer's deployments — the checkout's as `default`, and each kept by name — with the starter each was made from, its address and whether it is running |
+| `ospreyflow starters` | Lists the starters, and the install command for each (section 1a) |
 | `ospreyflow status` | Each service's state and health; exits 1 unless everything is running and healthy |
 | `ospreyflow open` | Opens the Glass in your browser |
 | `ospreyflow logs [service] [--follow] [--tail N]` | The services' logs (the last 200 lines by default) |
+| `ospreyflow apply` | Applies a changed `osprey.yaml` to the installed deployment (section 8.3): renders it again, keeps every password and key, asks for a newly enabled provider's key (from `OSPREY_MODEL_KEY_<NAME>` or a hidden prompt), and restarts only the services whose settings changed. It makes no account, adds no demo pack and touches no data |
 | `ospreyflow repair-sign-in [--no-demo-accounts]` | Registers the sign-in again — the identity provider's clients, roles and the demo accounts (leave them out with `--no-demo-accounts`); safe to run again |
+| `ospreyflow models` | Lists the model engines, each role's default engine, and whether each provider's key is present (yes or no — never the key) |
+| `ospreyflow models key <name>` | Sets or replaces a provider's key, from `OSPREY_MODEL_KEY_<NAME>` in the terminal or a hidden prompt; writes it to `deployment.env` alone and restarts the model gateway (and the Conduit when the key's presence changes) |
+| `ospreyflow models remove-key <name>` | Removes a provider's key; the provider stays enabled but shows "no key" and is not offered to analysts |
 | `ospreyflow uninstall [--keep-data] [--yes]` | Removes the containers; with `--keep-data` the data volumes stay, without it cases, accounts and indexes go too. Your checkout, `osprey.yaml` and your own folders are never touched |
 
-Every service restarts itself if it stops; nothing is registered with the operating system.
+Every command takes `--name <name>` to act on a deployment kept by name, or `--name default` for the
+checkout's own (section 1a.1). Every service restarts itself if it stops; nothing is registered with
+the operating system.
 
 **Enterprise** is looked after with Kubernetes' own tools, not these verbs (which drive a Compose
 deployment): `kubectl get pods -n ospreyflow`, `kubectl logs`, and `helm uninstall ospreyflow -n
@@ -371,15 +567,19 @@ One front proxy is the deployment's only door. Under the address in `network.pub
 - **sign-in** (Keycloak) at `id.`;
 - **dashboards** (Superset) at `bi.`, when dashboards are on.
 
-Lite publishes port 80 and, on this computer only, `127.0.0.1:2480` for the graph store's own
-tools. Small publishes 80 (for the certificate) and 443. The Conduit's own port is published only
-with `network.expose_conduit: true`.
+Lite publishes port 80 (or its own address's port) and `2480` for the graph store's own tools, both
+on this computer only (`127.0.0.1`): other machines cannot reach a Lite deployment. Small publishes
+80 (for the certificate and the move to HTTPS) and 443 on every network interface, because other
+people reach it. Which of them is plain HTTP and which HTTPS: the note **HTTP or HTTPS** in
+section 1. The Conduit's own port is published only with `network.expose_conduit: true` — on Lite,
+on this computer only.
 
 ### 8.2 Where things are
 
 | Where | What |
 | --- | --- |
 | `osprey.yaml` (the checkout) | The deployment's settings; never a secret |
+| `~/.ospreyflow/deployments/<name>/` | A deployment kept by name (section 1a.1): its own `osprey.yaml`, every file rendered from it, its `deployment.env` (`600`) and its `backups/`; `~/.ospreyflow/current` names the one last used |
 | `deploy/generated/<profile>/` | The deployment: `compose.yaml`, `deployment.env` (every password and key it made), `Caddyfile`, `glass.json`, `realm.json`, `litellm.yaml`, `versions.lock`, `RUNBOOK.md`, `state/` |
 | `backups/` | Backup sets |
 | `.install/` | The guided page's draft and answers; a release install's verified lock |
@@ -387,6 +587,29 @@ with `network.expose_conduit: true`.
 | Your ingest and basemap folders | As the answers named them |
 
 `RUNBOOK.md`, written for each deployment, lists what runs, its paths and its addresses.
+
+`deployment.env` is readable by your own account alone (`600`): `ospreyflow install` writes it so,
+and `ospreyflow apply`, `models key` and `models remove-key` keep it so.
+
+### 8.3 Changing a setting
+
+Edit `osprey.yaml` in the checkout, then run:
+
+```
+ospreyflow apply
+```
+
+It checks the file first, and if anything in it is wrong it says what, and changes nothing. Then it
+renders the deployment again from it, keeping every password and key the deployment already has,
+and starts again only the services whose settings changed; the rest keep running. A provider newly
+enabled under `models.providers` needs its key: give it as `OSPREY_MODEL_KEY_<NAME>` in the same
+terminal, or type it at the hidden prompt `apply` shows. `apply` makes no account, adds no demo pack,
+rebuilds nothing and never touches the stored data. Do not run `ospreyflow install` again over a
+running deployment to change a setting; `ospreyflow start --build` rebuilds the code but reads the
+settings the deployment already has.
+
+A changed `deployment.name` names a different deployment, which `apply` refuses: install it as a new
+one.
 
 ## 9. People and accounts
 
@@ -405,6 +628,7 @@ holding its right:
 | Dashboards | `manage_dashboards` | Register a dashboard's account (its secret shown once), see when it last pulled, remove it |
 | Schedules and runs | `operate_schedules` | Every scheduled or watched pipeline: pause, resume, run now, change its time, its runs |
 | System | `administer_system` | Each component's health, the models in use, the version and whether an update exists |
+| Datasets | `administer_system` | Every dataset and its egress — whether its material may be sent to a hosted model engine (section 10) |
 | Demo packs | `administer_system` | Which packs are loaded, and the command that adds one |
 
 ![Admin → People and roles: each person's roles, with Access, Disable and Reset sign-in](images/admin/01-people.png)
@@ -413,9 +637,9 @@ holding its right:
 
 | Role | For |
 | --- | --- |
-| **Analyst** | Cases: investigate, edit the graph, confirm what models proposed, alerts and rules, exports, watches |
+| **Analyst** | Cases: investigate, edit the graph, confirm what models proposed, alerts and rules, exports, watches; proposing and approving connection-strength influencers |
 | **Data Engineer** | Pipelines: build, verify, publish, run and schedule them; the source files they load; held rows; screening lists. (It also carries the right to revert a load, which no screen or command uses yet) |
-| **Admin** (`osprey-admin`) | The Admin area; the ontology and the map; the audit and export ledgers |
+| **Admin** (`osprey-admin`) | The Admin area; the ontology and the map; the audit and export ledgers; proposing and approving connection-strength influencers |
 | **Reports Viewer** | Reports and data feeds; the alert queue, read-only |
 
 A single right can be given on its own. **Nobody can be given more than the person giving it
@@ -435,25 +659,226 @@ A mail server is set in `osprey.yaml`'s `mail:` (appendix A); if it signs in, it
 once at install as `OSPREY_SMTP_PASSWORD` and kept only in `deployment.env`. With mail, the sign-in
 page also offers *Reset your password*.
 
+### 9.4 Monitoring: whom a hotlist's alerts reach
+
+Analysts work alerts in one queue, in the Glass's **Monitoring** place: the case's rule alerts reach
+every member of the case; a watched pattern's alerts reach its owner and the people of the owner's
+**unit** (the unit set on their account, section 9.3); a hotlist's alerts reach its owner, and the
+owner's unit too only when the hotlist is shared. Two settings in `osprey.yaml` decide hotlists:
+
+```yaml
+monitoring:
+  hotlist_audience: only_me        # or team: a new hotlist is shared with its owner's unit
+  hotlist_audience_editable: true  # false: owners cannot choose, and a change is refused
+```
+
+`hotlist_audience` is where a **new** hotlist starts; it never changes an existing one, and every
+hotlist made before the setting existed reaches only its owner until the owner changes it. With
+`hotlist_audience_editable: false`, every new hotlist takes `hotlist_audience`, the Glass offers no
+choice and says so, and a change is refused in words. A match on data its owner cannot see is never
+shared. Change either with `ospreyflow apply` (section 8.3). Both are in appendix A.
+
+### 9.5 Screening lists: subscribing, licences and the refresh
+
+OspreyFlow screens customers against sanctions, PEP and adverse-media lists that the deployment
+**subscribes** to. Each list is read through its **connector**, which knows one publisher's own
+export format:
+
+| Connector | Reads | Licence (as its publisher states it, 1 November 2026) |
+| --- | --- | --- |
+| OFAC SDN list | `SDN.CSV`, with `ALT.CSV` and `ADD.CSV` beside it when present | A US Government work, in the public domain; OFAC's own pages state no licence |
+| HM Treasury OFSI consolidated list | `ConList.csv` | Open Government Licence v3.0. **Reads a closed list**: the OFSI Consolidated List closed on 28 January 2026 and is no longer updated. Use the UK Sanctions List below for UK designations |
+| UK Sanctions List (FCDO) | `UK-Sanctions-List.xml` (the XML format) | Open Government Licence v3.0 (Crown copyright). The only source of UK sanctions designations since 28 January 2026. Its XML schema carries a notice of its own about commercial use; OspreyFlow does not ship it |
+| UN Security Council consolidated list | `consolidated.xml` | **Licence not confirmed.** No open licence found: the UN's terms of use allow personal, non-commercial use. Confirm with the UN before relying on it. Synthetic lists only until then |
+| EU consolidated financial sanctions list | the FSF XML 1.1 file | The European Commission's reuse notice (Decision 2011/833/EU) |
+| OpenSanctions | `entities.ftm.json` | **Licence not confirmed.** CC BY-NC 4.0: **non-commercial only**. Screening inside a business is commercial use and needs OpenSanctions' data licence. Synthetic lists only until then |
+
+Check the licence for your use before you subscribe. The architecture's licence register (spec 00 §7)
+records where each statement was read.
+
+**A closed list: OFSI.** HM Treasury closed the OFSI Consolidated List on 28 January 2026; the FCDO's
+UK Sanctions List is now the only source of UK designations. OspreyFlow keeps the OFSI connector, so a
+file you already hold can still be read, but nothing new will ever be published to it: the Lists tab
+says "Closed list" on such a list's row, and the subscribe form names the connector "reads a closed
+list" and points to the UK Sanctions List. To screen against UK designations, download
+`UK-Sanctions-List.xml` from the list's page (gov.uk/government/publications/the-uk-sanctions-list;
+the FCDO keeps it at a fixed address, `sanctionslist.fcdo.gov.uk/docs/UK-Sanctions-List.xml`), put it
+in the ingest folder, and subscribe to it through the **UK Sanctions List (FCDO)** connector. OspreyFlow
+does not fetch it for you. The connector reads the XML only (its schema is published; the CSV's column
+order is not).
+
+**Licence not confirmed: UN and OpenSanctions.** Until their licences for a customer's screening are
+confirmed, these two connectors read OspreyFlow's own synthetic lists only. The Lists tab marks each
+such list "Licence not confirmed", with the reason, and the subscribe form says so beside the
+connector. A real UN or OpenSanctions file is refused, in words, even when this device's exceptions
+admit its dataset, and nothing loads; `python -m scripts.load_screening_list` refuses a list whose
+dataset is `opensanctions` or `un_consolidated` the same way.
+
+**Real lists and this device.** OspreyFlow ships only synthetic lists. A real list loads only when this
+device's own `config/real_data_exceptions.yaml` (never committed, never copied between machines) names
+its dataset — for example `ofac_sdn` — for the use the subscription gives; otherwise the refresh is
+refused, in words, and nothing loads. Add an entry with
+`python -m scripts.real_data_exceptions add`. A list counts as synthetic only when its file is one of
+OspreyFlow's own (`packages/demo_fixtures/screening_lists/`, known by its fingerprint); a file cannot
+make itself synthetic by saying so.
+
+**Subscribing.** In the Glass, open **Monitoring → Lists** (it needs the `load_screening_lists` right,
+which the administrator and data-engineer roles hold). Under **Subscribe to a list**, give the list a
+name, choose its connector, name its file inside the ingest folder (for example `lists/SDN.CSV`), and,
+for a real list, the dataset it is. A location outside the ingest folder is refused. Put each new
+download of the list in the same place.
+
+**The refresh.** **Refresh now** beside a list (or, on the host,
+`python -m scripts.refresh_screening_list "<list name>"`, with `--list` to see the subscriptions) reads
+the file again and applies it as a new **version**: the publisher's own date where the format has one,
+otherwise the file's fingerprint. OspreyFlow compares it with the version before and re-screens every
+customer of every case with a screening rule against **the added and changed entries only**, as each
+rule's deployer and within that case's datasets; each new match is a high-severity alert in that case's
+queue, its link to the listed party inferred until a person confirms it. A file that is not in the
+connector's format fails in words and leaves the list as it was. Every refresh is recorded under
+**Latest refreshes**, with what it added, changed and removed, and how many customers it re-screened and
+how many alerts it raised **in your own unit**: each screening rule re-screens as its deployer, and its
+customers and alerts are counted for the deployer's unit alone, so an administrator never learns how
+many of another unit's customers a list touched. *Refresh now* answers the same way. The audit
+records who refreshed which list.
+
+**When.** A list is refreshed when someone presses **Refresh now**, runs the command, or on the list's
+own **refresh schedule**. Under **Refresh schedule** in Monitoring → Lists, choose the list, **every
+day** or **every week** (and the day), and the hour (UK time), then **Save the schedule**; **by hand
+only** stops it. The **Schedule** column shows when each list is refreshed and when next.
+
+- **A scheduled refresh runs as the person who saved the schedule**, resolved afresh each time —
+  never as the system. If they can no longer sign in or no longer hold `load_screening_lists`, that
+  refresh is refused, recorded under **Latest refreshes** in words, and nothing is read; save the
+  schedule again as someone who holds the right.
+- Each scheduled time runs once, whichever Conduit replica takes it; after downtime only the latest
+  runs. A refresh that ran on its schedule says so under **Latest refreshes**.
+- Put each new download in the list's location before the scheduled hour: the schedule reads the file
+  that is there.
+
+### 9.6 Approval rights: a second person
+
+Three decisions wait for a second person with the right, and **the person who proposed one can never
+approve it** (ADR-133 decision 7):
+
+| Decision | Who proposes it | Who approves it |
+| --- | --- | --- |
+| Deploying, changing or retiring a rule **for the whole deployment** | An Author of the case who holds `deploy_rules` and `administer_system` (an analyst who is also an administrator) | **Another** person with the same rights and level |
+| Closing a **high-severity** alert another person may see | A member of the case who triages alerts (`triage_alerts`, Editor) | **Another** member who triages alerts in that case |
+| A new version of the **installation-wide connection-strength influencers** (ADR-139) | Anyone holding `manage_strength_influencers` (the Analyst and Admin roles hold it) | **Another** person holding it |
+
+A rule for one case, or just for its author, needs no approval. An alert only its owner may see (their
+own hotlist's, kept to them) is closed by its owner alone, since no second person may read it. Writing
+a rule as a sentence needs `keep_watches` as well as `deploy_rules`, so a data engineer attaches rules
+to pipelines (Checks on load) but does not write them.
+
+**So a deployment that writes whole-deployment rules needs at least two people holding both the
+Analyst and the Admin roles** (or `deploy_rules` and `administer_system` granted singly), each an
+Author of a case the rule is listed in (a whole-deployment rule is listed in every case). With one such person, a whole-deployment rule can be
+proposed but never run.
+
+**Approving influencers.** In **Monitoring → Connection strength**, a version waiting for a second
+person shows what it would put in force, who proposed it and why. Another holder of the right chooses
+**Approve version N**, or **Send it back** with words; its proposer sees the approval withheld and may
+withdraw it. Until a version is approved, the influencers shipped in the weights file are in force.
+Every version is kept, with who proposed and who decided it, and each step is in the audit stream. A
+case's Author may add influencers for that case, or switch off installation-wide ones in it, without a
+second person; that too is audited. Give the right singly (`right:manage_strength_influencers`) to
+someone who should set influencers without the rest of a role.
+
+Every proposal, approval and rejection is in the case's rule audit, and every rule keeps its versions
+— who proposed each and who decided it. **After upgrading to this version**, a whole-deployment rule
+that was running waits for a second person's approval before it runs again; Monitoring → Rules lists
+it as waiting, "deployed before a second person's approval was needed".
+
 ## 10. Models
 
 By default every model runs on the deployment itself (extraction, vision, transcription and
 embedding — appendix A, `models.*`) and **no case content leaves it**. A client with its own
-agreement with a model provider (OpenAI, Anthropic, Gemini, Azure, Bedrock…) may name it:
+agreement with one or more model providers may enable them as further **engines**: `openai`,
+`anthropic` and `gemini` (Google), and other LiteLLM providers such as `azure` or `bedrock` in the
+same shape.
 
 ```yaml
 models:
   local_only: false
   sendable_handling_codes: [P]
-  provider:
-    name: openai
-    roles: {extraction: gpt-4o}
+  providers:
+    - name: gemini
+      roles: {extraction: gemini/gemini-2.5-flash}
+    - name: openai
+      label: OpenAI (client tenancy)
+      roles: {extraction: gpt-4o, vision: gpt-4o-mini}
+      privacy_contract: true
+      contract_reference: DPA 2026/07
+  defaults:
+    extraction: gemini
 ```
 
-The provider then **replaces** the local model for the roles named — for material whose handling
-code is in `sendable_handling_codes` only; anything else runs on the local model. Its key is given
-once at install as `OSPREY_MODEL_PROVIDER_KEY` and kept only in `deployment.env`. Admin → System
-shows each role's model, where it runs, and a notice that case content then leaves the deployment.
+- **`providers`** lists each enabled provider: its model for each role it takes, an optional
+  `api_base` (`https://` only) and an optional `label` — the name analysts see. Without one, the
+  label is OpenAI, Anthropic or Gemini.
+- **`defaults`** names each role's default engine: `local` or a provider's name. A role not named
+  runs on `local`.
+- **`privacy_contract`** marks a provider as under a privacy contract: set it to `true` only when
+  your organisation holds a data-processing agreement with the provider that covers this key. It is
+  `false` unless you set it. **`contract_reference`** says which agreement, in words ("DPA 2026/07");
+  it is shown to analysts, so it is never a secret, and one that looks like a key is refused.
+- The older single `provider:` is still read, as a one-entry list whose roles default to it. Naming
+  both `provider` and `providers` is refused.
+
+**Keys.** Each provider's key is `OSPREY_MODEL_KEY_<NAME>` — for example `OSPREY_MODEL_KEY_GEMINI`
+(the single `provider:` keeps `OSPREY_MODEL_PROVIDER_KEY`). Give it in the installer's terminal
+before `ospreyflow install`, or on the guided install's Models screen; an enabled provider without
+its key stops the install, and a later install keeps a key already given. To enable a provider on a
+running deployment, add it to `osprey.yaml` and run `ospreyflow apply` (section 8.3), which takes
+its key from `OSPREY_MODEL_KEY_<NAME>` or asks for it at a hidden prompt. On a running deployment,
+`ospreyflow models key <name>` sets or replaces a key and `ospreyflow models remove-key <name>`
+removes it (section 8); `ospreyflow models` says whether each is present. A key is kept in
+`deployment.env` alone and read only by the deployment's model gateway — never by the Conduit,
+never written to `osprey.yaml`, never shown in the Admin area or any page of the Glass.
+
+**On the guided install page** (section 4.1), the Models screen has a key field for each enabled
+provider. A key typed there is sent only to the install page, on this computer — a request from
+anywhere else is refused — and is held there until the install gives it to `deployment.env`. It is
+never written anywhere else, never logged and never shown again: the field empties once the key is
+sent, and the page says only "key set" or "no key".
+
+**What may leave.** Material is sent to a provider only when both of these allow it:
+
+- **its handling code** is in `sendable_handling_codes` (one list, for every engine); and
+- **every dataset it comes from** allows that provider. Each dataset has an **egress** setting:
+  - `none` — never sent to a hosted engine. **This is every dataset's setting until you change
+    it.**
+  - `contracted` — sent only to a provider marked `privacy_contract: true`.
+  - `any` — sent to any enabled provider.
+
+Anything else runs on the local engine, whatever was chosen, and is refused in words when the
+deployment has no local model for the role. Material whose datasets are not known is treated as
+`none`, so nothing leaves by omission. Embeddings never leave the deployment.
+
+**Setting a dataset's egress.** Only an administrator sets it: Admin → Datasets lists every dataset,
+the unit that holds it and its egress; choose the setting and press Save beside it. Each change is
+recorded in the audit log — who made it, when, and from what to what.
+
+> **After upgrading to this release, hosted engines receive nothing** until an administrator sets
+> a dataset's egress to `contracted` or `any`. Every existing dataset, demo packs included, starts
+> at `none`; until you change one, every question runs on the deployment's own models, whatever
+> engine an analyst chooses. Set only the datasets you are entitled to send.
+
+**Who chooses.** The administrator sets each role's default. An analyst may choose, for each
+question in Ask the case, among the engines offered — the local engine and each enabled provider
+that has a key — each shown "under contract" or "no contract". An engine the case's datasets may not
+reach is shown but cannot be chosen, with the reason beneath the choice. Ask to search offers the
+same choice: its question goes under the case's handling and from the case's datasets, through the
+same two checks, and the deployment's own model answers whenever they do not allow the engine
+chosen. Every answer names the engine and model that produced it.
+
+Admin → System shows each role's model, each engine with its models, the roles it is the default
+for, whether its key is present and whether it is under a privacy contract (with its reference), and
+a notice that case content then leaves the deployment. `ospreyflow models` shows the same mark
+beside each provider ("privacy contract: yes (DPA 2026/07)" or "privacy contract: no"), and the
+guided install's Models screen shows it as the configuration holds it.
 
 ## 11. Demo packs
 
@@ -464,8 +889,13 @@ shows each role's model, where it runs, and a notice that case content then leav
 | `operation-ledger` | Preventive AML: a structuring ring, onboarding screened before it commits, ownership through a trust (synthetic) | Generated |
 | `prison-intelligence` | Prison intelligence, end to end: a fictional jail's records as an intelligence team receives them, loaded through the Ingest Studio from source files, each with its own marking (synthetic) | Generated |
 | `prison-intelligence-scale` | The same estate at scale: 3,000 prisoners and 30,000 links across six establishments, to show a large network grouped by community (synthetic) | Generated |
+| `cyber-intrusion` | Cyber threat analysis in STIX 2.1: a fictional threat actor's campaign against a water company — its backdoor, two command-and-control servers, the indicators that find them and the traffic observed; its case is set to STIX (synthetic) | Generated |
 | `paysim` | Mobile-money fraud: 6.36 million simulated transactions with fraud labels | Downloaded by you |
 | `enron` | **Real data**: about 150 people's real email at Enron, 1998–2002 — who wrote to whom, when, and about what | Downloaded by you; accepted before it loads; never by an install |
+
+**Which a starter brings** is section 1a's table: a starter loads its domain's packs, into cases
+set to its domain's packs. A **public dataset** of your own choosing, such as a VAST Challenge
+dataset, is added with `ospreyflow demo add public` (section 1a.2).
 
 Choose them at install (`demo_packs`), or later: `ospreyflow demo list`, `ospreyflow demo add
 <id>`. Each loads into its own case, with the installing administrator as Author. Adding **HMP**
@@ -524,6 +954,27 @@ Each pull is made as that account, at its clearance, audited and recorded in the
 ![Admin → Dashboards: registering a dashboard's account and seeing when it last pulled](images/admin/03-dashboards.png)
 
 ![Superset at bi.: the boards and charts built on the reporting figures](images/admin/07-superset.png)
+
+### The monitoring board
+
+The feed also carries four monitoring sections, for every kind of alert (typology, hotlist and
+monitor), each a row of `section`, `label`, `typology`, `week_start` and `value` in the reporting
+database's `figures` table, beside `raised`, `open_by_age` and `outcome`:
+
+| `section` | `label` | What it counts |
+| --- | --- | --- |
+| `raised_by_rule` | `typology` (with its `typology`), `hotlists` or `monitors` | alerts raised each week, by rule |
+| `closed` | the closing reason as stored: `true_positive` (True match), `false_positive` (False positive), `duplicate`, `no_further_action` or `referred`; or `closed` (taken back, no outcome) | alerts closed each week, by outcome |
+| `time_to_close` | `under a day`, `1 to 7 days`, `7 to 30 days`, `over 30 days` | alerts closed in the period, by how long they took |
+| `hotlist_matches` | `hotlists` | hotlist matches each week |
+
+A typology rule is named by its typology, never by its own name, which an analyst writes and the
+feed does not carry. Every figure is counted as the dashboard's account may see it; a hotlist kept
+"only me" is counted for its owner alone, so never on a dashboard. No board ships as a file: build
+the monitoring board in Superset from the `figures` table, filtered on these sections — for
+example a stacked bar of `raised_by_rule` by `week_start` and `label`, a bar of `closed` by
+`label`, a table of `time_to_close`, and a line of `hotlist_matches` — with a filter on
+`case_name`. Report sync fills it on its next pull; nothing else needs to change.
 
 ## 13. Backup and restore
 
@@ -633,17 +1084,28 @@ Made from the deployment's own schema. Settings marked *section* hold the settin
 | `components.storage.data` | str | `/var/lib/osprey/data` | Where the deployment keeps its data inside the containers. |
 | `components.storage.staging` | str | `/var/lib/osprey/staging` | Where loads stage their rows before they reach the graph. |
 | `components.storage.backups` | str | `/var/lib/osprey/backups` | Where backups are written. |
-| `components.storage.ingest` | str | `/var/lib/osprey/ingest` | The host folder of source files the Ingest Studio lists (read-only to it; uploads go to its uploaded/ folder). |
-| `components.storage.tiles` | str | `/var/lib/osprey/tiles` | The host folder a built basemap lives in. |
+| `components.storage.ingest` | str | `/var/lib/osprey/ingest` | The host folder of source files the Ingest Studio lists (read-only to it; uploads go to its uploaded/ folder). A relative path is read from the folder osprey.yaml is in. |
+| `components.storage.tiles` | str | `/var/lib/osprey/tiles` | The host folder a built basemap lives in. A relative path is read from the folder osprey.yaml is in. |
 | `components.source_path` | str or none | none | The owned services (workspace, api, ingest) are PULLED, by the digest recorded in versions.lock, from the registry reference harness/render.py's own service_images names. This is the operator path: the harness image itself carries no services/ or apps/workspace source, and round 05's own finding was that the documented one-command bootstrap could not Launch without it — a clean laptop has no checkout. Set to a checkout root containing services/api/Dockerfile, services/ingest/Dockerfile and apps/workspace/Dockerfile (this repository's own root, for a developer/CI run) to BUILD owned images from source instead. Declared and the Dockerfiles absent is refused by name (harness.render.MissingDockerfileError) — never silently treated as the pull path. |
-| `models` | section | — | The local models, and a client's own model provider if one is chosen. |
+| `models` | section | — | The local models, and the client's own model providers (engines) if any are enabled. |
 | `models.local_only` | bool | true | No hosted fallback |
 | `models.hosted_fallback` | str or none | none | A provider name, never a credential. |
 | `models.sendable_handling_codes` | list of str | — | Which handling codes may leave for a hosted model. |
-| `models.provider` | section or none | none | A client's own model provider, reached through the deployment's gateway. |
+| `models.provider` | section or none | none | The older one-provider form, read as a one-entry providers list; not with providers. |
 | `models.provider.name` | str | required | LiteLLM's name for the provider: openai, anthropic, gemini, azure, bedrock… |
+| `models.provider.label` | str or none | none | The name analysts see for this engine. Default: OpenAI, Anthropic or Gemini for those three, else the provider's name capitalised. |
 | `models.provider.roles` | mapping | required | The roles it takes, each with the provider's model for it |
 | `models.provider.api_base` | str or none | none | The provider's address, where it is not LiteLLM's default (an Azure deployment, a proxy) |
+| `models.provider.privacy_contract` | bool | false | True when the deployment's organisation holds a data-processing agreement with the provider covering this key. A dataset whose egress is `contracted` is sent only to a provider marked so. Default: false. |
+| `models.provider.contract_reference` | str or none | none | The agreement's reference, in words (for example DPA 2026/07); never a secret. Shown beside the mark. |
+| `models.providers` | list of section | — | The providers (engines) an administrator enables, each reached through the deployment's gateway; each key is OSPREY_MODEL_KEY_<NAME>. |
+| `models.providers.name` | str | required | LiteLLM's name for the provider: openai, anthropic, gemini, azure, bedrock… |
+| `models.providers.label` | str or none | none | The name analysts see for this engine. Default: OpenAI, Anthropic or Gemini for those three, else the provider's name capitalised. |
+| `models.providers.roles` | mapping | required | The roles it takes, each with the provider's model for it |
+| `models.providers.api_base` | str or none | none | The provider's address, where it is not LiteLLM's default (an Azure deployment, a proxy) |
+| `models.providers.privacy_contract` | bool | false | True when the deployment's organisation holds a data-processing agreement with the provider covering this key. A dataset whose egress is `contracted` is sent only to a provider marked so. Default: false. |
+| `models.providers.contract_reference` | str or none | none | The agreement's reference, in words (for example DPA 2026/07); never a secret. Shown beside the mark. |
+| `models.defaults` | mapping | — | Each role's default engine, `local` or an enabled provider's name. A role not named runs on `local` (for the single `provider`, on it). |
 | `models.extraction` | `qwen2.5:7b-instruct` \| `qwen2.5:14b-instruct` | `qwen2.5:7b-instruct` | The local model that extracts entities from text. Default: qwen2.5:7b-instruct, the model the product ships with. |
 | `models.vision` | `moondream:1.8b-v2-q4_K_M` | `moondream:1.8b-v2-q4_K_M` | The local model that describes an image and reads its text. |
 | `models.transcription` | `Systran/faster-whisper-tiny.en` | `Systran/faster-whisper-tiny.en` | The local model that transcribes a video's speech. |
@@ -701,6 +1163,9 @@ Made from the deployment's own schema. Settings marked *section* hold the settin
 | `reporting.sync_memory` | str | `256m` | Report sync's memory limit. |
 | `reporting.superset` | bool | false | Run Superset |
 | `reporting.superset_memory` | str | `2g` | Superset's memory limit. |
+| `monitoring` | section | — | Monitoring and alerts: whom a new hotlist's alerts reach, and who changes it. |
+| `monitoring.hotlist_audience` | `only_me` \| `team` | `only_me` | Whom a new hotlist's alerts reach: its owner alone (only_me), or also the owner's team, the people of the owner's organisational unit (team). Applies to hotlists made after it is set, never to an existing one. |
+| `monitoring.hotlist_audience_editable` | bool | true | Whether a hotlist's owner may choose its audience, when making it or later. When false, every new hotlist takes hotlist_audience and a change is refused. |
 | `mail` | section or none | none | A mail server, for invitations and password resets by email. |
 | `mail.host` | str | required | The mail server's name |
 | `mail.port` | int | `587` | The mail server's port. |
@@ -713,6 +1178,14 @@ Made from the deployment's own schema. Settings marked *section* hold the settin
 | `welcome.accessibility` | str or none | none | The organisation's accessibility statement. |
 | `welcome.privacy` | str or none | none | The organisation's privacy notice. |
 | `welcome.service_status` | str or none | none | A page saying whether the service is up. |
+| `deployment` | section | — | Which deployment this is, on a machine that runs more than one. |
+| `deployment.name` | str or none | none | Names this deployment's Compose project, its volumes and its rendered folder, so a second deployment on the same machine shares none of them. |
+| `deployment.graph_port` | int or none | none | The port on this machine (127.0.0.1 only) the graph store's own tools reach it at. A deployment installed beside another with ospreyflow install --name is given one of its own, so the two share no port. |
+| `appearance` | section | — | How every page looks: the deployment's brand, and what a GOV.UK header names. |
+| `appearance.brand` | `ospreyflow` \| `govuk` | `ospreyflow` | The GOV.UK look, for a service on a gov.uk domain only. |
+| `appearance.service_name` | str or none | none | The service's name in the GOV.UK header and the page title. |
+| `appearance.organisation` | str or none | none | The organisation in the GOV.UK footer and the page title. |
+| `appearance.phase` | `alpha` \| `beta` \| `live` \| `none` | `none` | The phase banner shows at alpha or beta. |
 | `external` | section | — | What a cloud runs for the deployment instead of a container (Small). |
 | `external.postgres` | section or none | none | A cloud's managed PostgreSQL; its password arrives at install. |
 | `external.postgres.host` | str | required | The managed server's address |

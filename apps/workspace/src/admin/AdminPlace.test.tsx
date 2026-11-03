@@ -67,7 +67,7 @@ describe("the Admin area", () => {
     place(["manage_dashboards"]);
     fireEvent.change(await screen.findByLabelText("Dashboard name"), { target: { value: "Board" } });
     fireEvent.change(screen.getByLabelText("Dashboard unit"), { target: { value: "verify" } });
-    await waitFor(() => expect((screen.getByLabelText("Dashboard clearance") as HTMLSelectElement).value).toBe("OFFICIAL"));
+    await waitFor(() => expect((screen.getByLabelText("Dashboard reads at clearance") as HTMLSelectElement).value).toBe("OFFICIAL"));
     fireEvent.click(screen.getByRole("button", { name: "Register" }));
     expect(await screen.findByText("s3cret")).toBeTruthy();
     expect(screen.getByRole("table", { name: "Dashboard identities" }).textContent).toContain("sa-1");
@@ -82,7 +82,7 @@ describe("the Admin area", () => {
     place(["manage_dashboards"]);
     fireEvent.change(await screen.findByLabelText("Dashboard name"), { target: { value: "Board" } });
     fireEvent.change(screen.getByLabelText("Dashboard unit"), { target: { value: "verify" } });
-    await waitFor(() => expect((screen.getByLabelText("Dashboard clearance") as HTMLSelectElement).value).toBe("OFFICIAL"));
+    await waitFor(() => expect((screen.getByLabelText("Dashboard reads at clearance") as HTMLSelectElement).value).toBe("OFFICIAL"));
     fireEvent.click(screen.getByRole("button", { name: "Register" }));
     expect(await screen.findByText("A dashboard cannot read above your own clearance (SECRET asked).")).toBeTruthy();
   });
@@ -295,6 +295,54 @@ describe("the System tab's models", () => {
   });
 });
 
+// ADR-135 decision 5: the System tab shows each engine, its models, the roles it is the default
+// for, and whether its key is present: Yes or No, never the key.
+describe("the System tab's engines", () => {
+  it("lists each engine with its models, the roles it is the default for and whether its key is present", async () => {
+    serve((path) =>
+      path === "system"
+        ? json(200, {
+            components: [], models: [], model_notice: null,
+            engines: [
+              { name: "local", label: "This deployment's own model", models: { extraction: "qwen2.5:7b-instruct", embedding: "all-minilm" }, default_for: ["embedding"], key_present: true },
+              { name: "gemini", label: "Gemini", models: { extraction: "gemini/gemini-2.5-flash" }, default_for: ["extraction"], key_present: true,
+                privacy_contract: true, contract_reference: "DPA 2026/07" },
+              { name: "openai", label: "OpenAI", models: { vision: "openai/gpt-4o-mini" }, default_for: [], key_present: false, privacy_contract: false },
+            ],
+          })
+        : null,
+    );  // prettier-ignore
+    place(["administer_system"]);
+    const table = await screen.findByRole("table", { name: "Engines" });
+    const rows = within(table).getAllByRole("row").slice(1).map((row) =>
+      within(row).getAllByRole("cell").map((cell) => cell.textContent),
+    );
+    expect(rows).toEqual([
+      ["This deployment's own model", "extraction: qwen2.5:7b-instruct; embedding: all-minilm", "embedding", "Yes", "Not needed: nothing leaves"],
+      ["Gemini", "extraction: gemini/gemini-2.5-flash", "extraction", "Yes", "Under contract (DPA 2026/07)"],
+      ["OpenAI", "vision: openai/gpt-4o-mini", "None", "No", "No contract"],
+    ]);
+    // ADR-136 decision 1: the privacy-contract mark, beside each engine.
+    expect(within(table).getAllByRole("columnheader").map((h) => h.textContent)).toEqual([
+      "Engine", "Models", "Default for", "Key present", "Privacy contract",
+    ]);  // prettier-ignore
+  });
+
+  it("never shows a key, even one the response wrongly carried", async () => {
+    serve((path) =>
+      path === "system"
+        ? json(200, {
+            components: [], models: [], model_notice: null,
+            engines: [{ name: "gemini", label: "Gemini", models: { extraction: "gemini/x" }, default_for: [], key_present: true, key: "AIza-not-a-real-key" }],
+          })
+        : null,
+    );  // prettier-ignore
+    place(["administer_system"]);
+    await screen.findByRole("table", { name: "Engines" });
+    expect(document.body.textContent).not.toContain("AIza-not-a-real-key");
+  });
+});
+
 // ADR-114 decision 13, Amendment 8 point 2: the version and the last update check.
 describe("the System tab's version", () => {
   it("says the version and an update offered, with its notes and address", async () => {
@@ -327,3 +375,59 @@ describe("the System tab's version", () => {
   });
 });
 
+
+// ADR-136 decision 2: each dataset's egress, set by an administrator.
+describe("the Datasets tab", () => {
+  const DATASETS = [
+    { id: "enron", name: "Enron corpus", owning_unit: "verify", egress: "none" },
+    { id: "fixture-corp", name: "Fixture Corp", owning_unit: "verify", egress: "contracted" },
+  ];
+
+  it("is the system administrator's, and says what each setting means and that none is the default", async () => {
+    serve((path) => (path === "datasets" ? json(200, DATASETS) : null));
+    place(["manage_people"]);
+    expect(screen.queryByRole("tab", { name: "Datasets" })).toBeNull();
+    cleanup();
+    serve((path) => (path === "datasets" ? json(200, DATASETS) : null));
+    place(["administer_system"]);
+    fireEvent.click(screen.getByRole("tab", { name: "Datasets" }));
+    const table = await screen.findByRole("table", { name: "Datasets" });
+    const egress = within(table).getByLabelText("Egress for Enron corpus") as HTMLSelectElement;
+    expect(egress.value).toBe("none");
+    expect(Array.from(egress.options).map((o) => o.value)).toEqual(["none", "contracted", "any"]);
+    expect(screen.getByText(/Every dataset is none until you change it/)).toBeTruthy();
+  });
+
+  it("saves one dataset's egress and says so", async () => {
+    const sent = serve((path, init) =>
+      path === "datasets"
+        ? json(200, DATASETS)
+        : path === "datasets/enron/egress" && init?.method === "PUT"
+          ? json(200, { ...DATASETS[0], egress: "any" })
+          : null,
+    );
+    place(["administer_system"]);
+    fireEvent.click(screen.getByRole("tab", { name: "Datasets" }));
+    fireEvent.change(await screen.findByLabelText("Egress for Enron corpus"), { target: { value: "any" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save egress for Enron corpus" }));
+    await waitFor(() => expect(sent.some((s) => s.path === "PUT datasets/enron/egress")).toBe(true));
+    expect(sent.find((s) => s.path === "PUT datasets/enron/egress")?.body).toEqual({ egress: "any" });
+    expect(await screen.findByText("Enron corpus: egress is now any.")).toBeTruthy();
+  });
+
+  it("says a refusal in words and leaves the setting as it was", async () => {
+    serve((path, init) =>
+      path === "datasets"
+        ? json(200, DATASETS)
+        : path === "datasets/enron/egress" && init?.method === "PUT"
+          ? json(403, { detail: "forbidden" })
+          : null,
+    );
+    place(["administer_system"]);
+    fireEvent.click(screen.getByRole("tab", { name: "Datasets" }));
+    fireEvent.change(await screen.findByLabelText("Egress for Enron corpus"), { target: { value: "any" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save egress for Enron corpus" }));
+    expect(await screen.findByText("Your account does not hold the right for this.")).toBeTruthy();
+    expect(screen.queryByText("Enron corpus: egress is now any.")).toBeNull();
+  });
+});

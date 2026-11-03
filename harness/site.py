@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from schemas.deployment import OspreyConfig
+from schemas.deployment import OspreyConfig, Profile
 
 #: Caddy 2.11.4 (Apache-2.0), released 3 June 2026.
 PROXY_IMAGE = "caddy:2.11.4-alpine"
@@ -67,6 +67,21 @@ def render_caddyfile(config: OspreyConfig, *, doors: bool = True) -> str:
         lines += ["\tauto_https off", f"\thttp_port {PROXY_HTTP_PORT}"]
     lines.append("}")
     for name, upstream in routes:
+        if name == f"id.{names.host}" and config.appearance.brand == "govuk":
+            # ADR-132 Amendment 2: the sign-in page's GOV.UK stylesheet and fonts come from the
+            # Glass, on the sign-in page's own name, so they are same-origin there.
+            lines += [
+                "",
+                f"{names.scheme}://{name} {{",
+                "\thandle /assets/govuk/* {",
+                "\t\treverse_proxy workspace:8080",
+                "\t}",
+                "\thandle {",
+                f"\t\treverse_proxy {upstream}",
+                "\t}",
+                "}",
+            ]
+            continue
         lines += ["", f"{names.scheme}://{name} {{", f"\treverse_proxy {upstream}", "}"]
     # ADR-114 Amendment 7: the doors this machine alone uses, through the proxy, so the services
     # behind them need no published port — and so no route out (measured: a published port needs
@@ -111,17 +126,30 @@ def loopback_doors(config: OspreyConfig) -> list[tuple[int, str]]:
     return doors
 
 
+#: S10 (GDS re-audit, the owner's ruling of 2 November 2026; `05_DEPLOYMENT.md` §7): **Lite answers
+#: on this computer only.** Every port a Lite deployment publishes is bound to `127.0.0.1`; a bare
+#: `HOST:CONTAINER` makes Docker publish it on every interface, and a machine on the same network
+#: that sent `Host: ospreyflow.localhost` reached the Glass and sign-in in plain HTTP. Small and
+#: Enterprise are reached by other people, so their 80 and 443 stay on every interface.
+LOOPBACK = "127.0.0.1"
+
+
+def _bind(config: OspreyConfig, mapping: str) -> str:
+    """`mapping` as Lite publishes it, on loopback; as written for Small, on every interface."""
+    return f"{LOOPBACK}:{mapping}" if config.profile is Profile.LOCAL_LITE else mapping
+
+
 def _door_ports(config: OspreyConfig) -> list[str]:
-    published = ["127.0.0.1:${OSPREY_ARCADEDB_PORT:-2480}:2480"]
+    published = [f"{LOOPBACK}:${{OSPREY_ARCADEDB_PORT:-2480}}:2480"]
     if config.network.expose_conduit:
-        published.append("${OSPREY_API_PORT:-8000}:8000")
+        published.append(_bind(config, "${OSPREY_API_PORT:-8000}:8000"))
     return published
 
 
 def proxy_service(config: OspreyConfig) -> dict[str, Any]:
     names = sites(config)
     if names.scheme == "http":
-        ports = [f"{names.port}:{PROXY_HTTP_PORT}"]
+        ports = [_bind(config, f"{names.port}:{PROXY_HTTP_PORT}")]
         extra: dict[str, Any] = {
             "user": "65534:65534",
             "environment": {"XDG_DATA_HOME": "/tmp/caddy", "XDG_CONFIG_HOME": "/tmp/caddy"},
@@ -129,7 +157,7 @@ def proxy_service(config: OspreyConfig) -> dict[str, Any]:
         health = f"http://127.0.0.1:{PROXY_HTTP_PORT}/healthz"
     else:
         # Caddy's automatic HTTPS: certificates for the client's own domain (proven in stage B6).
-        ports = ["80:80", f"{names.port}:443"]
+        ports = [_bind(config, "80:80"), _bind(config, f"{names.port}:443")]
         extra = {"volumes": ["proxy-data:/data"]}
         health = "http://127.0.0.1:80/healthz"
     service: dict[str, Any] = {
@@ -175,7 +203,8 @@ def deployment_version() -> str:
 
 def render_glass_settings(config: OspreyConfig) -> str:
     """What the Glass reads at start (`/deployment.json`): where its identity provider is, the
-    marking it shows before any case data is on screen, and the welcome page's settings."""
+    marking it shows before any case data is on screen, the welcome page's settings and the
+    deployment's appearance (ADR-132)."""
     welcome = config.welcome
     links = {
         name: address
@@ -193,6 +222,8 @@ def render_glass_settings(config: OspreyConfig) -> str:
         "marking": marking_floor(config),
         "organisation_sign_in": config.governance.organisation_sign_in,
         "welcome": {"about": welcome.about, "links": links},
+        # ADR-132: the deployment's brand and what its GOV.UK header, footer and banner name.
+        "appearance": config.appearance.model_dump(),
         "version": deployment_version(),
     }
     return json.dumps(settings, indent=2) + "\n"

@@ -50,6 +50,7 @@ import type {
   EntityTypeDef,
   Node,
   Path as GraphPath,
+  StrengthLegend,
 } from "../../../../packages/schemas/generated";
 import type { ExportMark } from "../export/api";
 import { captureChartImage } from "../export/chartExport";
@@ -114,6 +115,7 @@ import { LIT_ANSWER_LATE, readLit, selectionChangedSince } from "../crossfilter/
 import type { TimeWindow, WeekdayHourCell } from "../crossfilter/store";
 import { removeFromWorkingSet } from "./removeNodes";
 import { ViewActions } from "./ViewActions";
+import { focusAnnouncement } from "./focusAnnouncement";
 import { settleLayout, type LayoutNode } from "./forceLayout";
 import { BubbleOverlay, type Bubble } from "./BubbleOverlay";
 import { ARRANGE_MAX_NODES, arrange, enclosingCircle, linkKey, packBubbles, treeLinkKeys, type LayoutMode } from "./layoutModes";
@@ -240,6 +242,9 @@ export interface GlassCanvasProps {
   dimmedNodeIds?: ReadonlySet<string>;
   /** Link ids the active cross-filter excludes (ADR-087): dimmed, never removed. */
   dimmedEdgeIds?: ReadonlySet<string>;
+  /** ADR-139 decision 7: the case's connection-strength legend (the influencers in force, the
+   * direct link types, the rarity note), drawn in the legend box. Absent: not shown. */
+  strengthLegend?: StrengthLegend | null;
   onSelectionChange?: (nodeIds: string[]) => void;
   /** A branch of the selected nodes was made (ADR-084): the new case's id and name. The caller
    * opens it. Absent: this canvas offers no "Branch selected" button. */
@@ -293,6 +298,13 @@ export interface GlassCanvasProps {
    * bring the Inspector's Picture part forward — the choice itself (file, marking, legal basis)
    * stays there, never in the menu. */
   onSetPicture?: (nodeId: string) => void;
+  /** `02_GLASS_FRONTEND.md` §2 rule 1: "Switching view never refetches and never loses selection."
+   * The nodes selected when this canvas is drawn — what was selected in the Matrix or before the
+   * Map was opened — read once, when it mounts; ids not in the view are left out. Absent, nothing
+   * is selected, as before. */
+  initialSelectedNodeIds?: readonly string[];
+  /** The link selected when this canvas is drawn, read once, as `initialSelectedNodeIds` is. */
+  initialSelectedEdgeId?: string | null;
 }
 
 /** Phase 7 Stage 3: what the metrics panel needs from outside the canvas's own event handlers —
@@ -407,6 +419,7 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       bearerToken,
       dimmedNodeIds = EMPTY_DIMMED_SET,
       dimmedEdgeIds = EMPTY_DIMMED_SET,
+      strengthLegend = null,
       onSelectionChange,
       onBranchCreated,
       onAskAboutDocuments,
@@ -422,6 +435,8 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       getEventsWindow,
       onOpenDocument,
       onSetPicture,
+      initialSelectedNodeIds,
+      initialSelectedEdgeId,
     }: GlassCanvasProps,
     ref,
   ) {
@@ -433,7 +448,9 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       WorkingSetNodeAttributes,
       WorkingSetEdgeAttributes
     > | null>(null);
-    const [selected, setSelected] = useState<Set<string>>(new Set());
+    const [selected, setSelected] = useState<Set<string>>(
+      () => new Set((initialSelectedNodeIds ?? []).filter((id) => graph.hasNode(id))),
+    );
     const canvasDescriptionId = useId();
     const [zoomPercent, setZoomPercent] = useState<number | undefined>(undefined);
     const [hoverLink, setHoverLink] = useState<{ key: string; x: number; y: number } | null>(null);
@@ -539,7 +556,14 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
     >({});
     // A link selected by click or by keyboard. A ref as well, because the Sigma edge reducer
     // reads it when drawing.
-    const [selectedEdge, setSelectedEdge] = useState<string | null>(null);
+    const [selectedEdge, setSelectedEdge] = useState<string | null>(() =>
+      // A link and nodes are never selected together (`selectLink` below).
+      initialSelectedEdgeId &&
+      graph.hasEdge(initialSelectedEdgeId) &&
+      !(initialSelectedNodeIds ?? []).some((id) => graph.hasNode(id))
+        ? initialSelectedEdgeId
+        : null,
+    );
     const selectedEdgeRef = useRef<string | null>(null);
     selectedEdgeRef.current = selectedEdge;
     // Links hidden from this view in this browser tab only (not recorded anywhere, not in History).
@@ -3206,6 +3230,11 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       return count;
     })();
 
+    function focusedNodeWords(id: string): string {
+      const data = graph.getNodeAttribute(id, "data") as Node | undefined;
+      return focusAnnouncement(data ? nodeLabel(data) : id, data?.type ?? "Group", graph.degree(id));
+    }
+
     async function askAboutSelected(): Promise<void> {
       const n = selectedDocumentCount;
       const made = await branchSelected(`Questions on ${n} document${n === 1 ? "" : "s"}`, {
@@ -3533,6 +3562,18 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
             }
           />
         )}
+        {/* GDS remediation plan A2 (WCAG 4.1.3): the node keyboard focus is on, said as focus moves —
+            its name as drawn, its type and its links on the canvas — in a polite live region, so a
+            screen reader hears where it is while the focus stays on the canvas. */}
+        <span
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          className="visually-hidden"
+          data-testid="canvas-focus-announcement"
+        >
+          {focused && graph.hasNode(focused) ? focusedNodeWords(focused) : ""}
+        </span>
         {/* ADR-115 E4: what the canvas holds selected, read with its name (the reference's label). */}
         <span id={canvasDescriptionId} className="visually-hidden">
           {selected.size > 0
@@ -3583,7 +3624,13 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
           className="canvas-corner"
           style={toolbarHeight ? ({ "--canvas-toolbar-height": `${toolbarHeight}px` } as CSSProperties) : undefined}
         >
-          <CanvasLegend types={legendTypes} links={legendLinks} valueIcons={legendValueIcons} onToggleLink={toggleLinkType} />
+          <CanvasLegend
+            types={legendTypes}
+            links={legendLinks}
+            valueIcons={legendValueIcons}
+            onToggleLink={toggleLinkType}
+            strength={strengthLegend}
+          />
           <ZoomControls onZoomIn={() => zoomBy("in")} onZoomOut={() => zoomBy("out")} onFit={fitToView} percent={zoomPercent} />
         </div>
         {addingFiles && bearerToken && investigationId && (

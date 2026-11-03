@@ -233,3 +233,137 @@ describe("QuestionsPanel", () => {
     expect(onDelta).not.toHaveBeenCalled();
   });
 });
+
+// ADR-135 decision 5: Ask the case offers the engines the deployment offers for extraction, the
+// role's default chosen; the request names the one chosen; each answer says which engine and model
+// produced it; a refused engine is said in the Conduit's words.
+const ENGINES = {
+  engines: [
+    { name: "local", label: "This deployment's own model", roles: ["extraction", "embedding"], default_for: ["embedding"] },
+    { name: "gemini", label: "Gemini", roles: ["extraction"], default_for: ["extraction"] },
+    { name: "openai", label: "OpenAI", roles: ["vision"], default_for: [] },
+  ],
+};
+const ONLY_LOCAL = {
+  engines: [{ name: "local", label: "This deployment's own model", roles: ["extraction"], default_for: ["extraction"] }],
+};
+
+describe("the engine choice (ADR-135)", () => {
+  // ADR-136: the case's own engines route, so an engine its data may not reach comes back disabled.
+  const engineRoute = (body: unknown) => ({ "GET /models/engines": () => json(200, body) });
+
+  it("lists only the engines offered for extraction, with the default chosen", async () => {
+    serve({ "GET /questions": () => json(200, []), ...engineRoute(ENGINES) });
+    mount();
+    const choice = (await screen.findByRole("combobox", { name: "Model engine" })) as HTMLSelectElement;
+    expect(Array.from(choice.options).map((o) => [o.value, o.textContent])).toEqual([
+      ["local", "This deployment's own model"],
+      ["gemini", "Gemini (no contract)"],
+    ]);
+    expect(choice.value).toBe("gemini");
+  });
+
+  it("is not shown when only the local engine is offered, and the request names none", async () => {
+    const calls = serve({
+      "GET /questions": () => json(200, []),
+      "POST /questions": () => json(200, ANSWERED),
+      ...engineRoute(ONLY_LOCAL),
+    });
+    mount();
+    await screen.findByText("No questions asked in this case yet.");
+    await waitFor(() => expect(calls.some((c) => c.url.endsWith("/v1/investigations/b1/models/engines"))).toBe(true));
+    expect(screen.queryByRole("combobox", { name: "Model engine" })).toBeNull();
+    fireEvent.change(screen.getByLabelText("Your question"), { target: { value: "Who?" } });
+    fireEvent.click(screen.getByRole("button", { name: "Ask" }));
+    await screen.findByText("Dana Mercer wrote about it [1].");
+    const posted = calls.find((c) => c.init?.method === "POST")!;
+    expect(JSON.parse(String(posted.init!.body))).not.toHaveProperty("engine");
+  });
+
+  it("sends the engine chosen, and the answer says which engine and model answered", async () => {
+    const calls = serve({
+      "GET /questions": () => json(200, []),
+      "POST /questions": () => json(200, { ...ANSWERED, engine: "local", model: "qwen2.5:7b-instruct" }),
+      ...engineRoute(ENGINES),
+    });
+    mount();
+    const choice = await screen.findByRole("combobox", { name: "Model engine" });
+    fireEvent.change(choice, { target: { value: "local" } });
+    fireEvent.change(screen.getByLabelText("Your question"), { target: { value: "Who?" } });
+    fireEvent.click(screen.getByRole("button", { name: "Ask" }));
+    expect(await screen.findByText("Answered by This deployment's own model (qwen2.5:7b-instruct)")).toBeTruthy();
+    const posted = calls.find((c) => c.init?.method === "POST")!;
+    expect(JSON.parse(String(posted.init!.body)).engine).toBe("local");
+  });
+
+  it("names a provider's engine by its label on an answer in the history, and says nothing for an older answer", async () => {
+    serve({
+      "GET /questions": () => json(200, [{ ...ANSWERED, engine: "gemini", model: "gemini/gemini-2.5-flash" }, { ...WITH_FACTS }]),
+      ...engineRoute(ENGINES),
+    });
+    mount();
+    expect(await screen.findByText("Answered by Gemini (gemini/gemini-2.5-flash)")).toBeTruthy();
+    expect(screen.getAllByText(/^Answered by/)).toHaveLength(1);
+  });
+
+  it("shows a refused engine's words", async () => {
+    serve({
+      "GET /questions": () => json(200, []),
+      "POST /questions": () =>
+        json(422, { error: "engine_refused", detail: "Gemini has no key on this deployment, so it is not offered." }),
+      ...engineRoute(ENGINES),
+    });
+    mount();
+    await screen.findByRole("combobox", { name: "Model engine" });
+    fireEvent.change(screen.getByLabelText("Your question"), { target: { value: "Who?" } });
+    fireEvent.click(screen.getByRole("button", { name: "Ask" }));
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      "Gemini has no key on this deployment, so it is not offered.",
+    );
+  });
+});
+
+
+describe("an engine the case's data may not reach (ADR-136)", () => {
+  const REASON =
+    "Not available for this case: “Enron corpus” is set to egress none, never sent to a hosted engine such as Gemini.";
+  const BLOCKED = {
+    engines: [
+      { name: "local", label: "This deployment's own model", roles: ["extraction"], default_for: [], available: true },
+      { name: "gemini", label: "Gemini", roles: ["extraction"], default_for: ["extraction"], privacy_contract: false,
+        available: false, reason: REASON },
+      { name: "anthropic", label: "Claude", roles: ["extraction"], default_for: [], privacy_contract: true, available: true },
+    ],
+  };  // prettier-ignore
+
+  it("asks the case's own engines, shows each one's contract mark, and disables one with the reason in words", async () => {
+    const calls = serve({ "GET /questions": () => json(200, []), "GET /models/engines": () => json(200, BLOCKED) });
+    mount();
+    const choice = (await screen.findByRole("combobox", { name: "Model engine" })) as HTMLSelectElement;
+    expect(calls.some((c) => c.url === "http://api/v1/investigations/b1/models/engines")).toBe(true);
+    expect(Array.from(choice.options).map((o) => [o.value, o.textContent, o.disabled])).toEqual([
+      ["local", "This deployment's own model", false],
+      ["gemini", "Gemini (no contract) — not available", true],
+      ["anthropic", "Claude (under contract)", false],
+    ]);
+    expect(screen.getByText(`Gemini: ${REASON}`)).toBeTruthy();
+  });
+
+  it("never chooses a disabled default: the local engine is chosen and sent instead", async () => {
+    const calls = serve({
+      "GET /questions": () => json(200, []),
+      "GET /models/engines": () => json(200, BLOCKED),
+      "POST /questions": () => json(200, { ...ANSWERED, engine: "local", model: "qwen2.5:7b-instruct" }),
+    });
+    mount();
+    const choice = (await screen.findByRole("combobox", { name: "Model engine" })) as HTMLSelectElement;
+    expect(choice.value).toBe("local");
+    fireEvent.change(choice, { target: { value: "gemini" } }); // a disabled option is not taken
+    expect(choice.value).toBe("local");
+    fireEvent.change(screen.getByLabelText("Your question"), { target: { value: "Who?" } });
+    fireEvent.click(screen.getByRole("button", { name: "Ask" }));
+    await screen.findByText("Dana Mercer wrote about it [1].");
+    const posted = calls.find((c) => c.init?.method === "POST")!;
+    expect(JSON.parse(String(posted.init!.body)).engine).toBe("local");
+  });
+});

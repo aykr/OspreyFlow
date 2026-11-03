@@ -16,6 +16,17 @@ export function nodeName(node: Node): string {
   return `${node.type} ${node.id.slice(-6)}`;
 }
 
+/** One line of "What this alert concerns": the node's name and type and, for a screening list's own
+ * entry (`kyc_rules._listed_write` gives it `listing` and `list_name`), whose entry it is. A screening
+ * alert cites the customer and that entry, joined by an inferred same-as link; the two are never
+ * merged (rule 6), and named alike they read as one person listed twice (step 9d finding 2). */
+export function concernWords(node: Node): string {
+  const props = node.properties as Record<string, unknown>;
+  const list = props.list_name;
+  const listed = typeof props.listing === "string" && typeof list === "string" && list.trim() !== "";
+  return `${nodeName(node)} · ${node.type}${listed ? ` · the entry on ${list}` : ""}`;
+}
+
 export const TYPOLOGY_LABELS: Record<string, string> = {
   structuring: "Structuring",
   rapid_movement: "Rapid movement",
@@ -24,6 +35,12 @@ export const TYPOLOGY_LABELS: Record<string, string> = {
   shared_attributes: "Shared contact details",
   document_verification: "Unverified customer",
   pattern: "Drawn pattern",
+  sentence: "Sentence rule",
+  // ADR-133 stage (c): the new AML templates.
+  high_risk_jurisdiction: "High-risk jurisdiction",
+  large_cash: "Large cash",
+  dormant_reactivated: "Dormant account reactivated",
+  velocity_rise: "Sudden rise in velocity",
 };
 
 export function typologyLabel(typology: string | null | undefined): string {

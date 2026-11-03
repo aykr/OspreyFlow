@@ -30,6 +30,7 @@ from typing import Any
 
 import yaml
 
+from harness.keycloak_theme import clear_theme_cache
 from harness.release import (
     GITHUB_API,
     ReleaseRefused,
@@ -423,7 +424,17 @@ def apply_update(
         if prepared.pull:
             _ok(host, [*compose, "pull"], "pull the release's images")
         _ok(host, up, "start the release")
-        for service, flag in (("litellm", "proxy_changed"), ("keycloak", "theme_changed")):
+        # `proxy_changed` names the models' proxy (LiteLLM); `routing_changed` the front proxy's
+        # routing table (ADR-132 Amendment 2).
+        restarts = (
+            ("litellm", "proxy_changed"),
+            ("proxy", "routing_changed"),
+            ("keycloak", "theme_changed"),
+        )
+        for service, flag in restarts:
+            if changed.get(flag) and service == "keycloak":
+                # The theme's gzip copies outlive a restart (`harness/keycloak_theme.py`).
+                _ok(host, clear_theme_cache(compose), "start the release")
             if changed.get(flag):
                 _ok(host, [*compose, "restart", service], "start the release")
                 _ok(host, up, "start the release")

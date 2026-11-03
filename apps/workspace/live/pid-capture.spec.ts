@@ -1,41 +1,73 @@
 // The Prison Intelligence demo's screen captures (Brief 3 Part C), against the deployed Glass and
 // the loaded synthetic PID case. Every shot is a function of a named case state that this file
 // puts there itself; nothing is mocked and no image is edited. See `pid-capture.config.ts` for how
-// to run it. Each PNG is named exactly its capture id and written to the demo's `screens/` folder.
+// to run it, and `CAPTURE_RUNBOOK_v4.md` beside the demo script for the order and the deployment
+// state each shot needs. Each PNG is named exactly its capture id and written to the demo's
+// `screens/` folder, or to `OSPREY_PID_CAPTURE_SCREENS` when it is set (the second brand's shots).
+// The shared helpers are in `capture-kit.ts`; never import from this file (it would run it).
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { expect, test, type Page } from "@playwright/test";
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const CORE = join(HERE, "../../..");
-const SCREENS = join(CORE, "../OspreyFlow_presentations/prison_intelligence_demo/screens");
+import {
+  CORE,
+  PRESENTATIONS,
+  closeOpenedAlert,
+  dismissWelcome,
+  lightTheme,
+  monitoringTab,
+  openCaseNamed,
+  openQueuedAlert,
+  rail,
+  reportsTab,
+  runNowAndWait,
+  scrollAllToTop,
+  shotInto,
+  signInAs,
+  type Persona,
+} from "./capture-kit";
+
+const SCREENS =
+  process.env.OSPREY_PID_CAPTURE_SCREENS ?? join(PRESENTATIONS, "prison_intelligence_demo/screens");
 const ENV_FILE =
   process.env.OSPREY_PID_CAPTURE_ENV ?? join(CORE, "deploy/generated/local-lite/deployment.env");
 
 export const CASE_NAME = "Prison Intelligence Dataset (synthetic demo)";
 
-/** The coordinator's number, as the plan writes it (`07`… national form) and as it is stored
- * (`+44`…), read from the plan itself: Brief 1's J2 check refuses any file of the repository that
- * writes it, so that a search for it finds the PID's data and nothing else. */
-function coordinatorNumber(): { national: string; international: string } {
-  const out = execFileSync(
+/** A value of the demo plan or its monitoring batches, read from the generator itself (Python), so
+ * no number is written in this file: Brief 1's J2 check refuses any file of the repository that
+ * writes the coordinator's number, so that a search for it finds the PID's data and nothing else. */
+function fromPlan(expression: string): string[] {
+  return execFileSync(
     join(CORE, ".venv/bin/python"),
     [
       "-c",
-      "from demo_fixtures import pid_plan; e = pid_plan.build_plan('demo').entity('number:coordinator');" +
-        " print(e.properties['value_raw']); print(e.properties['value_normalised'])",
+      "from demo_fixtures import pid_plan, pid_monitoring; plan = pid_plan.build_plan('demo')\n" +
+        `for line in (${expression}): print(line)`,
     ],
     { cwd: CORE, env: { ...process.env, PYTHONPATH: ".:packages" } },
   )
     .toString()
     .trim()
     .split("\n");
-  const [national, international] = out;
+}
+
+/** The coordinator's number, as the plan writes it (`07`… national form) and as it is stored
+ * (`+44`…). */
+function coordinatorNumber(): { national: string; international: string } {
+  const e = "plan.entity('number:coordinator').properties";
+  const [national, international] = fromPlan(`${e}['value_raw'], ${e}['value_normalised']`);
   if (!national || !international) throw new Error("the plan gave no coordinator's number");
   return { national, international };
+}
+
+/** The number on the seized handset that the PIN first contacts reach (S1's subject), stored form. */
+function unownedNumber(): string {
+  const [number] = fromPlan("[pid_monitoring.EXPECTED_ALERTS[2].number]");
+  if (!number) throw new Error("the monitoring batches gave no rule-alert number");
+  return number;
 }
 
 test.skip(
@@ -43,77 +75,22 @@ test.skip(
   "captures the owner's deployment; opt in with OSPREY_PID_CAPTURE=1",
 );
 
-type Persona = "analyst" | "engineer" | "viewer" | "admin";
-
-const ACCOUNTS: Record<Persona, { username: string; secret: string }> = {
-  analyst: { username: "osprey-demo-analyst", secret: "OSPREY_DEMO_ANALYST_PASSWORD" },
-  engineer: { username: "osprey-demo-engineer", secret: "OSPREY_DEMO_ENGINEER_PASSWORD" },
-  viewer: { username: "osprey-demo-report-viewer", secret: "OSPREY_DEMO_REPORT_VIEWER_PASSWORD" },
-  admin: { username: "osprey-demo-admin", secret: "OSPREY_DEMO_ADMIN_PASSWORD" },
-};
-
-/** The persona's password, read from the deployment's own file and never printed or logged. */
-function passwordOf(persona: Persona): string {
-  const name = ACCOUNTS[persona].secret;
-  for (const line of readFileSync(ENV_FILE, "utf-8").split("\n")) {
-    if (line.startsWith(`${name}=`)) return line.slice(name.length + 1).replace(/^"|"$/g, "");
-  }
-  throw new Error(`${name} is not in the deployment's env file`);
-}
-
 test.beforeEach(async ({ page }) => {
-  await page.addInitScript(() => {
-    try {
-      localStorage.setItem("ospreyflow.theme", "light");
-    } catch {
-      /* storage may be blocked; the attribute below still decides this page */
-    }
-    document.documentElement.setAttribute("data-theme", "light");
-  });
+  await lightTheme(page);
 });
 
-/** Through the deployment's own sign-in page, as a person would. Tokens live in memory only, so
- * a shot never reloads the page after this. */
+/** Signs in as the persona through the deployment's own sign-in page. */
 export async function signIn(page: Page, persona: Persona): Promise<void> {
-  await page.goto("/");
-  const glass = new URL(page.url()).hostname;
-  await page.getByRole("button", { name: "Sign in", exact: true }).click();
-  await page.locator("#username").fill(ACCOUNTS[persona].username);
-  await page.locator("#password").fill(passwordOf(persona));
-  await page.locator("#kc-login").click();
-  // Back on the Glass's own address, once it has taken the code out of the address bar.
-  await page.waitForURL((url) => url.hostname === glass && !url.searchParams.has("code"));
+  await signInAs(page, ENV_FILE, persona);
 }
 
-/** Opens the PID case by its name in the case switcher, or from the case picker on first entry.
- * On a deployment holding several cases, sign-in lands on Home, whose recent list need not name
- * this one: Open Glass is taken first, then the picker or the switcher. */
+/** Opens the PID case (or another by name). */
 export async function openCase(page: Page, name = CASE_NAME): Promise<void> {
-  const picker = page.getByRole("button", { name, exact: true });
-  const switcher = page.getByRole("button", { name: /^Case:/ });
-  const openGlass = page.getByRole("button", { name: /^Open Glass/ });
-  await expect(picker.or(switcher).or(openGlass).first()).toBeVisible();
-  if (!(await picker.first().isVisible()) && (await openGlass.isVisible())) await openGlass.click();
-  await expect(picker.or(switcher).first()).toBeVisible();
-  if (!(await picker.first().isVisible())) await switcher.click();
-  await page.getByRole("button", { name, exact: true }).first().click();
-  await expect(page.getByRole("button", { name: /^Case:/ })).toContainText(name);
+  await openCaseNamed(page, name);
 }
 
 export async function shot(page: Page, id: string): Promise<void> {
-  mkdirSync(SCREENS, { recursive: true });
-  await page.screenshot({ path: join(SCREENS, `${id}.png`) });
-}
-
-
-/** Closes the welcome panel when it is open, so it does not sit over the canvas in a shot. */
-export async function dismissWelcome(page: Page): Promise<void> {
-  const welcome = page.getByRole("dialog", { name: "Welcome back" });
-  if (await welcome.isVisible().catch(() => false)) {
-    await page.keyboard.press("Escape");
-  }
-  const close = page.getByRole("button", { name: /close/i }).filter({ hasText: "×" });
-  if (await close.first().isVisible().catch(() => false)) await close.first().click();
+  await shotInto(page, SCREENS, id);
 }
 
 /** The search box: types `text` and returns the type-ahead's options. */
@@ -138,9 +115,18 @@ export async function pickFromSearch(page: Page, text: string, pick: RegExp): Pr
  * left, through the view's own Clear view and its confirmation. */
 export async function clearCanvas(page: Page): Promise<void> {
   const clear = page.getByRole("button", { name: "Clear view" });
-  if (await clear.isEnabled().catch(() => false)) {
-    await clear.click();
-    await page.getByRole("button", { name: /^Clear all/ }).click();
+  // The case's saved working set arrives after the page draws: checked at once, Clear view was still
+  // disabled and the saved nodes landed after it (357 of them, 1 November 2026). So it is checked
+  // again until the canvas reads empty.
+  await expect(counts(page)).toBeVisible();
+  await page.waitForTimeout(3000);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (/^0 nodes/.test((await counts(page).textContent()) ?? "")) break;
+    if (await clear.isEnabled().catch(() => false)) {
+      await clear.click();
+      await page.getByRole("button", { name: /^Clear all/ }).click();
+    }
+    await page.waitForTimeout(3000);
   }
   await expect(counts(page)).toContainText(/^0 nodes/);
   // The working set is the server's: wait out a late delta from an earlier shot before adding.
@@ -153,14 +139,20 @@ export const counts = (page: Page) => page.locator(".status-bar__counts");
 
 /** Opens the case for `persona` on an empty canvas with the welcome panel closed. */
 export async function freshCase(page: Page, persona: Persona = "analyst"): Promise<void> {
-  await signIn(page, persona);
-  await openCase(page);
+  // Once per page: a second sign-in found the identity provider's session and never showed the
+  // form, so CAP-S7 and CAP-S8, which open the case twice, waited out their timeouts (rehearsal,
+  // 2 November 2026). A page already signed in keeps its persona and goes back to the graph.
+  if (page.url() === "about:blank") {
+    await signIn(page, persona);
+    await openCase(page);
+  } else {
+    const graph = page.getByRole("group", { name: "View" }).getByRole("button", { name: "Graph", exact: true });
+    if (await graph.isVisible().catch(() => false)) await graph.click();
+    else await openCase(page);
+  }
   await dismissWelcome(page);
   await clearCanvas(page);
 }
-
-export const rail = (page: Page, name: string) =>
-  page.getByRole("navigation", { name: "Workspace" }).getByRole("button", { name });
 
 /** Explore, Most connected, the node's Add…, then "With all N links…". */
 export async function addWithAllLinks(page: Page, label: string): Promise<void> {
@@ -275,6 +267,9 @@ test("CAP-A1-J2", async ({ page }) => {
 const COHORT = process.env.OSPREY_PID_COHORT_LIST ?? "";
 
 test("CAP-A1-J3", async ({ page }) => {
+  // OSPREY_PID_COHORT_LIST is the demo's 40-identifier list (`pid_files.cohort_list`, script J3:
+  // 37 found, 3 match nothing, 1 repeated), not the scale cohort's 3,000: those are in another case.
+  test.setTimeout(900_000);
   await freshCase(page);
   await page.getByRole("button", { name: "Add many from a list", exact: true }).first().click();
   await page.getByRole("textbox", { name: /identifiers/i }).fill(readFileSync(COHORT, "utf-8"));
@@ -285,8 +280,8 @@ test("CAP-A1-J3", async ({ page }) => {
   await page.getByRole("button", { name: "Cancel", exact: true }).click();
   await closeMessages(page);
   console.log(`J3 counts: ${await counts(page).textContent()}`);
-  await page.getByRole("button", { name: "Communities" }).click();
-  await page.waitForTimeout(3000);
+  // No community grouping (script v3, J3): grouped, the 11 links folded into the clusters and the
+  // slide read as nodes with no links (found reviewing the deck, 1 November 2026).
   await page.getByRole("button", { name: "Fit to view" }).click();
   await rail(page, "Explore").click();
   const explore = page.getByRole("dialog", { name: "Explore" });
@@ -475,13 +470,6 @@ test("CAP-A1-J9-a", async ({ page }) => {
   await shot(page, "CAP-A1-J9-a");
 });
 
-/** The Reports view on one of its tabs. */
-export async function reportsTab(page: Page, tab: string): Promise<void> {
-  await page.getByRole("button", { name: "Reports", exact: true }).click();
-  await page.getByRole("tab", { name: tab, exact: true }).click();
-  await page.waitForTimeout(4000);
-}
-
 test("CAP-A1-J9-b", async ({ page }) => {
   await freshCase(page);
   await reportsTab(page, "Data feeds");
@@ -495,7 +483,14 @@ test("CAP-A1-J9-c", async ({ page }) => {
   await page.waitForTimeout(2500);
   await page.getByRole("tab", { name: "Packs", exact: true }).click();
   await page.waitForTimeout(2500);
-  await page.getByRole("button", { name: /^Wing F supply route/ }).first().click();
+  // The pack a presenter makes in rehearsal; made here when the deployment has none yet.
+  const pack = page.getByRole("button", { name: /^Wing F supply route/ }).first();
+  if (!(await pack.isVisible().catch(() => false))) {
+    await page.getByLabel("New pack title").fill("Wing F supply route");
+    await page.getByRole("button", { name: "Create pack" }).click();
+    await page.waitForTimeout(2500);
+  }
+  await pack.click();
   await page.getByLabel("Saved trend").selectOption({ label: "Throw-overs by yard" });
   await page.getByRole("button", { name: "Add item" }).click();
   await page.waitForTimeout(3000);
@@ -515,17 +510,6 @@ export async function throwOverTrend(page: Page): Promise<void> {
   await page.getByRole("button", { name: /^Preview/ }).click();
   await page.waitForTimeout(5000);
   await scrollAllToTop(page);
-}
-
-/** Puts every scrolled pane back at its top, so a shot starts at the top of each. */
-export async function scrollAllToTop(page: Page): Promise<void> {
-  await page.evaluate(() => {
-    for (const el of Array.from(document.querySelectorAll<HTMLElement>("*"))) {
-      if (el.scrollTop > 0) el.scrollTop = 0;
-    }
-    window.scrollTo(0, 0);
-  });
-  await page.waitForTimeout(500);
 }
 
 test("CAP-A2-C10-b", async ({ page }) => {
@@ -550,10 +534,10 @@ test("CAP-M1", async ({ page }) => {
   await page.waitForTimeout(5000);
   await shot(page, "CAP-M1-b");
   // V6: the schedule editor's preview, read and never saved (Brief 2 section 7.4).
-  const cadence = page.getByLabel("How often");
+  const cadence = page.getByLabel("Run on a schedule (how often)");
   console.log(`V6 cadences: ${JSON.stringify(await cadence.locator("option").allTextContents())}`);
   await cadence.selectOption("weekdays");
-  await page.getByLabel("Time", { exact: true }).fill("07:30");
+  await page.getByLabel("At (time)", { exact: true }).fill("07:30");
   await page.waitForTimeout(3000);
   const preview = page.getByRole("status", { name: "Schedule preview" });
   console.log(`V6 preview: ${await preview.textContent().catch(() => "(none)")}`);
@@ -583,18 +567,31 @@ async function runNow(page: Page, open: RegExp): Promise<string> {
   await page.getByRole("button", { name: open }).click();
   const publish = page.getByRole("button", { name: "Publish", exact: true });
   const run = page.getByRole("button", { name: "Run now" });
-  // A published recipe opens on its Publish screen; a draft opens on its canvas first.
+  // A published recipe opens on its Publish screen; a draft opens on its canvas first. There the
+  // first "Publish" is the pipeline's Publish stage, which only moves to the Publish screen; the
+  // Publish button on that screen is what publishes it. On a deployment whose recipes were all
+  // published in earlier rehearsals the second press was never needed (found capturing a fresh
+  // GOV.UK-brand deployment, 31 October 2026).
   try {
     await run.waitFor({ timeout: 10_000 });
   } catch {
     await publish.click();
+    try {
+      await run.waitFor({ timeout: 10_000 });
+    } catch {
+      await publish.click();
+    }
   }
-  await run.click();
-  const outcome = page.getByText(/Succeeded:|Failed|refused/i).first();
-  await expect(outcome).toBeVisible({ timeout: 240_000 });
+  // The new run's own answer, never the runs list's older "Succeeded:" (step 9d finding 7).
+  const runs = await runNowAndWait(page, run, 240_000);
   await page.waitForTimeout(3000);
-  const runs = (await page.getByRole("list", { name: "Runs of this recipe" }).textContent()) ?? "";
-  await page.getByRole("button", { name: /Back/ }).first().click();
+  // The Publish screen's own way back to the recipe list, by its exact name: `/Back/` also matched
+  // the rail's "Back to the investigation", which left the Studio (31 October 2026).
+  await page.getByRole("button", { name: "← Back", exact: true }).click();
+  // A pipeline with a canvas (the reports pipeline once published by the fallback) goes back to its
+  // canvas, not to the list: its "Pipelines" button is the way to the list (2 November 2026).
+  const toList = page.getByRole("button", { name: "Pipelines", exact: true });
+  if (await toList.isVisible().catch(() => false)) await toList.click();
   return runs;
 }
 
@@ -602,6 +599,19 @@ test("chapter 4: the reports, then their incidents", async ({ page }) => {
   test.setTimeout(600_000);
   await studio(page);
   console.log(`R9: ${await runNow(page, /^Open Intelligence reports/)}`);
+  // Back to the pipeline list by the Studio's own Pipelines tab: after the reports' run, the way back
+  // left a page where "Open Report incidents" never appeared, and the test waited out its whole
+  // timeout (rehearsal, 2 November 2026). Signing in again is no way back: the identity provider's
+  // session skips the form.
+  const incidents = page.getByRole("button", { name: /^Open Report incidents/ });
+  if (!(await incidents.isVisible().catch(() => false))) {
+    await page
+      .getByRole("tab", { name: "Pipelines", exact: true })
+      .or(page.getByRole("button", { name: "Pipelines", exact: true }))
+      .first()
+      .click();
+  }
+  await expect(incidents).toBeVisible();
   console.log(`R17: ${await runNow(page, /^Open Report incidents/)}`);
 });
 
@@ -686,9 +696,54 @@ test("CAP-A2-C8-b", async ({ page }) => {
   await shot(page, "CAP-A2-C8-b");
 });
 
+// --- Chapter 9: a hotlist, a rule and three alerts (script v4; ADR-127 Amendment 41) -----------
+// Run in this order, after `--release-batch-2` (which lists all three chapter-9 files): 9a, 9b, C9,
+// M4-a, 9c, C9Q-a, 9d, C9S, 9e, C9Q-b. Each "chapter …" test changes the deployment's state as the
+// presenter would; each CAP- test only reads and shoots, except where its comment says otherwise.
+
+/** The rule P1 deploys (`pid_monitoring.P1_RULE_NAME`). */
+const P1_RULE = "Calls to a number on a seized handset";
+
+/** The incoming folder `pid_files.write_files` writes the chapter-9 files to, as the Conduit sees
+ * it: the demo loads them, the seed does not. */
+const INCOMING = "/var/lib/osprey/ingest/uploaded/prison-intelligence/incoming";
+
+/** Runs a published pipeline over one of the chapter-9 files from its Publish screen, as the data
+ * engineer, and says what its runs list reads afterwards. */
+async function loadIncoming(page: Page, open: RegExp, file: string): Promise<void> {
+  await studio(page);
+  await page.getByRole("button", { name: open }).click();
+  const run = page.getByRole("button", { name: "Run now" });
+  await run.waitFor();
+  await page.getByLabel(/^Source file/).fill(`${INCOMING}/${file}`);
+  // The new run's own answer, never the runs list's older "Succeeded" (step 9d finding 7).
+  console.log(`${file}: ${await runNowAndWait(page, run)}`);
+  await page.waitForTimeout(5000);
+}
+
+/** The queue's hotlist rows, newest first (high severity, then newest: `alerts.py`'s order), so
+ * `nth(0)` is H2 (the bookings) and `nth(1)` is H1 (batch 2) once both are raised. */
+const hotlistRows = (page: Page) =>
+  page
+    .getByRole("region", { name: "Alert queue" })
+    .getByRole("button", { name: /^Open alert: .*Hotlist/ });
+
+async function openHotlistAlert(page: Page, nth: number) {
+  const row = hotlistRows(page).nth(nth);
+  await expect(row).toBeVisible({ timeout: 60_000 });
+  await row.click();
+  const detail = page.getByRole("region", { name: "What fired this alert" });
+  await expect(detail).toBeVisible();
+  await page.waitForTimeout(1500);
+  return detail;
+}
+
+/** S1's row: its words begin with the number it names (`EXPECTED_ALERTS[2]`). */
+const ruleAlertSummary = () => new RegExp(unownedNumber().replace(/[+]/g, "\\+") + ".*within 2 step");
+
 test("chapter 9a: the analyst hotlists the coordinator's number", async ({ page }) => {
   await freshCase(page);
-  await rail(page, "Watches").click();
+  await monitoringTab(page, "Watches");
   await page.getByLabel("Identifier", { exact: true }).fill(coordinatorNumber().national);
   await page.getByLabel("Review date").fill("2027-01-31");
   await page.getByRole("button", { name: "Add to hotlist" }).click();
@@ -698,26 +753,22 @@ test("chapter 9a: the analyst hotlists the coordinator's number", async ({ page 
 
 test("chapter 9b: the engineer loads batch 2", async ({ page }) => {
   test.setTimeout(600_000);
-  await studio(page);
-  await page.getByRole("button", { name: /^Open Seized media/ }).click();
-  const run = page.getByRole("button", { name: "Run now" });
-  await run.waitFor();
-  await page.getByLabel(/^Source file/).fill(
-    "/var/lib/osprey/ingest/uploaded/prison-intelligence/pid_seized_comms_batch2.csv",
-  );
-  await run.click();
-  await expect(page.getByRole("list", { name: "Runs of this recipe" })).toContainText(/batch2|Succeeded.*\n?.*Succeeded/, { timeout: 300_000 }).catch(() => undefined);
-  await page.waitForTimeout(5000);
-  console.log(`batch 2 runs: ${await page.getByRole("list", { name: "Runs of this recipe" }).textContent()}`);
+  await loadIncoming(page, /^Open Seized media/, "pid_seized_comms_batch2.csv");
 });
 
 test("CAP-A2-C9", async ({ page }) => {
-  // A hotlist's alert is in the Watches rail's Alert inbox; the Alerts rail is the typology rules'
-  // queue. The alert explains itself (ADR-130 decision 1): the identifier as typed and its review
-  // date, and the node it matched with the files and rows that put it there.
+  // The Watches tab of Monitoring (the rail's Watches entry is gone, the owner's answer of
+  // 1 November 2026): the hotlist and its Alert inbox. The alert explains itself (ADR-130 decision
+  // 1): the identifier as typed and its review date, and the node it matched with the files and
+  // rows that put it there.
   await freshCase(page);
-  await rail(page, "Watches").click();
+  await monitoringTab(page, "Watches");
   await expect(page.getByText(/^Hotlist: /).first()).toBeVisible({ timeout: 60_000 });
+  // The alert's explanation sits below the hotlists, under the fold at 1440 by 900: brought into view
+  // so the shot shows it, not only the inbox's heading (2 November 2026); CAP-M4-a keeps the top. It is
+  // aligned at the bottom so the hotlist stays in view: under the GOV.UK brand the whole page scrolls,
+  // and aligning the inbox's heading at the top showed the footer instead.
+  await page.getByRole("button", { name: "Jump into investigation" }).first().evaluate((el) => el.scrollIntoView({ block: "end" }));
   await page.waitForTimeout(1500);
   await shot(page, "CAP-A2-C9");
   await shot(page, "CAP-M4-b");
@@ -725,9 +776,225 @@ test("CAP-A2-C9", async ({ page }) => {
 
 test("CAP-M4-a", async ({ page }) => {
   await freshCase(page);
-  await rail(page, "Watches").click();
+  await monitoringTab(page, "Watches");
   await page.waitForTimeout(2500);
   await shot(page, "CAP-M4-a");
+});
+
+test("chapter 9c: the engineer loads the visit bookings", async ({ page }) => {
+  test.setTimeout(600_000);
+  await loadIncoming(page, /^Open Visit bookings/, "pid_visit_bookings.csv");
+});
+
+test("CAP-A2-C9Q-a", async ({ page }) => {
+  // P2: the one queue holds both hotlist alerts; H2 (the bookings, newest) is opened. It is the
+  // analyst's alone ("Only its owner") and was raised as the bookings loaded, before the visit.
+  await freshCase(page);
+  await monitoringTab(page, "Queue");
+  console.log(`queue: ${await page.getByRole("region", { name: "Alert queue" }).textContent()}`);
+  await openHotlistAlert(page, 0);
+  await shot(page, "CAP-A2-C9Q-a");
+});
+
+test("chapter 9d: the case's Author writes the rule as a sentence, previews it and deploys it", async ({ page }) => {
+  // A rule for the case team needs the case's Author level (ADR-109 ruling 4; the sentence route);
+  // the demo analyst is an Editor, and the demo admin, who holds the Analyst role too, is the
+  // case's Author. Deployed only after the bookings load: before it, the rule would also flag the
+  // coordinator's number as the bookings touch it (ADR-127 Amendment 41, "The order").
+  // Shoots CAP-A2-C9R-a (the sentence, its drawn pattern and its preview) before deploying.
+  test.setTimeout(600_000);
+  await freshCase(page, "admin");
+  await monitoringTab(page, "Rules");
+  const rules = page.getByRole("list", { name: "Rules" });
+  // An active rule offers Retire; a retired one does not.
+  if (await page.getByRole("button", { name: `Retire ${P1_RULE}` }).isVisible().catch(() => false)) {
+    console.log(`rules: ${await rules.textContent()}`);
+    throw new Error(`"${P1_RULE}" is already deployed: retire it first (a rule raises a finding once)`);
+  }
+  const form = page.getByRole("form", { name: "Write a rule as a sentence" });
+  await form.getByRole("combobox", { name: "Subject" }).selectOption("Endpoint");
+  await form.getByRole("button", { name: "Add a condition" }).click();
+  await form.getByRole("combobox", { name: "Condition 1: property" }).selectOption("endpoint_kind");
+  await form.getByRole("combobox", { name: "Condition 1: test" }).selectOption("equals");
+  await form.getByRole("combobox", { name: "Condition 1: value" }).selectOption("msisdn");
+  await form.getByRole("combobox", { name: "Relationship" }).selectOption("within_steps");
+  await form.getByRole("combobox", { name: "Steps" }).selectOption("2");
+  await form.getByRole("combobox", { name: "Of a (the type near it)" }).selectOption("Device");
+  await form.getByRole("combobox", { name: "Severity" }).selectOption("high");
+  await form.getByRole("combobox", { name: "For (scope)" }).selectOption("this_case");
+  await form.getByRole("combobox", { name: "Alert goes to (team)" }).selectOption("case");
+  await form.getByRole("combobox", { name: "Runs" }).selectOption("post_commit");
+  await form.getByRole("button", { name: "Show the drawn pattern" }).click();
+  await expect(form.getByRole("region", { name: "The drawn pattern" })).toBeVisible();
+  await form.getByRole("button", { name: "Preview on the last 90 days" }).click();
+  const preview = form.getByRole("region", { name: "Preview" });
+  await expect(preview).toBeVisible({ timeout: 240_000 });
+  console.log(`P1 drawn pattern: ${await form.getByRole("region", { name: "The drawn pattern" }).textContent()}`);
+  console.log(`P1 preview: ${await preview.textContent()}`);
+  await form.scrollIntoViewIfNeeded();
+  await page.waitForTimeout(1000);
+  await shot(page, "CAP-A2-C9R-a");
+  await form.getByRole("textbox", { name: "Name of the sentence rule" }).fill(P1_RULE);
+  await form.getByRole("button", { name: "Deploy the sentence" }).click();
+  await expect(page.getByRole("status").filter({ hasText: P1_RULE })).toBeVisible({ timeout: 60_000 });
+  console.log(`deployed: ${await page.getByRole("status").filter({ hasText: P1_RULE }).textContent()}`);
+});
+
+test("CAP-A2-C9S", async ({ page }) => {
+  // Checks on load and Verify's would-be alerts, as the data engineer. Shown on the Intelligence
+  // reports pipeline, which has a canvas (and so the Checks on load and Verify buttons) since
+  // chapter 4: the seed publishes the PIN first contacts pipeline from its recipe with no canvas,
+  // so reaching its own Checks on load means Reopen for editing, a new version (not done here).
+  // Reads only: the checks are not saved, and Verify is a dry run that writes nothing.
+  test.setTimeout(600_000);
+  await studio(page);
+  await page.getByRole("button", { name: /^Open Intelligence reports/ }).click();
+  await page.getByRole("button", { name: "Checks on load", exact: true }).click();
+  const table = page.getByRole("table", { name: "Rules this pipeline may be checked by" });
+  await expect(table.or(page.getByText(/No rule of this case/)).first()).toBeVisible({ timeout: 60_000 });
+  // The Studio has no `main` landmark: waiting on one hung the test for its whole timeout
+  // (2 November 2026), so the log reads the checks' own table.
+  console.log(`checks: ${await table.or(page.getByText(/No rule of this case/)).first().textContent({ timeout: 10_000 }).catch(() => "")}`.slice(0, 800));
+  await page.waitForTimeout(1000);
+  await shot(page, "CAP-A2-C9S-a");
+  await page.getByRole("button", { name: "← Back to the pipeline" }).click();
+  await page.getByRole("button", { name: "Verify", exact: true }).click();
+  await page.getByRole("button", { name: "Run verify" }).click();
+  const would = page.getByRole("heading", { name: "Alerts this sample would raise" });
+  await expect(would).toBeVisible({ timeout: 240_000 });
+  await would.scrollIntoViewIfNeeded();
+  await page.waitForTimeout(1500);
+  console.log(`would raise: ${await would.locator("xpath=../..").textContent()}`.slice(0, 600));
+  await shot(page, "CAP-A2-C9S-b");
+});
+
+test("chapter 9e: the engineer loads the PIN first contacts", async ({ page }) => {
+  test.setTimeout(600_000);
+  await loadIncoming(page, /^Open PIN phone first contacts/, "pid_pin_new_contacts.csv");
+});
+
+test("CAP-A2-C9Q-b", async ({ page }) => {
+  // P1: the rule's alert, S1, for the case team, naming the number Pryce's seized handset called.
+  await freshCase(page);
+  await monitoringTab(page, "Queue");
+  console.log(`queue: ${await page.getByRole("region", { name: "Alert queue" }).textContent()}`);
+  const detail = await openQueuedAlert(page, ruleAlertSummary());
+  console.log(`S1: ${(await detail.textContent())?.slice(0, 600)}`);
+  await shot(page, "CAP-A2-C9Q-b");
+});
+
+// --- Chapter 10: closes, the trend and the figures (P3, P4) ---------------------------------------
+// After chapter 9, in this order: 10a, 10b, (10c, the open question), C10M-d, C11M, (C10M-e).
+
+test("chapter 10a: the analyst closes H2 as Referred, alone (CAP-A2-C10M-a)", async ({ page }) => {
+  // H2 is "Only its owner": its owner closes it with no second person (ADR-133 Amendment 4 item 5).
+  await freshCase(page);
+  await monitoringTab(page, "Queue");
+  await openHotlistAlert(page, 0);
+  await closeOpenedAlert(page, "Referred", "To the visits team: the visit goes ahead under closed conditions.");
+  await shot(page, "CAP-A2-C10M-a");
+});
+
+test("chapter 10b: the analyst proposes S1's close as Referred (CAP-A2-C10M-b)", async ({ page }) => {
+  // High severity, for the case team: closing it proposes the close, which waits for a second
+  // person (ADR-133 decision 7, stage (d)). Never True match in a rehearsal: the reset then refuses.
+  await freshCase(page);
+  await monitoringTab(page, "Queue");
+  await openQueuedAlert(page, ruleAlertSummary());
+  await closeOpenedAlert(page, "Referred", "To the regional intelligence unit for a subscriber check on the number.");
+  await shot(page, "CAP-A2-C10M-b");
+});
+
+test("chapter 10c, open question 13: the admin approves S1's close as the second person (CAP-A2-C10M-c)", async ({ page }) => {
+  // Not part of the script's stage path (the script narrates the approval from a slide). The demo
+  // admin holds the Analyst role and is the case's Author, so the Conduit should accept it as the
+  // second person (`approve_close` refuses only the proposer); this test is how that is found out.
+  // Shoots the approval before and after. Run it only when the owner wants the slide's images.
+  await freshCase(page, "admin");
+  await monitoringTab(page, "Queue");
+  const detail = await openQueuedAlert(page, ruleAlertSummary());
+  const approve = detail.getByRole("button", { name: "Approve the close" });
+  await expect(approve).toBeVisible();
+  await shot(page, "CAP-A2-C10M-c");
+  await approve.click();
+  await expect(detail.getByRole("status")).toBeVisible({ timeout: 30_000 });
+  console.log(`approval: ${await detail.getByRole("status").textContent()}`);
+  await page.waitForTimeout(1500);
+  await shot(page, "CAP-A2-C10M-c2");
+});
+
+/** P3's trend: the case's alerts, counted by week and split by rule (ADR-134 decision 3). */
+const ALERT_TREND = "Alerts by rule, weekly";
+
+test("CAP-A2-C10M-d", async ({ page }) => {
+  // Saves the trend (a state change chapter 11 needs), once: a second run finds it saved.
+  await freshCase(page);
+  await reportsTab(page, "Trends");
+  await page.getByLabel("Title", { exact: true }).fill(ALERT_TREND);
+  await page.getByRole("radiogroup", { name: "What to count" }).getByRole("radio", { name: "Alerts" }).check();
+  await page.getByLabel("Interval").selectOption("week");
+  await page.getByLabel("Series").selectOption({ label: "By rule" });
+  await page.getByRole("button", { name: /^Preview/ }).click();
+  await page.waitForTimeout(5000);
+  await scrollAllToTop(page);
+  await shot(page, "CAP-A2-C10M-d");
+  const saved = page.getByRole("region", { name: "Saved trends" });
+  if (!((await saved.textContent().catch(() => "")) ?? "").includes(ALERT_TREND)) {
+    await page.getByRole("button", { name: "Save trend" }).click();
+    await page.waitForTimeout(2500);
+  }
+});
+
+test("CAP-A2-C11M", async ({ page }) => {
+  // Chapter 11's pack: the alert trend and H1, still open, as an `alert` item (ADR-134 decision 1).
+  // Adds the two items to the briefing pack (a state change), then shoots the pack.
+  await freshCase(page);
+  await reportsTab(page, "Packs");
+  const pack = page.getByRole("button", { name: /^Wing F supply route/ }).first();
+  if (!(await pack.isVisible().catch(() => false))) {
+    await page.getByLabel("New pack title").fill("Wing F supply route");
+    await page.getByRole("button", { name: "Create pack" }).click();
+    await page.waitForTimeout(2500);
+  }
+  await pack.click();
+  await page.getByLabel("Item kind").selectOption("trend");
+  await page.getByLabel("Saved trend").selectOption({ label: ALERT_TREND });
+  await page.getByRole("button", { name: "Add item" }).click();
+  await page.waitForTimeout(3000);
+  await page.getByLabel("Item kind").selectOption("alert");
+  const options = await page.getByLabel("Alert", { exact: true }).locator("option").allTextContents();
+  console.log(`alerts offered: ${JSON.stringify(options)}`);
+  const h1 = options.find((o) => /Open/.test(o) && /hotlisted/.test(o));
+  if (!h1) throw new Error("H1 (the open hotlist alert) is not offered for the pack");
+  await page.getByLabel("Alert", { exact: true }).selectOption({ label: h1 });
+  await page.getByRole("button", { name: "Add item" }).click();
+  await page.waitForTimeout(3000);
+  await scrollAllToTop(page);
+  // The new items are the pack's last: on a pack with earlier rehearsals' items the top of the pack
+  // showed none of them (2 November 2026), so the alert item is brought into view.
+  await page.getByText(/hotlisted identifier appeared/).last().evaluate((el) => el.scrollIntoView({ block: "center" }));
+  await page.waitForTimeout(1000);
+  await shot(page, "CAP-A2-C11M");
+});
+
+test("CAP-A2-C10M-e", async ({ page }) => {
+  // P4 on the Superset monitoring board, only where one is registered for this case (dashboards
+  // on, a board built as administration guide §12 describes, its account a Viewer of the case).
+  // Otherwise skipped: chapter 10 then shows P4 from a slide. The board never counts an "only me"
+  // hotlist, so it holds S1 alone.
+  await signIn(page, "viewer");
+  await openCase(page);
+  const boards = rail(page, "Dashboards");
+  test.skip(!(await boards.isVisible().catch(() => false)), "no dashboard for this case: P4 is a slide");
+  await boards.click();
+  await page.waitForTimeout(15_000);
+  // Dashboards on, the rail entry is there whether or not a board is registered for this case: the
+  // place then says so, and that empty page was shot (2 November 2026). Skip it instead.
+  test.skip(
+    await page.getByText(/^No dashboard you may open/).isVisible().catch(() => false),
+    "no dashboard registered for this case: P4 is a slide",
+  );
+  await shot(page, "CAP-A2-C10M-e");
 });
 
 test("CAP-A2-C6", async ({ page }) => {
@@ -859,4 +1126,284 @@ test("CAP-M5-b", async ({ page }) => {
   await page.waitForTimeout(4000);
   await shot(page, "CAP-M5-b");
   await shot(page, "CAP-A2-C10-c");
+});
+
+// --- connection strength (ADR-139; the demo script's strength scene, ADR-127 Amendment 42) --------
+//
+// Read-only but for CAP-S6, which saves the case's own influencer as its Author (the presenter's
+// step; `CAPTURE_RUNBOOK_v4.md` says how to undo it), and CAP-S7 and CAP-S10, which switch the case
+// to client parity and back (ADR-139 Amendment 2; ADR-127 Amendment 43). Every person is found by the prison number
+// the plan gives them, never by a name written here.
+
+/** The cast member's prison number and the name the canvas draws ("Family, Given"). */
+function castMember(key: string): { number: string; name: string } {
+  const e = `plan.entity('${key}').properties`;
+  const [number, family, given] = fromPlan(`${e}['prison_number'], ${e}['family_name'], ${e}['given_names']`);
+  if (!number || !family) throw new Error(`the plan gave no prison number for ${key}`);
+  return { number, name: `${family}, ${given}` };
+}
+
+/** The Matrix view, two entity rows selected together (the Inspector's "What these two share"). */
+async function selectTwoInMatrix(page: Page, first: string, second: string): Promise<void> {
+  await page.getByRole("group", { name: "View" }).getByRole("button", { name: "Matrix", exact: true }).click();
+  const entities = page.getByRole("grid", { name: /^Entities in this view/ });
+  await entities.getByRole("rowheader", { name: new RegExp(first) }).click();
+  // Command on a Mac, Control elsewhere: on macOS a Control-click is a right-click, which selected
+  // nothing more (rehearsal, 2 November 2026).
+  await entities.getByRole("rowheader", { name: new RegExp(second) }).click({ modifiers: ["ControlOrMeta"] });
+  await page.waitForTimeout(2000);
+}
+
+/** The Matrix view's link row from `from` of `linkLabel`, selected (the Inspector shows the link). */
+async function selectLinkInMatrix(page: Page, linkLabel: string, from: RegExp): Promise<void> {
+  await page.getByRole("group", { name: "View" }).getByRole("button", { name: "Matrix", exact: true }).click();
+  const links = page.getByRole("grid", { name: /^Links in this view/ });
+  const row = links.getByRole("row").filter({ hasText: linkLabel }).filter({ hasText: from }).first();
+  await row.getByRole("rowheader").click();
+  await page.waitForTimeout(2000);
+}
+
+test("CAP-S1", async ({ page }) => {
+  // The legend box: the influencers in force (shipped, so "to be confirmed with the client"), the
+  // direct link types, and that rarity is worked out over what the reader may see.
+  await principalStar(page);
+  const legend = page.locator(".canvas-legend");
+  await expect(legend.getByRole("list", { name: "Strength influencers" })).toBeVisible();
+  console.log(`S1 legend: ${await legend.textContent()}`);
+  // The legend scrolls inside itself: its Connection strength part sat below the link types, out of
+  // the shot (rehearsal, 2 November 2026), so it is brought into view.
+  await legend.getByRole("list", { name: "Strength influencers" }).scrollIntoViewIfNeeded();
+  await page.waitForTimeout(800);
+  await shot(page, "CAP-S1");
+});
+
+test("CAP-S2", async ({ page }) => {
+  // An assault-evidenced conflict drawn stronger: the principal's conflict with calder_1, both of
+  // them in assault_1; the Inspector says why, naming the Incident that evidences it.
+  await principalStar(page);
+  const calder = castMember("calder_1");
+  await selectLinkInMatrix(page, "In conflict with", new RegExp(calder.name.split(",")[0]!));
+  await onlyPanel(page, "Inspector");
+  await page.getByRole("button", { name: "Connection strength", exact: true }).click();
+  const why = page.getByRole("list", { name: "What this link's strength rests on" });
+  await expect(why).toContainText("evidences it");
+  console.log(`S2: ${await why.textContent()}`);
+  // Into view: under the GOV.UK brand's taller header the explanation sat below the fold (rehearsal).
+  await why.scrollIntoViewIfNeeded();
+  await shot(page, "CAP-S2");
+});
+
+test("CAP-S3", async ({ page }) => {
+  // A direct call against a shared address: two men who held the same cell at different times share
+  // that address in custody and nothing direct (a), where the principal's calls to the coordinator
+  // are a direct link, drawn stronger (b).
+  // On the principal's star, as the script's scene has them: two men added alone by search were left
+  // out of the server's view by the large-draw offer, and the Inspector said "No rarity to give"
+  // (rehearsal, 2 November 2026). Both are on the star.
+  await principalStar(page);
+  const [one, two] = ["cellmate_1", "cellmate_2"].map(castMember);
+  await selectTwoInMatrix(page, one!.name.split(",")[0]!, two!.name.split(",")[0]!);
+  await onlyPanel(page, "Inspector");
+  await page.getByRole("button", { name: "What these two share", exact: true }).click();
+  const shared = page.getByRole("list", { name: "Shared attributes, rarest first" });
+  await expect(shared).toBeVisible();
+  console.log(`S3-a: ${await shared.textContent()}`);
+  await shot(page, "CAP-S3-a");
+  // The same page, emptied: signing in a second time found the identity provider's session and never
+  // showed the sign-in form, so the test waited out its timeout (rehearsal, 2 November 2026).
+  await page.getByRole("group", { name: "View" }).getByRole("button", { name: "Graph", exact: true }).click();
+  await clearCanvas(page);
+  const { national } = coordinatorNumber();
+  await pickFromSearch(page, `+44 ${national.slice(1)}`, /^Endpoint/);
+  // Bounded: with no Expand on screen the click waited out the whole test (rehearsal, 2 November 2026).
+  await page.getByRole("button", { name: "Expand" }).first().click({ timeout: 5000 }).catch(() => undefined);
+  await page.waitForTimeout(4000);
+  await selectLinkInMatrix(page, "Communicated with", /PIN-/); // the Matrix says the label (rehearsal, 2 November 2026)
+  await page.getByRole("button", { name: "Connection strength", exact: true }).click();
+  const why = page.getByRole("list", { name: "What this link's strength rests on" });
+  await expect(why).toContainText("a direct link");
+  console.log(`S3-b: ${await why.textContent()}`);
+  await shot(page, "CAP-S3-b");
+});
+
+test("CAP-S4", async ({ page }) => {
+  // A rare shared contact ranking above a common one: relay_1 and relay_2 share relay_4 (three
+  // people know him) above the principal (linked to many) and the establishment (everyone).
+  // On the principal's star, as the script's scene has them: two men added alone by search were left
+  // out of the server's view by the large-draw offer, and the Inspector said "No rarity to give"
+  // (rehearsal, 2 November 2026). Both are on the star.
+  await principalStar(page);
+  const [one, two] = ["relay_1", "relay_2"].map(castMember);
+  await selectTwoInMatrix(page, one!.name.split(",")[0]!, two!.name.split(",")[0]!);
+  await onlyPanel(page, "Inspector");
+  await page.getByRole("button", { name: "What these two share", exact: true }).click();
+  const shared = page.getByRole("list", { name: "Shared attributes, rarest first" });
+  await expect(shared).toBeVisible();
+  console.log(`S4: ${await shared.textContent()}`);
+  await shot(page, "CAP-S4");
+});
+
+test("CAP-S5", async ({ page }) => {
+  // The two filters dimming: connection strength at 0.8 (a), then shared-attribute rarity (b).
+  await principalStar(page, "Metrics");
+  // The Metrics panel's own Filter section, exactly: /^Filter/ also matched the search box's
+  // "Filters" button (rehearsal, 2 November 2026).
+  await page.getByRole("button", { name: "Filter", exact: true }).click();
+  await page.getByRole("combobox", { name: "Filter by metric" }).selectOption("connection_strength");
+  const threshold = page.getByRole("slider", { name: "Metric value at least" });
+  await expect(threshold).toBeVisible();
+  await threshold.focus();
+  for (let i = 0; i < 60; i++) await page.keyboard.press("ArrowRight");
+  await page.waitForTimeout(2000);
+  console.log(`S5-a: ${await counts(page).textContent()}`);
+  await shot(page, "CAP-S5-a");
+  await page.getByRole("combobox", { name: "Filter by metric" }).selectOption("shared_attribute_rarity");
+  await expect(threshold).toBeVisible();
+  await threshold.focus();
+  for (let i = 0; i < 50; i++) await page.keyboard.press("ArrowRight");
+  await page.waitForTimeout(2000);
+  console.log(`S5-b: ${await counts(page).textContent()}`);
+  await shot(page, "CAP-S5-b");
+});
+
+test("CAP-S6", async ({ page }) => {
+  // A case's own influencer and a rule on strength, as the case's Author (the demo admin): an
+  // assault in this case draws a conflict at least 0.95 strong (a, the tab; the legend marks it a
+  // case override), and a sentence rule on conflicts reaching 0.95 is previewed (b): it would raise
+  // three alerts, the principal and the two men from the assaults, whenever the case was loaded
+  // (`test_pid_connection_strength.py`). Changes the case: the runbook says how to undo it.
+  test.setTimeout(600_000);
+  await freshCase(page, "admin");
+  await monitoringTab(page, "Connection strength");
+  const tab = page.locator(".strength-panel");
+  const form = tab.locator("fieldset").filter({ hasText: "Add an influencer" }).first();
+  await form.getByRole("textbox", { name: "Label in the legend" }).fill("Assault in this case");
+  await form.getByRole("checkbox", { name: "In conflict with" }).check();
+  await form.getByRole("combobox", { name: "When it applies" }).selectOption("record");
+  await form.getByRole("combobox", { name: "Kind of record" }).selectOption("Incident");
+  await form.getByRole("combobox", { name: "Its property" }).selectOption("category");
+  await form.getByRole("checkbox", { name: "assault" }).check();
+  await form.getByRole("combobox", { name: "Change" }).selectOption("floor");
+  await form.getByRole("spinbutton", { name: "Size" }).fill("0.95");
+  await form.getByRole("button", { name: "Add this influencer" }).click();
+  await tab.getByRole("button", { name: "Save this case's influencers" }).click();
+  await expect(page.getByRole("status").filter({ hasText: "saved" })).toBeVisible();
+  // From the top of the tab, where the case's own influencers are listed: shot where the form left
+  // it, the image showed only the emptied form (rehearsal, 2 November 2026).
+  await scrollAllToTop(page);
+  await shot(page, "CAP-S6-a");
+  await monitoringTab(page, "Rules");
+  const rule = page.getByRole("form", { name: "Write a rule as a sentence" });
+  await rule.getByRole("combobox", { name: "Subject" }).selectOption("Person");
+  // Linked by a conflict first, so the rule judges the people with one, not every person in the case.
+  await rule.getByRole("combobox", { name: "Relationship" }).selectOption("linked");
+  await rule.getByRole("combobox", { name: "Link type" }).selectOption("IN_CONFLICT_WITH");
+  await rule.getByRole("combobox", { name: "Linked to" }).selectOption("Person");
+  await rule.getByRole("combobox", { name: "Strength", exact: true }).selectOption("connection_strength");
+  await rule.getByRole("combobox", { name: "By (link type, for strength)" }).selectOption("IN_CONFLICT_WITH");
+  await rule.getByRole("combobox", { name: "With (type, for strength)" }).selectOption("Person");
+  await rule.getByRole("spinbutton", { name: "Reaches" }).fill("0.95");
+  await rule.getByRole("combobox", { name: "Severity" }).selectOption("high");
+  await rule.getByRole("button", { name: "Preview on the last 90 days" }).click();
+  const preview = rule.getByRole("region", { name: "Preview" });
+  await expect(preview).toBeVisible({ timeout: 240_000 });
+  console.log(`S6 preview: ${await preview.textContent()}`);
+  await rule.scrollIntoViewIfNeeded();
+  await shot(page, "CAP-S6-b");
+});
+
+// --- both compositions on one case (ADR-139 Amendment 2; ADR-127 Amendment 43) -------------------
+//
+// First run at the step 11 rehearsal (2 November 2026). The case's Author switches it to client parity (CAP-S7), the Inspector shows the raw
+// sums on the client's scale (CAP-S8), what two relay members share is ranked by the client's own
+// measure (CAP-S9), and the Author switches it back (CAP-S10). Every figure the logs must say is
+// proved on the plan by `tests/scenarios/test_pid_client_parity.py`.
+
+/** Monitoring > Connection strength, as the case's Author: the case's composition chosen and saved. */
+async function setCaseComposition(page: Page, value: "client_parity" | ""): Promise<void> {
+  await monitoringTab(page, "Connection strength");
+  const tab = page.locator(".strength-panel");
+  await tab.getByRole("combobox", { name: "How strength is worked out in this case" }).selectOption(value);
+  await tab.getByRole("button", { name: "Save this case's influencers" }).click();
+  await expect(page.getByRole("status").filter({ hasText: "saved" })).toBeVisible();
+}
+
+test("CAP-S7", async ({ page }) => {
+  // The case's Author switches the case to client parity (a), and the legend says so, marked as
+  // the case's own (b). Changes the case: CAP-S10 switches it back.
+  await freshCase(page, "admin");
+  await setCaseComposition(page, "client_parity");
+  await expect(page.getByLabel("Composition in force")).toContainText("client parity (this case's own)");
+  // Brought into view: the save leaves the tab scrolled to its form, and the shot showed the form
+  // alone (rehearsal, 2 November 2026).
+  await page.getByLabel("Composition in force").evaluate((el) => el.scrollIntoView({ block: "center" }));
+  await shot(page, "CAP-S7-a");
+  await principalStar(page);
+  const indicator = page.locator(".canvas-legend").getByLabel("Composition", { exact: true });
+  await expect(indicator).toContainText("Composition: client parity");
+  console.log(`S7 legend: ${await indicator.textContent()}`);
+  // The legend scrolls inside itself; its composition line sat below the link types (rehearsal).
+  await indicator.scrollIntoViewIfNeeded();
+  await page.waitForTimeout(800);
+  await shot(page, "CAP-S7-b");
+});
+
+test("CAP-S8", async ({ page }) => {
+  // Under client parity: the principal's busiest call, explained, with its raw sum on the client's
+  // scale, the same as the case's quietest call's (a); and his assault-evidenced conflict, above
+  // every plain conflict (b).
+  await freshCase(page);
+  const { national } = coordinatorNumber();
+  await pickFromSearch(page, `+44 ${national.slice(1)}`, /^Endpoint/);
+  // Bounded: with no Expand on screen the click waited out the whole test (rehearsal, 2 November 2026).
+  await page.getByRole("button", { name: "Expand" }).first().click({ timeout: 5000 }).catch(() => undefined);
+  await page.waitForTimeout(4000);
+  await selectLinkInMatrix(page, "Communicated with", /PIN-/); // the Matrix says the label (rehearsal, 2 November 2026)
+  await onlyPanel(page, "Inspector");
+  await page.getByRole("button", { name: "Connection strength", exact: true }).click();
+  const raw = page.getByLabel("Raw sum on the client's scale");
+  await expect(raw).toBeVisible();
+  console.log(`S8-a: ${await raw.textContent()} | ${await page.getByRole("list", { name: "What this link's strength rests on" }).textContent()}`);
+  await shot(page, "CAP-S8-a");
+  await principalStar(page);
+  const calder = castMember("calder_1");
+  await selectLinkInMatrix(page, "In conflict with", new RegExp(calder.name.split(",")[0]!));
+  await onlyPanel(page, "Inspector");
+  await page.getByRole("button", { name: "Connection strength", exact: true }).click();
+  await expect(raw).toBeVisible();
+  console.log(`S8-b: ${await raw.textContent()}`);
+  // Into view, as S2 (rehearsal, 2 November 2026).
+  await raw.scrollIntoViewIfNeeded();
+  await shot(page, "CAP-S8-b");
+});
+
+test("CAP-S9", async ({ page }) => {
+  // What two relay members share, ranked by the client's own measure (one less a value's share of
+  // the pair links through values of its kind): the fourth relay man, then the principal, then
+  // Fenwick Moor.
+  // On the principal's star, as the script's scene has them: two men added alone by search were left
+  // out of the server's view by the large-draw offer, and the Inspector said "No rarity to give"
+  // (rehearsal, 2 November 2026). Both are on the star.
+  await principalStar(page);
+  const [one, two] = ["relay_1", "relay_2"].map(castMember);
+  await selectTwoInMatrix(page, one!.name.split(",")[0]!, two!.name.split(",")[0]!);
+  await onlyPanel(page, "Inspector");
+  await page.getByRole("button", { name: "What these two share", exact: true }).click();
+  const shared = page.getByRole("list", { name: "Shared attributes, rarest first" });
+  await expect(shared).toBeVisible();
+  await expect(page.getByText(/measured by share of pair links/)).toBeVisible();
+  console.log(`S9: ${await shared.textContent()}`);
+  await shot(page, "CAP-S9");
+});
+
+test("CAP-S10", async ({ page }) => {
+  // The case's Author switches it back: the legend reads the shipped composition again.
+  await freshCase(page, "admin");
+  await setCaseComposition(page, "");
+  await expect(page.getByLabel("Composition in force")).toContainText("Composition: standard");
+  console.log(`S10: ${await page.getByLabel("Composition in force").textContent()}`);
+  // Brought into view: the save leaves the tab scrolled to its form, and the shot showed the form
+  // alone (rehearsal, 2 November 2026).
+  await page.getByLabel("Composition in force").evaluate((el) => el.scrollIntoView({ block: "center" }));
+  await shot(page, "CAP-S10");
 });

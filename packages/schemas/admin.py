@@ -125,6 +125,48 @@ class ModelRoleStatus(BaseModel):
     local_model: str | None = None
 
 
+class EngineStatus(BaseModel):
+    """One model engine as the Admin area's System screen shows it (ADR-135 decision 5): its models,
+    the roles it is the default for, and whether its key is present — never the key."""
+
+    #: `local`, or the provider's name.
+    name: str
+    label: str
+    #: Each role it has a model for, with the model.
+    models: dict[str, str]
+    #: The roles `osprey.yaml` names it the default for (a default with no key runs locally).
+    default_for: list[str]
+    #: Always true for `local`; for a provider, whether `deployment.env` holds its key.
+    key_present: bool
+    #: ADR-136 decision 1: the deployment's organisation holds a data-processing agreement with the
+    #: provider covering this key. Always false for `local`, which sends nothing anywhere.
+    privacy_contract: bool = False
+    #: The agreement's reference, in words — never a secret.
+    contract_reference: str | None = None
+
+
+#: ADR-136 decision 2: where a dataset's material may go. `none` (the default): never to a hosted
+#: engine; `contracted`: only to a provider marked `privacy_contract: true`; `any`: to any enabled
+#: provider. The handling code must still be sendable.
+DatasetEgress = Literal["none", "contracted", "any"]
+
+
+class AdminDataset(BaseModel):
+    """One dataset as the Admin area's Datasets screen shows it (ADR-136 decision 2): its name, the
+    unit that holds it, and its egress."""
+
+    id: str
+    name: str
+    owning_unit: str
+    egress: DatasetEgress
+
+
+class DatasetEgressInput(BaseModel):
+    """`PUT /v1/admin/datasets/{dataset_id}/egress`: an administrator's change, audited."""
+
+    egress: DatasetEgress
+
+
 class UpdateNotice(BaseModel):
     """The last `ospreyflow update --check` (ADR-114 Amendment 8 point 2), as it wrote it."""
 
@@ -147,6 +189,8 @@ class SystemStatus(BaseModel):
     components: list[ComponentHealth]
     #: ADR-114 decision 11: each role's model and where it runs; never a key.
     models: list[ModelRoleStatus] = Field(default_factory=list)
+    #: ADR-135: each engine, its defaults, and whether its key is present; never a key.
+    engines: list[EngineStatus] = Field(default_factory=list)
     #: Said whenever a role runs at the client's provider: what case content leaves, and to whom.
     model_notice: str | None = None
     #: ADR-114 Amendment 8: the last update check; none when there has been none.
@@ -266,6 +310,6 @@ ALL_MODELS: list[type[BaseModel]] = [
     PersonAccount, DashboardIdentity, RegisteredDashboard, RolesInput, DashboardInput,
     ComponentHealth, UpdateNotice, SystemStatus, EmbeddedDashboard, DashboardGuestToken,
     AccessInput, InviteInput, SignInDelivery, DemoPackStatus,
-    ModelRoleStatus, ScheduleRunView, AdminSchedule, PauseScheduleInput, DataFeed,
-    ChangeScheduleInput,
+    ModelRoleStatus, EngineStatus, ScheduleRunView, AdminSchedule, PauseScheduleInput, DataFeed,
+    ChangeScheduleInput, AdminDataset, DatasetEgressInput,
 ]  # fmt: skip

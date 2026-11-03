@@ -5,6 +5,7 @@
 import { createRoot } from "react-dom/client";
 
 import "../src/design/tokens.css";
+import { applyHarnessBrand } from "./brandHarness";
 import "../src/design/primitives.css";
 import { ClassificationStrip } from "../src/shell/ClassificationStrip";
 import { LeftRail } from "../src/shell/LeftRail";
@@ -89,6 +90,8 @@ window.__TOPBAR_CANVAS__ = {
   count: () => workingSet.graph.order,
 };
 
+await applyHarnessBrand();
+
 const container = document.getElementById("root");
 if (!container) throw new Error("#root not found");
 
@@ -146,8 +149,7 @@ createRoot(container).render(
         onHelp={() => { window.__TOPBAR__!.help = (window.__TOPBAR__!.help ?? 0) + 1; }}
         items={[
           { id: "cases", label: "Cases", icon: "cases", onSelect: rail("cases") },
-          { id: "watches", label: "Watches", icon: "watches", onSelect: rail("watches") },
-          { id: "alerts", label: "Alerts", icon: "alerts", onSelect: rail("alerts") },
+          { id: "alerts", label: "Monitoring", icon: "alerts", onSelect: rail("alerts") },
           { id: "ownership", label: "Ownership", icon: "ownership", onSelect: rail("ownership") },
           { id: "history", label: "History", icon: "history", onSelect: rail("history") },
           { id: "explore", label: "Explore", icon: "explore", onSelect: rail("explore") },

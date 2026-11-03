@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import duckdb
@@ -21,6 +21,10 @@ import duckdb
 from ontology.handling import HandlingScheme
 from ports.analytics import TrendLimitExceeded
 from schemas.analytics import (
+    ActivityRequest,
+    ActivityResult,
+    AlertFact,
+    AlertTrendRequest,
     BaselineRequest,
     BaselineResult,
     CountedHandling,
@@ -31,6 +35,8 @@ from schemas.analytics import (
     EventRecord,
     FirstSeenRequest,
     FirstSeenResult,
+    FrequencyRequest,
+    FrequencyResult,
     GeoBin,
     GeoBinRequest,
     GeocodedEvent,
@@ -41,6 +47,8 @@ from schemas.analytics import (
     HistogramBucket,
     HistogramBucketing,
     HistogramRequest,
+    NodeActivity,
+    NodeFrequency,
     Sighting,
     SightingRequest,
     TrendInterval,
@@ -52,6 +60,7 @@ from schemas.analytics import (
 from schemas.domain import Handling, Interval, Principal
 
 from .access_filter import AccessFilter, SqlPredicate
+from .alert_facts import FACT_COLUMNS, HANDLING_COLUMNS, alert_predicate, series_expression
 
 #: Event columns a `CATEGORICAL` dimension may bucket by directly. Anything
 #: else is looked up inside the JSON `properties` column — validated as a
@@ -300,6 +309,91 @@ class AnalyticsDuckDBAdapter:
             classifications=classifications,
             handlings=handlings,
         )
+
+    # --- alert trends (ADR-134 decision 3) --------------------------------------------------------
+
+    async def alert_trend(self, req: AlertTrendRequest, principal: Principal) -> TrendResult:
+        predicate = alert_predicate(req, principal, self._access)
+        unit = "week" if req.interval is TrendInterval.WEEK else "month"
+        period = f"date_trunc('{unit}', raised_at)"
+        series = series_expression(req)
+        periods, groups = self._con.execute(
+            f"SELECT COUNT(DISTINCT {period}), COUNT(DISTINCT {series}) FROM alert_facts "
+            f"WHERE {predicate.where}",
+            predicate.params,
+        ).fetchone() or (0, 0)
+        if periods > req.max_periods:
+            raise TrendLimitExceeded("periods", req.max_periods, int(periods))
+        if groups > req.max_series:
+            raise TrendLimitExceeded("series", req.max_series, int(groups))
+        rows = self._con.execute(
+            f"SELECT {period} AS period, {series} AS series, COUNT(*) AS n FROM alert_facts "
+            f"WHERE {predicate.where} GROUP BY period, series ORDER BY period, series NULLS FIRST",
+            predicate.params,
+        ).fetchall()
+        counted = f"alert_id IN (SELECT alert_id FROM alert_facts WHERE {predicate.where})"
+        handlings = [
+            CountedHandling(
+                classification=str(c), handling_code=str(h), owning_unit=str(u), originator=str(o)
+            )
+            for c, h, u, o in self._con.execute(
+                "SELECT DISTINCT handling_classification, handling_code, owning_unit, originator "
+                f"FROM alert_fact_handlings WHERE {counted} ORDER BY 1, 2, 3, 4",
+                predicate.params,
+            ).fetchall()
+        ]
+        points = [
+            TrendPoint(
+                period_start=(p if p.tzinfo else p.replace(tzinfo=UTC)),
+                series=None if g is None else str(g),
+                value=float(n),
+            )
+            for p, g, n in rows
+        ]
+        return TrendResult(
+            interval=req.interval,
+            measure=TrendMeasure.COUNT,
+            points=points,
+            series=sorted({pt.series for pt in points if pt.series is not None}),
+            total=float(sum(pt.value for pt in points)),
+            events=int(sum(r[2] for r in rows)),
+            classifications=sorted({h.classification for h in handlings}),
+            handlings=handlings,
+        )
+
+    async def load_alert_facts(self, facts: Sequence[AlertFact]) -> None:
+        """Each fact replaces what was kept for its alert, in one transaction."""
+        if not facts:
+            return
+        ids = [f.alert_id for f in facts]
+        marks = ",".join("?" for _ in ids)
+        self._con.execute("BEGIN TRANSACTION")
+        try:
+            self._con.execute(f"DELETE FROM alert_facts WHERE alert_id IN ({marks})", ids)
+            self._con.execute(f"DELETE FROM alert_fact_handlings WHERE alert_id IN ({marks})", ids)
+            self._con.executemany(
+                f"INSERT INTO alert_facts ({FACT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    [f.alert_id, f.investigation_scope, f.kind, f.rule, f.typology, f.severity,
+                     f.outcome, f.raised_at, f.owner_id, f.audience, f.team, f.dataset_id,
+                     0 if f.handlings is None else 1]
+                    for f in facts
+                ],
+            )  # fmt: skip
+            rows = [
+                [f.alert_id, h.classification, h.handling_code, h.owning_unit, h.originator]
+                for f in facts
+                for h in f.handlings or []
+            ]
+            if rows:
+                self._con.executemany(
+                    f"INSERT INTO alert_fact_handlings ({HANDLING_COLUMNS}) VALUES (?,?,?,?,?)",
+                    rows,
+                )
+        except Exception:
+            self._con.execute("ROLLBACK")
+            raise
+        self._con.execute("COMMIT")
 
     def _fixed_interval_histogram(
         self, predicate: SqlPredicate, interval_seconds: int | None
@@ -618,6 +712,125 @@ class AnalyticsDuckDBAdapter:
         return FirstSeenResult(
             nodes={node_id: _as_utc(first) for node_id, first in node_rows},
             edges={edge_id: _as_utc(first) for edge_id, first in edge_rows},
+        )
+
+    # --- event_frequency (ADR-133 decision 1, stage (b)) -------------------------------------
+
+    async def event_frequency(
+        self, req: FrequencyRequest, principal: Principal
+    ) -> FrequencyResult:
+        predicate = self._predicate(req.filter, principal)
+        subjects = req.filter.node_ids
+        marks = ",".join("?" for _ in subjects)
+        amount = (
+            "NULL"
+            if req.amount_property is None
+            else f"TRY_CAST({_field_expression(req.amount_property)} AS DOUBLE)"
+        )
+        # Each event once per subject it touches: an event to itself is one event, not two.
+        touched = (
+            f"SELECT source_id AS node, occurred_at, {amount} AS amount FROM events "
+            f"WHERE {predicate.where} AND source_id IN ({marks}) "
+            "UNION ALL "
+            f"SELECT target_id AS node, occurred_at, {amount} AS amount FROM events "
+            f"WHERE {predicate.where} AND target_id IN ({marks}) AND target_id <> source_id"
+        )
+        params = [*predicate.params, *subjects, *predicate.params, *subjects]
+        rows = self._con.execute(
+            "SELECT node, MAX(n), MAX(total) FROM ("
+            "  SELECT node, COUNT(*) OVER span AS n, SUM(amount) OVER span AS total "
+            f"  FROM ({touched}) "
+            "  WINDOW span AS (PARTITION BY node ORDER BY occurred_at "
+            f"  RANGE BETWEEN INTERVAL {int(req.span_days)} DAY PRECEDING AND CURRENT ROW)"
+            ") GROUP BY node",
+            params,
+        ).fetchall()
+        # The first ever: the same filter and access step without the window's start.
+        window = req.filter.window
+        unbounded = self._predicate(
+            req.filter.model_copy(update={"window": None}), principal
+        )
+        upper, upper_params = "", list[object]()
+        if window is not None and window.valid_to is not None:
+            upper, upper_params = " AND occurred_at <= ?", [window.valid_to]
+        firsts = dict(
+            self._con.execute(
+                "SELECT node, MIN(occurred_at) FROM ("
+                f"  SELECT source_id AS node, occurred_at FROM events "
+                f"  WHERE {unbounded.where}{upper} AND source_id IN ({marks}) "
+                "  UNION ALL "
+                f"  SELECT target_id AS node, occurred_at FROM events "
+                f"  WHERE {unbounded.where}{upper} AND target_id IN ({marks})"
+                ") GROUP BY node",
+                [*unbounded.params, *upper_params, *subjects,
+                 *unbounded.params, *upper_params, *subjects],
+            ).fetchall()
+        )  # fmt: skip
+        found = {node: (int(n), None if total is None else float(total)) for node, n, total in rows}
+        return FrequencyResult(
+            nodes={
+                node: NodeFrequency(
+                    most_in_span=found.get(node, (0, None))[0],
+                    largest_total=found.get(node, (0, None))[1],
+                    first_at=_as_utc(first),
+                )
+                for node, first in firsts.items()
+            }
+        )
+
+    # --- account_activity (ADR-133 decision 2, stage (c)) -------------------------------------
+
+    async def account_activity(
+        self, req: ActivityRequest, principal: Principal
+    ) -> ActivityResult:
+        window = req.filter.window
+        assert window is not None and window.valid_from is not None and window.valid_to is not None
+        # The filter and the access step without the window, bounded above by the window's end:
+        # the baseline and the last movement before the window lie before its start.
+        unbounded = self._predicate(req.filter.model_copy(update={"window": None}), principal)
+        subjects = req.filter.node_ids
+        marks = ",".join("?" for _ in subjects)
+        amount = (
+            "NULL"
+            if req.amount_property is None
+            else f"TRY_CAST({_field_expression(req.amount_property)} AS DOUBLE)"
+        )
+        touched = (
+            f"SELECT source_id AS node, occurred_at, {amount} AS amount FROM events "
+            f"WHERE {unbounded.where} AND occurred_at <= ? AND source_id IN ({marks}) "
+            "UNION ALL "
+            f"SELECT target_id AS node, occurred_at, {amount} AS amount FROM events "
+            f"WHERE {unbounded.where} AND occurred_at <= ? AND target_id IN ({marks}) "
+            "AND target_id <> source_id"
+        )
+        start, baseline_start = window.valid_from, window.valid_from - timedelta(
+            days=req.baseline_days
+        )
+        rows = self._con.execute(
+            "SELECT node, "
+            "COUNT(*) FILTER (WHERE occurred_at >= ?), "
+            "SUM(amount) FILTER (WHERE occurred_at >= ?), "
+            "COUNT(*) FILTER (WHERE occurred_at < ? AND occurred_at >= ?), "
+            "SUM(amount) FILTER (WHERE occurred_at < ? AND occurred_at >= ?), "
+            "MIN(occurred_at) FILTER (WHERE occurred_at >= ?), "
+            "MAX(occurred_at) FILTER (WHERE occurred_at < ?) "
+            f"FROM ({touched}) GROUP BY node",
+            [start, start, start, baseline_start, start, baseline_start, start, start,
+             *unbounded.params, window.valid_to, *subjects,
+             *unbounded.params, window.valid_to, *subjects],
+        ).fetchall()  # fmt: skip
+        return ActivityResult(
+            nodes={
+                node: NodeActivity(
+                    recent_count=int(recent),
+                    recent_total=None if recent_total is None else float(recent_total),
+                    baseline_count=int(baseline),
+                    baseline_total=None if baseline_total is None else float(baseline_total),
+                    first_in_window=None if first is None else _as_utc(first),
+                    last_before_window=None if last is None else _as_utc(last),
+                )
+                for node, recent, recent_total, baseline, baseline_total, first, last in rows
+            }
         )
 
     # --- writes -------------------------------------------------------------

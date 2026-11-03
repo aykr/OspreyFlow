@@ -33,11 +33,11 @@ export type Staging = string;
  */
 export type Backups = string;
 /**
- * Default: /var/lib/osprey/ingest. The host folder of source files the Ingest Studio lists (read-only to it; uploads go to its uploaded/ folder).
+ * Default: /var/lib/osprey/ingest. The host folder of source files the Ingest Studio lists (read-only to it; uploads go to its uploaded/ folder). A relative path is read from the folder osprey.yaml is in.
  */
 export type Ingest = string;
 /**
- * Default: /var/lib/osprey/tiles. The host folder a built basemap lives in.
+ * Default: /var/lib/osprey/tiles. The host folder a built basemap lives in. A relative path is read from the folder osprey.yaml is in.
  */
 export type Tiles = string;
 /**
@@ -61,9 +61,25 @@ export type SendableHandlingCodes = string[];
  */
 export type Name = string;
 /**
+ * ADR-135: the name analysts see for this engine. Default: OpenAI, Anthropic or Gemini for those three, else the provider's name capitalised.
+ */
+export type Label = string | null;
+/**
  * The provider's address, where it is not LiteLLM's default (an Azure deployment, a proxy)
  */
 export type ApiBase = string | null;
+/**
+ * ADR-136: true when the deployment's organisation holds a data-processing agreement with the provider covering this key. A dataset whose egress is `contracted` is sent only to a provider marked so. Default: false.
+ */
+export type PrivacyContract = boolean;
+/**
+ * ADR-136: the agreement's reference, in words (for example DPA 2026/07); never a secret. Shown beside the mark.
+ */
+export type ContractReference = string | null;
+/**
+ * ADR-135: the providers an administrator enables; each key is OSPREY_MODEL_KEY_<NAME>, entered at install or with `ospreyflow models key`.
+ */
+export type Providers = ModelProviderConfig[];
 /**
  * ADR-095: the local model that extracts entities from text. Default: qwen2.5:7b-instruct, the model the product ships with.
  */
@@ -146,7 +162,7 @@ export type Default = string;
  *
  * @minItems 1
  */
-export type Providers = [MapProvider, ...MapProvider[]];
+export type Providers1 = [MapProvider, ...MapProvider[]];
 /**
  * The provider's own name, as map.default names it
  */
@@ -154,7 +170,7 @@ export type Id = string;
 /**
  * What the Glass's map menu calls it
  */
-export type Label = string;
+export type Label1 = string;
 /**
  * `00_ARCHITECTURE.md` §1.2: "Four source kinds cover the field."
  */
@@ -261,6 +277,14 @@ export type Superset = boolean;
  */
 export type SupersetMemory = string;
 /**
+ * Default: only_me. Whom a new hotlist's alerts reach: its owner alone (only_me), or also the owner's team, the people of the owner's organisational unit (team). Applies to hotlists made after it is set, never to an existing one.
+ */
+export type HotlistAudience = "only_me" | "team";
+/**
+ * Default: true. Whether a hotlist's owner may choose its audience, when making it or later. When false, every new hotlist takes hotlist_audience and a change is refused.
+ */
+export type HotlistAudienceEditable = boolean;
+/**
  * The mail server's name
  */
 export type Host = string;
@@ -300,6 +324,30 @@ export type Privacy = string | null;
  * Default: no link. A page saying whether the service is up.
  */
 export type ServiceStatus = string | null;
+/**
+ * Default: osprey-<profile>, rendered to deploy/generated/<profile>/. Names this deployment's Compose project, its volumes and its rendered folder, so a second deployment on the same machine shares none of them.
+ */
+export type Name2 = string | null;
+/**
+ * Default: 2480. The port on this machine (127.0.0.1 only) the graph store's own tools reach it at. A deployment installed beside another with ospreyflow install --name is given one of its own, so the two share no port.
+ */
+export type GraphPort = number | null;
+/**
+ * Default: ospreyflow. The GOV.UK look, for a service on a gov.uk domain only.
+ */
+export type Brand = "ospreyflow" | "govuk";
+/**
+ * Default: none. The service's name in the GOV.UK header and the page title.
+ */
+export type ServiceName = string | null;
+/**
+ * Default: none. The organisation in the GOV.UK footer and the page title.
+ */
+export type Organisation = string | null;
+/**
+ * Default: none. The phase banner shows at alpha or beta.
+ */
+export type Phase = "alpha" | "beta" | "live" | "none";
 /**
  * The managed server's address
  */
@@ -381,11 +429,14 @@ export interface OspreyConfig {
    */
   map?: MapConfig | null;
   reporting?: ReportingConfig;
+  monitoring?: MonitoringConfig;
   /**
    * Default: none — one-time codes
    */
   mail?: MailConfig | null;
   welcome?: WelcomeConfig;
+  deployment?: DeploymentConfig;
+  appearance?: AppearanceConfig;
   external?: ExternalConfig;
 }
 /**
@@ -424,27 +475,42 @@ export interface ModelsConfig {
   local_only?: LocalOnly;
   hosted_fallback?: HostedFallback;
   sendable_handling_codes?: SendableHandlingCodes;
+  /**
+   * ADR-114 Amendment 6: one provider, read as a one-entry `providers` whose roles default to it; its key is OSPREY_MODEL_PROVIDER_KEY. Not with `providers`.
+   */
   provider?: ModelProviderConfig | null;
+  providers?: Providers;
+  defaults?: Defaults;
   extraction?: Extraction;
   vision?: Vision;
   transcription?: Transcription;
   embedding?: Embedding;
 }
 /**
- * A client's own model provider (ADR-114 decision 11, Amendment 6 point 4), reached through the
- * deployment's LiteLLM gateway. For each role it names, it **replaces** the local model — for
- * material whose handling code is in `models.sendable_handling_codes` only; anything else runs on
- * the local model. Its key is never here: it is `OSPREY_MODEL_PROVIDER_KEY` at install.
+ * A client's own model provider (ADR-114 decision 11, Amendment 6 point 4; ADR-135), reached
+ * through the deployment's LiteLLM gateway, for material whose handling code is in
+ * `models.sendable_handling_codes` only; anything else runs on the local model. Its key is never
+ * here: it is `OSPREY_MODEL_KEY_<NAME>` at install (`OSPREY_MODEL_PROVIDER_KEY` for the single
+ * `models.provider`), kept in the deployment's `deployment.env` and read by the gateway alone.
  */
 export interface ModelProviderConfig {
   name: Name;
+  label?: Label;
   roles: Roles;
   api_base?: ApiBase;
+  privacy_contract?: PrivacyContract;
+  contract_reference?: ContractReference;
 }
 /**
  * The roles it takes, each with the provider's model for it
  */
 export interface Roles {
+  [k: string]: string;
+}
+/**
+ * ADR-135: each role's default engine, `local` or an enabled provider's name. A role not named runs on `local` (for the single `provider`, on it).
+ */
+export interface Defaults {
   [k: string]: string;
 }
 /**
@@ -504,12 +570,12 @@ export interface NetworkConfig {
  */
 export interface MapConfig {
   default: Default;
-  providers: Providers;
+  providers: Providers1;
   [k: string]: unknown;
 }
 export interface MapProvider {
   id: Id;
-  label: Label;
+  label: Label1;
   kind: MapSourceKind;
   licence: ProviderLicence;
   source?: Source;
@@ -571,6 +637,15 @@ export interface ReportingConfig {
   superset_memory?: SupersetMemory;
 }
 /**
+ * Monitoring and alerts (`06_DECISIONS.md` ADR-133 ruling 3): whom a new hotlist's alerts reach
+ * in the shared alert queue, and whether its owner may change that. A hotlist made before the
+ * setting existed keeps `only_me` whatever is set here.
+ */
+export interface MonitoringConfig {
+  hotlist_audience?: HotlistAudience;
+  hotlist_audience_editable?: HotlistAudienceEditable;
+}
+/**
  * The mail server the identity provider sends invitations and sign-in resets through
  * (`06_DECISIONS.md` ADR-114 Amendment 5). Without one, people are signed in by a one-time code.
  * **No password here**: `osprey.yaml` never holds a secret (§2.5); the install reads it from
@@ -594,6 +669,26 @@ export interface WelcomeConfig {
   accessibility?: Accessibility;
   privacy?: Privacy;
   service_status?: ServiceStatus;
+}
+/**
+ * Which deployment this is, on a machine that may run more than one (ADR-132 Amendment 1).
+ */
+export interface DeploymentConfig {
+  name?: Name2;
+  graph_port?: GraphPort;
+}
+/**
+ * How every page of the deployment looks (ADR-132): the deployment's brand, which is not the
+ * viewer's light or dark choice. `govuk` is the GOV.UK look the Service Manual requires on a
+ * `*.service.gov.uk` service: its header and footer, GDS Transport, its colours and the light
+ * page. The network's own colours and shapes are the same under either brand. Read by the Glass
+ * from `/deployment.json`; the Admin console's Appearance tab is to write the same section.
+ */
+export interface AppearanceConfig {
+  brand?: Brand;
+  service_name?: ServiceName;
+  organisation?: Organisation;
+  phase?: Phase;
 }
 /**
  * What a cloud runs for the deployment instead of a container (ADR-114 decision 8).

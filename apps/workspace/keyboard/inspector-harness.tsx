@@ -6,6 +6,7 @@ import { useState } from "react";
 import { createRoot } from "react-dom/client";
 
 import "../src/design/tokens.css";
+import { applyHarnessBrand } from "./brandHarness";
 import "../src/design/primitives.css";
 import { Inspector } from "../src/inspector/Inspector";
 import type { Edge, EdgeTypeDef, Node } from "../../../packages/schemas/generated";
@@ -118,6 +119,66 @@ function Harness() {
   );
 }
 
+await applyHarnessBrand();
+
+/** `?strength=1` (ADR-139 decision 9): the link's connection strength explained, answered by the page
+ * itself and opened, for the axe scan. Synthetic (rule 9). */
+const STRENGTH_ANSWERS = {
+  links: [{
+    edge_id: "e1", edge_type: "ASSOCIATE_OF", base_weight: 0.62, strength: 0.71, parameter_set: "3/default", heavy: 10,
+    fixed: null, occurrences: 2, last_seen: "2026-04-18T00:00:00Z",
+    applied: [{ id: "incident-source", label: "Evidenced by an assault, disorder or find", change: "add", size: 0.1348,
+      layer: "file", record_kind: "Incident" }],
+  }],
+  legend: { influencers: [], direct_link_types: [], switched_off: [], rarity_note: "" },
+}; // prettier-ignore
+const RARITY_ANSWERS = {
+  scope: "dataset",
+  node_values: {},
+  pairs: [{ a: "a", b: "b", score: 2.31, dataset: "prison-intelligence", shared: [
+    { node: { ...person("x1", "unused"), type: "Endpoint", properties: { value_normalised: "+441234567891" } }, score: 2.31 },
+    { node: { ...person("x2", "unused"), type: "Organisation", properties: { name: "Fenwick Moor Prison" } }, score: 0 },
+  ] }],
+}; // prettier-ignore
+/** `?strength=parity` (ADR-139 Amendment 2): the same link under client parity, its raw sum shown. */
+const PARITY = new URLSearchParams(window.location.search).get("strength") === "parity";
+if (PARITY) {
+  Object.assign(STRENGTH_ANSWERS.links[0]!, {
+    composition: "client_parity", rarity_term: 0.75, raw_sum: 1.0848, dataset: "prison-intelligence", strength: 0.6969,
+    applied: [{ id: "direct", label: "Direct link", change: "add", size: 0.1348, layer: "file", record_kind: null }],
+  }); // prettier-ignore
+  Object.assign(RARITY_ANSWERS, { measure: "share", composition: "client_parity" });
+  Object.assign(RARITY_ANSWERS.pairs[0]!, { score: 0.9, parity_raw: 0.9, parity_strength: 0.2689, parity_applied: [] });
+}
+const STRENGTH_OPEN = new URLSearchParams(window.location.search).get("strength") === "1" || PARITY;
+if (STRENGTH_OPEN) {
+  window.fetch = async (input: RequestInfo | URL) => {
+    const url = String(input);
+    // The link's other parts read as a link with none of them has it.
+    const body = url.endsWith("/connection-strength")
+      ? STRENGTH_ANSWERS
+      : url.endsWith("/rarity")
+        ? RARITY_ANSWERS
+        : url.includes("/notes")
+          ? { notes: [] }
+          : url.includes("/history")
+            ? { changes: [], truncated: false }
+            : { total: 0, offset: 0, limit: 50, events: [] };
+    return new Response(JSON.stringify(body), { status: 200 });
+  };
+}
+
 const container = document.getElementById("root");
 if (!container) throw new Error("#root not found");
 createRoot(container).render(<Harness />);
+
+if (STRENGTH_OPEN) {
+  for (let i = 0; i < 40; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const header = [...document.querySelectorAll<HTMLButtonElement>("button")].find((b) => b.textContent === "Connection strength");
+    if (header) {
+      header.click();
+      break;
+    }
+  }
+}

@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import json
 import os
 import subprocess
 import sys
@@ -79,6 +80,9 @@ from schemas.deployment import (
     OspreyConfig,
     Profile,
     SearchBackend,
+    compose_project,
+    generated_folder,
+    host_folder_source,
 )
 
 #: Where the workspace's nginx serves the basemap's glyph files from
@@ -265,23 +269,80 @@ def render_litellm_config(config: OspreyConfig) -> str:
 
 
 def provider_model_entries(config: OspreyConfig) -> list[dict[str, object]]:
-    """ADR-114 Amendment 6, point 4: the client's provider's models, each routed through the
-    gateway as `provider/model`, its key read by LiteLLM from the gateway's own environment
-    (`os.environ/OSPREY_MODEL_PROVIDER_KEY`) — never written into this file."""
-    provider = config.models.provider
-    if provider is None:
-        return []
+    """ADR-114 Amendment 6 point 4, ADR-135 decision 2: each enabled provider's models, routed
+    through the gateway as `provider/model`, each reading its own provider's key from the gateway's
+    own environment (`os.environ/OSPREY_MODEL_KEY_<NAME>`, or `OSPREY_MODEL_PROVIDER_KEY` for the
+    single `models.provider`) — never written into this file."""
     entries: list[dict[str, object]] = []
-    for model in dict.fromkeys(provider.roles.values()):
-        name = f"{provider.name}/{model}"
-        params: dict[str, object] = {
-            "model": name,
-            "api_key": "os.environ/OSPREY_MODEL_PROVIDER_KEY",
-        }
-        if provider.api_base:
-            params["api_base"] = provider.api_base
-        entries.append({"model_name": name, "litellm_params": params})
+    for provider in config.models.enabled_providers:
+        key = config.models.key_variable(provider.name)
+        for model in dict.fromkeys(provider.roles.values()):
+            name = f"{provider.name}/{model}"
+            params: dict[str, object] = {"model": name, "api_key": f"os.environ/{key}"}
+            if provider.api_base:
+                params["api_base"] = provider.api_base
+            entries.append({"model_name": name, "litellm_params": params})
     return entries
+
+
+def model_key_variables(config: OspreyConfig) -> dict[str, str]:
+    """Each enabled provider's name and the `deployment.env` variable its key is kept in."""
+    return {p.name: config.models.key_variable(p.name) for p in config.models.enabled_providers}
+
+
+def model_engines_env(config: OspreyConfig) -> list[str]:
+    """ADR-135: what the Conduit is told of the engines, as `deployment.env` lines — each enabled
+    provider's name, label, model per role and privacy-contract mark (ADR-136), each role's
+    default engine, and the sendable codes.
+    Never a key, and not whether one is present: that is resolved by Compose from the env file when
+    the Conduit starts (`OSPREY_MODEL_KEY_PRESENT_<NAME>`, `_keys_for_the_gateway_alone`), so
+    setting or removing a key needs no render."""
+    models = config.models
+    if not models.enabled_providers:
+        return []
+    engines = [
+        {
+            "name": p.name,
+            "label": p.label,
+            "roles": {role: f"{p.name}/{model}" for role, model in p.roles.items()},
+            # ADR-136 decision 1: the contract mark and its reference (words, never a secret).
+            "privacy_contract": p.privacy_contract,
+            "contract_reference": p.contract_reference,
+        }
+        for p in models.enabled_providers
+    ]
+    compact = {"separators": (",", ":"), "ensure_ascii": True}
+    return [
+        "OSPREY_MODEL_ENGINES=" + json.dumps(engines, **compact),  # type: ignore[arg-type]
+        "OSPREY_MODEL_DEFAULTS=" + json.dumps(models.role_defaults, **compact),  # type: ignore[arg-type]
+        "OSPREY_SENDABLE_HANDLING_CODES=" + ",".join(models.sendable_handling_codes),
+    ]
+
+
+def _keys_for_the_gateway_alone(config: OspreyConfig, services: dict[str, Any]) -> None:
+    """ADR-135 decision 2: a provider's key is read by the LiteLLM gateway alone. The keys live in
+    `deployment.env`, which every owned service reads whole (`env_file`), so each such service's own
+    environment — which Compose, and the chart's `env` over `envFrom`, put above the file — blanks
+    every key. The Conduit is told instead whether each key is present, by Compose from the same
+    file (`${KEY:+yes}`: "yes" or empty), so it offers analysts only an engine that has one."""
+    keys = model_key_variables(config)
+    if not keys:
+        return
+    for name, service in services.items():
+        if name == "litellm":
+            service["environment"] = {
+                **dict(service.get("environment") or {}),
+                **{key: f"${{{key}:-}}" for key in keys.values()},
+            }
+            continue
+        if "env_file" not in service:
+            continue
+        environment = dict(service.get("environment") or {})
+        environment.update({key: "" for key in keys.values()})
+        if name == "api":
+            for provider, key in keys.items():
+                environment[f"OSPREY_MODEL_KEY_PRESENT_{provider.upper()}"] = f"${{{key}:+yes}}"
+        service["environment"] = environment
 
 
 def _local_model_table(config: OspreyConfig, extraction: str) -> str:
@@ -373,7 +434,9 @@ def git_sha(repo_root: Path = REPO_ROOT) -> str:
 #: `05_DEPLOYMENT.md` §3/§5/§7's own reference for where a customer checks for a published
 #: release once the digest resolvers above have failed to find one — named here so
 #: `UnpinnedImagesError`'s own message and those sections stay one string apart, not two to drift.
-#: The user repository (ADR-114 Amendment 21).
+#: The user repository: `aykr/OspreyFlow` (ADR-114 Amendment 21; Amendment 31 withdrew
+#: Amendment 30's move to `Solirius/ospreyflow`). A checkout cloned from it accepts only a release
+#: signed by that repository's own `release.yml` (`harness.signatures`).
 RELEASES_URL = "https://github.com/aykr/OspreyFlow/releases"
 
 
@@ -414,7 +477,9 @@ class UnpinnedImagesError(RuntimeError):
 OWNED_IMAGE_REGISTRY = "ghcr.io/ospreyflow"
 
 
-def service_images(config: OspreyConfig) -> list[ServiceImage]:
+def service_images(
+    config: OspreyConfig, *, build_context: str = "../../.."
+) -> list[ServiceImage]:
     """Every container the rendered stack runs, in a deterministic order.
 
     `05_DEPLOYMENT.md` §3's own `local-lite` list is the reference: "the workspace, one Conduit,
@@ -439,7 +504,7 @@ def service_images(config: OspreyConfig) -> list[ServiceImage]:
             return ServiceImage(
                 service,
                 f"osprey/{service}:local",
-                build_context=BUILD_CONTEXT_FROM_OUTPUT_DIR,
+                build_context=build_context,
                 dockerfile=dockerfile,
             )
         # ADR-114 Amendment 8: a user repository's release pushes to its own owner's registry.
@@ -529,6 +594,20 @@ def service_images(config: OspreyConfig) -> list[ServiceImage]:
 #: such file or directory`, which names the symptom and not the cause.
 BUILD_CONTEXT_FROM_OUTPUT_DIR = "../../.."
 
+
+def build_context_for(out_dir: Path, source_path: str | None) -> str:
+    """The `build.context` a deployment rendered into `out_dir` names: `../../..` when `out_dir` is
+    `<source>/deploy/generated/<name>/`, as every checkout-rooted deployment is (so its files are
+    byte for byte what they were); the checkout's own absolute path otherwise — a deployment kept
+    under `~/.ospreyflow/deployments/<name>/` (ADR-138 decision 2), where three levels up is the
+    home folder, not the checkout."""
+    if source_path is None:
+        return BUILD_CONTEXT_FROM_OUTPUT_DIR
+    source = Path(source_path).resolve()
+    if (out_dir / BUILD_CONTEXT_FROM_OUTPUT_DIR).resolve() == source:
+        return BUILD_CONTEXT_FROM_OUTPUT_DIR
+    return str(source)
+
 #: Published host ports, as `service -> (env var, default)`. Every one is overridable, because
 #: Preflight found 8000 already held by an unrelated container on a real machine and a deployment
 #: that cannot move its own ports is one an operator has to fight. The defaults are the
@@ -546,6 +625,14 @@ PORT_OVERRIDES: dict[str, tuple[str, int]] = {
     # run on the host and need the database (owner's ruling of 29 September 2026).
     "arcadedb": ("OSPREY_ARCADEDB_PORT", 2480),
 }
+
+def _published_port(config: OspreyConfig, service: str, default: int) -> int:
+    """The host port a service is published at: ArcadeDB's is `deployment.graph_port` when set
+    (ADR-138 decision 2: a deployment beside another shares no port), every other its default."""
+    if service == "arcadedb" and config.deployment.graph_port is not None:
+        return config.deployment.graph_port
+    return default
+
 
 _CONTAINER_PORTS: dict[str, int] = {
     "api": 8000,
@@ -842,7 +929,7 @@ def compose_services(config: OspreyConfig, images: Sequence[ServiceImage]) -> di
             # `/fonts/`, the bundled style's `glyphs` URL. Read-only. An empty folder is fine: the
             # Glass probes for the glyphs and draws the map unlabelled without them.
             service["volumes"] = [
-                f"{config.components.storage.tiles}/fonts:{GLYPHS_CONTAINER_PATH}:ro",
+                f"{host_folder_source(config.components.storage.tiles)}/fonts:{GLYPHS_CONTAINER_PATH}:ro",
                 # ADR-114 Amendment 4 decision 5: where the identity provider is, read by the Glass
                 # at start — so the one bundle serves every deployment.
                 "./glass.json:/usr/share/nginx/html/deployment.json:ro",
@@ -911,18 +998,18 @@ def compose_services(config: OspreyConfig, images: Sequence[ServiceImage]) -> di
                 # contents, and a writable mount would let a compromised Conduit alter the source
                 # material it is reading from. Rendered for every profile, so an analyst always
                 # has a door; `05_DEPLOYMENT.md` §3 and `DEMO_GUIDE.md` name the folder.
-                f"{config.components.storage.ingest}:{INGEST_CONTAINER_PATH}:ro",
+                f"{host_folder_source(config.components.storage.ingest)}:{INGEST_CONTAINER_PATH}:ro",
                 # **ADR-067 — the one writable door, laid over the read-only root.** Browser upload
                 # needs the Conduit to write somewhere; only this sub-folder is writable, so the
                 # evidence an operator put in the root above is still not. Docker lets a nested
                 # bind mount be writable inside a read-only parent. Not run against Docker from the
                 # session that wrote it: on Linux the host folder's owner must let the container's
                 # user write (ADR-067 names this).
-                f"{config.components.storage.ingest}/{INGEST_UPLOAD_SUBDIR}:"
+                f"{host_folder_source(config.components.storage.ingest)}/{INGEST_UPLOAD_SUBDIR}:"
                 f"{INGEST_CONTAINER_PATH}/{INGEST_UPLOAD_SUBDIR}",
                 # The built basemap, read-only, at the path a map provider's `source` names. See
                 # `StorageRoots.tiles`.
-                f"{config.components.storage.tiles}:{TILES_CONTAINER_PATH}:ro",
+                f"{host_folder_source(config.components.storage.tiles)}:{TILES_CONTAINER_PATH}:ro",
             ]
             service["depends_on"] = {
                 dependency: {"condition": "service_healthy"}
@@ -953,12 +1040,6 @@ def compose_services(config: OspreyConfig, images: Sequence[ServiceImage]) -> di
                 "KC_HOSTNAME_BACKCHANNEL_DYNAMIC": "true",
                 "KC_PROXY_HEADERS": "xforwarded",
                 "KC_HTTP_ENABLED": "true",
-            }
-        if entry.service == "litellm" and config.models.provider is not None:
-            # ADR-114 Amendment 6: the gateway alone reads the client's provider key.
-            service["environment"] = {
-                **_SERVICE_EXTRAS["litellm"]["environment"],  # type: ignore[dict-item]
-                "OSPREY_MODEL_PROVIDER_KEY": "${OSPREY_MODEL_PROVIDER_KEY:?set in the env file}",
             }
         if entry.service == "ollama":
             # ADR-114 Amendment 7: the server that reads case content has no route out; the
@@ -997,7 +1078,12 @@ def compose_services(config: OspreyConfig, images: Sequence[ServiceImage]) -> di
         services[entry.service] = service
     # ADR-111 Amendment 2: report-sync (the Conduit's own image) and Superset, when switched on.
     api = next(entry for entry in images if entry.service == "api")
-    services.update(reporting_services(config, api_image=api.image, building=api.building))
+    services.update(
+        reporting_services(
+            config, api_image=api.image, building=api.building, build_context=api.build_context
+        )
+    )
+    _keys_for_the_gateway_alone(config, services)
     if "keycloak" in services and ("postgres" in services or config.external.postgres is not None):
         services["keycloak-db"] = _keycloak_database_step(config)
     if config.external.postgres is not None:
@@ -1010,7 +1096,8 @@ def compose_services(config: OspreyConfig, images: Sequence[ServiceImage]) -> di
 def _render_compose(config: OspreyConfig, images: Sequence[ServiceImage]) -> str:
     services = compose_services(config, images)
     document = {
-        "name": f"osprey-{config.profile.value}",
+        # ADR-132 Amendment 1: `deployment.name`, else `osprey-<profile>` as before.
+        "name": compose_project(config),
         "services": services,
         "volumes": {
             "osprey-data": {"driver": "local"},
@@ -1065,8 +1152,8 @@ def egress_needs(config: OspreyConfig) -> set[str]:
         needs |= {"api", "ingest"}  # staging, site images, the tile cache, media: the cloud's S3
     if external.media is not None:
         needs.add("api")  # media on Blob
-    if config.models.provider is not None:
-        needs.add("litellm")  # the client's own model provider
+    if config.models.enabled_providers:
+        needs.add("litellm")  # the client's own model providers (ADR-135)
     if config.mail is not None or config.governance.organisation_sign_in:
         needs.add("keycloak")  # mail for invitations; an organisation's sign-in
     if any(
@@ -1221,22 +1308,24 @@ def _render_env(config: OspreyConfig) -> str:
         f"OSPREY_DASHBOARDS_ORIGIN={sites(config).dashboards}",
         # ADR-114 Amendment 5: invitations and resets by the identity provider's emailed link.
         *(["OSPREY_SIGN_IN_EMAIL=true"] if config.mail is not None else []),
+        # ADR-133 ruling 3: a new hotlist's audience in the alert queue, and whether its owner may
+        # change it.
+        f"OSPREY_HOTLIST_AUDIENCE={config.monitoring.hotlist_audience}",
+        "OSPREY_HOTLIST_AUDIENCE_EDITABLE="
+        + ("true" if config.monitoring.hotlist_audience_editable else "false"),
         "",
         "# Ports published besides the front proxy's: the Conduit only when network.expose_conduit",
         "# asks, ArcadeDB on loopback only (ADR-114 Amendment 4 decision 3). Each is overridable.",
-        *[f"{variable}={default}" for variable, default in PORT_OVERRIDES.values()],
+        *[
+            f"{variable}={_published_port(config, service, default)}"
+            for service, (variable, default) in PORT_OVERRIDES.items()
+        ],
     ]
     if config.models.hosted_fallback is not None:
         lines.append(f"OSPREY_HOSTED_FALLBACK={config.models.hosted_fallback}")
-    # ADR-114 Amendment 6: each role the client's provider takes, and what may be sent to it. The
-    # key is not here: only the gateway reads it, from the secrets apply writes.
-    if config.models.provider is not None:
-        provider = config.models.provider
-        for role, model in provider.roles.items():
-            lines.append(f"OSPREY_PROVIDER_{role.upper()}_MODEL={provider.name}/{model}")
-        lines.append(
-            "OSPREY_SENDABLE_HANDLING_CODES=" + ",".join(config.models.sendable_handling_codes)
-        )
+    # ADR-135 (ADR-114 Amendment 6): the engines, each role's default, and what may be sent. No
+    # key is here: only the gateway reads one, from the secrets apply writes.
+    lines += model_engines_env(config)
     lines += reporting_env(config)
     # §2.5: "It never sees a secret. Credentials are entered as references." Nothing above is a
     # value; every one of these is a name, a path or a choice already written in osprey.yaml.
@@ -1405,6 +1494,7 @@ def render(
     resolver: DigestResolver | None = None,
     allow_unpinned: bool = False,
     resolved_source_label: str = "local-docker-daemon",
+    build_context: str | None = None,
 ) -> RenderResult:
     """Produces all four of §2.1's artefacts in memory. Pure apart from the digest resolver, which
     is why byte-stability across runs is a property this can be tested for at all.
@@ -1420,7 +1510,11 @@ def render(
         resolver = (
             unresolved_digest_resolver if allow_unpinned else daemon_then_registry_digest_resolver
         )
-    images = service_images(config)
+    images = (
+        service_images(config)
+        if build_context is None
+        else service_images(config, build_context=build_context)
+    )
     if config.profile is Profile.CLUSTER:
         # 05 §3b: the chart's values, translated from the same services (`harness/cluster.py`).
         from harness.cluster import render_cluster
@@ -1514,12 +1608,29 @@ def diff_for(result: RenderResult, out_dir: Path) -> dict[str, str]:
     return diffs
 
 
+#: The rendered file that holds, once `apply` has written them, the deployment's secrets.
+SECRETS_FILE = "deployment.env"
+
+
+def write_private(path: Path, text: str) -> None:
+    """`text` into `path`, readable and writable by its owner alone (`600`), whether the file is new
+    or was looser before (ADR-137 decision 2: `deployment.env` had been written `644`, readable by
+    every account on the machine). The mode is set on the open file, before anything is written."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        handle.write(text)
+
+
 def write(result: RenderResult, out_dir: Path) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     written = []
     for name, content in sorted(result.artefacts.items()):
         target = out_dir / name
-        target.write_text(content, encoding="utf-8")
+        if name == SECRETS_FILE:
+            write_private(target, content)
+        else:
+            target.write_text(content, encoding="utf-8")
         written.append(target)
     return written
 
@@ -1602,7 +1713,7 @@ def main(argv: list[str] | None = None) -> int:
         components = config.components.model_copy(update={"source_path": str(REPO_ROOT)})
         config = config.model_copy(update={"components": components})
     result = render(config, allow_unpinned=args.allow_unpinned)
-    out_dir = args.out_root / config.profile.value
+    out_dir = args.out_root / generated_folder(config)
 
     if args.check:
         drifted = find_drift(result, out_dir)

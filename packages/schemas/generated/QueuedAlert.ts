@@ -16,14 +16,23 @@ export type EdgeIds = EdgeId[];
 export type EventIds = string[];
 export type ValidFrom = string;
 export type ValidTo = string | null;
-export type Trigger = ("pre_commit" | "post_commit") | null;
-export type Status = "open" | "claimed" | "closed";
+export type Trigger = ("pre_commit" | "post_commit" | "schedule") | null;
+export type Status = "open" | "claimed" | "closing" | "closed";
 export type Assignee = string | null;
-export type Disposition = ("true_positive" | "false_positive") | null;
+export type Disposition = ("true_positive" | "false_positive" | "duplicate" | "no_further_action" | "referred") | null;
 export type DispositionReason = string | null;
 export type DecidedBy = string | null;
 export type DecidedAt = string | null;
+export type CloseProposedBy = string | null;
+export type CloseProposedAt = string | null;
+export type Severity = ("low" | "medium" | "high") | null;
+export type Team = string | null;
 export type Summary = string;
+export type Kind = "typology" | "hotlist" | "monitor";
+export type Severity1 = "low" | "medium" | "high";
+export type Audience = "case" | "team" | "owner";
+export type Team1 = string | null;
+export type AssigneeName = string | null;
 
 /**
  * One row of the case's alert queue: the alert, and its finding in words with the entities
@@ -32,6 +41,11 @@ export type Summary = string;
 export interface QueuedAlert {
   alert: Alert;
   summary: Summary;
+  kind?: Kind;
+  severity?: Severity1;
+  audience?: Audience;
+  team?: Team1;
+  assignee_name?: AssigneeName;
   [k: string]: unknown;
 }
 /**
@@ -75,6 +89,10 @@ export interface Alert {
   disposition_reason?: DispositionReason;
   decided_by?: DecidedBy;
   decided_at?: DecidedAt;
+  close_proposed_by?: CloseProposedBy;
+  close_proposed_at?: CloseProposedAt;
+  severity?: Severity;
+  team?: Team;
   [k: string]: unknown;
 }
 export interface Interval {

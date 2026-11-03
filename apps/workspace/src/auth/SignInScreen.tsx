@@ -9,6 +9,7 @@
 // deployment says (decision 8); the strip is the deployment's marking (decision 2).
 import { useEffect, useState } from "react";
 
+import { currentBrand } from "../brand/brand";
 import { applyTheme, currentTheme, onThemeChange, storeTheme, type Theme } from "../theme/theme";
 import { ClassificationStrip } from "../shell/ClassificationStrip";
 import { MeshMark, SolidMark } from "../shell/BrandMark";
@@ -45,6 +46,8 @@ const CAPABILITIES = [
     says: "Places on a basemap served from your own deployment." },
   { name: "Timeline trends", icon: "M2 13.5h12M3.5 11V8M6.5 11V4.5M9.5 11V6.5M12.5 11V3",
     says: "Brush a window to dim what falls outside it, or fold a case onto one week." },
+  { name: "Monitoring and alerts", icon: "M8 2a4 4 0 0 0-4 4v3l-1.5 2h11L12 9V6a4 4 0 0 0-4-4zM6.5 13a1.5 1.5 0 0 0 3 0",
+    says: "Hotlists, watches and typology rules raise an alert as new data arrives, and each alert explains itself." },
   { name: "Reporting", icon: "M4 2h6l3 3v9H4zM10 2v3h3M6 8.5h5M6 11h5",
     says: "Trends, assessments and notes in report packs, each item under its own marking." },
 ]; // prettier-ignore
@@ -59,6 +62,8 @@ const LINK_NAMES: [WelcomeLink, string][] = [
 function ThemeButton() {
   const [theme, setTheme] = useState<Theme>(currentTheme());
   useEffect(() => onThemeChange(setTheme), []);
+  // ADR-132: the GOV.UK brand is light only, so there is no choice to offer.
+  if (currentBrand() === "govuk") return null;
   const next: Theme = theme === "light" ? "dark" : "light";
   return (
     <button
@@ -79,12 +84,16 @@ function SignInCard({ reason, intent, onSignIn, welcome }: Required<Pick<SignInS
   const [opening, setOpening] = useState<"organisation" | "account" | null>(null);
   const organisation = welcome.organisationSignIn;
   const help = welcome.links.account_help;
+  // ADR-132 Amendment 4: under GOV.UK the card is plain and names no product (ruling 7).
+  const govuk = currentBrand() === "govuk";
   const purpose =
     intent === "ingest"
       ? "Sign in to bring a new source of data in: connect it, map it, check it, publish it."
       : intent === "admin"
         ? "Sign in to administer this deployment."
-        : "You see only what your role, clearance and cases allow. Every session is recorded in the audit log.";
+        : govuk
+          ? "You'll see only the cases your role and clearance allow. Your activity is recorded."
+          : "You see only what your role, clearance and cases allow. Every session is recorded in the audit log.";
   const start = (which: "organisation" | "account") => {
     setOpening(which);
     onSignIn(which === "organisation" && organisation ? organisation : undefined);
@@ -110,11 +119,13 @@ function SignInCard({ reason, intent, onSignIn, welcome }: Required<Pick<SignInS
                     onClick={() => start("organisation")}>
               {opening === "organisation" ? "Opening your organisation's sign-in page…" : "Continue with organisation sign-in"}
             </button>
-            <p className="welcome-card__note">Your password is entered only on your organisation's sign-in page.</p>
-            <div className="welcome-card__divider"><span>or use an OspreyFlow account</span></div>
+            {!govuk && <p className="welcome-card__note">Your password is entered only on your organisation's sign-in page.</p>}
+            <div className="welcome-card__divider"><span>{govuk ? "or" : "or use an OspreyFlow account"}</span></div>
             <button type="button" className="btn welcome-card__secondary" disabled={opening !== null}
                     onClick={() => start("account")}>
-              {opening === "account" ? "Opening the sign-in page…" : "Sign in with an OspreyFlow account"}
+              {opening === "account"
+                ? "Opening the sign-in page…"
+                : govuk ? "Sign in with a username and password" : "Sign in with an OspreyFlow account"}
             </button>
           </>
         ) : (
@@ -123,11 +134,11 @@ function SignInCard({ reason, intent, onSignIn, welcome }: Required<Pick<SignInS
                     onClick={() => start("account")}>
               {opening === "account" ? "Opening the sign-in page…" : "Sign in"}
             </button>
-            <p className="welcome-card__note">Your password is entered only on the OspreyFlow sign-in page, never here.</p>
+            {!govuk && <p className="welcome-card__note">Your password is entered only on the OspreyFlow sign-in page, never here.</p>}
           </>
         )}
         <p className="welcome-card__foot">
-          No account yet? Your OspreyFlow administrator invites people and assigns roles.
+          {govuk ? "No account? Ask your administrator." : "No account yet? Your OspreyFlow administrator invites people and assigns roles."}
           {help && (
             <>
               {" "}Locked out or seeing the wrong cases? <a href={help}>Get account help</a>.
@@ -144,12 +155,17 @@ export function SignInScreen({ reason, intent, onSignIn, marking = null, welcome
     <div className="welcome">
       {marking && <ClassificationStrip marking={marking} />}
       <header className="welcome-header">
-        <span className="welcome-header__brand">
-          <MeshMark size={28} />
-          <span className="welcome-header__wordmark">
-            <b>Osprey</b>Flow
+        {/* ADR-132: under GOV.UK the GOV.UK header above names the service; no OspreyFlow mark. */}
+        {currentBrand() === "govuk" ? (
+          <span className="welcome-header__brand" />
+        ) : (
+          <span className="welcome-header__brand">
+            <MeshMark size={28} />
+            <span className="welcome-header__wordmark">
+              <b>Osprey</b>Flow
+            </span>
           </span>
-        </span>
+        )}
         <nav aria-label="Page" className="welcome-header__nav">
           {welcome.about && <a href="#about">About</a>}
           <ThemeButton />
@@ -159,11 +175,12 @@ export function SignInScreen({ reason, intent, onSignIn, marking = null, welcome
         <section className="welcome-hero">
           <div className="welcome-hero__story">
             <div className="welcome-hero__intro">
-              <h1 className="welcome-hero__title">Crime analysis on one graph</h1>
+              {/* ADR-115 Amendment 4: intelligence mapping first, then what it is for. */}
+              <h1 className="welcome-hero__title">Intelligence mapping</h1>
               <p className="welcome-hero__lead">
-                Fraud, anti-money-laundering and organised-crime investigation in one workspace. Network, map, timeline
-                and reports read the same case, and a filter applied in one view applies in all of them. Every element
-                carries its handling and where it came from.
+                For crime analysis, anti-money-laundering, fraud detection, and event monitoring and alerting. Network,
+                map, timeline and reports read the same case, and a filter applied in one view applies in all of them.
+                Every element carries its handling and where it came from.
               </p>
             </div>
             <dl className="welcome-capabilities">
@@ -183,14 +200,19 @@ export function SignInScreen({ reason, intent, onSignIn, marking = null, welcome
           </div>
           <SignInCard reason={reason} intent={intent} onSignIn={onSignIn} welcome={welcome} />
         </section>
-        {welcome.about && <WelcomeAbout />}
+        {welcome.about && <WelcomeAbout version={welcome.version} />}
       </main>
       <footer className="welcome-footer">
-        <div className="welcome-footer__brand">
-          <SolidMark size={16} />
-          <span>OspreyFlow</span>
-          {welcome.version && <span className="value">{welcome.version}</span>}
-        </div>
+        {/* ADR-132 Amendment 4: under GOV.UK the GOV.UK footer credits the product and About names it. */}
+        {currentBrand() === "govuk" ? (
+          <span />
+        ) : (
+          <div className="welcome-footer__brand">
+            <SolidMark size={16} />
+            <span>OspreyFlow</span>
+            {welcome.version && <span className="value">{welcome.version}</span>}
+          </div>
+        )}
         <nav aria-label="Footer" className="welcome-footer__links">
           {LINK_NAMES.filter(([key]) => welcome.links[key]).map(([key, name]) => (
             <a key={key} href={welcome.links[key]}>

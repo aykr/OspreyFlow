@@ -65,9 +65,13 @@
 .combobox__option { padding: var(--sp-6) var(--sp-8); cursor: pointer; color: var(--text-primary); }
 .combobox__option:hover, .combobox__option[aria-selected="true"] { background: var(--surface-hover); }
 
-.slider { -webkit-appearance: none; width: 100%; height: 4px; border-radius: var(--r-chip); background: var(--border); }
+/* The input is the 24px target (WCAG 2.5.8; found opening the Metrics panel's Filter section to scan it,
+   ADR-139), the 4px track drawn inside it. */
+.slider { -webkit-appearance: none; appearance: none; width: 100%; height: 24px; margin: 0; background: transparent; }
+.slider::-webkit-slider-runnable-track { height: 4px; border-radius: var(--r-chip); background: var(--border); }
+.slider::-moz-range-track { height: 4px; border-radius: var(--r-chip); background: var(--border); }
 /* A control at rest is neutral; brass only while it has focus (ADR-097, DESIGN.md §3.2). */
-.slider::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: var(--text-secondary); cursor: pointer; }
+.slider::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; margin-top: -5px; border-radius: 50%; background: var(--text-secondary); cursor: pointer; }
 .slider:focus-visible::-webkit-slider-thumb { background: var(--brass); }
 
 .range-slider { position: relative; height: 20px; }
@@ -539,6 +543,56 @@
    and focus only (DESIGN.md §3.2). */
 .canvas-legend__link input { margin: 0; width: 24px; height: 24px; flex: none; accent-color: var(--text-secondary); }
 .canvas-legend__swatch { flex: none; width: 14px; height: 3px; border-radius: 2px; }
+/* ADR-139 decision 7: the connection-strength part, under the links. */
+.canvas-legend__strength { border-top: 1px solid var(--border-subtle); padding-top: var(--sp-6); }
+.canvas-legend__strength[hidden] { display: none; }
+.canvas-legend__caption { margin: 0; padding: 0 var(--sp-8) var(--sp-4); font-weight: 600; color: var(--text-primary); }
+.canvas-legend__strength .canvas-legend__links { border-top: 0; padding-top: 0; }
+.canvas-legend__influencer .canvas-legend__meaning { display: block; }
+.canvas-legend__tag {
+  margin-left: var(--sp-4); padding: 0 var(--sp-4); border: 1px solid var(--border-strong);
+  border-radius: var(--r-control); color: var(--text-primary);
+}
+.canvas-legend__note { margin: 0; padding: 0 var(--sp-8) var(--sp-6); color: var(--text-secondary); }
+/* ADR-139 decision 9: the Inspector's account of a link's strength. */
+.strength-explained { display: grid; gap: var(--sp-8); }
+.strength-explained__lines, .strength-explained__shared {
+  margin: 0; padding-left: var(--sp-16); display: grid; gap: var(--sp-4); color: var(--text-primary);
+}
+.strength-explained__shared li { display: list-item; }
+.strength-explained__shared li > span + span { margin-left: var(--sp-8); }
+.strength-explained__heading { margin: 0; font-weight: 600; color: var(--text-primary); }
+.strength-explained__muted { margin: 0; color: var(--text-secondary); }
+.strength-explained__problem { margin: 0; color: var(--error); }
+/* ADR-139 Amendment 2: under client parity, the raw sum on the client's scale beside the drawn one. */
+.strength-explained__raw {
+  margin: 0; display: flex; justify-content: space-between; gap: var(--sp-8);
+  padding: var(--sp-4) var(--sp-8); border: 1px solid var(--border-strong); border-radius: var(--r-control);
+  color: var(--text-primary);
+}
+.strength-explained__raw .value { font-variant-numeric: tabular-nums; font-weight: 600; }
+/* ADR-139 decision 3: Monitoring's Connection strength tab. */
+.strength-panel { display: grid; gap: var(--sp-16); max-width: 720px; }
+.strength-panel section { display: grid; gap: var(--sp-8); }
+.strength-panel__heading { margin: 0; font-weight: 600; color: var(--text-primary); }
+.strength-panel__muted { margin: 0; color: var(--text-secondary); }
+.strength-panel__problem { margin: 0; color: var(--error); }
+.strength-panel__said { margin: 0; color: var(--text-primary); }
+.strength-panel__list { margin: 0; padding-left: var(--sp-16); display: grid; gap: var(--sp-6); color: var(--text-primary); }
+.strength-panel__list li > span { margin-right: var(--sp-8); }
+.strength-panel__form, .strength-panel__choices {
+  margin: 0; padding: var(--sp-8); display: grid; gap: var(--sp-8);
+  border: 1px solid var(--border-subtle); border-radius: var(--r-control); color: var(--text-primary);
+}
+.strength-panel__choices { grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
+.strength-panel__choices legend, .strength-panel__form legend { padding: 0 var(--sp-4); font-weight: 600; }
+.strength-panel__choice { display: flex; align-items: center; gap: var(--sp-6); min-height: 24px; }
+.strength-panel__field { display: grid; gap: var(--sp-4); color: var(--text-secondary); }
+.strength-panel__waiting, .strength-panel__proposal {
+  display: grid; gap: var(--sp-8); padding: var(--sp-8);
+  border: 1px solid var(--border-strong); border-radius: var(--r-control);
+}
+.strength-panel__history { color: var(--text-secondary); }
 /* The canvas toolbar (ADR-097 step 2, design review item 12): one docked row along the canvas's top
    edge, a hairline below and no shadow (DESIGN.md §6); labelled groups, the Show group one segmented
    control. Its controls are quiet buttons here, not the floating overlay buttons they are elsewhere. */
@@ -667,7 +721,7 @@
 }
 /* The canvas's own focus ring (DESIGN.md §8; ADR-115 E4): inset, so it is never clipped by the
    panels beside it. It used to be suppressed. */
-.network-canvas:focus-visible { outline: 2px solid var(--brass); outline-offset: -2px; }
+.network-canvas:focus-visible { outline: var(--focus-width) solid var(--focus); outline-offset: calc(0px - var(--focus-width)); }
 /* The Inspector's single node (ADR-115 E4; the reference): a 96px key column, the node's marking as a
    badge, and the provenance stroke as the canvas draws it. */
 .inspector-keys { margin: 0; display: grid; gap: var(--sp-4); }
@@ -770,3 +824,67 @@
 .case-tree__danger { color: var(--error); }
 .case-tree__problem { margin: var(--sp-4) 0 0; font-size: var(--fs-12); color: var(--error); }
 
+/* The skip link and the phase banner under the OspreyFlow brand (ADR-132). Under GOV.UK the
+   package's own govuk-skip-link and govuk-phase-banner classes draw them. The skip link is out of
+   the page's flow until it has focus, so it moves nothing. */
+.skip-link {
+  position: absolute; left: var(--sp-8); top: var(--sp-8); z-index: 1000;
+  padding: var(--sp-6) var(--sp-12); background: var(--surface-raised); color: var(--text-primary);
+  border-bottom: 0; box-shadow: var(--overlay-shadow);
+  clip-path: inset(50%); width: 1px; height: 1px; overflow: hidden; white-space: nowrap;
+}
+.skip-link:focus { clip-path: none; width: auto; height: auto; overflow: visible; }
+.phase-banner {
+  display: flex; align-items: center; gap: var(--sp-8); padding: var(--sp-4) var(--sp-16);
+  border-bottom: 1px solid var(--border-subtle); background: var(--surface-panel); color: var(--text-secondary);
+  font-size: var(--fs-12); line-height: var(--lh-12);
+}
+.phase-banner__tag {
+  /* Neutral, not brass: brass is for the primary action, focus and selection only (ADR-097). */
+  padding: 0 var(--sp-6); border: 1px solid var(--border); border-radius: var(--r-control);
+  background: var(--surface-raised); color: var(--text-primary); font-weight: 600;
+}
+/* The skip link's target is focused by script, not by the viewer, and is not a control. */
+.main-content:focus { outline: none; }
+
+/* The Matrix view (02_GLASS_FRONTEND.md §6; GDS remediation plan A1): the working set as two tables.
+   A selected row is the raised surface with a 3px bar at its start, in primary text — never brass,
+   and never colour alone (the bar is a shape; the row says aria-selected). A dimmed row keeps full
+   contrast and says "Dimmed by filter" in words. */
+.matrix-view { position: absolute; inset: 0; overflow: auto; padding: var(--sp-16) var(--sp-24); background: var(--surface-app); }
+.matrix-view__heading { margin: 0 0 var(--sp-4); font-size: var(--fs-16); }
+.matrix-view__subheading { margin: var(--sp-16) 0 var(--sp-8); font-size: var(--fs-14); }
+.matrix-view__intro { margin: 0; max-width: 72ch; font-size: var(--fs-13); color: var(--text-secondary); }
+.matrix-grid caption { caption-side: top; text-align: left; padding: 0 0 var(--sp-8); font-size: var(--fs-12); color: var(--text-secondary); }
+.matrix-grid th[scope="row"] { font-size: var(--fs-13); font-weight: 400; color: var(--text-primary); }
+.matrix-grid td, .matrix-grid th[scope="row"] { cursor: default; vertical-align: middle; }
+.matrix-grid .numeric { text-align: right; font-variant-numeric: tabular-nums; }
+.matrix-grid tr[aria-selected="true"] > td, .matrix-grid tr[aria-selected="true"] > th { background: var(--surface-raised); }
+.matrix-grid tr[aria-selected="true"] > :first-child { box-shadow: inset 3px 0 0 var(--text-primary); }
+.matrix-grid__sort {
+  display: inline-flex; align-items: center; gap: var(--sp-4); min-width: 24px; min-height: 24px; padding: 0;
+  font: inherit; color: inherit; background: none; border: 0; cursor: pointer;
+}
+.matrix-grid__sort-mark { fill: currentColor; }
+.matrix-grid__action { padding: var(--sp-2) var(--sp-8); min-height: 24px; min-width: 24px; }
+.matrix-grid__tag {
+  margin-left: var(--sp-8); padding: 0 var(--sp-4); font-size: var(--fs-11); color: var(--text-secondary);
+  border: 1px dashed var(--border); border-radius: var(--r-1); white-space: nowrap;
+}
+.matrix-grid .marking-badge { margin-left: 0; }
+.matrix-view__pager { display: flex; align-items: center; gap: var(--sp-8); margin: var(--sp-8) 0 var(--sp-16); font-size: var(--fs-12); color: var(--text-secondary); }
+
+/* ADR-133 stage (a): an alert's severity in the Monitoring queue — said in a word, which carries
+   the meaning, and outlined in its colour, which only repeats it. */
+.severity {
+  display: inline-block;
+  padding: 0 var(--sp-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-1);
+  color: var(--text-primary);
+  font-size: var(--fs-11);
+  font-weight: 600;
+}
+.severity--high { border-color: var(--error); }
+.severity--medium { border-color: var(--warning); }
+.severity--low { border-color: var(--text-tertiary); }

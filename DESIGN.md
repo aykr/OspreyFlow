@@ -401,3 +401,67 @@ size-switched two-cut mark instead of one logo stretched across every size.
 data, the nine categorical channels with their shape pairings, provenance encoded by stroke style
 only, the sequential and diverging ramps, both theme ramps, the type split and scale, spacing,
 radii, motion and the accessibility floor. The rebrand touched the identity, not the mechanics.
+
+---
+
+## 11. Deployment brands
+
+A deployment may show another brand instead of the OspreyFlow identity (`appearance.brand` in
+`osprey.yaml`, `06_DECISIONS.md` ADR-132). A brand is one `[data-brand="<name>"]` block in
+`tokens.css`, after the light theme's, and it obeys one rule: **it redefines chrome only, never a
+`--ch-*`, `--chart-*`, `--seq-*` or `--div-*` token.** The nine channels and their shapes, the chart
+palette and the two ramps are the same under every brand. A brand is always shown light. Every
+colour a brand block sets is listed below for that brand; anything else in the block is drift.
+`src/design/designContract.test.ts` holds the block to this section.
+
+### govuk
+
+The GOV.UK look, for a service on a gov.uk domain only. GOV.UK Frontend 6.6.0's palette, GDS
+Transport, square corners (every radius token, status chips included, is 0), and the Design System's focus state: a 3px `--focus` outline with a 2px
+`--focus-ink` inner shadow. `--warning` is not set (v6 has none), so the light theme's stands.
+
+| Token | Value | Use |
+|---|---|---|
+| `--n0` | `#ffffff` | page |
+| `--n1` | `#ffffff` | page |
+| `--n2` | `#f4f8fb` | panel, the GOV.UK surface |
+| `--n3` | `#f4f8fb` | raised |
+| `--n4` | `#cecece` | hover |
+| `--n5` | `#cecece` | border, subtle |
+| `--n6` | `#cecece` | border |
+| `--n7` | `#484949` | border, strong |
+| `--n8` | `#484949` | disabled text |
+| `--n9` | `#484949` | tertiary text |
+| `--n10` | `#0b0c0c` | secondary text |
+| `--n11` | `#0b0c0c` | primary text |
+| `--brass` | `#1d70b8` | the accent: GOV.UK blue |
+| `--brass-hover` | `#0f385c` | accent hover |
+| `--brass-press` | `#0f385c` | accent pressed |
+| `--brass-ink` | `#ffffff` | text on the accent |
+| `--error` | `#ca3535` | error |
+| `--success` | `#0f7a52` | success |
+| `--focus` | `#ffdd00` | focus outline |
+| `--focus-ink` | `#0b0c0c` | focus inner shadow |
+
+Type (the owner's ruling of 31 October 2026): the welcome, start and Admin pages take GOV.UK's
+scale, 19px body; the workspace keeps the 13px base (§9 exception 1).
+
+| Token | GOV.UK pages | Use |
+|---|---|---|
+| `--fs-11` | 14 / 20 | small meta |
+| `--fs-12` | 16 / 20 | small text, table headers |
+| `--fs-13` | 19 / 25 | body |
+| `--fs-14` | 19 / 25 | body, emphasised |
+| `--fs-16` | 19 / 25 | small headings |
+| `--fs-19` | 24 / 30 | medium headings |
+| `--fs-23` | 36 / 40 | page titles |
+| `--fs-30` | 48 / 50 | large titles |
+
+Page width (ADR-132 Amendment 4): the sign-in and start pages hold their content in GOV.UK's width
+container, 960px with 30px gutters (15px at 640px and narrower), so it starts on the logo's edge.
+GOV.UK's own header, service navigation, phase banner and footer keep GOV.UK's link styling, with no
+Glass link border.
+
+Identity under GOV.UK (ADR-132 Amendment 4): no OspreyFlow mark in the page's chrome. The GOV.UK footer
+says "Built with OspreyFlow, open source." in words; the workspace's top bar keeps its mark; the
+welcome page's About section opens with the mark, the name and the version.

@@ -55,6 +55,10 @@ async function serve(page: Page): Promise<string[]> {
                           case_name: "HMP fixture (synthetic demo)", loaded_case_id: null,
                           command: "ospreyflow demo add hmp", source_page: null, size_bytes: null }]);  // prettier-ignore
     if (path === "system") return json(200, { components: [{ name: "Graph store", ok: true, millis: 12 }] });
+    // ADR-136 decision 2: the Datasets tab.
+    if (path === "datasets") return json(200, [{ id: "enron", name: "Enron corpus", owning_unit: "verify", egress: "none" }]);
+    if (path === "datasets/enron/egress" && request.method() === "PUT")
+      return json(200, { id: "enron", name: "Enron corpus", owning_unit: "verify", ...(request.postDataJSON() as object) });
     if (path === "schedules") return json(200, [SCHEDULE]);
     if (path === "schedules/feed/pause") return json(200, { ...SCHEDULE, paused: true, paused_reason: "paused by admin-1" });
     if (path === "schedules/feed/resume") return json(200, SCHEDULE);
@@ -97,6 +101,30 @@ test("a dashboard is registered and removed by keyboard", async ({ page }) => {
   await press(page, "Remove osprey-dashboard-old");
   await expect.poll(() => asked).toContain("DELETE dashboards/osprey-dashboard-old");
   registerCovered(REGISTRY, "remove-a-dashboard-by-keyboard");
+});
+
+// ADR-136 decision 2 (rule 13): the Datasets tab is reached, a dataset's egress changed and saved, by
+// keyboard alone; the PUT carries the setting chosen.
+test("a dataset's egress is set by keyboard", async ({ page }) => {
+  const asked = await serve(page);
+  const sent: unknown[] = [];
+  page.on("request", (request) => {
+    if (request.method() === "PUT" && request.url().endsWith("/datasets/enron/egress")) sent.push(request.postDataJSON());
+  });
+  await page.goto("/keyboard/admin-harness.html?rights=administer_system");
+  const tab = page.getByRole("tab", { name: "Datasets" });
+  await tab.focus();
+  await page.keyboard.press("Enter");
+  const egress = page.getByLabel("Egress for Enron corpus", { exact: true });
+  await egress.focus();
+  // A closed select takes an arrow key differently by platform; typing an option's start chooses it.
+  await page.keyboard.type("any");
+  await expect(egress).toHaveValue("any");
+  await press(page, "Save egress for Enron corpus");
+  await expect(page.getByText("Enron corpus: egress is now any.")).toBeVisible();
+  expect(asked).toContain("PUT datasets/enron/egress");
+  expect(sent).toEqual([{ egress: "any" }]);
+  registerCovered(REGISTRY, "set-a-datasets-egress-by-keyboard");
 });
 
 test("the system is asked again by keyboard", async ({ page }) => {
@@ -205,11 +233,11 @@ test("a schedule is changed by keyboard, keeping its owner", async ({ page }) =>
   const asked = await serve(page);
   await page.goto("/keyboard/admin-harness.html?rights=operate_schedules");
   await press(page, "Change schedule of Daily custody export");
-  const often = page.getByLabel("How often");
+  const often = page.getByLabel("Run on a schedule (how often)");
   await often.selectOption("weekdays"); // a native select, as the other walkthroughs drive one
   await often.focus();
   await page.keyboard.press("Tab");
-  await expect(page.getByLabel("Time", { exact: true })).toBeFocused();
+  await expect(page.getByLabel("At (time)", { exact: true })).toBeFocused();
   await page.keyboard.type("0730");
   await expect(page.getByRole("status", { name: "Schedule preview" })).toContainText("every weekday at 07:30");
   await press(page, "Save schedule of Daily custody export");

@@ -5,8 +5,8 @@
 
 export type Rights = ReadonlySet<string> | null;
 export type RailEntry =
-  | "cases" | "watches" | "alerts" | "ownership" | "history" | "explore" | "questions" | "types" | "ingest" | "dashboards" | "admin";
-export type GlassView = "graph" | "map" | "reports";
+  | "cases" | "alerts" | "ownership" | "history" | "explore" | "questions" | "types" | "ingest" | "dashboards" | "admin";
+export type GlassView = "graph" | "map" | "matrix" | "reports";
 
 const has = (rights: Rights, ...any: string[]) => rights === null || any.some((r) => rights.has(r));
 const known = (rights: Rights, ...any: string[]) => rights !== null && any.some((r) => rights.has(r));
@@ -17,8 +17,9 @@ const ADMINISTRATION = ["manage_people", "manage_dashboards", "administer_system
 export function railEntries(rights: Rights): RailEntry[] {
   const entries: [RailEntry, boolean][] = [
     ["cases", true],
-    ["watches", has(rights, "keep_watches")],
-    ["alerts", has(rights, "read_alert_queue")],
+    // The owner's answer of 1 November 2026: no Watches entry of its own. Watches are in the
+    // Monitoring place's Watches tab, so Monitoring is offered to whoever keeps watches too.
+    ["alerts", has(rights, "read_alert_queue", "keep_watches")],
     ["ownership", has(rights, "trace_ownership")],
     ["history", has(rights, "investigate")],
     ["explore", has(rights, "investigate")],
@@ -64,6 +65,8 @@ export function viewsFor(rights: Rights): GlassView[] {
   const views: [GlassView, boolean][] = [
     ["graph", has(rights, "investigate")],
     ["map", has(rights, "investigate")],
+    // `02_GLASS_FRONTEND.md` §6: the screen-reader-navigable rendering of the same working set.
+    ["matrix", has(rights, "investigate")],
     ["reports", has(rights, "read_reports")],
   ];
   return views.filter(([, shown]) => shown).map(([view]) => view);

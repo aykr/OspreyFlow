@@ -35,6 +35,7 @@ is still `python -m harness.apply`. Every compose call reads the deployment's ow
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
@@ -46,6 +47,8 @@ from harness.apply import _compose
 from harness.keycloak_theme import (
     THEME_DIRECTORY,
     THEME_NAME,
+    clear_theme_cache,
+    login_theme_options,
     read_tokens,
     render_login_theme,
     write_login_theme,
@@ -60,12 +63,11 @@ from harness.render import (
     render_ollama_pull_script,
     service_images,
 )
-from harness.site import answer_localhost_with_loopback, deployment_origins
+from harness.site import LOOPBACK, answer_localhost_with_loopback, deployment_origins
 
-from schemas.deployment import OspreyConfig
+from schemas.deployment import OspreyConfig, Profile, generated_folder
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PROFILE = "local-lite"
 
 
 class NothingToRefresh(Exception):
@@ -86,9 +88,25 @@ def _register(argv: list[str]) -> int:
     return register_sign_in.main(argv)
 
 
+#: ADR-138: the folder of a deployment kept under `~/.ospreyflow/deployments/<name>/`, which the
+#: `ospreyflow` command names when it runs this (or a seed) for a deployment chosen with `--name`.
+DEPLOYMENT_DIR_VARIABLE = "OSPREYFLOW_DEPLOYMENT_DIR"
+
+
 def _deployment_dir(repo_root: Path) -> Path:
+    named = os.environ.get(DEPLOYMENT_DIR_VARIABLE)
+    if named:
+        chosen = Path(named)
+        if not (chosen / "compose.yaml").is_file():
+            raise NothingToRefresh(
+                f"{chosen} holds no rendered deployment (no compose.yaml). Install it first with "
+                "`ospreyflow install --name <name>`."
+            )
+        return chosen
     generated = repo_root / "deploy" / "generated"
-    preferred = generated / DEFAULT_PROFILE
+    # ADR-132 Amendment 1: the deployment's own folder first, `deployment.name` or the profile, so a
+    # product folder holding two rendered deployments rebuilds the one its `osprey.yaml` names.
+    preferred = generated / generated_folder(load_config(repo_root / "osprey.yaml"))
     if (preferred / "compose.yaml").is_file():
         return preferred
     found = sorted(p.parent for p in generated.glob("*/compose.yaml"))
@@ -111,15 +129,17 @@ def _theme_changed(directory: Path, repo_root: Path) -> bool:
     tokens = read_tokens(repo_root)
     root = directory / THEME_DIRECTORY / THEME_NAME
     # ADR-115 decision 6: the page's words depend on whether the deployment can mail a reset link.
+    # ADR-132 Amendment 2: and, under the GOV.UK brand, on the deployment's appearance.
     config_path = directory / "osprey.yaml"
-    reset_by_email = config_path.is_file() and load_config(config_path).mail is not None
-    wanted = render_login_theme(tokens, reset_by_email=reset_by_email)
+    config = load_config(config_path) if config_path.is_file() else OspreyConfig()
+    options = login_theme_options(config)
+    wanted = render_login_theme(tokens, **options)
     changed = any(
         not (root / name).is_file() or (root / name).read_text(encoding="utf-8") != content
         for name, content in wanted.items()
     )
     if changed:
-        write_login_theme(directory, tokens_css=tokens, reset_by_email=reset_by_email)
+        write_login_theme(directory, tokens_css=tokens, **options)
     return changed
 
 
@@ -193,6 +213,14 @@ def _models_up_to_date(directory: Path) -> bool:
     return False
 
 
+def _build_context(services: dict) -> str:
+    """The `build.context` the deployment's own Conduit names (`../../..` before ADR-138)."""
+    api = services.get("api")
+    build = api.get("build") if isinstance(api, dict) else None
+    context = build.get("context") if isinstance(build, dict) else None
+    return str(context) if context else "../../.."
+
+
 def _like_the_deployment(config: OspreyConfig, services: dict, directory: Path) -> OspreyConfig:
     """Build or pull as the deployment does. `apply --build` builds the owned images from the
     checkout but leaves the copied `osprey.yaml` without `source_path`, so the mode is read from the
@@ -200,7 +228,9 @@ def _like_the_deployment(config: OspreyConfig, services: dict, directory: Path) 
     that does not exist)."""
     api = services.get("api")
     if isinstance(api, dict) and "build" in api and config.components.source_path is None:
-        root = directory.parent.parent.parent
+        # Where the deployment builds from: three levels up for one in a checkout's
+        # `deploy/generated/`, the checkout's own path for one kept under `~/.ospreyflow` (ADR-138).
+        root = (directory / str(_build_context(services))).resolve()
         return config.model_copy(
             update={"components": config.components.model_copy(update={"source_path": str(root)})}
         )
@@ -222,7 +252,9 @@ def _new_services_added(directory: Path) -> None:
     document = yaml.safe_load(text)
     services = document.setdefault("services", {})
     config = _like_the_deployment(config, services, directory)
-    rendered = yaml.safe_load(_render_compose(config, service_images(config)))["services"]
+    rendered = yaml.safe_load(
+        _render_compose(config, service_images(config, build_context=_build_context(services)))
+    )["services"]
     changed = False
     layout = _on_the_internal_network(document)
     left_out = []
@@ -320,6 +352,62 @@ def _glass_settings_up_to_date(directory: Path) -> None:
         path.write_text(wanted, encoding="utf-8")
 
 
+def _routing_up_to_date(directory: Path) -> bool:
+    """The front proxy's routing table as this checkout renders it; True when it changed, since the
+    proxy reads it at start (ADR-132 Amendment 2: under GOV.UK the `id.` name routes
+    `/assets/govuk/` to the Glass). It names no secret, so it is written whole."""
+    config_path = directory / "osprey.yaml"
+    if not config_path.is_file():
+        return False
+    from harness.render import _BANNER, _comment_block
+    from harness.site import render_caddyfile
+
+    wanted = _comment_block(_BANNER, "#") + render_caddyfile(load_config(config_path))
+    path = directory / "Caddyfile"
+    if path.is_file() and path.read_text(encoding="utf-8") == wanted:
+        return False
+    path.write_text(wanted, encoding="utf-8")
+    return True
+
+
+def _bare(port: object) -> bool:
+    """A short-form published port with no host address (`80:8080`,
+    `${OSPREY_API_PORT:-8000}:8000`): the part before the first colon is an address only when it
+    has a dot or a bracket."""
+    if not isinstance(port, str) or ":" not in port:
+        return False
+    host = port.split(":", 1)[0]
+    return "." not in host and not host.startswith("[")
+
+
+def _published_on_loopback(directory: Path) -> None:
+    """S10 (`05_DEPLOYMENT.md` §7): every port a Lite deployment publishes is bound to `127.0.0.1`.
+    A deployment rendered before it publishes its proxy as a bare `HOST:CONTAINER`, on every
+    interface, and nothing else here rewrites a service the deployment already has (found at the
+    step 11 rehearsal, 2 November 2026: both of the owner's deployments still answered on every
+    interface after `start --build`). Only the host address is added; the operator's own port
+    numbers stay, and `up` recreates the service because its ports changed."""
+    config_path = directory / "osprey.yaml"
+    if not config_path.is_file() or load_config(config_path).profile is not Profile.LOCAL_LITE:
+        return
+    compose_path = directory / "compose.yaml"
+    text = compose_path.read_text(encoding="utf-8")
+    header_end = text.find("\nname:") + 1
+    document = yaml.safe_load(text)
+    changed = False
+    for service in (document.get("services") or {}).values():
+        ports = service.get("ports") if isinstance(service, dict) else None
+        if not ports:
+            continue
+        bound = [f"{LOOPBACK}:{port}" if _bare(port) else port for port in ports]
+        if bound != ports:
+            service["ports"] = bound
+            changed = True
+    if changed:
+        body = yaml.safe_dump(document, sort_keys=False, default_flow_style=False)
+        compose_path.write_text(text[:header_end] + body, encoding="utf-8")
+
+
 def _pins_moved(directory: Path) -> None:
     """A service built from no source here whose rendered image differs from the deployment's is
     moved to it, with the rendered values of its settings (a new version's launch options). Secrets
@@ -336,7 +424,9 @@ def _pins_moved(directory: Path) -> None:
     # report-sync runs the Conduit's image with no `build` of its own: rendered in pull mode it
     # looked "moved" to a registry image that does not exist (ADR-111 Amendment 4's refresh).
     config = _like_the_deployment(config, services, directory)
-    rendered = yaml.safe_load(_render_compose(config, service_images(config)))["services"]
+    rendered = yaml.safe_load(
+        _render_compose(config, service_images(config, build_context=_build_context(services)))
+    )["services"]
     moved: dict[str, str] = {}
     for name, wanted in rendered.items():
         service = services.get(name)
@@ -378,9 +468,15 @@ def files_up_to_date(repo_root: Path = REPO_ROOT) -> dict[str, bool]:
     proxy_changed = _models_up_to_date(directory)
     _new_services_added(directory)
     _pins_moved(directory)
+    _published_on_loopback(directory)
     _glass_settings_up_to_date(directory)
+    routing_changed = _routing_up_to_date(directory)
     _release_up_to_date(directory)
-    return {"proxy_changed": proxy_changed, "theme_changed": theme_changed}
+    return {
+        "proxy_changed": proxy_changed,
+        "theme_changed": theme_changed,
+        "routing_changed": routing_changed,
+    }
 
 
 def refresh(
@@ -400,7 +496,10 @@ def refresh(
         # containers itself, since their command and environment file changed.
         run([*compose, "restart", "litellm"])
         run([*compose, "up", "-d", "--wait"])
+    if changed["routing_changed"]:
+        run([*compose, "restart", "proxy"])
     if theme_changed:
+        run(clear_theme_cache(compose))
         run([*compose, "restart", "keycloak"])
         run([*compose, "up", "-d", "--wait"])
     identity = _identity_origin(directory / "deployment.env")

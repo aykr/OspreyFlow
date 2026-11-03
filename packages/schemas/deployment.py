@@ -31,6 +31,7 @@ from __future__ import annotations
 import re
 from enum import StrEnum
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
@@ -87,6 +88,18 @@ class SearchBackend(StrEnum):
 #: Where the Conduit's container sees `components.storage.tiles`.
 TILES_CONTAINER_PATH = "/data/tiles"
 
+#: From a rendered deployment's folder, `<product>/deploy/generated/<name>/`, back to the product
+#: folder that holds `osprey.yaml` (ADR-054 Amendment 6).
+GENERATED_TO_PRODUCT = "../../.."
+
+
+def host_folder_source(value: str) -> str:
+    """`components.storage.ingest` or `tiles` as a Compose bind source (ADR-054 Amendment 6). An
+    absolute path is used as it is. A relative one is read from the product folder, and Compose
+    reads a relative source from the folder `compose.yaml` is in, so it is written relative to that
+    folder: no rendered file then carries the host's own absolute path."""
+    return value if value.startswith("/") else f"{GENERATED_TO_PRODUCT}/{value}"
+
 
 class StorageRoots(BaseModel):
     """`05_DEPLOYMENT.md` §2.1's Components screen: "the storage roots for data, staging and
@@ -130,7 +143,8 @@ class StorageRoots(BaseModel):
         default="/var/lib/osprey/ingest",
         description=(
             "Default: /var/lib/osprey/ingest. The host folder of source files the Ingest Studio "
-            "lists (read-only to it; uploads go to its uploaded/ folder)."
+            "lists (read-only to it; uploads go to its uploaded/ folder). A relative path is read "
+            "from the folder osprey.yaml is in."
         ),
     )
     #: **The folder the built basemap lives in (ADR-054 Amendment 4).** A map provider's
@@ -141,7 +155,10 @@ class StorageRoots(BaseModel):
     #: process that serves them.
     tiles: str = Field(
         default="/var/lib/osprey/tiles",
-        description="Default: /var/lib/osprey/tiles. The host folder a built basemap lives in.",
+        description=(
+            "Default: /var/lib/osprey/tiles. The host folder a built basemap lives in. A relative "
+            "path is read from the folder osprey.yaml is in."
+        ),
     )
 
 
@@ -216,16 +233,48 @@ EXTRACTION_CONTEXT_TOKENS = 32768
 ModelRole = Literal["extraction", "vision", "transcription", "embedding"]
 
 
+#: The label analysts see for the providers ADR-135 names; any other is its name, capitalised.
+PROVIDER_LABELS: dict[str, str] = {"openai": "OpenAI", "anthropic": "Anthropic", "gemini": "Gemini"}
+
+#: The engine name that means the deployment's own models (ADR-135 decision 1).
+LOCAL_ENGINE = "local"
+
+
+#: ADR-136: how long a contract reference may be — a name or number, not a document.
+MAX_CONTRACT_REFERENCE = 200
+#: A provider key's own prefixes (OpenAI and Anthropic `sk-`, Google `AIza`).
+_KEY_PREFIXES = ("sk-", "AIza")
+
+
+def _looks_like_a_key(text: str) -> bool:
+    """A key's shape: a known key prefix, or one unbroken run of 24 or more letters, digits, `-`
+    and `_` mixing letters and digits. A reference in words (`DPA-2026-0001, signed 3 March`) has
+    spaces or is short."""
+    if any(word.startswith(_KEY_PREFIXES) for word in text.split()):
+        return True
+    return bool(
+        re.fullmatch(r"[A-Za-z0-9_\-]{24,}", text)
+        and re.search(r"[A-Za-z]", text)
+        and re.search(r"[0-9]", text)
+    )
+
+
 class ModelProviderConfig(BaseModel):
-    """A client's own model provider (ADR-114 decision 11, Amendment 6 point 4), reached through the
-    deployment's LiteLLM gateway. For each role it names, it **replaces** the local model — for
-    material whose handling code is in `models.sendable_handling_codes` only; anything else runs on
-    the local model. Its key is never here: it is `OSPREY_MODEL_PROVIDER_KEY` at install."""
+    """A client's own model provider (ADR-114 decision 11, Amendment 6 point 4; ADR-135), reached
+    through the deployment's LiteLLM gateway, for material whose handling code is in
+    `models.sendable_handling_codes` only; anything else runs on the local model. Its key is never
+    here: it is `OSPREY_MODEL_KEY_<NAME>` at install (`OSPREY_MODEL_PROVIDER_KEY` for the single
+    `models.provider`), kept in the deployment's `deployment.env` and read by the gateway alone."""
 
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(
         description="LiteLLM's name for the provider: openai, anthropic, gemini, azure, bedrock…"
+    )
+    label: str | None = Field(
+        default=None,
+        description="ADR-135: the name analysts see for this engine. Default: OpenAI, Anthropic "
+        "or Gemini for those three, else the provider's name capitalised.",
     )
     roles: dict[ModelRole, str] = Field(
         description="The roles it takes, each with the provider's model for it"
@@ -234,6 +283,17 @@ class ModelProviderConfig(BaseModel):
         default=None,
         description="The provider's address, where it is not LiteLLM's default (an Azure "
         "deployment, a proxy)",
+    )
+    privacy_contract: bool = Field(
+        default=False,
+        description="ADR-136: true when the deployment's organisation holds a data-processing "
+        "agreement with the provider covering this key. A dataset whose egress is `contracted` is "
+        "sent only to a provider marked so. Default: false.",
+    )
+    contract_reference: str | None = Field(
+        default=None,
+        description="ADR-136: the agreement's reference, in words (for example DPA 2026/07); "
+        "never a secret. Shown beside the mark.",
     )
 
     @field_validator("name")
@@ -265,6 +325,47 @@ class ModelProviderConfig(BaseModel):
             )
         return value
 
+    @field_validator("contract_reference")
+    @classmethod
+    def _reference_is_words(cls, value: str | None) -> str | None:
+        """ADR-136 decision 1: words, never a secret. One line, short, and not shaped like a key —
+        the mark and its reference are shown in the Admin area and the analysts' engine choice."""
+        if value is None:
+            return None
+        if "\n" in value or "\r" in value:
+            raise ValueError("the contract reference is one line of words")
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        if len(cleaned) > MAX_CONTRACT_REFERENCE:
+            raise ValueError(
+                f"the contract reference is at most {MAX_CONTRACT_REFERENCE} characters"
+            )
+        if not re.fullmatch(r"[A-Za-z0-9 .,;:/()&'_+\-]+", cleaned):
+            # It travels to the Conduit in `deployment.env`, where `$` and ` #` would be read as
+            # an interpolation and a comment, and in JSON, where a quote or backslash is escaped.
+            raise ValueError(
+                "the contract reference may hold letters, digits, spaces and . , ; : / ( ) & ' _ "
+                "+ - only"
+            )
+        if _looks_like_a_key(cleaned):
+            raise ValueError(
+                "the contract reference looks like a key; it is shown to analysts, so give the "
+                "agreement's name or number in words, and the key with ospreyflow models key"
+            )
+        return cleaned
+
+    @model_validator(mode="after")
+    def _labelled(self) -> ModelProviderConfig:
+        if self.label is None or not self.label.strip():
+            self.label = PROVIDER_LABELS.get(self.name, self.name.replace("_", " ").title())
+        return self
+
+
+def provider_key_variable(provider: str, *, single: bool = False) -> str:
+    """`OSPREY_MODEL_KEY_<NAME>`; `OSPREY_MODEL_PROVIDER_KEY` for the single `models.provider`."""
+    return "OSPREY_MODEL_PROVIDER_KEY" if single else f"OSPREY_MODEL_KEY_{provider.upper()}"
+
 
 class ModelsConfig(BaseModel):
     """`05_DEPLOYMENT.md` §2.1's Models screen: "Local only, or local with a named hosted fallback
@@ -286,7 +387,23 @@ class ModelsConfig(BaseModel):
     )
     #: ADR-114 decision 11, Amendment 6: a client's own provider, replacing the local model for the
     #: roles it names (sendable material only). Supersedes `hosted_fallback`, which nothing acts on.
-    provider: ModelProviderConfig | None = None
+    provider: ModelProviderConfig | None = Field(
+        default=None,
+        description="ADR-114 Amendment 6: one provider, read as a one-entry `providers` whose "
+        "roles default to it; its key is OSPREY_MODEL_PROVIDER_KEY. Not with `providers`.",
+    )
+    #: ADR-135 decision 1: each enabled provider (engine), its models per role, its label.
+    providers: list[ModelProviderConfig] = Field(
+        default_factory=list,
+        description="ADR-135: the providers an administrator enables; each key is "
+        "OSPREY_MODEL_KEY_<NAME>, entered at install or with `ospreyflow models key`.",
+    )
+    #: ADR-135 decision 1: each role's default engine — `local` or an enabled provider's name.
+    defaults: dict[ModelRole, str] = Field(
+        default_factory=dict,
+        description="ADR-135: each role's default engine, `local` or an enabled provider's name. "
+        "A role not named runs on `local` (for the single `provider`, on it).",
+    )
     extraction: ExtractionModel = Field(
         default="qwen2.5:7b-instruct",
         description="ADR-095: the local model that extracts entities from text. Default: "
@@ -305,14 +422,46 @@ class ModelsConfig(BaseModel):
         description="ADR-095: the local model that turns text into vectors.",
     )
 
+    @property
+    def enabled_providers(self) -> list[ModelProviderConfig]:
+        """ADR-135: every enabled provider — `providers`, or the single `provider` as a one-entry
+        list."""
+        return [self.provider] if self.provider is not None else list(self.providers)
+
+    def key_variable(self, provider: str) -> str:
+        """Where a provider's key is kept in `deployment.env` (ADR-135 decision 2):
+        `OSPREY_MODEL_KEY_<NAME>`, or `OSPREY_MODEL_PROVIDER_KEY` for the single `provider`, so an
+        install made before ADR-135 keeps working. `ospreyflow models` (`cli/ospreyflow/models.py`)
+        names it by the same rule; `test_model_engines.py` holds the two to each other."""
+        return provider_key_variable(provider, single=self.provider is not None)
+
+    @property
+    def role_defaults(self) -> dict[ModelRole, str]:
+        """Each role's default engine as named. The single `provider` keeps Amendment 6's meaning:
+        the roles it takes default to it. A role not here runs on `local`."""
+        if self.provider is not None and not self.defaults:
+            return {role: self.provider.name for role in self.provider.roles}
+        return dict(self.defaults)
+
     @model_validator(mode="after")
     def _hosted_fallback_and_local_only_are_consistent(self) -> ModelsConfig:
-        if self.provider is not None and self.local_only:
+        if self.provider is not None and self.providers:
+            raise ValueError(
+                "both models.provider and models.providers are named; list every provider under "
+                "providers (provider is the older one-provider form)"
+            )
+        enabled = self.enabled_providers
+        seen: set[str] = set()
+        for provider in enabled:
+            if provider.name in seen:
+                raise ValueError(f"the provider {provider.name} is named twice in models.providers")
+            seen.add(provider.name)
+        if enabled and self.local_only:
             raise ValueError(
                 "models.local_only is true but a provider is named; set local_only: false to "
                 "declare that case content may leave the deployment"
             )
-        if self.provider is not None and self.hosted_fallback is not None:
+        if enabled and self.hosted_fallback is not None:
             raise ValueError(
                 "models.provider replaces the old hosted_fallback; name only the provider"
             )
@@ -321,11 +470,25 @@ class ModelsConfig(BaseModel):
                 "models.local_only is true but a hosted_fallback is named; set local_only: false "
                 "to declare the egress exception explicitly rather than by implication"
             )
-        if self.sendable_handling_codes and self.hosted_fallback is None and self.provider is None:
+        if self.sendable_handling_codes and self.hosted_fallback is None and not enabled:
             raise ValueError(
                 "models.sendable_handling_codes is set but no hosted_fallback is named; handling "
                 "codes cannot be sendable to nothing"
             )
+        by_name = {p.name: p for p in enabled}
+        for role, engine in self.defaults.items():
+            if engine == LOCAL_ENGINE:
+                continue
+            if engine not in by_name:
+                raise ValueError(
+                    f"models.defaults names {engine} for {role}, which is not an enabled engine "
+                    f"(local, or one of: {', '.join(by_name) or 'no provider is enabled'})"
+                )
+            if role not in by_name[engine].roles:
+                raise ValueError(
+                    f"models.defaults names {engine} for {role}, but {engine} takes no {role} "
+                    "model; add one under its roles, or choose another engine"
+                )
         return self
 
 
@@ -506,6 +669,30 @@ class ReportingConfig(BaseModel):
     superset_memory: str = Field(default="2g", description="Default: 2g. Superset's memory limit.")
 
 
+class MonitoringConfig(BaseModel):
+    """Monitoring and alerts (`06_DECISIONS.md` ADR-133 ruling 3): whom a new hotlist's alerts reach
+    in the shared alert queue, and whether its owner may change that. A hotlist made before the
+    setting existed keeps `only_me` whatever is set here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    hotlist_audience: Literal["only_me", "team"] = Field(
+        default="only_me",
+        description=(
+            "Default: only_me. Whom a new hotlist's alerts reach: its owner alone (only_me), or "
+            "also the owner's team, the people of the owner's organisational unit (team). Applies "
+            "to hotlists made after it is set, never to an existing one."
+        ),
+    )
+    hotlist_audience_editable: bool = Field(
+        default=True,
+        description=(
+            "Default: true. Whether a hotlist's owner may choose its audience, when making it or "
+            "later. When false, every new hotlist takes hotlist_audience and a change is refused."
+        ),
+    )
+
+
 class WelcomeConfig(BaseModel):
     """The welcome page before sign-in (ADR-115 decision 8): its About section, and the footer's
     links — the deploying organisation's own documents, each shown only when its address is
@@ -535,6 +722,77 @@ class WelcomeConfig(BaseModel):
         if value is not None and not value.startswith(("https://", "http://")):
             raise ValueError(f"welcome.{info.field_name} must be an http(s) address, not {value!r}")
         return value
+
+
+#: What Compose takes as a project name: lowercase letters, digits and hyphens, starting with a
+#: letter or digit.
+_COMPOSE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+class DeploymentConfig(BaseModel):
+    """Which deployment this is, on a machine that may run more than one (ADR-132 Amendment 1)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(
+        default=None,
+        description=(
+            "Default: osprey-<profile>, rendered to deploy/generated/<profile>/. Names this "
+            "deployment's Compose project, its volumes and its rendered folder, so a second "
+            "deployment on the same machine shares none of them."
+        ),
+    )
+    #: ADR-138 decision 2: a deployment installed beside another (`ospreyflow install --name`)
+    #: publishes its graph store on a loopback port of its own, so two share no port.
+    graph_port: int | None = Field(
+        default=None,
+        ge=1024,
+        le=65535,
+        description=(
+            "Default: 2480. The port on this machine (127.0.0.1 only) the graph store's own tools "
+            "reach it at. A deployment installed beside another with ospreyflow install --name is "
+            "given one of its own, so the two share no port."
+        ),
+    )
+
+    @field_validator("name")
+    @classmethod
+    def _a_compose_name(cls, value: str | None) -> str | None:
+        if value is not None and not _COMPOSE_NAME.match(value):
+            raise ValueError(
+                f"deployment.name {value!r} must be lowercase letters, digits and hyphens, "
+                "starting with a letter or digit"
+            )
+        return value
+
+
+class AppearanceConfig(BaseModel):
+    """How every page of the deployment looks (ADR-132): the deployment's brand, which is not the
+    viewer's light or dark choice. `govuk` is the GOV.UK look the Service Manual requires on a
+    `*.service.gov.uk` service: its header and footer, GDS Transport, its colours and the light
+    page. The network's own colours and shapes are the same under either brand. Read by the Glass
+    from `/deployment.json`; the Admin console's Appearance tab is to write the same section."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    brand: Literal["ospreyflow", "govuk"] = Field(
+        default="ospreyflow",
+        description="Default: ospreyflow. The GOV.UK look, for a service on a gov.uk domain only.",
+    )
+    service_name: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Default: none. The service's name in the GOV.UK header and the page title.",
+    )
+    organisation: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Default: none. The organisation in the GOV.UK footer and the page title.",
+    )
+    phase: Literal["alpha", "beta", "live", "none"] = Field(
+        default="none",
+        description="Default: none. The phase banner shows at alpha or beta.",
+    )
 
 
 class MailConfig(BaseModel):
@@ -663,8 +921,11 @@ class OspreyConfig(BaseModel):
     network: NetworkConfig = Field(default_factory=NetworkConfig)
     map: MapConfig | None = Field(default=None, description="Default: none declared")
     reporting: ReportingConfig = Field(default_factory=ReportingConfig)
+    monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
     mail: MailConfig | None = Field(default=None, description="Default: none — one-time codes")
     welcome: WelcomeConfig = Field(default_factory=WelcomeConfig)
+    deployment: DeploymentConfig = Field(default_factory=DeploymentConfig)
+    appearance: AppearanceConfig = Field(default_factory=AppearanceConfig)
     external: ExternalConfig = Field(default_factory=ExternalConfig)
 
     @model_validator(mode="after")
@@ -683,6 +944,17 @@ class OspreyConfig(BaseModel):
                 f"cluster settings are declared but profile is {self.profile.value!r}; they are "
                 "only meaningful at profile: cluster"
             )
+        if self.profile is Profile.CLUSTER:
+            # ADR-054 Amendment 6: on a cluster these folders are on other machines, so there is
+            # no product folder for a relative path to be read from.
+            for name in ("ingest", "tiles"):
+                value = getattr(self.components.storage, name)
+                if not value.startswith("/"):
+                    raise ValueError(
+                        f"components.storage.{name} {value!r} must be an absolute path at "
+                        "profile: cluster; a relative path is read from the product folder, which "
+                        "only a single-machine deployment has"
+                    )
         if self.profile is Profile.CLUSTER and not self.cluster.shared_storage_class:
             raise ValueError(
                 "a cluster names cluster.shared_storage_class: the one volume every Conduit "
@@ -718,6 +990,33 @@ class OspreyConfig(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _the_address_suits_the_profile(self) -> OspreyConfig:
+        """S11 and O2 (GDS re-audit; the owner's ruling of 2 November 2026; `05_DEPLOYMENT.md`
+        §7). Small and Enterprise are reached by other people over a network, so their address is
+        HTTPS. Lite answers on this computer only, in plain HTTP (S10), so a gov.uk address, which
+        the public reaches, is never Lite. Refused in words, so `ospreyflow apply` and the guided
+        page say why and what to write instead."""
+        origin = self.network.public_origin
+        if self.profile is not Profile.LOCAL_LITE and not origin.startswith("https://"):
+            name = "a Small" if self.profile is Profile.SMALL else "an Enterprise"
+            raise ValueError(
+                f"network.public_origin {origin!r} is plain HTTP: {name} deployment's "
+                "network.public_origin must be an https:// address (for example "
+                "https://osprey.example.org), because other people reach it over a network and the "
+                "front proxy obtains its certificate. Plain HTTP is for Lite, on this computer only"
+            )
+        host = (urlsplit(origin).hostname or "").rstrip(".").lower()
+        if self.profile is Profile.LOCAL_LITE and (host == "gov.uk" or host.endswith(".gov.uk")):
+            raise ValueError(
+                f"network.public_origin {origin!r} is a gov.uk address, and Lite answers on this "
+                "computer only, in plain HTTP. A gov.uk service is reached by the public over "
+                "HTTPS: install it as Small or Enterprise (profile: small or cluster) with an "
+                "https:// address, or give Lite a localhost address such as "
+                "http://ospreyflow.localhost"
+            )
+        return self
+
 
 #: Exported to `generate_ts.py`. `MapConfig` and its own members are already exported by
 #: `schemas/mapconfig.py`'s own `ALL_MODELS` and are deliberately not repeated here — the generator
@@ -738,3 +1037,15 @@ ALL_MODELS: tuple[type[BaseModel], ...] = (
     NetworkConfig,
     OspreyConfig,
 )
+
+
+def compose_project(config: OspreyConfig) -> str:
+    """The deployment's Compose project, which prefixes its volumes (ADR-132 Amendment 1):
+    `deployment.name`, else `osprey-<profile>` as every deployment was named before it."""
+    return config.deployment.name or f"osprey-{config.profile.value}"
+
+
+def generated_folder(config: OspreyConfig) -> str:
+    """The folder under `deploy/generated/` the deployment is rendered to, `deployment.env` with
+    it: `deployment.name`, else the profile, as before (ADR-132 Amendment 1)."""
+    return config.deployment.name or config.profile.value

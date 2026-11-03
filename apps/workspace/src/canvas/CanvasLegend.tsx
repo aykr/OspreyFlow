@@ -14,9 +14,17 @@
 //
 // Under the links, the icons chosen by a property's value (ADR-128 Decision 4): each drawing in use in
 // the view, what it means and how many nodes carry it, so an icon is never a guess.
+//
+// Last, connection strength (ADR-139 decision 7): exactly the influencers in force in the case, each
+// with what triggers it, the links it changes, the change and its size, and where it came from (a
+// case override marked as such); which link types count as direct; what the case switched off; and
+// that rarity is worked out over what the reader may see. And (ADR-139 Amendment 2) which composition
+// is in force — standard, or the client's parity sum — where it came from, and the rarity measure.
 import { useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
 
+import type { StrengthLegend } from "../../../../packages/schemas/generated";
 import { activePalette } from "../color/palette";
+import { andList, compositionWords, influencerWords, layerWords } from "../strength/words";
 import { TypeChip } from "../inspector/TypeChip";
 import type { EntityVisual } from "../ontology/schema";
 import { describeValueIcon, glyphImageUri } from "./valueIcons";
@@ -89,11 +97,14 @@ export function CanvasLegend({
   links = [],
   valueIcons = [],
   onToggleLink,
+  strength = null,
 }: {
   types: readonly LegendType[];
   links?: readonly LegendLink[];
   valueIcons?: readonly LegendValueIcon[];
   onToggleLink?: (type: string) => void;
+  /** ADR-139: the case's influencers in force, for the strength part. Absent: not shown. */
+  strength?: StrengthLegend | null;
 }) {
   const [open, setOpen] = useState(true);
   const [offset, setOffset] = useState<Offset>(remembered);
@@ -157,6 +168,7 @@ export function CanvasLegend({
     remember(start.at);
   };
 
+  const linkLabel = (type: string): string => links.find((l) => l.type === type)?.label ?? type;
   if (types.length === 0) return null;
   const sorted = [...types].sort((a, b) => b.count - a.count || a.type.localeCompare(b.type));
   const moved = offset.x !== 0 || offset.y !== 0;
@@ -228,6 +240,39 @@ export function CanvasLegend({
               </li>
             ))}
         </ul>
+      )}
+      {strength && (
+        <div className="canvas-legend__strength" hidden={!open}>
+          <p className="canvas-legend__caption">Connection strength</p>
+          <p className="canvas-legend__note canvas-legend__composition" aria-label="Composition">
+            {strength.composition_layer === "case" && <span className="canvas-legend__tag">Case override</span>}{" "}
+            {compositionWords(strength)}
+            {strength.composition === "client_parity" &&
+              strength.influencers.some((a) => (a.influencer.change ?? "add") !== "add") &&
+              " Only the adds count in it: a multiplier, floor or exclusion is not used."}
+          </p>
+          <ul aria-label="Strength influencers" className="canvas-legend__list canvas-legend__links">
+            {strength.influencers.map((active) => (
+              <li key={active.influencer.id} className="canvas-legend__influencer">
+                <span className="canvas-legend__meaning">
+                  <strong>{active.influencer.label}</strong>
+                  {active.layer === "case" && <span className="canvas-legend__tag">Case override</span>}{" "}
+                  {influencerWords(active.influencer, linkLabel)} ({layerWords(active)}
+                  {active.influencer.note ? `; ${active.influencer.note}` : ""})
+                </span>
+              </li>
+            ))}
+            {strength.influencers.length === 0 && <li>No influencers: each link is drawn at its stored strength.</li>}
+          </ul>
+          <p className="canvas-legend__note">
+            {strength.direct_link_types.length > 0
+              ? `Direct links: ${andList(strength.direct_link_types.map(linkLabel))}.`
+              : "No link type counts as direct in this case."}
+            {(strength.switched_off ?? []).length > 0 &&
+              ` Switched off in this case: ${andList(strength.switched_off ?? [])}.`}
+          </p>
+          <p className="canvas-legend__note">{strength.rarity_note}</p>
+        </div>
       )}
     </div>
   );

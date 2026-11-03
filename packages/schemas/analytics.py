@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -551,6 +551,77 @@ class TrendResult(BaseModel):
 ALL_MODELS = (*ALL_MODELS, TrendRequest, TrendPoint, CountedHandling, TrendResult)
 
 
+# --- Alert trends (`06_DECISIONS.md` ADR-134 decision 3) ------------------------------------------
+
+AlertFactKind = Literal["typology", "hotlist", "monitor"]
+#: Who may count an alert, as the one queue decides it (`services/api/alerts.py` `queue_scope`): a
+#: typology alert is its case's; a hotlist or monitor alert is its owner's, and its owner's team's
+#: when it is shared with them.
+AlertFactAudience = Literal["case", "team", "owner"]
+#: What an alert trend may split by or filter on: a closed list, never a property name.
+AlertTrendField = Literal["rule", "typology", "severity", "outcome"]
+ALERT_TREND_FIELDS: tuple[AlertTrendField, ...] = ("rule", "typology", "severity", "outcome")
+#: The rule key that counts every hotlist together, and every monitor together (decision 2).
+HOTLISTS_RULE, MONITORS_RULE = "hotlists", "monitors"
+
+
+class AlertFact(BaseModel):
+    """One alert as the analytics store keeps it for alert trends (ADR-134 decision 3): written by
+    the Conduit whenever the alert is raised or changes, replacing what was kept for it before.
+
+    `handlings` is every handling the alert rests on — each node, link and transaction it cites —
+    as they were when it was raised. A reader counts the alert only if they may view all of them
+    (rule 3, all or nothing, in the query). `None` means they are not known (an alert raised before
+    this was kept): such an alert is counted for no one, never guessed. An empty list is an alert
+    that cites nothing (a `notify` stub), counted for its audience alone."""
+
+    alert_id: str = Field(min_length=1)
+    #: The case a typology alert belongs to; a hotlist or monitor alert may name none.
+    investigation_scope: str | None = None
+    kind: AlertFactKind
+    #: `typology:<rule id>` for a typology alert, `hotlists` or `monitors` for the others.
+    rule: str = Field(min_length=1)
+    typology: str | None = None
+    severity: Literal["high", "medium", "low"]
+    #: `open`, `claimed`, one of the closing reasons (`true_positive` — a true match —,
+    #: `false_positive`, `duplicate`, `no_further_action`, `referred`), or `closed` (taken back, no
+    #: outcome).
+    outcome: Literal[
+        "open", "claimed", "true_positive", "false_positive", "duplicate", "no_further_action",
+        "referred", "closed",
+    ]  # fmt: skip
+    raised_at: datetime
+    owner_id: str
+    audience: AlertFactAudience
+    team: str | None = None
+    dataset_id: str | None = None
+    handlings: list[Handling] | None = None
+
+
+class AlertTrendRequest(BaseModel):
+    """Alerts raised per week or month, optionally split by one field and narrowed by up to five
+    equalities — a closed definition, counted as the reader (ADR-134 decision 3)."""
+
+    #: The case read: its typology alerts, and the hotlist and monitor alerts the reader may see.
+    investigation_scope: str
+    window: Interval
+    interval: TrendInterval = TrendInterval.WEEK
+    group_by: AlertTrendField | None = None
+    filters: dict[AlertTrendField, list[str]] = Field(default_factory=dict)
+    max_periods: int = Field(default=104, gt=0)
+    max_series: int = Field(default=12, gt=0)
+
+    @field_validator("filters")
+    @classmethod
+    def _at_most_five(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
+        if sum(len(v) for v in value.values()) > 5:
+            raise ValueError("an alert trend takes at most five equalities")
+        return value
+
+
+ALL_MODELS = (*ALL_MODELS, AlertFact, AlertTrendRequest)
+
+
 class CaseEventHolder(BaseModel):
     investigation_id: str
     name: str | None = None
@@ -567,3 +638,110 @@ class CaseEvents(BaseModel):
 
 
 ALL_MODELS = (*ALL_MODELS, CaseEventHolder, CaseEvents)
+
+
+# --- Frequency and amount conditions (06_DECISIONS.md ADR-133 decision 1, stage (b)) ------------
+
+#: The longest span a frequency condition counts within: a year and a day, as a typology's window.
+FREQUENCY_SPAN_DAYS_MAX = 366
+#: The most subjects one frequency read asks about; more is the caller's to refuse (rule 2).
+FREQUENCY_NODES_MAX = 1000
+
+
+class FrequencyRequest(BaseModel):
+    """How often each of `filter.node_ids` took part in an event, for a rule's frequency or amount
+    condition (ADR-133 decision 1): "3 or more times in 7 days", "a total of an amount over X in
+    D days", "the first time ever".
+
+    `filter.node_ids` are the subjects, at either end of an event; a caller passes only nodes it
+    has read as `principal` (a rule's subjects are matched as its own author). `filter.window`
+    bounds the events counted. Within it, for each subject, the most events — and the largest total
+    of `amount_property` — in any span of `span_days` days ending at one of its events. The access
+    step is in the query (rule 3): an event the principal may not see adds nothing to a count or a
+    total, and cannot be a subject's first."""
+
+    filter: EventFilter
+    span_days: int = Field(ge=1, le=FREQUENCY_SPAN_DAYS_MAX)
+    #: A declared numeric property of the counted link type, summed; `None` counts only.
+    amount_property: str | None = None
+
+    @field_validator("filter")
+    @classmethod
+    def _names_its_subjects(cls, value: EventFilter) -> EventFilter:
+        if not value.node_ids:
+            raise ValueError("a frequency is counted for named nodes; name at least one")
+        if len(value.node_ids) > FREQUENCY_NODES_MAX:
+            raise ValueError(
+                f"a frequency is counted for at most {FREQUENCY_NODES_MAX:,} nodes at once"
+            )
+        return value
+
+
+class NodeFrequency(BaseModel):
+    """One subject's answer. `most_in_span` and `largest_total` are over the request's window;
+    `first_at` is the subject's earliest visible event at all, up to the window's end (its start is
+    not applied), so "the first time ever" is `first_at` falling inside the window."""
+
+    most_in_span: int = Field(ge=0)
+    largest_total: float | None = None
+    first_at: datetime | None = None
+
+
+class FrequencyResult(BaseModel):
+    """Every subject asked about that has at least one visible event up to the window's end; a
+    subject with none is absent."""
+
+    nodes: dict[NodeId, NodeFrequency] = Field(default_factory=dict)
+
+
+ALL_MODELS = (*ALL_MODELS, FrequencyRequest, NodeFrequency, FrequencyResult)
+
+
+# --- An account against its own past (06_DECISIONS.md ADR-133 decision 2, stage (c)) ------------
+
+
+class ActivityRequest(BaseModel):
+    """Each of `filter.node_ids`' movements in `filter.window` (ends included) and in the
+    `baseline_days` before it, and its last movement before the window — what the AML templates "a
+    dormant account reactivated" and "a sudden rise in velocity" compare an account with. A subject
+    is at either end of an event, an event to itself counted once. The access step is in the query
+    (rule 3): an event the principal may not see is no movement, in either window or before."""
+
+    filter: EventFilter
+    baseline_days: int = Field(ge=1, le=FREQUENCY_SPAN_DAYS_MAX)
+    #: A declared numeric property of the counted link type, summed; `None` counts only.
+    amount_property: str | None = None
+
+    @field_validator("filter")
+    @classmethod
+    def _names_its_subjects_and_a_window(cls, value: EventFilter) -> EventFilter:
+        if not value.node_ids:
+            raise ValueError("activity is read for named nodes; name at least one")
+        if len(value.node_ids) > FREQUENCY_NODES_MAX:
+            raise ValueError(f"activity is read for at most {FREQUENCY_NODES_MAX:,} nodes at once")
+        window = value.window
+        if window is None or window.valid_from is None or window.valid_to is None:
+            raise ValueError("activity is read over a window with both ends")
+        return value
+
+
+class NodeActivity(BaseModel):
+    """One subject's answer: counts and totals in the window and in the baseline before it; its
+    first movement in the window; its last before the window, however long before."""
+
+    recent_count: int = Field(ge=0)
+    recent_total: float | None = None
+    baseline_count: int = Field(ge=0)
+    baseline_total: float | None = None
+    first_in_window: datetime | None = None
+    last_before_window: datetime | None = None
+
+
+class ActivityResult(BaseModel):
+    """Every subject with at least one visible movement up to the window's end; one with none is
+    absent, not zero."""
+
+    nodes: dict[NodeId, NodeActivity] = Field(default_factory=dict)
+
+
+ALL_MODELS = (*ALL_MODELS, ActivityRequest, NodeActivity, ActivityResult)

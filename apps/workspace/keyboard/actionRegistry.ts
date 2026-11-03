@@ -106,6 +106,8 @@ export const CANVAS_ACTIONS = defineActionRegistry("CANVAS_ACTIONS", [
   "ctrl-shift-arrow-walks-every-node",
   "arrow-walk-forward",
   "arrow-walk-backward",
+  // GDS remediation plan A2: the focused node's name, type and links said in a live region.
+  "focused-node-is-announced",
   "space-toggle-ring-membership",
   "enter-expand",
   "backslash-open-menu",
@@ -200,6 +202,12 @@ export const METRICS_PANEL_ACTIONS = defineActionRegistry("METRICS_PANEL_ACTIONS
   "row-select-and-centre",
   "filter-section-sets-a-strength-floor-by-keyboard",
   "filter-section-dims-below-a-metric-value-by-keyboard",
+  // ADR-139 decisions 6 and 7: the two new filter metrics, and the legend's strength part.
+  "filter-section-dims-below-connection-strength-by-keyboard",
+  "filter-section-dims-below-shared-attribute-rarity-by-keyboard",
+  "legend-lists-the-strength-influencers-by-keyboard",
+  // ADR-139 Amendment 2: the legend's composition indicator.
+  "legend-shows-the-composition-by-keyboard",
 ] as const);
 
 /**
@@ -237,6 +245,9 @@ export const QUERY_BUILDER_ACTIONS = defineActionRegistry("QUERY_BUILDER_ACTIONS
   "ask-to-search-propose-pattern",
   // A proposal replaces the pattern drawn; one press restores it.
   "restore-the-previous-pattern-after-ask",
+  // ADR-135 decision 5: the model engine is reached and changed by keyboard, and the engine chosen
+  // is the one the request names.
+  "choose-the-ask-to-search-engine-by-keyboard",
 ] as const);
 
 /**
@@ -250,6 +261,9 @@ export const QUERY_BUILDER_ACTIONS = defineActionRegistry("QUERY_BUILDER_ACTIONS
  */
 export const WATCH_PANEL_ACTIONS = defineActionRegistry("WATCH_PANEL_ACTIONS", [
   "submit-create-hotlist",
+  // ADR-133 ruling 3: whom a hotlist's alerts reach, chosen for a new one and changed on an old one.
+  "choose-a-new-hotlists-audience-by-keyboard",
+  "change-a-hotlists-audience-by-keyboard",
   "submit-create-monitor",
   "alert-row-jump",
   "jump-result-open-investigation",
@@ -537,7 +551,7 @@ export const PIPELINE_STUDIO_ACTIONS = defineActionRegistry("PIPELINE_STUDIO_ACT
   "split-and-mark-a-map-binding-optional-by-keyboard",
 ] as const);
 
-/** The Alerts place (ADR-109 phase B): the case team's queue, an alert's explanation and its
+/** The Monitoring place (ADR-133 decision 5; ADR-109 phase B's Alerts place): the one queue, an alert's explanation and its
  * triage, the rules (an Author deploys and retires), held rows and the rule audit, every action by
  * keyboard alone. `keyboard/alerts.spec.ts`. */
 export const ALERTS_ACTIONS = defineActionRegistry("ALERTS_ACTIONS", [
@@ -546,6 +560,10 @@ export const ALERTS_ACTIONS = defineActionRegistry("ALERTS_ACTIONS", [
   "release-an-alert-by-keyboard",
   "show-an-alert-on-the-canvas-by-keyboard",
   "close-an-alert-with-a-reason-by-keyboard",
+  // The owner's answer of 1 November 2026: the closing reason, one of a closed list of five; and
+  // the watches with their alert inbox, reached from the Watches tab now the rail has no entry.
+  "choose-a-closing-reason-by-keyboard",
+  "reach-the-watches-and-alert-inbox-by-keyboard",
   "filter-the-queue-by-keyboard",
   "deploy-a-rule-by-keyboard",
   "retire-a-rule-by-keyboard",
@@ -556,6 +574,64 @@ export const ALERTS_ACTIONS = defineActionRegistry("ALERTS_ACTIONS", [
   "deploy-a-kyc-rule-by-keyboard",
   // ADR-109 phase D: the no-code typology builder — a drawn, saved pattern deployed as a rule.
   "deploy-a-drawn-pattern-rule-by-keyboard",
+  // ADR-133 stage (a): the one queue's kind and severity filters, giving a case alert to a member,
+  // and a typology template filling the rule form.
+  "filter-the-queue-by-kind-and-severity-by-keyboard",
+  "give-an-alert-to-a-member-by-keyboard",
+  "use-a-template-by-keyboard",
+  // ADR-133 stage (b): a rule written as a sentence (shown as its drawn pattern, deployed), and
+  // previewed on the last 90 days.
+  "build-a-rule-as-a-sentence-by-keyboard",
+  "preview-a-rule-by-keyboard",
+  // ADR-133 stage (c): an AML template deployed with its jurisdiction list; the Lists tab read, a
+  // list refreshed and a list subscribed to.
+  "deploy-an-aml-template-by-keyboard",
+  "read-the-screening-lists-by-keyboard",
+  "refresh-a-screening-list-by-keyboard",
+  "subscribe-to-a-screening-list-by-keyboard",
+] as const);
+
+/** ADR-139 decision 3 in the Monitoring place's Connection strength tab: a waiting installation-wide
+ * version approved by a second holder of the right, and withdrawn (never approved) by its proposer; a
+ * new version proposed with an influencer written blank by blank; a case's own override set by its
+ * Author; and decision 8's strength blank written in a sentence rule. `keyboard/strength.spec.ts`. */
+export const STRENGTH_ACTIONS = defineActionRegistry("STRENGTH_ACTIONS", [
+  "approve-a-waiting-influencer-version-by-keyboard",
+  "withdraw-ones-own-influencer-version-by-keyboard",
+  "propose-an-influencer-version-by-keyboard",
+  "set-a-case-override-by-keyboard",
+  "write-a-strength-rule-by-keyboard",
+  // ADR-139 Amendment 2: the case switched to client parity, an installation version's composition
+  // and rarity measure chosen, and a rule's figure named on the client's scale.
+  "switch-a-case-to-client-parity-by-keyboard",
+  "choose-an-installation-composition-and-rarity-measure-by-keyboard",
+  "write-a-strength-rule-on-the-clients-scale-by-keyboard",
+] as const);
+
+/** ADR-133 stage (d) in the Monitoring place: a rule written to run on a schedule, its schedule and
+ * runs read; a whole-deployment rule approved and another's change rejected by a second person; a
+ * rule's versions read; a high-severity alert's close proposed, approved by a second member, and
+ * another sent back; a screening list's refresh schedule set. `keyboard/monitoring-stage-d.spec.ts`. */
+export const MONITORING_STAGE_D_ACTIONS = defineActionRegistry("MONITORING_STAGE_D_ACTIONS", [
+  "schedule-a-rule-by-keyboard",
+  "read-a-rules-schedule-and-runs-by-keyboard",
+  "approve-a-whole-deployment-rule-by-keyboard",
+  "reject-a-whole-deployment-rule-change-by-keyboard",
+  "read-a-rules-versions-by-keyboard",
+  "propose-closing-a-high-severity-alert-by-keyboard",
+  "approve-closing-a-high-severity-alert-by-keyboard",
+  "send-back-a-proposed-close-by-keyboard",
+  "set-a-list-refresh-schedule-by-keyboard",
+] as const);
+
+/** ADR-133 decision 6, stage (d): the Ingest Studio's "Checks on load" step reached from a pipeline,
+ * a rule attached and set to hold on a hit, the choice saved; Verify's would-be alerts read beside
+ * the rejections. `keyboard/checks-on-load.spec.ts`. */
+export const CHECKS_ON_LOAD_ACTIONS = defineActionRegistry("CHECKS_ON_LOAD_ACTIONS", [
+  "open-checks-on-load-by-keyboard",
+  "attach-a-rule-and-hold-on-a-hit-by-keyboard",
+  "save-the-checks-by-keyboard",
+  "read-the-alerts-a-sample-would-raise-by-keyboard",
 ] as const);
 
 /** The Ownership place (ADR-109 phase C): find an entity, trace its beneficial owners, change the
@@ -579,6 +655,9 @@ export const QUESTIONS_ACTIONS = defineActionRegistry("QUESTIONS_ACTIONS", [
   "close-the-questions-drawer-by-keyboard",
   // ADR-129 decision 1: a cited graph fact selects what it stands for and brings it into view.
   "select-a-graph-fact-from-an-answer-by-keyboard",
+  // ADR-135 decision 5: the model engine is reached and changed by keyboard, and the engine chosen
+  // is the one the question names.
+  "choose-the-model-engine-by-keyboard",
 ] as const);
 
 /** Files added straight to a case (ADR-094 step 3): from the strip over the canvas, standing alone,
@@ -634,6 +713,10 @@ export const INSPECTOR_ACTIONS = defineActionRegistry("INSPECTOR_ACTIONS", [
   "score-a-neighbourhoods-risk-by-keyboard",
   // ADR-115 E4: Expand from the Inspector, through the canvas's own preview.
   "expand-a-node-from-the-inspector-by-keyboard",
+  // ADR-139 decision 9: a link's strength explained, and what its ends share ranked by rarity.
+  "explain-a-links-strength-by-keyboard",
+  // ADR-139 Amendment 2: under client parity, the composition and the raw sum on the client's scale.
+  "read-a-links-raw-sum-under-client-parity-by-keyboard",
 ] as const);
 
 /** The workspace shell (ADR-097 step 1): the top bar, the left rail, the classification strip.
@@ -650,6 +733,8 @@ export const SHELL_ACTIONS = defineActionRegistry("SHELL_ACTIONS", [
   "views-chosen-by-keyboard",
   // ADR-115 E6: the rail's Help reopens the welcome panel.
   "help-from-the-rail-by-keyboard",
+  // ADR-132: the skip link, under both brands.
+  "skip-to-main-content-by-keyboard",
 ] as const);
 
 export const ADMIN_ACTIONS = defineActionRegistry("ADMIN_ACTIONS", [
@@ -670,6 +755,8 @@ export const ADMIN_ACTIONS = defineActionRegistry("ADMIN_ACTIONS", [
   // ADR-110 Amendment 3: Run now and Change schedule, as the schedule's owner.
   "run-a-schedule-now-by-keyboard",
   "change-a-schedule-by-keyboard",
+  // ADR-136 decision 2: a dataset's egress, set by an administrator.
+  "set-a-datasets-egress-by-keyboard",
 ] as const);
 
 // ADR-110 decision 7 (D5): the Publish screen's structured schedule.
@@ -719,12 +806,16 @@ export const TRENDS_ACTIONS = defineActionRegistry("TRENDS_ACTIONS", [
   "build-and-preview-a-trend-by-keyboard",
   "save-a-trend-by-keyboard",
   "add-a-trend-to-a-pack-by-keyboard",
+  // ADR-134 decision 3: the builder's second source.
+  "build-an-alert-trend-by-keyboard",
 ] as const);
 
 // ADR-113 stage 5: the Packs and Published tabs.
 export const PACKS_ACTIONS = defineActionRegistry("PACKS_ACTIONS", [
   "create-a-pack-by-keyboard",
   "add-a-note-to-a-pack-by-keyboard",
+  // ADR-134 decision 1: an alert of the case's queue as a pack item.
+  "add-an-alert-to-a-pack-by-keyboard",
   "move-a-pack-item-by-keyboard",
   "refresh-a-snapshot-by-keyboard",
   "publish-a-pack-by-keyboard",
@@ -772,4 +863,24 @@ export const CONNECTIONS_ACTIONS = defineActionRegistry("CONNECTIONS_ACTIONS", [
   "widen-by-one-degree-by-keyboard",
   "add-a-route-to-the-canvas-by-keyboard",
   "clear-the-degree-marks-by-keyboard",
+] as const);
+
+/** The Matrix view (`02_GLASS_FRONTEND.md` §6; GDS remediation plan A1): reached from the view
+ * switch, walked cell by cell, a row selected (alone and added to), sorted, paged, the selection
+ * carried to the canvas and back, a link row selected, and a row's Expand and Show done by the
+ * canvas. `keyboard/matrix.spec.ts`. */
+export const MATRIX_ACTIONS = defineActionRegistry("MATRIX_ACTIONS", [
+  "reach-the-matrix-view-by-keyboard",
+  "move-between-cells-by-keyboard",
+  "select-a-row-by-keyboard",
+  "add-a-row-to-the-selection-by-keyboard",
+  "sort-a-column-by-keyboard",
+  "turn-the-page-by-keyboard",
+  "selection-carried-to-the-canvas",
+  "canvas-selection-carried-to-the-matrix",
+  "select-a-link-row-by-keyboard",
+  "expand-from-a-row-by-keyboard",
+  "show-a-row-on-the-graph-by-keyboard",
+  // ADR-139 decision 6: the link table sorts by connection strength and by its ends' rarity.
+  "sort-links-by-strength-and-rarity-by-keyboard",
 ] as const);

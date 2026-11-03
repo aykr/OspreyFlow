@@ -84,6 +84,12 @@
 
   --overlay-shadow:0 8px 24px -8px rgba(0,0,0,.7);
 
+  /* Focus (ADR-132): the ring every interactive element draws, read from tokens so a deployment
+     brand can replace it. Under the OspreyFlow brand it is the brass at 2px, 2px out (DESIGN.md §8). */
+  --focus:var(--brass);
+  --focus-width:2px;
+  --focus-offset:2px;
+
   /* Type */
   --ui:'Atkinson Hyperlegible Next','Atkinson Hyperlegible',system-ui,sans-serif;
   --mono:'IBM Plex Mono',ui-monospace,monospace;
@@ -163,6 +169,54 @@
   --overlay-shadow:0 6px 20px -6px rgba(25,27,28,.18);
 }
 
+/* Deployment brand: GOV.UK (ADR-132, DESIGN.md §11). Chosen per deployment in osprey.yaml
+   (appearance.brand), never per viewer, and always shown light. GOV.UK Frontend 6.6.0's own
+   palette. Chrome only: every --ch-*, --chart-*, --seq-* and --div-* token is deliberately NOT
+   redefined here. The Design System does not govern data visualisation, and the nine channels
+   with their shape pairing are the product (DESIGN.md §3). After the light block, so it wins. */
+[data-brand="govuk"] {
+  --n0:#ffffff;  --n1:#ffffff;  --n2:#f4f8fb;  --n3:#f4f8fb;
+  --n4:#cecece;  --n5:#cecece;  --n6:#cecece;  --n7:#484949;
+  --n8:#484949;  --n9:#484949;  --n10:#0b0c0c; --n11:#0b0c0c;
+
+  /* The single accent becomes GOV.UK blue; the brass never appears on a GOV.UK page. */
+  --brass:#1d70b8; --brass-hover:#0f385c; --brass-press:#0f385c; --brass-ink:#ffffff;
+  --error:#ca3535; --success:#0f7a52;
+
+  /* A 3px yellow outline with a 2px dark inner shadow, the Design System's focus state. */
+  --focus:#ffdd00; --focus-ink:#0b0c0c; --focus-width:3px; --focus-offset:0;
+
+  --ui:"GDS Transport",arial,sans-serif;
+  --r-control:0; --r-panel:0; --r-overlay:0;
+  /* GOV.UK tags are square too (ADR-132). */
+  --r-chip:0;
+}
+
+/* GOV.UK type on the GOV.UK brand's pages (ADR-132, the owner's ruling 3; DESIGN.md §11): the
+   welcome, start and Admin pages take GOV.UK's scale, 19px body. The workspace keeps the 13px base
+   (DESIGN.md §9 exception 1): density across monitors is the analyst's job there. The tokens are
+   redefined for these pages' subtrees, so every component inside them follows. */
+[data-brand="govuk"] :is(.welcome, .home, .admin-place) {
+  --fs-11:14px; --lh-11:20px; --fs-12:16px; --lh-12:20px;
+  --fs-13:19px; --lh-13:25px; --fs-14:19px; --lh-14:25px;
+  --fs-16:19px; --lh-16:25px; --fs-19:24px; --lh-19:30px;
+  --fs-23:36px; --lh-23:40px; --fs-30:48px; --lh-30:50px;
+  font-size: var(--fs-13); line-height: var(--lh-13);
+}
+
+/* GOV.UK page width (ADR-132 Amendment 4; DESIGN.md §11): the sign-in and start pages' rows hold
+   their content in GOV.UK's width container, 960px with 30px gutters (15px on a phone), so it starts
+   on the logo's edge as on every GOV.UK page. A row's rule still runs the full width. */
+[data-brand="govuk"] { --govuk-gutter: 30px; }
+@media (max-width: 640px) { [data-brand="govuk"] { --govuk-gutter: 15px; } }
+[data-brand="govuk"] :is(.welcome-header, .welcome-hero, .welcome-section, .welcome-footer, .home-header, .home-main) {
+  max-width: none;
+  padding-left: max(var(--govuk-gutter), calc((100% - 960px) / 2));
+  padding-right: max(var(--govuk-gutter), calc((100% - 960px) / 2));
+}
+/* GOV.UK's own header, service navigation and footer keep GOV.UK's link styling: no Glass border. */
+[data-brand="govuk"] :is(.govuk-header, .govuk-service-navigation, .govuk-footer, .govuk-phase-banner) a { border-bottom: 0; }
+
 html, body { margin:0; padding:0; }
 
 body {
@@ -174,7 +228,8 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-*:focus-visible { outline: 2px solid var(--brass); outline-offset: 2px; }
+*:focus-visible { outline: var(--focus-width) solid var(--focus); outline-offset: var(--focus-offset); }
+[data-brand="govuk"] *:focus-visible { box-shadow: inset 0 0 0 2px var(--focus-ink); }
 
 a { color: var(--brass); text-decoration: none; border-bottom: 1px solid var(--border); }
 a:hover { color: var(--brass-hover); border-bottom-color: var(--brass-hover); }

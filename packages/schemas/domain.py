@@ -13,11 +13,14 @@ good as of Phase 7 Stage 2 — see `tests/schemas/test_placeholder_lifecycle.py`
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from enum import StrEnum
 from typing import Annotated, Any, Final, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+from schemas.sentences import RuleSentence, SentenceRuleParams
 
 # --- Scalar identifiers -------------------------------------------------
 #
@@ -721,6 +724,21 @@ class Alert(BaseModel):
     disposition_reason: str | None = None
     decided_by: str | None = None
     decided_at: datetime | None = None
+    #: ADR-133 decision 7, stage (d): who proposed closing a high-severity alert, and when. The
+    #: alert is `closing` until a second person approves (then `decided_by`), and keeps who
+    #: proposed it.
+    close_proposed_by: str | None = None
+    close_proposed_at: datetime | None = None
+    #: ADR-133 stage (a): how urgent the alert is. `None` on a row written before severity existed,
+    #: or by a producer that sets none; the queue then reads its kind's default
+    #: (`services/api/alerts.py::DEFAULT_SEVERITY`), so no stored row has to be rewritten.
+    severity: AlertSeverity | None = None
+    #: ADR-133 stage (a): the team a hotlist or monitor alert goes to: its owner's organisational
+    #: unit (`Principal.org_unit`) when it was raised, written by the producer. `None` reaches the
+    #: owner alone: every row from before, and every `notify` stub (ADR-038: it carries nothing a
+    #: second person may read). A typology alert's team is the case's members, not a unit, and it
+    #: carries `None` here.
+    team: str | None = None
 
 
 #: ADR-126 decision 1: the domain packs a case can carry, defined once here. `ontology.packs`
@@ -768,6 +786,11 @@ class Hotlist(BaseModel):
     #: ADR-099 Amendment 3: the dataset of the case it was made in; read only in a case reading
     #: it. `None` for one made before, until `stamp_datasets` places it.
     dataset_id: str | None = None
+    #: ADR-133 decision 5 and ruling 3: who its alerts reach in the shared queue. `only_me` (its
+    #: owner alone, as every hotlist before ADR-133) or `team` (also its owner's organisational
+    #: unit). A new hotlist takes the deployment's `monitoring.hotlist_audience`; every hotlist
+    #: made before keeps `only_me` until its owner changes it.
+    audience: HotlistAudience = "only_me"
 
 
 class Monitor(BaseModel):
@@ -811,14 +834,50 @@ TypologyName = Literal[
     "shared_attributes",
     "document_verification",
     "pattern",
+    "sentence",
+    "high_risk_jurisdiction",
+    "large_cash",
+    "dormant_reactivated",
+    "velocity_rise",
 ]
 #: ADR-109 ruling 1: the rule chooses where it runs. `pre_commit` judges the incoming rows inside
 #: the load (a hit loads with its alert; a failure holds the rows); `post_commit` runs on the
 #: change stream after the load commits, best-effort.
-RuleTrigger = Literal["pre_commit", "post_commit"]
-RuleStatus = Literal["active", "retired"]
-AlertStatus = Literal["open", "claimed", "closed"]
-AlertDisposition = Literal["true_positive", "false_positive"]
+#: ADR-133 stage (d): a rule written as a sentence may also run on a schedule, never at a load.
+RuleTrigger = Literal["pre_commit", "post_commit", "schedule"]
+#: ADR-133 decision 7, stage (d): a whole-deployment rule is `pending` until a second person
+#: approves it, and runs only once `active`.
+RuleStatus = Literal["pending", "active", "retired"]
+#: What a change to a rule did: deployed it, changed it, or retired it (decision 7's maker–checker).
+RuleChangeAction = Literal["deploy", "change", "retire"]
+#: ADR-133 decision 7, stage (d): `closing` is a high-severity alert someone has proposed to close,
+#: waiting for a second person with the right to approve it.
+AlertStatus = Literal["open", "claimed", "closing", "closed"]
+#: ADR-133 decision 7's closed list of closing reasons, as the owner named it on 1 November 2026.
+#: The first two keep the values stages (a) to (d) stored. Only `true_positive` ("True match") is
+#: the human confirmation rule 5 waits for; every other reason leaves what the alert found
+#: `inferred`.
+AlertDisposition = Literal[
+    "true_positive", "false_positive", "duplicate", "no_further_action", "referred"
+]
+#: Each closing reason as the Glass, the guides and the refusal say it, in the order offered.
+CLOSING_REASONS: dict[str, str] = {
+    "true_positive": "True match",
+    "false_positive": "False positive",
+    "duplicate": "Duplicate",
+    "no_further_action": "No further action",
+    "referred": "Referred",
+}
+#: ADR-133 stage (a): an alert's severity, and the three kinds the one queue holds — told apart by
+#: `Alert.rule_id`'s prefix (`typology:`, `hotlist:`, `monitor:`); a scheduled run's notice is none
+#: of these and is never queued.
+AlertSeverity = Literal["low", "medium", "high"]
+AlertKind = Literal["typology", "hotlist", "monitor"]
+#: ADR-133 ruling 3: whom a hotlist's alerts reach — its owner alone, or its owner's team too.
+HotlistAudience = Literal["only_me", "team"]
+#: Who may see a queued alert, in words the Glass shows: the case's members (a typology alert), the
+#: owner's team (a hotlist with audience `team`, or a monitor), or its owner alone.
+AlertAudience = Literal["case", "team", "owner"]
 
 
 class StructuringParams(BaseModel):
@@ -876,6 +935,74 @@ class DocumentVerificationParams(BaseModel):
     typology: Literal["document_verification"] = "document_verification"
 
 
+# --- ADR-133 decision 2, stage (c): the new AML transaction-monitoring templates ---------------
+#
+# Each a typed typology with its parameters (rule 8: no expression language), judged over a load's
+# money movements (`TRANSACTED`) as the rule's deployer (`services/api/aml_rules.py`).
+
+#: A cash movement's `transaction_type` (the core ontology's `TRANSACTED` enum).
+CashType = Literal["CASH_IN", "CASH_OUT"]
+
+
+class HighRiskJurisdictionParams(BaseModel):
+    """A movement to or from an account held in a jurisdiction on the rule's own list. The list is
+    data in the rule — ISO 3166-1 alpha-2 codes, chosen by the rule's Author (a deployment's
+    policy, such as the FATF's lists, is theirs to enter) — and an account's jurisdiction is its
+    IBAN's country code (ISO 13616: the IBAN's first two letters)."""
+
+    typology: Literal["high_risk_jurisdiction"] = "high_risk_jurisdiction"
+    jurisdictions: list[str] = Field(min_length=1, max_length=250)
+
+    @field_validator("jurisdictions")
+    @classmethod
+    def _two_letter_codes(cls, value: list[str]) -> list[str]:
+        codes = []
+        for code in value:
+            code = code.strip().upper()
+            if not re.fullmatch(r"[A-Z]{2}", code):
+                raise ValueError(
+                    f"“{code}” is not a two-letter country code (ISO 3166-1 alpha-2, such as GB)"
+                )
+            if code not in codes:
+                codes.append(code)
+        return codes
+
+
+class LargeCashParams(BaseModel):
+    """A cash movement (paid in, or drawn out) at or over the threshold."""
+
+    typology: Literal["large_cash"] = "large_cash"
+    threshold: float = Field(gt=0)
+    cash_types: list[CashType] = Field(
+        default_factory=lambda: list[CashType](["CASH_IN", "CASH_OUT"]), min_length=1
+    )
+
+
+class DormantReactivatedParams(BaseModel):
+    """An account moving money again after at least `dormant_days` days without a movement. An
+    account with no movement before is new, not dormant."""
+
+    typology: Literal["dormant_reactivated"] = "dormant_reactivated"
+    dormant_days: int = Field(default=180, ge=30, le=3650)
+
+
+VelocityMeasure = Literal["count", "amount"]
+
+
+class VelocityRiseParams(BaseModel):
+    """An account's movements over the last `recent_days` days at `factor` times or more its own
+    daily rate over the `baseline_days` before — counted, or by amount — with at least
+    `min_recent` movements in the recent days. An account with no movements in the baseline has no
+    rate to rise from and is not judged."""
+
+    typology: Literal["velocity_rise"] = "velocity_rise"
+    recent_days: int = Field(default=7, ge=1, le=90)
+    baseline_days: int = Field(default=90, ge=7, le=366)
+    factor: float = Field(default=3.0, gt=1, le=100)
+    min_recent: int = Field(default=5, ge=1, le=10000)
+    measure: VelocityMeasure = "count"
+
+
 class PatternRuleParams(BaseModel):
     """ADR-109 phase D, the no-code typology builder: a sub-graph drawn in the query builder and
     saved (a `SavedPattern` the deployer owns, read afresh at each evaluation — ADR-036's own
@@ -895,7 +1022,12 @@ TypologyParams = Annotated[
     | KycScreeningParams
     | SharedAttributesParams
     | DocumentVerificationParams
-    | PatternRuleParams,
+    | PatternRuleParams
+    | SentenceRuleParams
+    | HighRiskJurisdictionParams
+    | LargeCashParams
+    | DormantReactivatedParams
+    | VelocityRiseParams,
     Field(discriminator="typology"),
 ]
 
@@ -912,16 +1044,37 @@ class TypologyRuleInput(BaseModel):
 
     @model_validator(mode="after")
     def _a_drawn_pattern_runs_after_commit(self) -> TypologyRuleInput:
+        if self.trigger == "schedule" and not isinstance(self.params, SentenceRuleParams):
+            raise ValueError("only a rule written as a sentence runs on a schedule")
         if self.params.typology == "pattern" and self.trigger != "post_commit":
             raise ValueError(
                 "a drawn pattern is matched against the stored graph, so it runs after commit"
             )
+        if (
+            self.params.typology in ("dormant_reactivated", "velocity_rise")
+            and self.trigger != "post_commit"
+        ):
+            raise ValueError(
+                "an account is compared with its own past as stored, which holds the load's own "
+                "movements only once it has committed, so this template runs after each load "
+                "commits"
+            )
+        if (
+            isinstance(self.params, SentenceRuleParams)
+            and self.trigger != self.params.sentence.runs
+        ):
+            raise ValueError("a sentence says when it runs; the rule runs then")
         return self
 
 
 class TypologyRule(TypologyRuleInput):
     """A deployed rule. It belongs to the case it was deployed in and evaluates as its deployer's
-    principal, resolved fresh at each evaluation (ADR-036, unchanged by ADR-109)."""
+    principal, resolved fresh at each evaluation (ADR-036, unchanged by ADR-109).
+
+    ADR-133 stage (d): `version` counts its changes, each kept as a `RuleVersion`; `pending_action`
+    names a change waiting for a second person's approval (a whole-deployment rule's deploy, change
+    or retire), proposed by `pending_by`. The rule runs as it stands until that change is
+    approved."""
 
     id: str
     investigation_id: str
@@ -930,6 +1083,13 @@ class TypologyRule(TypologyRuleInput):
     created_at: datetime
     retired_at: datetime | None = None
     dataset_id: str | None = None
+    version: int = 1
+    pending_action: RuleChangeAction | None = None
+    pending_by: str | None = None
+    pending_version: int | None = None
+    #: ADR-106: `pending_by`'s display name, resolved when the rules list is served and never
+    #: stored (step 9d finding 1: the waiting change named its proposer by an identity-provider id).
+    pending_by_name: str | None = None
 
 
 HeldRowStatus = Literal["held", "released", "rejected"]
@@ -998,6 +1158,29 @@ class OutcomeCount(BaseModel):
     claimed: int = Field(default=0, ge=0)
     true_positive: int = Field(default=0, ge=0)
     false_positive: int = Field(default=0, ge=0)
+
+
+class LabelledWeekCount(BaseModel):
+    """A count in one week under a fixed label (ADR-134 decision 2): the rule group an alert was
+    raised by (`typology`, with its typology, `hotlists` or `monitors`), the outcome it was closed
+    with, or `hotlists` for a hotlist's matches. Never a rule's own name or an alert's words."""
+
+    week_start: date
+    label: str
+    typology: str = ""
+    count: int = Field(ge=0)
+
+
+class MonitoringFigures(BaseModel):
+    """The monitoring dashboard's figures (ADR-134 decision 2): every kind of alert the one queue
+    holds for the reader — typology, hotlist and monitor — counted as them, per case. A hotlist
+    kept "only me" is in its owner's figures alone (the queue's own scope)."""
+
+    raised_by_rule: list[LabelledWeekCount] = Field(default_factory=list)
+    closed_by_outcome: list[LabelledWeekCount] = Field(default_factory=list)
+    #: Alerts closed in the period, by how long they took, in the `open_by_age` bands.
+    time_to_close: list[ReportCount] = Field(default_factory=list)
+    hotlist_matches: list[LabelledWeekCount] = Field(default_factory=list)
 
 
 class HeldFigures(BaseModel):
@@ -1076,6 +1259,9 @@ class ReportFigures(BaseModel):
     alerts_by_week: list[WeekCount] = Field(default_factory=list)
     open_by_age: list[ReportCount] = Field(default_factory=list)
     outcomes: list[OutcomeCount] = Field(default_factory=list)
+    #: ADR-134 decision 2: the monitoring dashboard's sections. The figures above count typology
+    #: alerts only, as they always have; these count every kind.
+    monitoring: MonitoringFigures = Field(default_factory=MonitoringFigures)
     held: HeldFigures | None = None
     #: ADR-126 decision 3: set when `fibo` is among the case's packs; `None` is "this case has no
     #: KYC card", not zero customers.
@@ -1113,6 +1299,16 @@ class QueuedAlert(BaseModel):
 
     alert: Alert
     summary: str
+    #: ADR-133 stage (a): which kind of alert, how urgent (the stored severity, else its kind's
+    #: default), and who may see it (`audience`, with the owner's unit as `team` when shared with a
+    #: team). Defaults keep a typology alert's row as it read before.
+    kind: AlertKind = "typology"
+    severity: AlertSeverity = "medium"
+    audience: AlertAudience = "case"
+    team: str | None = None
+    #: ADR-106 Amendment 1, as `AlertExplanation.assignee_name`: the display name of
+    #: `alert.assignee`, resolved for the rows served, never stored (step 9e).
+    assignee_name: str | None = None
 
 
 class ExplainedTransaction(BaseModel):
@@ -1138,11 +1334,62 @@ class AlertExplanation(BaseModel):
     nodes: list[Node] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)
     transactions: list[ExplainedTransaction] = Field(default_factory=list)
+    #: ADR-133 stage (a), as on `QueuedAlert`.
+    kind: AlertKind = "typology"
+    severity: AlertSeverity = "medium"
+    audience: AlertAudience = "case"
+    team: str | None = None
+    #: ADR-106: the display name of `alert.close_proposed_by`, resolved when the alert is explained
+    #: to a reader who may read it, never stored (step 9d finding 1: the approval screen named the
+    #: proposer by an identity-provider id).
+    close_proposed_by_name: str | None = None
+    #: ADR-106 Amendment 1: the display name of `alert.assignee`, resolved the same way (step 9e:
+    #: "Claimed by" named the assignee by an identity-provider id).
+    assignee_name: str | None = None
 
 
 class AlertDispositionInput(BaseModel):
+    """Closing an alert (ADR-133 decision 7: "closing needs a reason"): one of the closed list of
+    reasons (`CLOSING_REASONS`), and words. A reason outside the list is refused in words that name
+    the list; a reason of only spaces is no reason, refused as an empty one is."""
+
     disposition: AlertDisposition
     reason: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("disposition", mode="before")
+    @classmethod
+    def _one_of_the_closing_reasons(cls, value: object) -> object:
+        if value not in CLOSING_REASONS:
+            raise ValueError(
+                "the closing reason must be one of: " + ", ".join(CLOSING_REASONS.values())
+            )
+        return value
+
+    @field_validator("reason")
+    @classmethod
+    def _a_reason_in_words(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("closing an alert needs a reason")
+        return value.strip()
+
+
+class AlertAssignInput(BaseModel):
+    """ADR-133 stage (a): giving an open or claimed alert to one member of the case."""
+
+    assignee: str = Field(min_length=1, max_length=200)
+
+
+class AlertAssignee(BaseModel):
+    """One member an alert may be given to: an Editor or Author of the case, by name."""
+
+    id: str
+    name: str | None = None
+
+
+class HotlistAudienceInput(BaseModel):
+    """ADR-133 ruling 3: the owner's choice of who a hotlist's alerts reach."""
+
+    audience: HotlistAudience
 
 
 class KycDocument(BaseModel):
@@ -1345,6 +1592,24 @@ class ListNodesPage(BaseModel):
     next_cursor: NodeId | None = None
 
 
+class CompiledSentence(BaseModel):
+    """ADR-133 decision 1: a sentence's drawn pattern — its "advanced" view in the query builder —
+    and the sentence in words. The pattern holds the subject (variable `subject`), its equality
+    conditions a pattern may carry (ADR-121) and the link the sentence names; the rest of the
+    sentence is the rule's typed parameters."""
+
+    pattern: PatternQuery
+    words: str
+
+
+class SentenceReadRequest(BaseModel):
+    """Read a drawn pattern back as a sentence: the pattern (as drawn, or as edited in the query
+    builder) and the sentence whose other blanks it keeps."""
+
+    pattern: PatternQuery
+    sentence: RuleSentence
+
+
 ALL_MODELS: tuple[type[BaseModel], ...] = (
     PropertyDef,
     ResolutionConfig,
@@ -1384,6 +1649,12 @@ ALL_MODELS: tuple[type[BaseModel], ...] = (
     SharedAttributesParams,
     DocumentVerificationParams,
     PatternRuleParams,
+    HighRiskJurisdictionParams,
+    LargeCashParams,
+    DormantReactivatedParams,
+    VelocityRiseParams,
+    CompiledSentence,
+    SentenceReadRequest,
     TypologyRuleInput,
     TypologyRule,
     HeldRow,
@@ -1391,6 +1662,8 @@ ALL_MODELS: tuple[type[BaseModel], ...] = (
     RuleAuditPage,
     ReportCount,
     WeekCount,
+    LabelledWeekCount,
+    MonitoringFigures,
     OutcomeCount,
     HeldFigures,
     KycFigures,
@@ -1400,6 +1673,9 @@ ALL_MODELS: tuple[type[BaseModel], ...] = (
     ReportFigures,
     ReportLimitExceeded,
     QueuedAlert,
+    AlertAssignInput,
+    AlertAssignee,
+    HotlistAudienceInput,
     KycDocument,
     RiskFactor,
     KycStatus,

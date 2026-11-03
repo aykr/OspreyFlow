@@ -65,13 +65,14 @@ SHA-256, that never travels inside an artefact (`06_DECISIONS.md` ADR-114 Amendm
 | Scenario B (comms and identity pivot) | `shipped` | Partly built; the remaining work is split across several build stages by ADR-022 | — |
 | **Extraction and entity resolution** | `shipped` | Built, **API only** | Demonstrable to engineers through the API; there are no screens yet |
 | **Scenario C — "Fixture Corp"** (Enron-*shaped*, R24, AMLSim-*shaped* generator) | `shipped` | **Built** (`scripts.seed_fixture_corp`) — its four ADR-035 §C5 properties are **verified structurally** (`tests/scenarios/test_fixture_corp_shape.py`). Moving the resolution threshold live is now verified through the Glass. **`explain`, the pathfinder and path-length comparison are not, and currently cannot be: no Fixture Corp entity can be loaded into the working set** — 0 of its 65 Persons carry any of the identifiers search matches on, against 400 of 400 for HMP (measured directly). See §6 and the internal rehearsal log, §4. Not the ~150-employee Enron-shaped corporation §6 and Scenario C (C1–C20) describe — see §6 | See §6 |
-| **Operation Ledger** (preventive AML: structuring ring, onboarding screened before commit, ownership through a trust) | `shipped` | **Built and walked live** (`scripts.seed_ledger_fixture`; ADR-109, ADR-113) | Alerts explained in words, ownership traced, trends and report packs |
-| **Prison Intelligence Dataset (synthetic)** (a fictional jail's records, loaded through the Ingest Studio from source files by seventeen recipes; every element is OFFICIAL) | `shipped` | **Built** (`scripts.seed_pid`; ADR-127 Amendments 23 and 30 to 32): seeded, as the demo data engineer, with `ospreyflow demo add prison-intelligence`, which prints and checks the demo's numbers as it finishes, once `components.post_ingest_resolution: false` is set in `osprey.yaml` and the deployment re-rendered (the seed warns while it is on, and the reset and `--release-batch-2` refuse); restored between rehearsals with `python -m scripts.seed_internal prison-intelligence --reset-live --stop-api`, and carrying two mid-demo commands that leave the Conduit running (`--release-batch-2`, `--publish-reports-fallback`). **Live walkthrough not yet recorded** | Data feeds with each source's last run, and the live reports load |
+| **Operation Ledger** (preventive AML: structuring ring, onboarding screened before commit, ownership through a trust) | `shipped` | **Built and walked live** (`scripts.seed_ledger_fixture`; ADR-109, ADR-113). **The monitoring week** (ADR-108 Amendment 5, §8b below): the seed also writes the bank's next weekly export out of the Studio's sight and subscribes a synthetic UK Sanctions List (FCDO format; ADR-133 Amendment 6); three mid-demo commands copy files only and leave the Conduit running (`python -m scripts.seed_internal ledger --release-week-2`, `--release-list-update`, `--reset-week-2`). As the week loads, a rapid-movement and a circular-flow rule each raise one alert and a hotlist on a mule's account raises a third; a list update raises a screening alert on an existing customer; the pass-through is closed as *Referred* and goes into the case's pack and the monitoring figures. The reset cannot revert the week's load (it names `scripts.revert_load`) or retire the rehearsal's rules and hotlist. **Live walkthrough of the week not yet recorded** | Alerts explained in words, ownership traced, trends and report packs; the monitoring week's four alerts in Monitoring |
+| **Prison Intelligence Dataset (synthetic)** (a fictional jail's records, loaded through the Ingest Studio from source files by nineteen recipes; every element is OFFICIAL) | `shipped` | **Built** (`scripts.seed_pid`; ADR-127 Amendments 23, 30 to 32 and 41): seeded, as the demo data engineer, with `ospreyflow demo add prison-intelligence`, which prints and checks the demo's numbers as it finishes, once `components.post_ingest_resolution: false` is set in `osprey.yaml` and the deployment re-rendered (the seed warns while it is on, and the reset and `--release-batch-2` refuse); restored between rehearsals with `python -m scripts.seed_internal prison-intelligence --reset-live --stop-api`, and carrying two mid-demo commands that leave the Conduit running (`--release-batch-2`, which lists chapter 9's three files: the second seized-phone batch, the week's visit bookings and the PIN first contacts; `--publish-reports-fallback`, which publishes chapter 4's reports pipeline from its committed file and loads nothing: *Intelligence reports*, then *Report incidents*, are still run from the Studio). **Monitoring in the storyline** (Amendment 41; §8c below): in chapter 9 a hotlist on the coordinator's number fires on the seized-phone batch and again on a visit booking, before the visit, and a rule written as a sentence, previewed and deployed by the case's Author, flags the PIN first contacts' call to the number on a seized handset; chapter 10 closes two of the three as *Referred* (the visit-booking alert by its owner alone; the rule alert's close proposed, and approved by a second person, which the demo shows from a slide since it has one analyst account), adds a weekly alert trend and reads the monitoring figures (from a Superset board where one is registered for the case, otherwise a slide: the Glass shows no monitoring figure); chapter 11's pack carries the first alert, still open. Retire the rehearsal's rule before the next run: the reset cannot. **Live walkthrough not yet recorded** | Data feeds with each source's last run, the live reports load, and chapter 9's three alerts in Monitoring |
 | **Prison Intelligence Dataset: scale cohort (synthetic)** (3,000 prisoners and 30,000 links across six establishments, written straight from the generator's plan; every element is OFFICIAL) | `shipped` | **Built** (`scripts.seed_pid_scale`; ADR-127 Amendment 40): seeded with `ospreyflow demo add prison-intelligence-scale`, into its own case, which reads only that dataset. The paste list for Add many from a list is `python -m scripts.write_pid_files --out DIR --profile scale`, which writes `scale_cohort_list.txt`. It makes no load record, so the rehearsal reset does not touch it and a second run changes nothing. **Live walkthrough not yet recorded** | Added with all their links, the 3,000 open as a working set of more than 10,000 links, grouped by community |
+| **Cyber intrusion (synthetic)** (a fictional threat actor's campaign against a water company, as a STIX 2.1 bundle: its backdoor, two command-and-control servers, indicators and observed traffic; documentation-range addresses only) | `shipped` | **Built** (`scripts.seed_cyber_intrusion`; ADR-138): generated deterministically by `packages/demo_fixtures/cyber_intrusion.py` and seeded with `ospreyflow demo add cyber-intrusion` into its own case, whose domains are STIX; the `cyber` starter loads it. **Live walkthrough not yet recorded** | Threat actor, campaign, malware and infrastructure on the graph; the observed traffic on the timeline |
 | **PaySim** (6.36 million simulated mobile-money transactions; CC BY-SA 4.0, Lopez-Rojas, Elmir and Axelsson, EMSS 2016) | `shipped`, as a **download** only — never inside an artefact | **Built** (`scripts.seed_paysim`); the pack is checked by size and SHA-256 before it is seeded, and carries its licence and attribution | The same views at scale: where to start and the timeline over every event |
 | **The real Enron email corpus** | `internal`, **admitted only via the owner's own local exceptions list — see §6** | Owner-run demonstration only, on the owner's own device, never distributed to an attendee | — |
 | **VAST Challenge dataset** (generated fixture) | `internal` | Decided (ADR-026); fixture not yet built | See §7 |
-| **VAST Challenge dataset** (the published files themselves) | Not admitted, any class | ADR-026: "standing rule 3 is not amended" — never used, shaped or verbatim | See §7 |
+| **VAST Challenge dataset** (the published files themselves) | Not admitted, any class | ADR-026: "standing rule 3 is not amended" — never in this repository or CI, shaped or verbatim. ADR-138 decision 3 ships only a manifest and a recipe for two challenges (`vast-2012-mc2`, `vast-2008-mc3`), for an administrator's own download into their own deployment (`ospreyflow demo add public`); the data never enters the project | See §7 |
 
 The honest summary: **Scenario A on the HMP fixture is the demo actually driven through the
 Glass**, and it is a good one — as of 26 September 2026 that now includes A12's Clique Metric and
@@ -768,6 +769,132 @@ granted on a real dataset (rule 9).
 Requires `reporting: {sync: true, superset: true}` in `osprey.yaml` (on by default since `ospreyflow install`); `ospreyflow start --build` does not rebuild
 the Superset image — after a change under `deploy/superset/`, build it and recreate the service
 (§2.7 of `spec/05_DEPLOYMENT.md`).
+
+## 8b. Operation Ledger: the monitoring week (A1 to A4) — `shipped`, 1 November 2026
+
+The last act of the Operation Ledger walkthrough, after the structuring ring, the onboarding gate and
+the ownership trace, which it leaves as they were (`spec/06_DECISIONS.md` ADR-108 Amendment 5; the
+golden tests are `tests/scenarios/test_ledger_monitoring_storyline.py`). All synthetic, in "Operation
+Ledger (synthetic demo)". It shows ongoing monitoring: what the next week's data raises, what a list
+update raises, and how a closed alert reaches the case's reports.
+
+**Before the act** (once per rehearsal; the seed has written the files and subscribed the list):
+
+- As the admin, *Monitoring → Lists*: "UK Sanctions List (synthetic)" reads *Not yet read*. **Refresh
+  now**: version 28/09/2026, five entries (a ship is not screened), every customer re-screened, no
+  alert. The list update needs the case's screening rule, *Screen customers against the lists*: the
+  seed deploys it from the *Screening on onboarding* template's defaults (its typology, *KYC screening*), after each load commits, as the
+  case's Author (`osprey-demo-admin`), and a reseed leaves it as it is. Check it is live under
+  *Monitoring → Rules*; if a rehearsal retired it, reseed, or deploy that template again as the Author.
+
+**1. After the SAR** (as the analyst):
+
+- *Monitoring → Watches*: hotlist Jamal Carter's Lloyds account, `GB58 LOYD 3096 1700 7099 43`
+  (*Only me*; the account number is matched however its spaces are written).
+- *Monitoring → Rules → Templates*, **as the case's Author** (deploying and retiring a case rule needs the Author
+  level; on a demonstration deployment that is `osprey-demo-admin`, which also holds the Analyst role, since
+  the seed makes `osprey-demo-analyst` an Editor): **Use** *Rapid movement*, keep its 48 hours and 80%, name it
+  "Money straight through an account", **Deploy** (after each load commits). Then **Use** *Circular
+  flow*, set **Within (days)** from 30 to 7, name it "Money back where it started within a week", and
+  **Deploy**. Say why a week: at 30 days the circle would also find September's ring going round
+  through Brightpath and Crescent, already an alert of its own. (A template has no *Preview*: that is
+  for a rule written as a sentence.)
+
+**2. The next weekly export** (the presenter, then the data engineer):
+
+- `python -m scripts.seed_internal ledger --release-week-2` puts `ledger_transactions_week2.csv` (13
+  rows, 5 to 11 October 2026) in the dataset's folder. Nothing else changes; the Conduit stays up.
+- As the engineer, build a pipeline over it in the Ingest Studio mapped as
+  `packages/demo_fixtures/ledger_transactions_recipe.yaml` (two accounts found by number, a
+  *transacted* link with its time, amount and type), as the onboarding chapter builds its own; *Checks
+  on load* lists the two new rules and applies every case rule while nothing is chosen (the default);
+  *Verify*'s *Alerts this sample would raise* says neither money-flow rule can be judged in a dry run
+  (they read money movements, which a dry run does not make); publish and run it.
+- As the analyst, *Monitoring*: three new alerts, in this order —
+  - **R1**, rapid movement, medium: £18,000 into Sofia Ruiz's Monzo account from Crescent Imports and
+    £17,400 out to Tomas Zelinsky's within 6.2 hours, "the account is a pass-through";
+  - **C1**, circular flow, medium: Crescent → Ruiz → Zelinsky → Crescent in three movements;
+  - **H1**, the hotlist, high, yours alone: a £9,700 cash deposit into Carter's account.
+  The week's ordinary trading between the three counterparties raises nothing.
+
+**3. A list update** (the presenter, then the admin):
+
+- `python -m scripts.seed_internal ledger --release-list-update` puts the list's version 2 where the
+  subscription reads it.
+- *Monitoring → Lists*, **Refresh now**: "Version 06/10/2026: 1 added, 1 changed, 1 removed. … customers
+  re-screened against 2 changed entries; 1 alert raised."
+- As the analyst: **K1**, a screening alert, high: Sofia Ruiz matches "RUIZ, Sofia" on a sanctions list,
+  score 1.00, "a suggestion to confirm, not a finding"; the link to the listed party is inferred.
+
+**4. Close and report** (as the analyst):
+
+- *Reports → Packs*: add R1 as an alert item while it is still open (the pack's alert list offers the
+  queue's open, claimed and closing alerts only).
+- Close R1 as **Referred**: "To the MLRO: a further SAR on the Monzo account, citing the circle through
+  Crescent." A medium-severity alert needs no second person.
+- Back in the pack, **Refresh** R1's item: it now says *closed*, *referred*, and *inferred* (only a True
+  match confirms what an alert found; ADR-134 decision 1 refreshes an alert added while open).
+- The monitoring figures for the week (the Superset board's sections, administration guide §12):
+  raised by rule — hotlists 1, rapid movement 1, circular flow 1, KYC screening 1; closed by outcome —
+  referred 1; under a day 1; hotlist matches 1; still open — C1, H1 and K1. A colleague's board holds the
+  three case alerts and no hotlist (it is yours alone).
+
+**Between rehearsals:** `python -m scripts.seed_internal ledger --reset-week-2` takes the week's file
+out of the dataset's folder and puts the list's version 1 back; refresh the list afterwards (it delists
+Ruiz and raises nothing). It cannot undo the week's load — revert it with `python -m scripts.revert_load
+<load id> --reverted-by <you>`, the Conduit stopped (the load id is on the Studio's run) — nor retire the
+rehearsal's two rules (the case's Author retires them) and hotlist (a hotlist entry cannot be removed in
+the Glass), nor take back the alerts, the close and the pack item.
+Close R1 as *Referred*, never *True match*, in a rehearsal: a true match confirms the alert's own node,
+and the revert then refuses the load.
+
+## 8c. Prison Intelligence: monitoring in chapters 9 to 11 (P1 to P4) — `shipped`, 1 November 2026
+
+The last three chapters of the Prison Intelligence demo's Act 2 (`spec/06_DECISIONS.md` ADR-127 Amendment
+41; the golden tests are `tests/scenarios/test_pid_monitoring_storyline.py`). All synthetic, in "Prison
+Intelligence Dataset (synthetic demo)". Chapters 1 to 8 and Act 1 are unchanged.
+
+**Before chapter 9:** `python -m scripts.seed_internal prison-intelligence --release-batch-2` lists its three
+files; they are loaded in that order. Use four signed-in browser profiles: the analyst, the data engineer,
+the report viewer and the admin (the case's Author).
+
+**Chapter 9** (as the persona named):
+1. Analyst, *Monitoring → Watches*: hotlist the coordinator's number (*Only me*, the default).
+2. Engineer: run *Seized media* over the second seized-phone batch. **H1**, in the Watches tab's alert inbox,
+   explained as before (ADR-130).
+3. Engineer: run *Visit bookings* over `pid_visit_bookings.csv`. **H2**, high, in *Monitoring → Queue*: the
+   coordinator has booked a social visit to the third group member for Saturday 9 May 2026, booked on the
+   Monday. The booking is a record; no visit is written.
+4. Case Author (the admin account; a rule for the case team needs the Author level, and the demo analyst
+   is an Editor), *Monitoring → Rules*: write "Calls to a number on a seized handset" as a sentence (an
+   Endpoint whose endpoint kind is msisdn, within 2 steps of a Device; high; this case; the case team;
+   after each load commits), **Show the drawn pattern**, **Preview on the last 90 days**, **Deploy the
+   sentence**. Only after step 3: deployed before the bookings load, it would also flag the coordinator's
+   number.
+5. Engineer: the *Intelligence reports* pipeline's **Checks on load** lists the rule, and its **Verify** says
+   the rule cannot be judged in a dry run (it reads links from the stored graph). *PIN phone first contacts*
+   was published by the seed with no canvas, so its own Checks on load is reached only through **Reopen for
+   editing** (a new version); every case rule judges it while nothing is chosen.
+6. Engineer: run *PIN phone first contacts* over `pid_pin_new_contacts.csv`. **S1**, high, for the case team,
+   on the number nobody owns, which the third group member's PIN account called twice.
+
+**Chapter 10:** close H2 as *Referred* (the owner's alone, so at once); propose S1's close as *Referred*
+(high severity, seen by the case team, so it waits for a second person; the proposer can never approve
+it). The demo has one analyst account; the demo admin also holds the Analyst role and is the case's Author,
+so it may serve as the second person, which has not been walked. Save a trend with *What to count*
+**Alerts**, by week, split **By rule**: counted as the analyst, the week holds hotlists 2 and the rule 1. The
+monitoring figures (administration guide §12) are the board's, where one is registered for the case; a
+board never counts an *Only me* hotlist, so it holds S1 alone.
+
+**Chapter 11:** add H1, still open, to the pack as an *Alert* item, beside the two trends: open, its match
+inferred.
+
+**Rehearsals:** never close S1 as *True match* (it confirms S1's alert node, and the reset then refuses the
+first-contacts load). Retire the rule as the case's Author before the next run (a rule raises a finding
+once). A hotlist entry cannot be removed in the Glass: keep the first rehearsal's and do not add the number
+again. The alert trend counts the week alerts were raised in by the clock, so rehearsals the same week add to
+it. The reset reverts the three loads (and with the first contacts, S1's node, closing S1); it cannot undo
+the hotlist, its alerts and H2's close, the rule, the trends or the pack's items.
 
 ## 9. Related documents
 

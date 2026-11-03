@@ -27,6 +27,7 @@ interface State {
   held: Record<string, unknown>[];
   sent: { method: string; path: string; body: unknown }[];
   queueFilters: string[];
+  queueSearches: string[];
 }
 
 function alert(state: State) {
@@ -74,6 +75,7 @@ async function serve(page: Page, level: "editor" | "author" = "author"): Promise
     ],
     sent: [],
     queueFilters: [],
+    queueSearches: [],
   };  // prettier-ignore
   await page.route("**/*/v1/**", async (route) => {
     const request = route.request();
@@ -87,6 +89,7 @@ async function serve(page: Page, level: "editor" | "author" = "author"): Promise
       return json(200, [{ id: "inv-1", name: "Ledger", level, created_at: "", created_by: "" }]);
     if (path === "alert-queue") {
       state.queueFilters.push(url.searchParams.get("status") ?? "");
+      state.queueSearches.push(url.search);
       return json(200, [{ alert: alert(state), summary: "4 movements from GB-MULE to GB-HUB" }]);
     }
     if (path === "alert-queue/a1")
@@ -113,6 +116,13 @@ async function serve(page: Page, level: "editor" | "author" = "author"): Promise
       state.status = "closed";
       return json(200, alert(state));
     }
+    if (path === "alert-assignees")
+      return json(200, [{ id: "analyst-1", name: "Ana Lyst" }, { id: "analyst-2", name: "Priya Shah" }]);
+    if (path === "alert-queue/a1/assign") {
+      state.status = "claimed";
+      state.assignee = (request.postDataJSON() as { assignee: string }).assignee;
+      return json(200, alert(state));
+    }
     if (path === "alert-queue/a1/canvas")
       return json(200, { delta: { seq: 2, op: "add", nodes: [], edges: [] }, added_nodes: 3, added_links: 3 });
     if (path === "patterns")
@@ -132,6 +142,31 @@ async function serve(page: Page, level: "editor" | "author" = "author"): Promise
       const offset = Number(url.searchParams.get("offset") ?? 0);
       return json(200, { entries: AUDIT.slice(offset, offset + 50), total: AUDIT.length });
     }
+    // ADR-133 stage (b): the ontology the sentence builder offers its blanks from, the preview,
+    // the drawn pattern and the deploy.
+    if (url.pathname === "/v1/ontology") return json(200, ONTOLOGY);
+    if (path === "rules/preview")
+      return json(200, { days: 90, would_raise: 2, words: "When a Person…", examples: [
+        { node_id: "p1", name: "Callum Okafor", entity_type: "Person", words: "Callum Okafor (Person)" },
+        { node_id: "p2", name: "Dana Okafor", entity_type: "Person", words: "Dana Okafor (Person)" }] });  // prettier-ignore
+    if (path === "rules/sentence/compile")
+      return json(200, { words: "When a Person whose listing is one of sanction, pep, raise a high-severity alert for the case team, after each load commits.",
+        pattern: { nodes: [{ var: "subject", entity_type: "Person", where: {} }], edges: [], limit: 50000 } });  // prettier-ignore
+    if (path === "rules/sentence" && method === "POST") {
+      const body = request.postDataJSON() as { name: string; sentence: unknown };
+      const made = { name: body.name, id: "r3", investigation_id: "inv-1", owner_id: "analyst-1", status: "active", trigger: "post_commit",
+        created_at: "2026-11-01T00:00:00Z", params: { typology: "sentence", pattern_id: "pat-9", sentence: body.sentence } };  // prettier-ignore
+      state.rules = [made, ...state.rules];
+      return json(201, made);
+    }
+    // ADR-133 stage (c): the screening lists (synthetic, rule 9).
+    if (url.pathname === "/v1/screening-lists") return json(200, { lists: LISTS, can_manage: false });
+    if (url.pathname === "/v1/admin/screening-lists" && method === "GET") return json(200, { lists: LISTS, updates: [], can_manage: true });
+    if (url.pathname === "/v1/admin/screening-lists" && method === "POST")
+      return json(201, { ...LISTS[0], ...(request.postDataJSON() as object), version: null, entries: 0, updated_at: null });
+    if (url.pathname === "/v1/admin/screening-lists/Synthetic%20list/refresh")
+      return json(200, { id: "u1", list_name: "Synthetic list", at: "2026-11-01T09:00:00Z", outcome: "updated", added: 1, changed: 1,
+        delisted: 1, rescreened: 4, alerts: 1, words: "Version v2: 1 added, 1 changed, 1 removed. 4 customers re-screened against 2 changed entries; 1 alert raised." });  // prettier-ignore
     if (path === "held-rows") return json(200, state.held);
     if (path === "held-rows/reject") {
       const ids = (request.postDataJSON() as { ids: string[] }).ids;
@@ -148,13 +183,30 @@ async function serve(page: Page, level: "editor" | "author" = "author"): Promise
   return state;
 }
 
+const LISTS = [
+  { list_name: "Synthetic list", source: "opensanctions", location: "lists/synthetic_opensanctions_v1.ftm.json", dataset: null,
+    synthetic: true, licence: "CC BY-NC 4.0: non-commercial use only, unless licensed by OpenSanctions", version: "v1",
+    entries: 10, updated_at: "2026-11-01T08:00:00Z", attempted_at: "2026-11-01T08:00:00Z", failure: null },
+];  // prettier-ignore
+
+const ONTOLOGY = {
+  version: 1,
+  entity_types: [
+    { name: "Person", pole_class: "person", channel: "indigo", shape: "circle", identifiers: [], properties: [
+      { name: "family_name", type: "string", indexed: true },
+      { name: "listing", type: "enum", values: ["sanction", "pep", "adverse_media"] }] },
+    { name: "Location", pole_class: "location", channel: "ochre", shape: "pin", identifiers: [], properties: [] },
+  ],
+  edge_types: [{ name: "PRESENT_AT", from: ["Person"], to: ["Location"], temporal: true, basis: "direct", label: "Present at" }],
+};  // prettier-ignore
+
 async function press(page: Page, target: Locator) {
   await target.focus();
   await page.keyboard.press("Enter");
 }
 
 async function openTheAlert(page: Page) {
-  await press(page, page.getByRole("button", { name: /Open alert: Structuring/ }));
+  await press(page, page.getByRole("button", { name: /Open alert: Medium severity, Structuring — / }));
   await expect(page.getByRole("table", { name: "Transactions this alert cites" })).toBeVisible();
 }
 
@@ -193,9 +245,13 @@ test("an alert is closed with its reason, by keyboard", async ({ page }) => {
   const state = await serve(page);
   await page.goto("/keyboard/alerts-harness.html");
   await openTheAlert(page);
-  await page.getByLabel("Reason for closing").fill("Matches the SAR");
-  await press(page, page.getByRole("button", { name: "Close as true positive" }));
-  await expect(page.getByText(/Closed as a true positive/)).toBeVisible();
+  // The closing reason: one of the owner's closed list, chosen with Space on the first.
+  await page.getByRole("radio", { name: "True match" }).focus();
+  await page.keyboard.press("Space");
+  await expect(page.getByRole("radio", { name: "True match" })).toBeChecked();
+  await page.getByLabel("Why, in words: the reason for closing").fill("Matches the SAR");
+  await press(page, page.getByRole("button", { name: "Close the alert" }));
+  await expect(page.getByText(/Closed as True match/).first()).toBeVisible();
   expect(state.sent.find((s) => s.path === "alert-queue/a1/disposition")?.body).toEqual({
     disposition: "true_positive",
     reason: "Matches the SAR",
@@ -203,12 +259,103 @@ test("an alert is closed with its reason, by keyboard", async ({ page }) => {
   registerCovered(REGISTRY, "close-an-alert-with-a-reason-by-keyboard");
 });
 
+test("a closing reason is chosen from the closed list with the arrow keys, by keyboard", async ({ page }) => {
+  const state = await serve(page);
+  await page.goto("/keyboard/alerts-harness.html");
+  await openTheAlert(page);
+  const close = page.getByRole("button", { name: "Close the alert" });
+  await page.getByLabel("Why, in words: the reason for closing").fill("Passed to the NCA");
+  await expect(close).toBeDisabled(); // words alone are not a closing reason
+  await page.getByRole("radio", { name: "True match" }).focus();
+  for (let i = 0; i < 4; i += 1) await page.keyboard.press("ArrowDown");
+  await expect(page.getByRole("radio", { name: "Referred" })).toBeChecked();
+  await expect(page.getByRole("radio", { name: "Referred" })).toBeFocused();
+  await press(page, close);
+  expect(state.sent.find((s) => s.path === "alert-queue/a1/disposition")?.body).toEqual({
+    disposition: "referred",
+    reason: "Passed to the NCA",
+  });
+  registerCovered(REGISTRY, "choose-a-closing-reason-by-keyboard");
+});
+
+test("the watches and their alert inbox are reached from Monitoring's Watches tab, by keyboard", async ({ page }) => {
+  // The owner's answer of 1 November 2026: the rail's Watches entry is gone, so this tab is the only
+  // way to the hotlists, the monitors and the alert inbox's jump into a new investigation.
+  await serve(page);
+  const fulfil = (body: unknown, status = 200) => ({ status, contentType: "application/json", body: JSON.stringify(body) });
+  await page.route("**/*/v1/investigations/inv-1/hotlists", (route) => route.fulfill(fulfil({ hotlists: [], audience_default: "only_me", audience_editable: true })));
+  await page.route("**/*/v1/investigations/inv-1/monitors", (route) => route.fulfill(fulfil({ monitors: [] })));
+  await page.route("**/*/v1/investigations/inv-1/patterns", (route) => route.fulfill(fulfil({ patterns: [] })));
+  await page.route("**/*/v1/investigations/inv-1/alerts", (route) =>
+    route.fulfill(fulfil({ alerts: [{
+      id: "w1", rule_id: "hotlist:hl-1", owner_id: "analyst-1", mode: "full", referent_node_ids: ["n1"],
+      evidence_available: true, investigation_id: "inv-1", created_at: "2026-09-22T00:00:00Z",
+      hotlist: { identifier: "07700 900918", kept_as_written: false, review_date: "2027-01-31" },
+      fired_on: [{ type: "Endpoint", label: "+447700900918", files: [{ name: "batch2.csv", row: 3 }], more_files: 0 }],
+    }] })),
+  );  // prettier-ignore
+  await page.route("**/*/v1/investigations/inv-1/alerts/w1/jump", (route) =>
+    route.fulfill(fulfil({ investigation: { id: "inv-branch-1", created_at: "2026-09-22T00:00:00Z", created_by: "analyst-1",
+      owning_unit: "unit-1", branched_from: "inv-1" }, seeded_count: 1 }, 201)),
+  );  // prettier-ignore
+  await page.goto("/keyboard/alerts-harness.html");
+  await press(page, page.getByRole("tab", { name: "Watches" }));
+  await expect(page.getByRole("heading", { name: "Hotlists" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Alert inbox" })).toBeVisible();
+  await press(page, page.getByRole("button", { name: "Jump into investigation" }));
+  await press(page, page.getByRole("button", { name: "Open investigation" }));
+  await expect.poll(() => page.evaluate(() => window.__ALERTS__?.openedInvestigationId)).toBe("inv-branch-1");
+  registerCovered(REGISTRY, "reach-the-watches-and-alert-inbox-by-keyboard");
+});
+
 test("the queue is filtered, by keyboard", async ({ page }) => {
   const state = await serve(page);
   await page.goto("/keyboard/alerts-harness.html");
-  await page.getByRole("combobox", { name: "Which alerts" }).selectOption("closed");
+  await page.getByRole("combobox", { name: "Show which alerts" }).selectOption("closed");
   await expect.poll(() => state.queueFilters).toContain("closed");
   registerCovered(REGISTRY, "filter-the-queue-by-keyboard");
+});
+
+test("the queue is filtered by kind and severity, by keyboard (ADR-133 stage a)", async ({ page }) => {
+  const state = await serve(page);
+  await page.goto("/keyboard/alerts-harness.html");
+  // A native select, chosen as "the queue is filtered" chooses one (its keyboard is the browser's).
+  await page.getByRole("combobox", { name: "Kind of alert" }).selectOption("hotlist");
+  await expect.poll(() => state.queueSearches).toContain("?status=active&kind=hotlist");
+  await page.getByRole("combobox", { name: "Severity" }).selectOption("high");
+  await expect.poll(() => state.queueSearches).toContain("?status=active&kind=hotlist&severity=high");
+  registerCovered(REGISTRY, "filter-the-queue-by-kind-and-severity-by-keyboard");
+});
+
+test("a case alert is given to a member, by keyboard (ADR-133 stage a)", async ({ page }) => {
+  const state = await serve(page);
+  await page.goto("/keyboard/alerts-harness.html");
+  await openTheAlert(page);
+  await page.getByRole("combobox", { name: "Give to (a member of the case)" }).selectOption("analyst-2");
+  await press(page, page.getByRole("button", { name: "Give", exact: true }));
+  await expect(page.getByText("Given to Priya Shah.")).toBeVisible();
+  expect(state.sent.find((s) => s.path === "alert-queue/a1/assign")?.body).toEqual({ assignee: "analyst-2" });
+  expect(state.assignee).toBe("analyst-2");
+  registerCovered(REGISTRY, "give-an-alert-to-a-member-by-keyboard");
+});
+
+test("a template fills the rule form, which is then deployed, by keyboard (ADR-133 stage a)", async ({ page }) => {
+  const state = await serve(page);
+  await page.goto("/keyboard/alerts-harness.html");
+  await press(page, page.getByRole("tab", { name: "Rules" }));
+  await press(page, page.getByRole("button", { name: "Use the template: Circular flow" }));
+  // The keyboard is put on the filled form's name.
+  await expect(page.getByLabel("Rule name")).toBeFocused();
+  await expect(page.getByLabel("Rule name")).toHaveValue("Circular flow");
+  await press(page, page.getByRole("button", { name: "Deploy", exact: true }));
+  await expect(page.getByText("Deployed “Circular flow”.")).toBeVisible();
+  expect(state.sent.find((s) => s.path === "rules")?.body).toEqual({
+    name: "Circular flow",
+    params: { typology: "circular_flow", max_hops: 4, window_days: 30 },
+    trigger: "post_commit",
+    budget_ms: 5000,
+  });
+  registerCovered(REGISTRY, "use-a-template-by-keyboard");
 });
 
 test("a rule is deployed and another retired, by keyboard", async ({ page }) => {
@@ -257,7 +404,7 @@ test("a pattern drawn in the Query builder is deployed as a rule, by keyboard", 
   await press(page, page.getByRole("tab", { name: "Rules" }));
   await page.getByLabel("Rule name").fill("Drawn: company with a phone");
   await page.getByRole("combobox", { name: "Typology" }).selectOption("pattern");
-  await page.getByRole("combobox", { name: "Saved pattern" }).selectOption("pat-1");
+  await page.getByRole("combobox", { name: "Saved pattern", exact: true }).selectOption("pat-1");
   await press(page, page.getByRole("button", { name: "Deploy", exact: true }));
   await expect(page.getByText("Deployed “Drawn: company with a phone”.")).toBeVisible();
   expect(state.sent.find((s) => s.path === "rules")?.body).toEqual({
@@ -303,6 +450,112 @@ test("an Editor is offered triage but neither deployment nor the audit", async (
   await expect(page.getByRole("tab", { name: "Audit" })).toHaveCount(0);
   await press(page, page.getByRole("tab", { name: "Rules" }));
   await expect(page.getByText("A case Author deploys and retires rules.")).toBeVisible();
+});
+
+// ADR-133 stage (b): a rule written as a sentence, blank by blank, its drawn pattern shown, previewed
+// on the last 90 days and deployed — each step proven at the server it reached.
+async function writeTheSentence(page: Page) {
+  await press(page, page.getByRole("tab", { name: "Rules" }));
+  await page.getByRole("combobox", { name: "Subject" }).focus();
+  await page.getByRole("combobox", { name: "Subject" }).selectOption("Person");
+  await press(page, page.getByRole("button", { name: "Add a condition" }));
+  await page.getByRole("combobox", { name: "Condition 1: property" }).selectOption("listing");
+  await page.getByRole("combobox", { name: "Condition 1: test" }).selectOption("one_of");
+  for (const value of ["sanction", "pep"]) {
+    await page.getByRole("checkbox", { name: `Condition 1: ${value}` }).focus();
+    await page.keyboard.press("Space");
+  }
+  await page.getByRole("combobox", { name: "Frequency" }).selectOption("count");
+  await page.getByLabel("Times or more").fill("3");
+  await page.getByRole("combobox", { name: "Severity" }).selectOption("high");
+}
+
+const WRITTEN = {
+  subject: "Person",
+  conditions: [{ op: "one_of", property: "listing", values: ["sanction", "pep"] }],
+  relationship: null,
+  frequency: { kind: "count", link_type: "PRESENT_AT", at_least: 3, within_days: 7 },
+  severity: "high", team: "case", runs: "post_commit", on_hit: "load", scope: "this_case",
+};  // prettier-ignore
+
+test("a rule is written as a sentence, shown as its drawn pattern and deployed, by keyboard", async ({ page }) => {
+  const state = await serve(page);
+  await page.goto("/keyboard/alerts-harness.html");
+  await writeTheSentence(page);
+  await press(page, page.getByRole("button", { name: "Show the drawn pattern" }));
+  await expect(page.getByRole("region", { name: "The drawn pattern" })).toContainText("When a Person whose listing is one of sanction, pep");
+  expect(state.sent.find((s) => s.path === "rules/sentence/compile")?.body).toEqual(WRITTEN);
+  await page.getByLabel("Name of the sentence rule").fill("Listed people seen often");
+  await press(page, page.getByRole("button", { name: "Deploy the sentence" }));
+  await expect(page.getByText("Deployed “Listed people seen often”.")).toBeVisible();
+  expect(state.sent.find((s) => s.path === "rules/sentence")?.body).toEqual({ name: "Listed people seen often", sentence: WRITTEN });
+  await expect(page.getByText(/When a Person whose listing is one of sanction, pep, 3 or more times by PRESENT_AT/)).toBeVisible();
+  registerCovered(REGISTRY, "build-a-rule-as-a-sentence-by-keyboard");
+});
+
+test("a sentence is previewed on the last 90 days, by keyboard, and nothing is deployed", async ({ page }) => {
+  const state = await serve(page);
+  await page.goto("/keyboard/alerts-harness.html");
+  await writeTheSentence(page);
+  await press(page, page.getByRole("button", { name: "Preview on the last 90 days" }));
+  const preview = page.getByRole("region", { name: "Preview" });
+  await expect(preview.getByRole("status")).toHaveText("It would have raised 2 alerts in the last 90 days.");
+  await expect(preview.getByRole("listitem")).toHaveText(["Callum Okafor (Person)", "Dana Okafor (Person)"]);
+  expect(state.sent.find((s) => s.path === "rules/preview")?.body).toEqual({ sentence: WRITTEN });
+  expect(state.sent.map((s) => s.path)).not.toContain("rules/sentence");
+  registerCovered(REGISTRY, "preview-a-rule-by-keyboard");
+});
+
+test("an AML template is deployed with its jurisdiction list, by keyboard (ADR-133 stage c)", async ({ page }) => {
+  const state = await serve(page);
+  await page.goto("/keyboard/alerts-harness.html");
+  await press(page, page.getByRole("tab", { name: "Rules" }));
+  await press(page, page.getByRole("button", { name: "Use the template: High-risk jurisdiction" }));
+  await expect(page.getByLabel("Rule name")).toBeFocused();
+  await page.getByRole("textbox", { name: "High-risk jurisdictions" }).focus();
+  await page.keyboard.type("xa, xb");
+  await press(page, page.getByRole("button", { name: "Deploy", exact: true }));
+  await expect(page.getByText("Deployed “High-risk jurisdiction”.")).toBeVisible();
+  expect(state.sent.find((s) => s.path === "rules")?.body).toEqual({
+    name: "High-risk jurisdiction",
+    params: { typology: "high_risk_jurisdiction", jurisdictions: ["XA", "XB"] },
+    trigger: "post_commit",
+    budget_ms: 5000,
+  });
+  registerCovered(REGISTRY, "deploy-an-aml-template-by-keyboard");
+});
+
+test("the screening lists are read by keyboard, with no action offered to a reader (ADR-133 stage c)", async ({ page }) => {
+  await serve(page);
+  await page.goto("/keyboard/alerts-harness.html");
+  await press(page, page.getByRole("tab", { name: "Lists" }));
+  const table = page.getByRole("table", { name: "Screening lists and their versions" });
+  await expect(table).toContainText("Synthetic list");
+  await expect(table).toContainText("Up to date with its last refresh.");
+  await expect(page.getByRole("button", { name: /Refresh now/ })).toHaveCount(0);
+  registerCovered(REGISTRY, "read-the-screening-lists-by-keyboard");
+});
+
+test("a screening list is refreshed and another subscribed to, by keyboard (ADR-133 stage c)", async ({ page }) => {
+  const state = await serve(page);
+  await page.goto("/keyboard/alerts-harness.html?lists=manage");
+  await press(page, page.getByRole("tab", { name: "Lists" }));
+  await press(page, page.getByRole("button", { name: "Refresh now: Synthetic list" }));
+  await expect(page.getByRole("status")).toContainText("1 alert raised");
+  expect(state.sent.some((s) => s.path === "/v1/admin/screening-lists/Synthetic%20list/refresh")).toBe(true);
+  registerCovered(REGISTRY, "refresh-a-screening-list-by-keyboard");
+  const form = page.getByRole("form", { name: "Subscribe to a list" });
+  await form.getByLabel("List name").focus();
+  await page.keyboard.type("UN list");
+  await form.getByRole("combobox", { name: "Connector" }).selectOption("un_consolidated");
+  await form.getByLabel("File in the ingest folder").focus();
+  await page.keyboard.type("lists/consolidated.xml");
+  await press(page, form.getByRole("button", { name: "Subscribe" }));
+  await expect(page.getByRole("status")).toContainText("Subscribed to “UN list”");
+  expect(state.sent.find((s) => s.path === "/v1/admin/screening-lists")?.body).toEqual({
+    list_name: "UN list", source: "un_consolidated", location: "lists/consolidated.xml", dataset: null, use: "local_development",
+  });  // prettier-ignore
+  registerCovered(REGISTRY, "subscribe-to-a-screening-list-by-keyboard");
 });
 
 test("every registered Alerts action has its own proving test case above", () => {

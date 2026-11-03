@@ -60,6 +60,7 @@ from schemas.domain import (
     HeldRow,
     Interval,
     NodeWrite,
+    OntologySchema,
     Principal,
     Provenance,
     ProvenanceState,
@@ -73,9 +74,11 @@ from schemas.domain import (
 from .alerts import AlertStore
 from .audit import AuditWriter
 from .held_rows import HeldRowStore
+from .hotlists import HotlistStore
 from .kyc_expiries import KycExpiryStore
 from .pattern_store import PatternStore
 from .screening import ScreeningListStore
+from .strength_influencers import InfluencerStore
 
 #: The edge type whose events are money movements.
 FLOW_EDGE_TYPE = "TRANSACTED"
@@ -256,6 +259,12 @@ RULE_AUDIT_ACTIONS: tuple[str, ...] = (
     "rows_released",
     "rows_rejected",
     "alert_node_withheld",
+    # ADR-133 stage (d): maker–checker's changes, and the pipeline checks rules are attached as.
+    "rule_change_proposed",
+    "rule_change_approved",
+    "rule_change_rejected",
+    "rule_changed",
+    "load_checks_set",
 )
 
 
@@ -346,6 +355,32 @@ class Finding:
         return Interval(valid_from=min(times), valid_to=max(times)) if times else None
 
 
+async def _readable_accounts(
+    ids: Sequence[str],
+    written: Sequence[NodeWrite | EdgeWrite],
+    graph: GraphPort,
+    scheme: HandlingScheme,
+    deployer: Principal,
+) -> set[str]:
+    """The accounts the deployer may read: from the load's own writes (a pre-commit rule's accounts
+    are still in the open transaction), judged by marking and dataset reach as the adapter judges
+    them; the rest asked of the store as the deployer, in one batched read (rule 3 in the adapter).
+    An account they may not read is absent."""
+    reach = deployer.datasets
+    found = {
+        w.id
+        for w in written
+        if isinstance(w, NodeWrite)
+        and w.id in set(ids)
+        and handling_readable(scheme, deployer, w.handling)
+        and (reach is None or bool(set(w.datasets) & set(reach)))
+    }
+    missing = [i for i in ids if i not in found]
+    if missing:
+        found |= {n.id for n in await graph.get_nodes(missing, deployer)}
+    return found
+
+
 async def judge(
     rule: TypologyRule,
     deployer: Principal,
@@ -354,14 +389,27 @@ async def judge(
     analytics: AnalyticsPort,
     scheme: HandlingScheme,
     investigation_scope: str,
+    graph: GraphPort | None = None,
+    written: Sequence[NodeWrite | EdgeWrite] = (),
 ) -> list[Finding]:
     """The rule over this load's events and the flows around them. Only events the deployer may
-    read are judged or read (rule 3); only findings citing one of this load's events count."""
+    read are judged or read (rule 3); only findings citing one of this load's events count.
+
+    An event carries its marking but no dataset (ADR-099 decision 7: it belongs to its case), so a
+    rule deployed within one of the case's datasets would otherwise judge every money movement of
+    the case. With `graph` (the rule gate always gives it), a movement is judged or read only when
+    the deployer may read both its accounts, as the AML templates read theirs (found building
+    ADR-108 Amendment 5: a rule in another dataset raised an alert on accounts its author could
+    not see)."""
     judged = [
         e
         for e in incoming
         if e.edge_type == FLOW_EDGE_TYPE and handling_readable(scheme, deployer, e.handling)
     ]
+    if graph is not None and judged:
+        ends = sorted({e.source_id for e in judged} | {e.target_id for e in judged})
+        readable = await _readable_accounts(ends, written, graph, scheme, deployer)
+        judged = [e for e in judged if e.source_id in readable and e.target_id in readable]
     params = rule.params
     if not isinstance(params, (StructuringParams, RapidMovementParams, CircularFlowParams)):
         return []
@@ -377,6 +425,10 @@ async def judge(
         node_ids=accounts,
         window=Interval(valid_from=min(times) - reach, valid_to=max(times) + reach),
     )
+    if graph is not None and context:
+        ends = sorted({e.source_id for e in context} | {e.target_id for e in context})
+        readable = await _readable_accounts(ends, written, graph, scheme, deployer)
+        context = [e for e in context if e.source_id in readable and e.target_id in readable]
     canonical = one_per_transaction([*context, *judged])
     by_id = {e.event_id: e for e in canonical.values()}
     hits = hits_citing(
@@ -436,6 +488,10 @@ async def write_alert_node(
     finding writes alongside (`pending`). `None` when no single marking is safe
     (`alert_handling`): the node is withheld, the queue row still raised."""
     record = writes if writes is not None else RuleWrites()
+    from .sentence_rules import is_just_me
+
+    if is_just_me(finding.rule):
+        return None  # an alert for its author alone puts nothing in the case's graph
     if finding.pending:
         pending_nodes = [w for w in finding.pending if isinstance(w, NodeWrite)]
         pending_edges = [w for w in finding.pending if isinstance(w, EdgeWrite)]
@@ -493,16 +549,17 @@ async def write_alert_node(
 
 
 def alert_row(finding: Finding, alert_node_id: str | None, investigation_id: str) -> Alert:
+    from .sentence_rules import sentence_alert_fields
+
+    fields = sentence_alert_fields(finding)
     return Alert(
+        **fields,
         id=new_id(),
-        rule_id=f"typology:{finding.rule.id}",
         owner_id=finding.deployer.id,
         mode=AlertMode.FULL,
         referent_node_ids=finding.node_ids,
         investigation_id=investigation_id,
         created_at=datetime.now(UTC),
-        dataset_id=finding.rule.dataset_id,
-        typology=finding.typology,
         words=finding.words,
         edge_ids=finding.edge_ids,
         event_ids=[e.event_id for e in finding.events],
@@ -577,6 +634,29 @@ class RuleGate:
     last_written: Sequence[NodeWrite | EdgeWrite] = ()
     #: ADR-109 phase F: where a verifying document's expiry is recorded for the daily sweep.
     expiries: KycExpiryStore | None = None
+    #: ADR-133 stage (b): a sentence's "on one of my hotlists", read as its author, and the
+    #: ontology a sentence's drawn pattern is read back against.
+    hotlists: HotlistStore | None = None
+    ontology: OntologySchema | None = None
+    #: ADR-133 decision 6, stage (d): what a hit of a rule does at this pipeline, as its "Checks on
+    #: load" step chose ("alert" or "hold"), by rule id. A rule not named keeps its author's choice.
+    on_hit: dict[str, str] = field(default_factory=dict)
+    #: ADR-139: where a sentence's strength condition reads the case's influencers (case, then
+    #: installation, then the weights file's); None, the file's alone.
+    influencers: InfluencerStore | None = None
+
+    def holds(self, rule: TypologyRule) -> bool:
+        """Whether a hit of `rule` holds its rows here: before commit only; as the pipeline chose,
+        else as the author wrote. A pipeline may make a whole-deployment rule hold, never loosen
+        one its author wrote to hold."""
+        from .sentence_rules import holds_on_hit, is_deployment_wide
+
+        if rule.trigger != "pre_commit":
+            return False
+        chosen = self.on_hit.get(rule.id)
+        if chosen is None or (is_deployment_wide(rule) and holds_on_hit(rule)):
+            return holds_on_hit(rule)
+        return chosen == "hold"
 
     async def record_expiries(self, written: Sequence[NodeWrite | EdgeWrite]) -> int:
         """Every verifying document this load wrote that carries an expiry, recorded so the
@@ -599,6 +679,12 @@ class RuleGate:
         deployer = await self.principal_for_owner(rule.owner_id)
         if deployer is not None and rule.dataset_id is not None:
             deployer = deployer.model_copy(update={"datasets": [rule.dataset_id]})
+        from .sentence_rules import is_deployment_wide
+
+        if deployer is not None and is_deployment_wide(rule):
+            # ADR-133 decision 1: a deployment-wide sentence judges each case's loads within that
+            # case's datasets (the loader's), as its administrator author may read them.
+            deployer = deployer.model_copy(update={"datasets": self.loader.datasets})
         return deployer
 
     async def _audit(self, action: str, detail: dict[str, object], count: int = 0) -> None:
@@ -644,7 +730,22 @@ class RuleGate:
         written: Sequence[NodeWrite | EdgeWrite],
     ) -> list[Finding]:
         """A flow typology over the load's money movements; a KYC typology over its new customers
-        (`kyc_rules.py`, imported here, not at the top: it builds on this module)."""
+        (`kyc_rules.py`, imported here, not at the top: it builds on this module). ADR-133 stage
+        (c)'s AML templates over the load's movements and the accounts' own past
+        (`aml_rules.py`)."""
+        from .aml_rules import AML_TYPOLOGIES, judge_aml
+
+        if rule.params.typology in AML_TYPOLOGIES:
+            return await judge_aml(
+                rule,
+                deployer,
+                events,
+                written,
+                graph=self.graph,
+                analytics=self.analytics,
+                scheme=self.scheme,
+                investigation_scope=self.investigation_id,
+            )
         if is_flow_rule(rule):
             if self.analytics is None:
                 raise RuntimeError(
@@ -657,6 +758,8 @@ class RuleGate:
                 analytics=self.analytics,
                 scheme=self.scheme,
                 investigation_scope=self.investigation_id,
+                graph=self.graph,
+                written=written,
             )
         if rule.params.typology == "pattern":
             from .pattern_rules import judge_pattern
@@ -664,6 +767,10 @@ class RuleGate:
             return await judge_pattern(
                 rule, deployer, written, graph=self.graph, patterns=self.patterns
             )
+        if rule.params.typology == "sentence":
+            from .sentence_rules import judge_sentence_rule
+
+            return await judge_sentence_rule(rule, deployer, written, events, self)
         from .kyc_rules import KycContext, judge_kyc
 
         context = KycContext(
@@ -685,7 +792,13 @@ class RuleGate:
         movement for a flow typology; those that created a customer for a KYC one."""
         if rule.params.typology == "pattern":
             return []  # a drawn pattern runs after commit only; it never holds a row
-        if is_flow_rule(rule):
+        if rule.params.typology == "sentence":
+            from .sentence_rules import sentence_rows
+
+            return sentence_rows(rule, events, written)
+        from .aml_rules import AML_TYPOLOGIES
+
+        if is_flow_rule(rule) or rule.params.typology in AML_TYPOLOGIES:
             return sorted(
                 {r for e in events if e.edge_type == FLOW_EDGE_TYPE for r in _source_rows(e)}
             )
@@ -749,6 +862,19 @@ class RuleGate:
                  "findings": len(fresh)},
                 len(fresh),
             )
+            from .sentence_rules import rows_of_finding
+
+            if self.holds(rule):
+                # ADR-133 decision 1: a hit holds its rows for a reviewer, the finding its reason.
+                for finding in fresh:
+                    rows = rows_of_finding(finding, events, written)
+                    for row in rows:
+                        verdict.hold.setdefault(row, (rule, f"it matched: {finding.words}"))
+                    verdict.notes.append(
+                        f"Rule “{rule.name}” matched {len(rows)} row(s); they are held for "
+                        "review, not loaded."
+                    )
+                continue
             for finding in fresh:
                 try:
                     node_id = await write_alert_node(
@@ -773,9 +899,25 @@ class RuleGate:
         """The queue rows for what `pre_commit` wrote into the committed graph."""
         return [await self._raise_row(f, node_id) for f, node_id in verdict.findings]
 
+    async def _rests_on(self, finding: Finding, node_id: str | None) -> list[Handling] | None:
+        """Every handling the alert rests on — its entities, its own node, the links and the
+        transactions it cites — read as its deployer, who raised it (ADR-134 decision 3). `None`
+        when any of them cannot be read so: not known, and the alert trend counts it for no one."""
+        node_ids = sorted({*finding.node_ids, *([node_id] if node_id else [])})
+        edge_ids = sorted(set(finding.edge_ids))
+        nodes = await self.graph.get_nodes(node_ids, finding.deployer) if node_ids else []
+        edges = await self.graph.get_edges(edge_ids, finding.deployer) if edge_ids else []
+        if {n.id for n in nodes} != set(node_ids) or {e.id for e in edges} != set(edge_ids):
+            return None
+        return [
+            *(n.handling for n in nodes),
+            *(e.handling for e in edges),
+            *(e.handling for e in finding.events),
+        ]
+
     async def _raise_row(self, finding: Finding, node_id: str | None) -> Alert:
         alert = alert_row(finding, node_id, self.investigation_id)
-        await self.alert_store.save(alert)
+        await self.alert_store.save(alert, handlings=await self._rests_on(finding, node_id))
         await self._remember(finding)
         detail: dict[str, object] = {
             "rule_id": finding.rule.id,
@@ -785,7 +927,9 @@ class RuleGate:
             "node_ids": finding.node_ids,
         }
         await self._audit("rule_fired", detail, 1)
-        if node_id is None:
+        from .sentence_rules import is_just_me
+
+        if node_id is None and not is_just_me(finding.rule):
             await self._audit(
                 "alert_node_withheld",
                 {"rule_id": finding.rule.id, "alert_id": alert.id, "node_ids": finding.node_ids,
@@ -799,6 +943,10 @@ class RuleGate:
         """A finding raised outside any load's transaction (after commit, or by the daily sweep):
         its node in a transaction of its own, then its queue row. `writes` collects what it wrote,
         for the record of the load it follows."""
+        from .sentence_rules import is_just_me
+
+        if is_just_me(finding.rule):
+            return await self._raise_row(finding, None)  # nothing goes into the case's graph
         tx = await self.graph.begin_transaction()
         try:
             node_id = await write_alert_node(

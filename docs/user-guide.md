@@ -1,7 +1,10 @@
 # OspreyFlow — User Guide
 
+OspreyFlow is an open-source intelligence mapping platform for crime analysis, anti-money-laundering,
+fraud detection, and event monitoring and alerting.
+
 For analysts: the people who investigate in OspreyFlow. It covers signing in, cases, the graph, the
-map, the timeline and the reports, alerts and watches, and how OspreyFlow decides what you can see.
+map, the timeline and the reports, monitoring and alerts, and how OspreyFlow decides what you can see.
 It describes what is built, and says plainly where something is not yet.
 
 The other guides in this folder are the [administration guide](administration-guide.md), for
@@ -11,10 +14,25 @@ engineers. The screenshots show the synthetic demonstration cases; no real data 
 <!-- document-control:begin -->
 ## Document control
 
-**Version 1.7** · 2026-10-29 · For OspreyFlow v0.4.1 · Issued
+**Version 1.22** · 2026-11-02 · For OspreyFlow v0.4.1 · Issued
 
 | Version | Date | What changed |
 | --- | --- | --- |
+| 1.22 | 2026-11-02 | Checked against the Glass end to end (build order step 10). §7.1: Monitoring's tabs include **Lists** and **Connection strength**, and say which levels see Held rows and Audit. §5.12: the legend marks the composition, not the rarity measure, as a case override (a case cannot choose the measure). §7.6: the *For* choices as the builder words them (*just me*). |
+| 1.21 | 2026-11-02 | §5.12: shared-attribute rarity is now worked out by the client's own measure (one less a shared value's share of the pairs linked through values of its kind), with the earlier measure still to choose; the two compositions, standard and client parity, and the raw sum on the client's scale; an influencer triggered by a dataset; a case switched to client parity by its Author. §7.6: a strength figure on the client's scale. |
+| 1.20 | 2026-11-02 | New §5.12, How connection strength is worked out: a link's strength from its own count and recency, the influencers that change it (direct links, and a boost from a record that evidences the link, such as an assault), shared-attribute rarity, the legend, the two new filters in Metrics, the Matrix's two sorts, the Inspector's explanation, who changes influencers, and why two analysts can see different rarity. §7.6: a rule on connection strength or rarity. |
+| 1.19 | 2026-11-02 | §4: the demonstration cases each starter brings, and their domains; a public dataset's case. |
+| 1.18 | 2026-11-01 | §7.5: a hotlist can hold an account number, matched on the account however its spaces are written. §7.4: a money-flow rule judges only movements between accounts its author may see. §7.10: the UK Sanctions List (FCDO) among the lists; the closed OFSI list says so. |
+| 1.17 | 2026-11-01 | §7.3: closing an alert takes one of five closing reasons (True match, False positive, Duplicate, No further action, Referred) and words. §7.5 and the left rail: watches, and the alert inbox, are in Monitoring's Watches tab; the rail has no Watches entry. §7.10: UN and OpenSanctions are marked "licence not confirmed", and whoever manages lists sees only their own unit's counts. Ask to search answers on the engine you choose when the case's data may leave (the engine choice). The mark on the top bar is read aloud as "Osprey, go to Home". |
+| 1.16 | 2026-11-01 | §7.11: a rule that runs on a schedule, every day or every week, and its runs. §7.12: a second person's approval — for a rule for the whole deployment, and for closing a high-severity alert; a rule's versions. §7.3 and §7.10 point to them, and a list may be refreshed on a schedule. |
+| 1.15 | 2026-11-01 | §7.9: the four new AML templates (a high-risk jurisdiction, large cash, a dormant account reactivated, a sudden rise in velocity). §7.10: screening lists — the Lists tab, re-screening when a list changes, and a match confirmed by a person. |
+| 1.14 | 2026-11-01 | §7.6–7.8: a rule written as a sentence, blank by blank from the ontology, and its drawn pattern; frequency and amount conditions; Preview on the last 90 days. |
+| 1.13 | 2026-11-01 | §9.1–9.3: an alert in a report pack (open or closed, inferred or confirmed); alert trends in the Trends tab; the monitoring figures dashboards receive. |
+| 1.12 | 2026-11-01 | §7 rewritten as Monitoring and alerts: the Monitoring place and its one queue for every kind of alert; severity, who may see an alert, giving it to a member, and closing it with a reason; the typologies as rule templates; whom a hotlist's alerts reach. §12: the canvas says the node the keyboard is on. |
+| 1.11 | 2026-11-01 | §5.11: the Matrix, the graph as two tables a screen reader can walk, with its keys in §12. |
+| 1.10 | 2026-11-01 | §6: an engine marked "under contract" or "no contract", and one the case's data may not reach shown not available, with the reason. |
+| 1.9 | 2026-11-01 | §6: choosing the model engine in Ask the case and Ask to search, and what an answer's "Answered by" line means. |
+| 1.8 | 2026-11-01 | The opening says what OspreyFlow is for: intelligence mapping, for crime analysis, anti-money-laundering, fraud detection, and event monitoring and alerting. |
 | 1.7 | 2026-10-29 | Describes v0.4.1: the top bar wraps to a second line when its items do not fit, and the map keeps what it showed when the timeline opens. |
 | 1.6 | 2026-10-28 | A source row is counted from 1 everywhere it is shown: the first row after the header is row 1. |
 | 1.5 | 2026-10-27 | Add many from a list; Select what is lit and the weekday-by-hour cell brush on the timeline; the case brief; icons by value; a property condition on a pattern node; graph facts in an answer; Ask to search; a hotlist alert that explains itself; and sources withheld where a case does not read their data. |
@@ -119,15 +137,33 @@ one dataset; you may see it through any one the case reads, but what it says of 
   Attaching and detaching are recorded, but do not appear in History.
 - A branch does not inherit the brief.
 
+**The demonstration cases a deployment starts with.** Your administrator may have installed
+OspreyFlow from a **starter** (a theme and a domain; administration guide §1a). Each starter brings
+the demonstration cases of its domain, all synthetic, each set to its domain's packs (so its reports
+and choices fit it). Every pack stays available to the cases you create.
+
+| Starter | The demonstration cases it brings | The cases' domain |
+| --- | --- | --- |
+| `…-crime` | Prison Intelligence Dataset (synthetic demo); HMP fixture (synthetic demo) | NIEM |
+| `…-aml` | Operation Ledger (synthetic demo), with its synthetic screening lists | FIBO |
+| `…-fraud` | Fixture Corp (synthetic demo); PaySim only if your administrator downloads and adds it | FIBO |
+| `…-cyber` | Cyber intrusion (synthetic demo): a STIX 2.1 threat case | STIX |
+| `…-blank` | None, and no demonstration accounts | — |
+
+The theme (`ospreyflow-…` or `govuk-…`) changes only the look: under the GOV.UK theme, the header
+names the service your administrator chose, the same on every case. A dataset your administrator
+added from outside, such as a VAST Challenge dataset, is a case of its own named after the dataset,
+"(public dataset)".
+
 ## 5. The Glass
 
 ![A case with nothing drawn yet: Where to start](images/user/04-case-where-to-start.png)
 
 | Part | What it is |
 | --- | --- |
-| **Top bar** | The case menu, search, the view switch (Graph, Map, Reports), Export, and your account |
-| **Left rail** | The places: Explore, Alerts, Ownership, Watches, Questions, History, Dashboards, Help — those your rights allow |
-| **Canvas** | The graph, the map or the reports |
+| **Top bar** | The case menu, search, the view switch (Graph, Map, Matrix, Reports), Export, and your account |
+| **Left rail** | The places: Explore, Monitoring (its Watches tab holds your watches), Ownership, Questions, History, Dashboards, Help — those your rights allow |
+| **Canvas** | The graph, the map, the Matrix or the reports |
 | **Right column** | The Inspector, Metrics, the query builder and Find connections, stacked; **Full width** and **Hide** |
 | **Timeline** | Folded at the bottom until opened |
 | **Status bar** | How many nodes and links are drawn, how many dimmed by a filter, and how many hidden by handling |
@@ -305,7 +341,7 @@ the sources would be listed, the Inspector's **Source**, a link's details and th
 (**View messages**) say "Its sources are in data this case does not read". They never say "No sources
 recorded": there are some, and they are not this case's to see. The node or link itself is still
 shown, as you may see it; only where it came from is held back. The same applies in an alert (section
-7.2). If an Author widens the case's datasets, records already on your canvas may keep saying this
+7.5). If an Author widens the case's datasets, records already on your canvas may keep saying this
 until you open the case afresh.
 
 ### 5.7 Metrics
@@ -313,9 +349,9 @@ until you open the case afresh.
 ![Metrics: a ranking by betweenness](images/user/20-metrics.png)
 
 **Metrics** ranks what is drawn by degree, weighted degree, betweenness, eigenvector, PageRank,
-clustering coefficient or the clique metric, and can compare two. Choose a row to go to it. Its
-filters — relationship strength, a metric's value — dim, never remove. A metric is shown as size,
-never as colour.
+clustering coefficient, the clique metric, connection strength or shared-attribute rarity (§5.12),
+and can compare two. Choose a row to go to it. Its filters — relationship strength, a metric's
+value — dim, never remove. A metric is shown as size, never as colour.
 
 ### 5.8 Find connections
 
@@ -381,6 +417,127 @@ nothing in the case. A proposal is a suggestion, not a finding.
   type are not forced to be different, so a count can include a node matched twice.
 - Asking needs the right to ask the model, and Viewer on the case.
 
+### 5.11 The Matrix
+
+**Matrix** in the view switch shows the same working set as the graph, as two tables: **Entities**
+and **Links**. It is the way to work through the graph with a screen reader, or whenever a list reads
+better than a picture.
+
+- **Entities** has a row for each node on the graph: its name, as the graph labels it; its type; its
+  own marking; its provenance, in words, so a node a model proposed reads **Inferred** until someone
+  confirms it; and how many links it has in view. **Links** has a row for each link: its type, the two
+  ends, its marking and its provenance.
+- The tables hold only what the graph holds. What you are not cleared to see is not in them, and they
+  give no count of it. A node a filter dims stays in the table and says **Dimmed by filter**.
+- Choose a column's heading to sort by it; choose it again to reverse. Each table's caption says how it
+  is sorted and which rows are shown. A long table is shown a hundred rows at a time, with **Previous**
+  and **Next**, and the caption says so: "Rows 101 to 200 of 12,481". Nothing is left out without
+  saying so.
+- The selection is the graph's. Select a row and the Inspector shows that node; go back to **Graph** and
+  it is selected there. What you selected on the graph is selected in the Matrix, which opens on the
+  page that holds it.
+- **Expand** on a row opens the graph and expands that node there, with the same preview and limits as
+  expanding it on the graph. **Show** opens the graph with that node selected and centred.
+- The Matrix lists the whole working set. Groups folded on the graph, links hidden from the view and
+  link types left out from the legend are shown in full.
+
+From the keyboard, each table is one Tab stop. The arrow keys move between cells, Home and End to the
+start and end of a row, Page Down and Page Up between pages. Enter selects the row's node; Space adds
+it to the selection or takes it out.
+
+### 5.12 How connection strength is worked out
+
+How strong a link is drawn rests on three ideas. Each can be seen, filtered and explained on its own.
+
+**1. The link's own evidence.** A link's stored weight comes from that link alone: how often it
+occurred, against what is heavy for its type (forty calls, twelve weeks in one cell, six payments),
+and how recently, halving every ninety days. A standing link (custody, family, co-defendants, group
+membership) has a fixed weight. No other link moves it, so nothing you cannot see changes it.
+
+**2. Influencers.** An influencer changes how strong a kind of link is drawn when you look at it:
+
+| Part | What it says |
+| --- | --- |
+| **What triggers it** | A record that evidences the link: for example an Incident whose category is assault, disorder or find, at one end of the link or involving both people. Or **a dataset**: every link in that dataset (an assaults table, say), as the client's own code boosts a whole table. **Direct links** have no trigger. |
+| **Which links it changes** | Named link types, such as *In conflict with* or *Role in*; or *a pair linked through a shared value* (two people who share a phone, say), which takes an added boost only. |
+| **The change** | **Add** a boost (the usual), **multiply**, set a **floor** (at least this strong), or **exclude** (no stronger than its stored weight). |
+| **Its size, and a label** | The label is what the legend shows. |
+
+OspreyFlow ships two. **Direct link**: calls, money transfers, visits and cell shares are drawn
+stronger than links that are only inferred or shared. **Evidenced by an assault, disorder or find**:
+a role in such an incident, and a conflict, association or cell share between people in one, are drawn
+stronger. Their sizes are calibrated so that a boost moves an ordinary link about as far as doubling
+its count would, and are marked "to be confirmed with the client". Boosts add up.
+
+**An influencer applies only if you may see the record that evidences the link,** or, for a dataset,
+only if your case reads that dataset. An assault report above your clearance never thickens a line
+you can see, so it never tells you it exists; a dataset your case does not read is not named in your
+legend at all. The stored
+weight never changes: influencers are applied as the link is read, so a change takes effect at once.
+
+**3. Shared-attribute rarity.** Two people who share something few others share are more interesting
+than two who share what everyone does. A thing two people of one kind share (a cell, a phone number, a
+visitor, a report, a group) is a **shared value**. By default rarity is worked out as the client works
+it out: a value held by *k* people links *k × (k − 1) / 2* pairs, and its rarity is one less its share
+of all the pairs linked through values of its kind. A phone two people share, among phones that link
+few pairs, scores near 1; the prison everyone is held in scores near 0. Two people take the rarity of
+the rarest value they share. Your installation may choose the earlier measure instead, **inverse
+frequency**, which adds, for each thing two people share, the logarithm of how many people there are
+over how many share it; the legend says which is in force. It is worked out per dataset unless you
+choose across the case's datasets, and **only over what you may see**: if two analysts have different
+access, they can see different rarity for the same pair, and both are right for what each may see.
+Rarity is its own measure, never folded into the strength, except under client parity (below).
+
+**Two compositions.** How the three ideas make a strength is the installation's choice, shown in the
+legend:
+
+| Composition | Strength is | Drawn on |
+| --- | --- | --- |
+| **Standard** (shipped) | the link's stored weight, from its own count and recency, with the influencers applied | 0 to 1 |
+| **Client parity** | rarity plus the influencers' added boosts, with no count and no recency: the client's own sum | 0 to 1, through a curve that keeps the sums' order; the Inspector also shows the **raw sum on the client's scale** |
+
+Under client parity, a stored link's rarity is that of the link itself among the links of its type you
+can see in its dataset (one less one over how many there are), and a pair linked through a shared
+value takes that value's rarity. Only added boosts count in the sum: a multiplier, floor or exclusion
+is left out, and the legend says so. Because rarity is worked out over what you may see, so is a
+client-parity strength. An installation chooses its composition in the same way as its influencers (a
+proposal and a second person's approval); a case's Author may switch one case to client parity, to
+compare the two on the same case, and back.
+
+**Where you see it:**
+- **The legend** lists, under *Connection strength*: the composition in force (marked **Case
+  override** if the case chose it); the rarity measure, which only the installation chooses; every
+  influencer in force in the case — what triggers it, the links it changes, the change and its size,
+  and where it came from (shipped, installation-wide, or **Case override**); which link types count
+  as direct; and the rarity note.
+- **Metrics** (§5.7) offers *Connection strength* and *Shared-attribute rarity* to rank by and to
+  filter by. Choose one under **Filter** and slide **Metric value at least**: a link below the
+  strength, and a person none of whose links reach it, fade; with rarity, a person whose rarest
+  pairing in view is below it fades. Nothing is removed.
+- **The Matrix** (§5.11) gives each link its **Strength** and the **Rarity** of its two ends, and sorts
+  by either.
+- **The Inspector** explains a selected link under **Connection strength**: its count against what is
+  heavy for its type, when it was last seen, the rule and weights version it was worked out under,
+  each influencer that changed it and the kind of record (or the dataset) that evidenced it, and what
+  its two ends share, rarest first, with the measure named. Under client parity it shows instead the
+  link's rarity term, each boost added, and the **raw sum on the client's scale**, beside the strength
+  it is drawn at. With two people selected, **What these two share** does the same for them.
+
+**Who changes influencers.** An installation-wide set is proposed in **Monitoring → Connection
+strength** by someone holding the right to manage influencers, and takes effect only when **another**
+person with that right approves it; the proposer can withdraw it but never approve it, and every
+version is kept; a version may also choose the composition and the rarity measure. A case's **Author**
+may add influencers for that case, switch off installation-wide ones in it, or choose its composition
+under *How strength is worked out in this case*; that needs no second person, because it changes only
+that case, and the legend marks it. Both are recorded in the audit.
+
+**Rules on strength.** A rule written as a sentence (§7.6) may say "and the connection strength
+between it and … reaches X", or "… the shared-attribute rarity between it and another … reaches X". A
+strength figure is on the drawn scale (0 to 1) or **on the client's scale** (the raw sum, which only
+client parity has: under the standard composition such a rule raises nothing). It is previewed like
+any other, and judged as its author, on what its author may see: it never raises an alert on evidence
+its author could not read.
+
 ## 6. Questions to the model
 
 ![Questions: ask about the documents in this case](images/user/12-questions.png)
@@ -410,35 +567,127 @@ answer is shown later only to someone who could see every item it was built from
 lower does not see an answer built on events above their clearance. An answer kept before that was
 recorded may still be shown as before.
 
+**Choosing the engine.** Where the deployment offers more than one model engine, a **Model engine**
+choice sits above your question: the deployment's own model, and any provider your administrator has
+enabled, such as Gemini. The one your administrator chose is selected; change it before you ask to use
+another. Where only the deployment's own model is offered,
+there is no choice to make, and none is shown. Choosing an engine is a request, not a promise: material
+your deployment may not send outside is always answered by its own model, whatever you choose. If an
+engine cannot be used — it is no longer enabled, or has no key — the question is refused in words and
+nothing is sent; choose another and ask again.
+
+**Engines you cannot choose, and why.** Beside each provider the choice says **under contract** or
+**no contract**: whether your organisation holds a privacy agreement with that provider. Your
+administrator also decides, for each dataset, whether its material may be sent to a provider at all:
+never, only to one under contract, or to any. An engine your case's data may not reach is still listed,
+marked **not available**, and cannot be chosen; the reason is written beneath the choice, for example
+"Gemini: Not available for this case: “Enron corpus” is set to egress none, never sent to a hosted
+engine such as Gemini." If the engine your administrator made the default is one of these, the
+deployment's own model is chosen instead. Every dataset starts at "never", so until your administrator
+changes yours, every question is answered by the deployment's own model.
+
+**"Answered by …".** Under each answer, a small line says which engine and model produced it, for
+example "Answered by Gemini (gemini/gemini-2.5-flash)" or "Answered by This deployment's own model
+(qwen2.5:7b-instruct)". It is what the deployment says it used, not what you chose. An answer kept
+before engines were named has no such line. **Ask to search** shows the same choice and line, and the
+choice applies there too: your question is about the case, so it goes under the case's handling and
+from the case's datasets, through the same two checks as Ask the case. It reaches the engine you chose
+only when the case's material, as you see it, may leave the deployment and every dataset of the case
+allows that engine; otherwise the deployment's own model answers, and its line says so.
+
 To ask in words for a pattern rather than an answer, use **Ask to search** in the query builder (section
 5.10).
 
-## 7. Alerts and watches
+## 7. Monitoring and alerts
 
-### 7.1 Alerts
+### 7.1 The Monitoring place
 
-![Alerts: the queue, with an alert's detail and its close box](images/user/09-alerts.png)
+![Monitoring: the one queue, with a hotlist alert open](images/user/09-monitoring.png)
 
-The rail's **Alerts** (its badge counts what is open or claimed) holds the alerts the case's rules
-raised — structuring, rapid movement, circular flow, screening matches, shared contact details,
-unverified customers, and patterns drawn by analysts. **An alert concerning anything you cannot see
-is neither shown nor counted.**
+The rail's **Monitoring** (its badge counts what is open or claimed) is the one place for alerts. Its
+tabs are **Queue**, **Rules**, **Watches**, **Lists** and **Connection strength**, and, by your level in the
+case, **Held rows** (an Editor or Author) and **Audit** (an Author or an administrator).
 
-Open one to see why it was raised and what it concerns; **Show on the canvas** draws them. **Claim**
-it to work on it (**Release** gives it back). **Close as true positive** confirms the node it raised;
-**Close as false positive** leaves it a suggestion. Closing needs a reason. Triage needs Editor; a
-Viewer reads. The **Rules** tab shows the rules judging this case; an Author deploys and retires them.
+**The queue holds every kind of alert you may see**, in one list:
 
-An entry in this queue is raised by a **rule**, a typology such as structuring or a pattern drawn by an
-analyst. It is not a hotlist match: those are in **Watches** (section 7.2), and are read there.
+- **rule alerts**, raised by the case's rules — structuring, rapid movement, circular flow, screening
+  matches, shared contact details, unverified customers, and patterns drawn by analysts;
+- **hotlist alerts**, when data touches an identifier on a hotlist (section 7.5);
+- **watched-pattern alerts**, when a monitor's saved pattern matches new data.
 
-### 7.2 Watches
+**An alert concerning anything you cannot see is neither shown nor counted**, whatever its kind.
+
+Each row says its **severity**, what kind it is and what it found, then where it stands (open, or
+claimed and by whom), **who may see it**, how long it has waited ("2 hours old") and when it was raised.
+The most severe come first, then the newest. **Show**, **Kind** and **Severity** above the list choose
+which alerts to list; the choice is made by the server, so a count always means what it says.
+
+### 7.2 Severity and who sees an alert
+
+Every alert is **high**, **medium** or **low**. Until rules can set their own (a later release), each
+kind has its own:
+
+| Alert | Severity |
+| --- | --- |
+| A hotlist match | High |
+| A screening match | High |
+| Shared contact details | Low |
+| Any other rule, and a watched pattern | Medium |
+
+Who may see an alert is shown on its row:
+
+- **The case team**: a rule alert reaches every member of the case.
+- **Shared with team …**: a watched pattern's alert, and a hotlist's alert when its owner has shared
+  it, reach the owner and the people of the owner's **unit** (the unit your administrator gave your
+  account).
+- **Only its owner**: a hotlist kept to its owner, and an alert raised before teams existed.
+
+### 7.3 Working an alert, and closing it
+
+Open one to see why it was raised and what it concerns; **Show on the canvas** draws them. **Claim** it
+to work on it (**Release** gives it back). A rule alert can also be **given to** a member of the case:
+choose them by name under **Give to**, then **Give**. An alert shared with a team, or its owner's alone,
+is claimed by someone who can see it, never given to another person.
+
+**Closing needs a reason, in two parts.** Choose one **closing reason** — **True match**, **False
+positive**, **Duplicate**, **No further action** or **Referred** (the arrow keys move between them) —
+and say why in words; **Close the alert** stays unavailable until you have done both, and words of only
+spaces are refused. **True match** confirms the node it raised; every other reason leaves it a
+suggestion. OspreyFlow accepts no reason outside this list. Triage needs Editor; a Viewer reads. **Closing a high-severity
+alert needs a second person** (§7.12): closing it proposes the close, and another member approves it.
+
+### 7.4 Rules and templates
+
+The **Rules** tab shows the rules judging this case; an Author deploys and retires them. Above the
+form, **Templates** lists the typologies as named starting points (the four new AML templates are in
+§7.9), grouped by the work they
+serve (anti-money-laundering transaction monitoring, KYC, any case), each with what it looks for and
+the severity of its alerts. **Use** fills the form with the template's defaults and puts you on the
+rule's name; change anything, then **Deploy**. Everyone in the case sees the templates; only an Author
+has **Use**. A rule can also be written as a sentence (§7.6).
+
+The money-flow templates (structuring, rapid movement, circular flow) judge each load's movements with
+the movements around them, and only those whose two accounts the rule's author may see, in the rule's
+own dataset: a movement between accounts hidden from them shapes no finding.
+
+### 7.5 Watches, and whom a hotlist's alerts reach
 
 ![Watches: hotlists, monitors, and the alerts they raise](images/user/13-watches.png)
 
-**Watches** keeps a **hotlist** of identifiers — a phone number, an email address — each with a review
-date: any data that touches one raises an alert. A **monitor** runs a saved pattern against new data.
-Both watch only their case's data. **Jump into investigation** starts a case from an alert. An alert
+The Monitoring place's **Watches** tab keeps a **hotlist** of identifiers — a phone number, an email address, an account
+number — each with a review date: any data that touches one raises an alert. An account number is
+matched however its spaces are written: `GB58 LOYD 3096 1700 7099 43` and `GB58LOYD30961700709943` are
+the same account. A **monitor** runs a saved pattern against new data.
+Both watch only their case's data. Under them, the **Alert inbox** lists what your hotlists and
+monitors raised; **Jump into investigation** starts a case from an alert. There is no separate
+Watches place on the left rail: open **Monitoring**, then **Watches**.
+
+**Who its alerts reach.** Each hotlist says who its alerts reach in the Monitoring queue: **Only me**,
+or **Me and my team**. A new hotlist starts from your deployment's choice (only you, unless your
+administrator has chosen otherwise); change it when you make the hotlist, or later on its row. A
+hotlist made before this choice existed reaches only you until you change it. Where your deployment
+fixes the choice, the panel says so ("Alerts reach only you. The deployment sets this.") and offers
+none. A match on data you cannot see is never shared with your team. An alert
 whose evidence you cannot see says only that a match fired.
 
 **A hotlist alert explains itself.** In **Watches**, under **Alert inbox**, a hotlist alert is headed
@@ -467,6 +716,169 @@ to data this case does not read**, the alert names its type and name and says "i
 this case does not read", with no file and no row (section 5.6): a file name is as much a source as a
 row.
 
+### 7.6 A rule written as a sentence
+
+![A rule written as a sentence, its drawn pattern, and its preview on the last 90 days](images/user/22-rule-sentences.png)
+
+On the **Rules** tab, **Write a rule as a sentence** builds a rule from blanks, read as one sentence:
+*When a* subject *whose* conditions, *and is* related to something, *how often*, *then* raise an alert.
+Every blank is a choice from a list made from the deployment's ontology — its types, their properties
+and its link types — so there is nothing to type that could fail to be understood.
+
+- **Subject.** A type, grouped as people, objects, locations, events and organisations.
+- **Whose.** Up to five conditions on the subject's properties: *is*, *is one of*, *is above*, *is
+  below*, *is within a time window*, or, for a location, *is within a drawn area* (entered by its four
+  corners). A property marked highly sensitive is never offered.
+- **And is.** Optionally: *linked by* a link type to something; *within* 1 to 4 *steps of* something
+  of a type; *at a location in a drawn area*; *on one of my hotlists*; or, for a person or an
+  organisation, *on a screening list* at a name match you choose.
+- **How strongly connected.** Optionally: *the connection strength* between the subject and something
+  it is linked to (by a link type, or any; to a type, or anything) *reaches* a figure up to 1, or *on
+  the client's scale* a raw sum up to 10 (met only under client parity); or *the
+  shared-attribute rarity* between it and another of its type *reaches* a figure, per dataset or across
+  the case's datasets (§5.12). Both are read from the stored graph, so the rule runs after commit or on
+  a schedule, and both are worked out as you, the rule's author, may see them.
+- **Then.** The alert's severity; whether it goes to the case team or is labelled for your team; and
+  when the rule runs — after each load commits, or before it. Before commit you also choose what a hit
+  does: load with its alert, or hold its rows for a reviewer in **Held rows**. A rule that names a link
+  runs after commit, since a link is read from the stored graph.
+- **For.** *just me* (the alerts reach you alone, like a monitor's), *this case*, or — for an
+  administrator — *the whole deployment*, which watches every case's loads.
+
+**Show the drawn pattern** shows the same rule as the Query builder would draw it. Once deployed, the
+pattern is saved among your patterns, and you can open and change it there: the rule follows the
+pattern as it now reads. **Read a saved pattern as a sentence** goes the other way, from a pattern
+you drew to a sentence. A pattern a sentence cannot say (more than one link, or a pinned node) is
+refused in words.
+
+Deploying needs a name. A case Editor may deploy a rule *just for me*; a case Author deploys one for
+the case; only an administrator, who is also the case's Author, deploys one for the whole deployment.
+A sentence that names something the ontology does not declare is refused, naming the blank.
+
+### 7.7 How often: frequency and amount conditions
+
+A sentence may also say how often:
+
+- *a number of times or more within some days* — for example, present at a location 3 or more times
+  within 7 days;
+- *a total amount over a figure within some days* — the total of a link's declared amount, such as a
+  payment's amount, over 10,000 within 30 days;
+- *for the first time ever* — the subject's first event of that link type.
+
+The events counted are those of the link type you choose, with the subject at either end. They are
+counted as the rule's author: an event you may not see adds nothing to a count or a total, and is
+never a "first".
+
+### 7.8 Preview on the last 90 days
+
+**Preview on the last 90 days** runs the rule as you, over the case's stored data, and says how many
+alerts it would have raised, with up to five of them. Use it to set a threshold against evidence
+before you deploy. A preview raises no alert and writes nothing. It counts only what you may see, so
+it says nothing about anything hidden from you. If the rule would judge more subjects than the
+working-set limit, the preview is refused and counts nothing: narrow the sentence and preview again.
+Frequency conditions are counted over the 90 days.
+
+### 7.9 The AML templates: jurisdiction, cash, dormancy and velocity
+
+![The Rules tab: the AML templates, and the form filled from "High-risk jurisdiction"](images/user/24-aml-templates.png)
+
+Four templates watch a case's money movements (its *transacted* links), each with settings you choose
+and no formula to write:
+
+- **High-risk jurisdiction** — a payment to or from an account held in a jurisdiction on your list.
+  Type the list as two-letter country codes, separated by commas (for example `XA, XB`): the list is
+  part of the rule, so your organisation's policy list is what you enter. An account's jurisdiction is
+  its IBAN's country code, the IBAN's first two letters; an account whose number is not an IBAN has no
+  jurisdiction here.
+- **Large cash** — cash paid in, drawn out, or either, of an amount at or over a threshold (10,000 by
+  default) in one movement.
+- **Dormant account reactivated** — an account moving money again after a number of days (180 by
+  default) without a movement. An account that has never moved before is new, not dormant.
+- **Sudden rise in velocity** — an account whose movements over the last days (7) run at a factor (3)
+  or more of its own daily rate over the days before (90), with at least a minimum (5) in the last
+  days; measured by the number of movements or by the amount moved. An account with nothing in those
+  days before has no rate to rise from and raises nothing.
+
+Each raises a medium-severity alert in the queue, in words: the movement, the accounts and what made it
+a finding. They judge only movements and accounts you could see as the rule's deployer: a movement
+hidden from them neither wakes a dormant account nor adds to a rate. The last two compare an account
+with its own stored past, so they run after each load commits.
+
+### 7.10 Screening lists, re-screened when they change
+
+![The Lists tab: each list's version, entries, last update and state, the latest refreshes, and subscribing](images/user/23-screening-lists.png)
+
+The **Lists** tab shows each sanctions, PEP or adverse-media list the deployment screens against: the
+list it is (OFAC, the FCDO's UK Sanctions List, the UN or EU consolidated list, OpenSanctions, or HM
+Treasury OFSI's, which closed on 28 January 2026 and is marked "Closed list"), its version, how
+many entries it holds, when it last changed, its licence, and its state — up to date, not yet read, or
+why its last refresh failed, in words. A list read from a file that is not in its publisher's format is
+left as it was, and says so.
+
+When a list changes, OspreyFlow re-screens every customer in every case that has a **Screening on
+onboarding** rule (§7.4) against **the entries that changed only** — those added and those whose names,
+date of birth or country changed. An entry that did not change was screened when it arrived, so it
+raises nothing again. Each new match raises a high-severity screening alert in that case's queue,
+naming the customer and the list entry, with its score. Like every screening match, it is a suggestion:
+the link between the customer and the listed party is inferred until a person confirms it, by closing
+the alert as a **True match** (§7.3). Customers are screened as the rule's deployer and within the case's
+datasets, so no one is screened, or alerted on, outside what that person may see.
+
+**Licence not confirmed.** The **UN** and **OpenSanctions** lists are marked "Licence not confirmed",
+with the reason: no open licence was found for the UN list, whose general terms allow personal,
+non-commercial use only; OpenSanctions is CC BY-NC 4.0, and screening in a business is commercial use,
+which needs its own data licence. Until a licence is confirmed, these connectors read OspreyFlow's
+synthetic lists only.
+
+Administrators and data engineers subscribe to a list and refresh it from this tab (the administration
+guide, §9.5, says how), and may have it refreshed every day or every week; the **Schedule** column
+says when, or "By hand only". They see how many customers each refresh re-screened, and the alerts it
+raised, **in their own unit only**. Everyone else sees the lists, not those numbers.
+
+### 7.11 A rule that runs on a schedule
+
+![A rule written to run every day: its schedule, its runs, and the versions it has had](images/user/25-scheduled-rule.png)
+
+A rule written as a sentence (§7.6) runs as data loads — before or after each load commits — or **on a
+schedule**. Choose **Runs: on a schedule**, then **Every** day or week, the day for a weekly rule, and
+the hour (UK time). At each run the rule looks at what is already stored over the last day or week,
+as you see it, and raises an alert for each new finding, once.
+
+- **It runs as you**, its author, never as the system: it judges only what you may see, and only
+  while you may still sign in, deploy rules and are still an Author of the case (an Editor, for a rule
+  just for you).
+- **Schedule and runs**, under the rule, says when it runs next and what each run did: how many
+  alerts it raised, or why it did not run, in words. A run the deployment missed while it was down is
+  said too; after downtime only the latest run happens.
+- **If it is refused three times in a row** — say, because you can no longer sign in — it stops, and
+  says why. Changing the rule starts it again.
+- A rule for the whole deployment does not run on a schedule: it is judged within each case as that
+  case's data loads.
+
+### 7.12 A second person's approval
+
+![A rule for the whole deployment waiting for a second person, and a high-severity alert whose close waits for approval](images/user/26-second-person.png)
+
+Two decisions need a second person with the right, and the person who proposed one can never approve
+it.
+
+**A rule for the whole deployment** (§7.6) — deploying it, changing it or retiring it. A new one is
+listed as *not running: waiting for a second person's approval*, with who proposed it; a change or a
+retirement waits beside the rule, which runs as it stood until then. Another administrator who is an
+Author of the case sees **Approve** and **Reject** (with a reason); a rejected rule never runs. A rule
+for one case, or just for you, is not held up: it runs as soon as it is deployed or changed.
+
+**Closing a high-severity alert** that someone else may see. Choosing a closing reason, writing why
+and **Propose the close** proposes the close: the alert stays in the queue as *Closing*, with your reason. Another
+member who triages alerts in the case opens it and chooses **Approve the close**, or **Send back**
+with a reason, which returns it to you, claimed. You may withdraw your own proposal the same way. An
+alert only you can see (your own hotlist's, kept to you) has no second reader, and you close it alone.
+
+**Every rule keeps its versions.** **Versions**, under a rule, lists each one: what it did (deployed,
+changed or retired), who made it and when, and who approved or rejected it. A changed rule runs as the
+person who wrote the change, since it is their judgement now. Everything here is in the case's rule
+audit.
+
 ## 8. Ownership and due diligence
 
 ![Ownership: who stands behind an organisation, and its due diligence](images/user/10-ownership-due-diligence.png)
@@ -492,6 +904,46 @@ packs, exported to PDF), **Published**, **Data feeds** and **Dashboards**.
 
 **Dashboards** draws the deployment's boards inside the Glass, showing only those you may open. The
 same boards are at `bi.` in front of the deployment's address, signed in the same way.
+
+![A report pack holding an open alert, a trend over alerts and a closed alert](images/user/21-alerts-in-reporting.png)
+
+### 9.1 Alerts in a report pack
+
+In **Packs**, under **Add an item**, choose **Alert** and then one of the alerts of the case's queue
+that you can see (each listed by severity, status and what it found). The pack keeps the alert as it
+was when you added it:
+
+- what it found, in words, its kind, its severity and when it was raised;
+- the entities it matched, and its evidence: the links and transactions it cites;
+- whether it was still open: an open alert says "Open: not yet decided when this was added";
+- if it was closed, its closing reason (for example "Closed as True match") and the words given;
+- "Inferred: no one has confirmed this match" until a person confirms it, by closing it as a True
+  match. A match is never shown as confirmed on anyone's behalf.
+
+**Refresh** reads the alert again, so an alert added while open can show how it was closed; the
+earlier copy stays in the pack's history.
+
+An alert item is marked at the highest marking of what it cites, and rests on every node, link and
+transaction it cites. A reader who may not see all of them does not get the item, and is told only
+that some items are withheld, never how many or which. Exporting checks each item again for the
+person exporting; someone who may see none of it is refused, and nothing is recorded.
+
+### 9.2 Alert trends
+
+In **Trends**, **What to count** offers **Events** or **Alerts**. An alert trend counts the alerts
+raised each week or month that you may see. Split it by **rule** (each typology rule by its name,
+hotlists together, monitors together), **typology**, **severity** or **outcome**, and narrow it with
+up to five filters on the same fields. Alerts are counted, never summed. An alert on something you
+cannot see is in no bar and no total. Save an alert trend and add it to a pack as any trend; it
+is bounded in the same way (104 periods and 12 series), and past that you are asked to narrow it.
+
+### 9.3 The monitoring dashboard
+
+The figures dashboards read now include monitoring figures for every kind of alert: alerts raised
+per week by rule, alerts closed per week by outcome, how long alerts took to close, and hotlist
+matches per week. They are counted as the dashboard's own account may see them, case by case. A
+hotlist kept "only me" is counted for its owner alone, so it never appears on a shared board. An
+administrator sets the board up (administration guide §12).
 
 ## 10. Judgements
 
@@ -526,7 +978,7 @@ recorded. Report packs export to PDF from the Packs and Published tabs.
 | Anywhere | `/` | Search |
 | Anywhere | `?` | The welcome panel, with keys worth knowing |
 | Canvas | Tab, Shift+Tab | Move into and out of the canvas |
-| Canvas | Arrows | Step to the next or previous neighbour |
+| Canvas | Arrows | Step to the next or previous neighbour; a screen reader hears its name, type and links |
 | Canvas | Ctrl/Cmd+Arrows | Step within the selection; with Shift, through every node |
 | Canvas | Space | Add or remove the focused node from the selection |
 | Canvas | Enter | Expand the focused node, or read a document |
@@ -536,6 +988,10 @@ recorded. Report packs export to PDF from the Packs and Published tabs.
 | Canvas | `F` | Fit the graph to the view |
 | Canvas | Shift+Arrows | Move the selection; with Alt, further |
 | Canvas | Delete | Hide the selected link, or remove the selection from view |
+| Matrix | Arrows, Home, End | Move between cells; with Ctrl, Home and End go to the first and last cell |
+| Matrix | Page Down, Page Up | The next or previous page of rows |
+| Matrix | Enter | Select the row's node or link |
+| Matrix | Space | Add the row's node to the selection, or take it out |
 | Anywhere | Esc | Clear the selection; close a menu, drawer or reader |
 | Forms | Ctrl/Cmd+Enter | Confirm a reason, save a change or a note, ask a question |
 | Side panels | Alt+Up, Alt+Down | Move a panel up or down the column |

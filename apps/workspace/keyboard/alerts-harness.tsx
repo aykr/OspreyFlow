@@ -10,7 +10,7 @@ import { AlertsPlace } from "../src/alerts/AlertsPlace";
 
 declare global {
   interface Window {
-    __ALERTS__?: { canvasNodeIds: string[] | null };
+    __ALERTS__?: { canvasNodeIds: string[] | null; openedInvestigationId?: string };
   }
 }
 
@@ -21,10 +21,18 @@ createRoot(document.getElementById("root")!).render(
     apiBaseUrl="http://keyboard-test.invalid"
     bearerToken="unused"
     investigationId="inv-1"
-    accountId="analyst-1"
-    isAdministrator={false}
+    // ADR-133 stage (d): `?account=` signs in as another member (a second person), `?admin=1` as an
+    // administrator, who approves a whole-deployment rule's change.
+    accountId={new URLSearchParams(window.location.search).get("account") ?? "analyst-1"}
+    isAdministrator={new URLSearchParams(window.location.search).get("admin") === "1"}
+    // ADR-133 stage (c): `?lists=manage` renders the Lists tab for whoever may load screening lists.
+    canManageLists={new URLSearchParams(window.location.search).get("lists") === "manage"}
     onCanvas={(_outcome, nodeIds) => {
       window.__ALERTS__!.canvasNodeIds = nodeIds;
+    }}
+    // The owner's answer of 1 November 2026: the alert inbox's jump, from the Watches tab.
+    onOpenInvestigation={(id) => {
+      window.__ALERTS__!.openedInvestigationId = id;
     }}
   />,
 );

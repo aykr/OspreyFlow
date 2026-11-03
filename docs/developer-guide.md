@@ -1,5 +1,8 @@
 # OspreyFlow — Developer Guide
 
+OspreyFlow is an open-source intelligence mapping platform for crime analysis, anti-money-laundering,
+fraud detection, and event monitoring and alerting.
+
 For data engineers: the people who bring data into OspreyFlow. It covers the Ingest Studio from a
 first pipeline to a scheduled one, the domain model data is mapped into, the rules a load must
 pass, and the interfaces a data engineer uses beyond the screens. It describes what is built, and
@@ -11,10 +14,16 @@ whoever installs and runs OspreyFlow, and the [user guide](user-guide.md), for a
 <!-- document-control:begin -->
 ## Document control
 
-**Version 1.6** · 2026-10-29 · For OspreyFlow v0.4.1 · Issued
+**Version 1.12** · 2026-11-02 · For OspreyFlow v0.4.1 · Issued
 
 | Version | Date | What changed |
 | --- | --- | --- |
+| 1.12 | 2026-11-02 | Checked against the code end to end (build order step 10). §7.6 and §7.7: the tests named are in the developer repository, beside the test suites, not in this one. |
+| 1.11 | 2026-11-02 | §7.6: the client's rarity measure (the default) and the IDF measure, the two compositions, dataset triggers and shared-value influencers, and the port's new parameters. New §7.7, The client's code and OspreyFlow's equivalent: their R function beside OspreyFlow's arithmetic, line by line, a worked synthetic example whose numbers match, the golden parity test, and the row shapes that do not map exactly. |
+| 1.10 | 2026-11-02 | New §7.6, Connection strength: the stored weight's formula, the influencer schema and its resolution order, influencers applied at read time under the reader's access, the rarity query, and shipping influencers in the weights file. §9.1: the strength and rarity routes and the influencers' routes. |
+| 1.9 | 2026-11-01 | §9.1: the API's OpenAPI document, `GET /v1/openapi.json`, signed in, its version the release. |
+| 1.8 | 2026-11-01 | §3.8a: the Checks on load step — attaching the case's and the deployment's rules to a pipeline and choosing what a hit does there. §3.8: Verify shows the alerts its sample would raise, beside the rejections, and writes nothing. §2: a data engineer attaches rules but does not write them. |
+| 1.7 | 2026-11-01 | The opening says what OspreyFlow is for: intelligence mapping, for crime analysis, anti-money-laundering, fraud detection, and event monitoring and alerting. |
 | 1.6 | 2026-10-29 | Describes v0.4.1. No change to its content. |
 | 1.5 | 2026-10-28 | §6.1: row numbers, counted from 1 in the Glass and from 0 in the API. |
 | 1.4 | 2026-10-27 | §7.5: the tests behind it described, not named by path (the build's folder is not part of the product). |
@@ -67,7 +76,9 @@ act), and their **rights** (what they may do). A right never widens what a perso
 | `create_case`, `share_case`, `investigate`, `run_analysis`, `read_reports` | Work in cases alongside analysts |
 
 It also carries `revert_loads`, for reverting a load — which no screen or command uses yet (section
-6.4). It does **not** hold `edit_graph`, `confirm_inferred`, `extract_files`, `resolve_entities`,
+6.4). It attaches rules to a pipeline (section 3.8a) but does not write them: a rule written as a
+sentence needs the analyst's `keep_watches` as well as `deploy_rules`, so an analyst writes it in
+Monitoring. It does **not** hold `edit_graph`, `confirm_inferred`, `extract_files`, `resolve_entities`,
 `export` or `read_report_feed`: those are the Analyst's and Reports Viewer's. An administrator can
 grant any single right on its own.
 
@@ -219,6 +230,39 @@ case's datasets as you), how many rows were deduplicated or rejected, and the gr
 Rejections are grouped by cause, naming the adapter and field — never the value. A value the
 ontology refuses (a date of birth that is not a date) rejects its row; nothing is silently
 changed. **A recipe is published only after it has verified.**
+
+![Verify: the alerts the sample would raise under the pipeline's checks, beside the rejections](images/developer/12-verify-would-raise.png)
+
+**Alerts this sample would raise.** Beside the rejections, Verify judges the sample with the
+pipeline's checks on load (section 3.8a), each rule as its author, as the load would — and lists, for
+each alert, the rule, its severity, the entity it names and what a hit would do here: load with an
+alert, or hold the rows. Nothing is raised, held or written: the run that does this has no way to
+write. It judges only the rows you may read in full, and names only entities the sample shows you.
+Some checks cannot be judged in a dry run, and say why: one that reads money movements or counts
+events (a dry run makes neither), and one that reads links already in the graph. Those are judged
+when the load runs.
+
+### 3.8a Checks on load
+
+![Checks on load: the rules that judge this pipeline's loads, and what a hit does here](images/developer/13-checks-on-load.png)
+
+**Checks on load**, a button at the top of a pipeline, chooses which rules judge this source's loads
+and what a hit does here. The list holds the case's rules and the whole deployment's that judge data
+as it loads, each with its sentence or typology in words, its severity and when it runs.
+
+- **Apply** attaches a rule to this pipeline. Until anyone chooses, every rule of the case judges the
+  pipeline's loads, as it always has; once you save, only the rules you attached do.
+- **A hit here** chooses what happens: **loads with an alert**, or **holds the rows for review** (they
+  wait under Held rows for a reviewer). Holding is offered only for a rule that runs before the load
+  commits.
+- **A rule for the whole deployment applies to every pipeline**: it cannot be left off, though you may
+  make its hits hold here. A rule an analyst keeps for themselves is their own watch, not a check on
+  a load, and is not listed.
+- A rule waiting for a second person's approval is listed, and runs once approved.
+
+**Save the checks** records your choice, with your name; it is read at every run, scheduled or not,
+and when held rows are released. You attach rules here; you do not write them. Rules are written by
+analysts in Monitoring, as sentences or from templates.
 
 ### 3.9 Publish, versions and running
 
@@ -411,6 +455,172 @@ wrap the read. Does it send the element, or anything built from it, to a reader?
 principal, changes an element in two datasets, and checks that every stored source is kept and that
 what is sent back carries none.
 
+### 7.6 Connection strength: weights, influencers and rarity
+
+A link's **connection strength** is its stored weight with the influencers that apply to it, worked
+out when it is read. **Shared-attribute rarity** is a separate measure beside it. Both are computed in
+the graph adapter, as the reader, and neither is ever stored (ADR-139; spec 01 §6.1a).
+
+**The stored weight** (weights version 3, `packages/ontology/weights/default.yaml`):
+
+```
+weight = normalise( α·log1p(occurrences)/log1p(heavy(type)) + β·recency(last seen) )
+normalise(x) = 1 / (1 + e^(−(x − midpoint)/scale)),   recency(t) = 0.5^(age/90 days)
+```
+
+with α = 0.5, β = 0.2, `scale` = α/3 and `midpoint` = β + α/3, or a structural type's fixed weight.
+It comes from the link alone (ADR-123): no other link's count reaches it.
+
+**Influencers** (`packages/schemas/strength.py`, `StrengthInfluencer`):
+
+| Field | Meaning |
+| --- | --- |
+| `id`, `label` | Its key (lower case, `-` and `_`) and what the legend says |
+| `trigger` | `{entity_type, property, values}` (`kind: record`, the default): a record of that type whose property holds one of the values, at one end of the link or linked to both ends. `{kind: dataset, datasets}`: every link that belongs to one of those datasets, applied only where the reader may read it (ADR-139 Amendment 2). Omitted: a **direct-links** influencer, applying to its link types always |
+| `link_types` | The link types it changes. `SHARED_VALUE` (reserved; no ontology declares it) is a pair linked through a shared value, the client's `dup_*` rows; it takes an `add` triggered by a dataset or by nothing |
+| `change`, `size` | `add` (a boost to the pre-logistic score, above 0 and at most 2), `multiply` (0.1 to 5), `floor` (a strength, above 0 and at most 1) or `exclude` (size 0: no stronger than the stored weight) |
+| `enabled` | `false` in a later layer switches off the influencer of the same id beneath it |
+| `note` | Shown beside it, such as "to be confirmed with the client" |
+
+Applied to a link of stored weight `w` (`ontology/influencers.py`, `connection_strength`):
+
+```
+raw      = midpoint + scale · ln(w / (1 − w))       # the logistic's inverse
+strength = normalise( (raw + Σ add) · Π multiply )
+strength = max(strength, every floor)
+strength = min(strength, w)   if any exclude
+```
+
+With nothing applying, the strength is `w`. Each step rises with `w`, so adding occurrences never
+lowers a strength, whatever influencers apply (the developer repository's
+`tests/ontology/test_influencers.py` proves it over a grid of every combination).
+
+**Resolution order:** a case override, then the installation set, then the weights file. Influencers
+are matched by `id`; a later layer's replaces an earlier one's, and a case may switch any off by id.
+The installation set is maker–checker (the right `manage_strength_influencers`; a second holder
+approves, never the proposer; every version kept in `strength_influencer_versions`). A case override
+is its Author's (`case_strength_influencers`, every version kept). Both are audited.
+
+**Read time, under access.** `GraphPort.connection_strengths(edge_ids, principal, influencers=…)`
+reads the links as `get_edges` does (the link and both ends visible), then, for each triggered
+influencer, finds the evidencing records with the access step on every vertex and every link it
+steps over. A record the reader may not see, or one reached only over a link they may not see, is not
+found, so it changes nothing: the strength is the strength in a world without it. The conformance
+suite's `test_unauthorised_connection_strength_matches_a_world_without_the_hidden_evidence` holds
+every adapter to it.
+
+**The rarity query.** `GraphPort.shared_attribute_rarity(node_ids, principal, scope=…, measure=…)`,
+for two visible entities of one type. An attribute (a **shared value**) is a visible node (of no type in
+the file's `rarity.exclude_types`) linked to each of the two by a visible link. Two measures, chosen by
+the weights file's `rarity.measure` or an installation version (ADR-139 Amendment 2):
+
+```
+share (the client's, the default):
+  rarity(a)    = 1 − C(k(a), 2) / Σ_b C(k(b), 2)      # b: every visible value of a's type in scope
+  rarity(u, v) = max over shared values a of rarity(a)
+idf:
+  rarity(u, v) = Σ over shared attributes a of ln( N_visible / df_visible(a) )
+```
+
+`k(a)` and `df_visible(a)` both count the visible entities of the pair's type linked to `a` by a
+visible link; `N_visible` counts the visible entities of the pair's type in scope. Under `share`, the
+sum over the kind is read too: every visible value of the kind with its visible holders, counted first
+and held to the cap (`render_kind_holders`), so a hidden holder is in no `k` and no sum
+(`test_unauthorised_share_rarity_matches_a_world_without_the_hidden_holders`). **Per dataset** (the default) it is
+worked out in each dataset the two and the attribute all belong to, the highest kept and named; **across
+the case**, over every dataset the reader may read. In ArcadeDB it is three reads: the entities and
+their attribute ids, each attribute's visible neighbours with their types and datasets, and the
+visible count per type and dataset (and, under `share`, the kind's values and holders). More pairs to
+score, or holders to read, than the cap (2,000,000) is refused as `limit_exceeded`, never scored in
+part. The Glass is sent the score and the visible shared attributes, never `N`, `df`, `k` or a sum.
+
+**Two compositions** (ADR-139 Amendment 2). The weights file's `composition:` (`standard`), an
+installation version's `composition`, or a case override's `composition` (resolved case, installation,
+file: `ontology/influencers.py`'s `resolve_settings`) chooses how strength is made:
+
+```
+standard:       strength = the influencers applied to the stored weight (above)
+client_parity:  raw_sum  = rarity term + Σ add   (no count, no recency; no multiply, floor or exclude)
+                strength = 1 / (1 + e^(−(raw_sum − 1) / 0.1))      # parity_drawn, order preserving
+  a stored link's rarity term   = 1 − 1/n   (n: the visible links of its type in the dataset)
+  a shared-value pair's term    = the share rarity of the value linking them
+```
+
+`connection_strengths(…, composition="client_parity")` returns each link's `rarity_term`, `raw_sum`
+and the `dataset` it was worked out in (the highest-scoring of those it belongs to and the reader may
+read); `shared_attribute_rarity(…, influencers=…, composition="client_parity")` returns each pair's
+`parity_raw`, `parity_strength` and `parity_applied`. Client parity always reads the `share` measure.
+The routes pass the case's resolved composition and measure; the legend carries them
+(`composition`, `composition_layer`, `rarity_measure`) and names a dataset trigger only by the
+datasets the reader may read.
+
+**Shipping influencers in the weights file.** The developer defaults sit beside the weight versions,
+under `influencers:`; they are not a weight version and change no stored weight:
+
+```yaml
+influencers:
+  - id: direct
+    label: Direct link
+    link_types: [COMMUNICATED_WITH, TRANSACTED, VISITED, SHARED_CELL_WITH]
+    change: add
+    size: 0.1348
+    note: to be confirmed with the client
+rarity:
+  exclude_types: [Alert]
+  measure: share          # or idf
+composition: standard     # or client_parity
+```
+
+A shipped boost's size is calibrated, not tuned: how far doubling an ordinary link's count (from the
+default rule's heavy count, 10, to 20) moves its pre-logistic score, α·(ln 21 − ln 11)/ln 11 = 0.1348.
+`test_influencers.py` holds the shipped sizes to it, and the loader refuses a malformed influencer by
+its position and id.
+
+### 7.7 The client's code and OspreyFlow's equivalent
+
+The client supplied the R function their pipeline uses (ADR-139 Amendment 2). It is called once per
+dataset's link table; `the_col` holds the shared value itself. Line by line, with what OspreyFlow does
+in its place:
+
+| The client's R | What it does | OspreyFlow's equivalent |
+| --- | --- | --- |
+| `shared_values_table_1 <- edges_dt[, .(shared_values=get(the_col))][, .N, by = shared_values]` | `N`: how many rows of the table carry each value | A value is an attribute node; the `dup_*` rows through it are its pairs of visible holders, `C(k, 2)` (`pair_links`), `k` counted by the adapter under access |
+| `shared_values_table_1[, edge_strength_1 := (1 - (N / sum(N)))]` | `1 − N/ΣN`, `ΣN` being every row of the table | `share_rarity(C(k,2), Σ_b C(k_b,2))`, the sum over the visible values of the same kind in the dataset (`ShareTotals`) |
+| `setnames(…)` | Renames the columns back | — (no arithmetic) |
+| `edges_dt <- merge(edges_dt, shared_values_table_1, by = the_col, all.x = T)` | Each row takes its value's term | A shared-value pair takes the term of the value linking it (the highest, if several: Amendment 3); a stored link takes `1 − 1/n`, itself a value held by its two ends among the `n` visible links of its type |
+| `edges_dt[, edge_strength := edge_strength_1 + abs_add]` | `abs_add` on every row of the table | A **dataset-triggered** influencer, `add` of `abs_add`, on the dataset's link types and `SHARED_VALUE` |
+| `edges_dt[, edge_strength_1 := NULL]` | Drops the column | — |
+| `edges_dt[!(type %like% "dup_"), edge_strength := edge_strength + non_dup_add]` | `non_dup_add` on every row not of a `dup_*` type | The **direct-links** influencer (no trigger), `add` of `non_dup_add`, on the stored link types; never on `SHARED_VALUE` |
+
+`raw_sum` is the client's `edge_strength`; the Glass draws `parity_drawn(raw_sum)` and the Inspector
+shows `raw_sum` to four places.
+
+**A worked example** (synthetic; the developer repository's `tests/ontology/client_r_function.py`). Three tables, each called with
+its own `abs_add` and a `non_dup_add` of 0.2:
+
+| Dataset | Rows | `abs_add` | The client's figures | OspreyFlow's figures |
+| --- | --- | --- | --- | --- |
+| phones | `dup_phone`: P1–P2 (ph1); P3–P4, P3–P5, P4–P5 (ph2); P1–P6 (ph3); P2–P6 (ph4) | 0.05 | ΣN = 6; ph1, ph3, ph4: 1 − 1/6 + 0.05 = **0.8833**; ph2: 1 − 3/6 + 0.05 = **0.5500** | holders 2, 3, 2, 2: Σ C(k,2) = 1 + 3 + 1 + 1 = 6; the same two figures, as `parity_raw` |
+| calls | `call`: X1–X2, X2–X3, X3–X4, X4–X5, each its own value | 0.1 | ΣN = 4; 1 − 1/4 + 0.1 + 0.2 = **1.0500** | four visible `COMMUNICATED_WITH` links: 1 − 1/4, plus the dataset and direct adds: **1.0500** as `raw_sum` |
+| transfers | `money`: T1–T2, T2–T3 | 0.15 | ΣN = 2; 1 − 1/2 + 0.15 + 0.2 = **0.8500** | two visible `TRANSACTED` links: **0.8500** |
+
+The golden parity test (`test_client_parity_scores_equal_a_transcription_of_the_clients_r_function`,
+in the `GraphPort` conformance suite) runs that table through a line-by-line transcription of the R
+function, loads the same data into the store, reads it back under `client_parity`, and asserts every
+row's score is identical; planting a slip (counting holders instead of pairs, or leaving the dataset's
+add off the shared values) turns it red.
+
+**How a direct row's term arises in their code, and where the mapping stops.** The R function adds
+`edge_strength_1` to every row, a direct row included: its `the_col` holds that row's own value, so its
+term is `1 − N(v)/ΣN`, with `ΣN` every row of the table of every type. OspreyFlow reads a stored link as
+a value of its own among the links of its type in the dataset. The two agree exactly when one call of
+the function holds **one kind**: `dup_*` rows through values of one kind, or direct rows of one type,
+each carrying its own value. They do **not** agree when one call mixes kinds (`dup_*` and direct rows
+together, two shared-value kinds, or two direct types: the client's `ΣN` then counts every row,
+OspreyFlow's one kind; `test_a_table_mixing_kinds_is_the_shape_that_does_not_map_exactly` shows it as
+a figure), nor when several direct rows carry one value (OspreyFlow stores one link per pair and type).
+Both are open questions for the client (ADR-139 Amendment 3).
+
 ## 8. Screening lists
 
 Sanctions, PEP and adverse-media lists are kept beside the graph, not in it, deployment-wide, and
@@ -434,6 +644,10 @@ Every route is under `/v1`; a case's routes are under `/v1/investigations/{inves
 missing right is refused with `403` and the right's name; a case you have no level on answers as if
 it did not exist.
 
+**The OpenAPI document** describes every route: `GET /v1/openapi.json` at the deployment's own address,
+signed in like every other route. Its `info.version` is the release the deployment runs (for example
+`v0.4.1`, or `dev-<commit>` off a release), the same version Admin → System shows.
+
 | Method and path | Needs |
 | --- | --- |
 | `GET /v1/ingest/connectors`, `/v1/ingest/packs`, `/v1/ingest/transforms` | Signed in |
@@ -450,7 +664,12 @@ it did not exist.
 | `GET …/held-rows` | `read_held_rows`, Editor |
 | `POST …/ingest/recipes/{recipe_id}/held-rows/release`; `POST …/held-rows/reject` | `decide_held_rows`, Author |
 | `GET /v1/admin/schedules` and its actions | `operate_schedules` |
+| `POST …/connection-strength`; `POST …/rarity` | `investigate`, Viewer: strengths and rarity over the working set, as the reader |
+| `GET …/strength-influencers` | `investigate`, Viewer: the legend and the case's override |
+| `PUT …/strength-influencers` | `investigate`, Author: the case's override |
+| `GET`, `POST /v1/strength-influencers`; `POST /v1/strength-influencers/{version}/approve`, `…/send-back` | `manage_strength_influencers`; never the proposer's approval |
 | `GET /v1/me/rights` | Signed in: your own rights |
+| `GET /v1/openapi.json` | Signed in: the OpenAPI document |
 
 ### 9.2 Files on the server
 

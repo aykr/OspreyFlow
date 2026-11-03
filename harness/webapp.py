@@ -184,6 +184,7 @@ from schemas.deployment import (
     ModelsConfig,
     OspreyConfig,
     Profile,
+    generated_folder,
 )
 
 #: The built frontend's own output directory — `apps/harness/dist`, present once `npm run build`
@@ -390,6 +391,14 @@ def create_app(
 
     @app.post("/api/consequences")
     def post_consequences(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        # S11: Small and Enterprise need an https:// address, but a profile's consequences
+        # (machines, orchestrator, memory) do not depend on it, and the Profile screen previews a
+        # choice before its address is typed. So the preview stands in an HTTPS address for a
+        # cloud profile; the save (`PUT /api/config`) judges the real one.
+        if body.get("profile") not in (None, Profile.LOCAL_LITE.value):
+            given = body.get("network")
+            network: dict[str, Any] = given if isinstance(given, dict) else {}
+            body = {**body, "network": {**network, "public_origin": "https://preview.invalid"}}
         try:
             config = OspreyConfig.model_validate(body)
         except ValidationError as exc:
@@ -474,7 +483,7 @@ def create_app(
             raise HTTPException(status_code=501, detail=str(exc)) from exc
 
     def _out_dir() -> Path:
-        return out_root / _read_config(config_path).profile.value
+        return out_root / generated_folder(_read_config(config_path))
 
     def _preflight_events(context: PreflightContext, *, only: str | None) -> Iterator[bytes]:
         for result in run_streaming(context, only=only):

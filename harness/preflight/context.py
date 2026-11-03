@@ -17,6 +17,7 @@ actually be put into that state", not at "is a fake more convenient".
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -27,7 +28,7 @@ from typing import Any
 
 import yaml
 
-from schemas.deployment import OspreyConfig
+from schemas.deployment import OspreyConfig, host_folder_source
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -140,6 +141,16 @@ class PreflightContext:
     #: one: nothing in the specification projects this yet, and the check says so rather than
     #: implying the number is derived.
     projected_staging_bytes: int = 20 * 1024**3
+    #: ADR-137: the host ports the deployment's own running containers publish, when an installed
+    #: deployment is applied again. The `ports` check does not bind-test them: the deployment
+    #: holding its own ports is not a reason to refuse its own apply.
+    own_ports: frozenset[int] = frozenset()
+
+    def host_folder(self, value: str) -> Path:
+        """`components.storage.ingest` or `tiles` on this machine, read the way Compose reads the
+        rendered mount (ADR-054 Amendment 6): a relative path from the product folder, whatever
+        folder the check is run from."""
+        return Path(os.path.normpath(self.out_dir / host_folder_source(value)))
 
     def rendered_compose(self) -> dict[str, Any]:
         """The compose file Stage 2 §1 wrote for this profile. Raises `RenderedOutputMissing` when

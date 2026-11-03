@@ -4,6 +4,8 @@
 // through `PUT /api/install/answers`; `harness/install_page.py` serves both.
 import { useEffect, useState } from "react";
 
+import { PRODUCT_STATEMENT } from "../../workspace/src/welcome/statement";
+
 import { errorMessage, getConfig, getInstallState, putConfig, putInstallAnswers } from "./api/client";
 import type { InstallAnswers, InstallMode, InstallState, OspreyConfig, Profile } from "./api/types";
 import { CloudScreen } from "./screens/CloudScreen";
@@ -23,8 +25,20 @@ import { SummaryRail } from "./SummaryRail";
 
 // Each mode's own profile (`ospreyflow.answers.PROFILES`), written to the draft when the mode is
 // saved. Enterprise's is not written: a cluster profile is refused until it names its hosts, which
-// stage B7 collects, so its answers are kept and the draft is left as it is.
-const PROFILE_FOR: Partial<Record<InstallMode, Profile>> = { lite: "local-lite", small: "small" };
+// stage B7 collects, so its answers are kept and the draft is left as it is. Small's is not written
+// with the mode either: Small is HTTPS (S11, the owner's ruling of 2 November 2026), so its profile
+// is refused until its address is known, and the Domain screen writes the two together.
+const PROFILE_FOR: Partial<Record<InstallMode, Profile>> = { lite: "local-lite" };
+
+/** The draft's profile and address for a Small install whose domain is answered, when the draft
+ * does not already say so; otherwise nothing to write. */
+function smallDraft(answers: InstallAnswers, config: OspreyConfig): Partial<OspreyConfig> | null {
+  const domain = answers.mode === "small" ? answers.cloud?.domain?.trim() : undefined;
+  if (!domain) return null;
+  const origin = `https://${domain}`;
+  if (config.profile === "small" && config.network?.public_origin === origin) return null;
+  return { profile: "small", network: { ...config.network, public_origin: origin } };
+}
 
 export function InstallApp() {
   const [config, setConfig] = useState<OspreyConfig | null>(null);
@@ -47,9 +61,10 @@ export function InstallApp() {
     const profile = PROFILE_FOR[answers.mode];
     const modeChanged = state !== null && answers.mode !== state.mode;
     setState(await putInstallAnswers(answers));
-    if (modeChanged && profile) {
+    const draft = modeChanged && profile ? { profile } : config ? smallDraft(answers, config) : null;
+    if (draft) {
       try {
-        setConfig(await putConfig({ profile }));
+        setConfig(await putConfig(draft));
       } catch (exc) {
         // The answers are saved; the draft keeps its profile, which the Profile screen can still change.
         throw new Error(`Your mode is saved, but its profile could not be set: ${errorMessage(exc)}`);
@@ -78,6 +93,8 @@ export function InstallApp() {
     <div className="harness-app">
       <SummaryRail decided={decided} screens={nav} ingestRoot={config.components?.storage?.ingest} />
       <main>
+        {/* ADR-034 Amendment 1: what the product is, above every screen. */}
+        <p className="help">{PRODUCT_STATEMENT}</p>
         <nav aria-label="Install screens">
           {nav.map((name) => (
             <button
@@ -98,7 +115,7 @@ export function InstallApp() {
         {current === "Domain" && <DomainScreen state={state} onSaveAnswers={handleSaveAnswers} />}
         {current === "Components" && <ComponentsScreen config={config} onSave={handleSave} />}
         {current === "Map" && <GeospatialScreen />}
-        {current === "Models" && <ModelsScreen config={config} onSave={handleSave} />}
+        {current === "Models" && <ModelsScreen config={config} onSave={handleSave} keyEntry />}
         {current === "Governance" && <GovernanceScreen config={config} onSave={handleSave} />}
         {current === "Demo packs" && <DemoPacksScreen state={state} onSaveAnswers={handleSaveAnswers} />}
         {current === "Review" && (

@@ -10,6 +10,7 @@ import type {
   OntologySchema,
   PublicMapConfig,
   Sighting,
+  StrengthLegend,
 } from "../../../packages/schemas/generated";
 import { fetchSightings } from "./analytics/api";
 import { followCrossFilterWithMapBins } from "./crossfilter/mapBins";
@@ -66,6 +67,8 @@ import { ResolutionThresholdControl } from "./resolution/ThresholdControl";
 import { placeableTypes, resolveNodeCoordinates } from "./map/geometries";
 import { HotspotHistogram, locationEdgeTypeNames } from "./map/HotspotHistogram";
 import { MapView } from "./map/MapView";
+import { MatrixView } from "./matrix/MatrixView";
+import { fetchCaseInfluencers } from "./strength/api";
 import { defaultProvider, fetchMapConfig } from "./map/providers";
 import { instantAtFraction, itemsUpTo } from "./playback/math";
 import {
@@ -89,6 +92,7 @@ import { placeOf, revealPanel } from "./investigation/openAttachment";
 import { caseIsOpenable, openCase } from "./investigation/cases";
 import { bringFactIntoView } from "./questions/graphFacts";
 import { QuestionsPanel } from "./questions/QuestionsPanel";
+import { exploreOverlayPlace } from "./explore/exploreOverlayPlace";
 import { ExplorePanel } from "./explore/ExplorePanel";
 import type { BusyDay, RankedLink } from "./explore/exploreApi";
 import { SiteCalibrationWizard } from "./site/SiteCalibrationWizard";
@@ -104,7 +108,6 @@ import type { HistoryStepSummary } from "./workingset/models";
 import { setWelcomeDismissed, useHelpKey, welcomeDismissed, WorkspaceWelcome } from "./welcome/WorkspaceWelcome";
 import { SidePanelStack } from "./layout/SidePanelStack";
 import { Timeline } from "./timeline/Timeline";
-import { AlertInbox } from "./watches/AlertInbox";
 import { AlertsPlace } from "./alerts/AlertsPlace";
 import { AdminPlace } from "./admin/AdminPlace";
 import { EmbeddedDashboards } from "./reports/EmbeddedDashboards";
@@ -120,8 +123,6 @@ import {
 import { startScreen } from "./shell/startScreen";
 import { loadHome, openInQueue, summariseHome, type HomeSummary } from "./home/homeData";
 import { OwnershipPlace } from "./ownership/OwnershipPlace";
-import { HotlistPanel } from "./watches/HotlistPanel";
-import { MonitorPanel } from "./watches/MonitorPanel";
 import {
   connectDeltaClient,
   type DeltaClient,
@@ -447,6 +448,10 @@ export function App() {
   // in its own colour, dotted. `null` until read, or when the read fails: the ontology's alone.
   const [caseLinkTypes, setCaseLinkTypes] = useState<CaseLinkTypes | null>(null);
   const [linkTypesRead, setLinkTypesRead] = useState(0);
+  // ADR-139 decision 7: the case's connection-strength legend (the influencers in force), read again
+  // whenever the influencer editor saves (`strengthRead`).
+  const [strengthLegend, setStrengthLegend] = useState<StrengthLegend | null>(null);
+  const [strengthRead, setStrengthRead] = useState(0);
   const edgeTypes = useMemo(
     () => caseLinkTypes?.definitions ?? ontologyEdgeTypes,
     [caseLinkTypes, ontologyEdgeTypes],
@@ -590,7 +595,7 @@ export function App() {
   }, [counts, classificationOrder]);
 
   const [view, setView] = useState<
-    "graph" | "map" | "reports" | "admin" | "dashboards" | "ingest" | "dossier" | "watches" | "alerts" | "ownership"
+    "graph" | "map" | "matrix" | "reports" | "admin" | "dashboards" | "ingest" | "dossier" | "alerts" | "ownership"
   >(handoff.view === "ingest" ? "ingest" : handoff.view === "admin" ? "admin" : "graph");
   // ADR-115 E6: the canvas toolbar's "Last change", read again as the working set changes.
   const [lastChange, setLastChange] = useState<string | null>(null);
@@ -646,7 +651,7 @@ export function App() {
       window.setTimeout(() => revealPanel(place.panel), 0);
     }
   };
-  const lastGlassView = useRef<"graph" | "map" | "reports" | "admin" | "dashboards" | "dossier" | "watches" | "alerts" | "ownership">("graph");
+  const lastGlassView = useRef<"graph" | "map" | "matrix" | "reports" | "admin" | "dashboards" | "dossier" | "alerts" | "ownership">("graph");
   // ADR-109 phase B: an alert put on the canvas is highlighted once the canvas has drawn it.
   const pendingHighlight = useRef<string[] | null>(null);
   useEffect(() => {
@@ -656,11 +661,25 @@ export function App() {
     const frame = requestAnimationFrame(() => glassCanvasRef.current?.highlightNodes(ids));
     return () => cancelAnimationFrame(frame);
   }, [view]);
+  // The Matrix view's Expand and Show (02_GLASS_FRONTEND.md §6, GDS remediation plan A1): done by the
+  // canvas itself once the Graph is drawn — Expand through its own preview and the working set's cap
+  // (rule 2), never a second expansion path.
+  const pendingCanvasAction = useRef<{ kind: "expand" | "show"; nodeId: string } | null>(null);
+  useEffect(() => {
+    if (view !== "graph" || !pendingCanvasAction.current) return;
+    const { kind, nodeId } = pendingCanvasAction.current;
+    pendingCanvasAction.current = null;
+    const frame = requestAnimationFrame(() => {
+      if (kind === "expand") glassCanvasRef.current?.expandNode(nodeId);
+      else glassCanvasRef.current?.focusOnNode(nodeId);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [view]);
   if (view !== "ingest") lastGlassView.current = view;
   // ADR-112: someone who may not investigate (a Reports Viewer) lands where they may look.
   useEffect(() => {
     const views: string[] = viewsFor(rights);
-    if ((view === "graph" || view === "map" || view === "reports") && !views.includes(view)) {
+    if ((view === "graph" || view === "map" || view === "matrix" || view === "reports") && !views.includes(view)) {
       setView(landingView(rights));
     }
   }, [rights, view]);
@@ -671,6 +690,32 @@ export function App() {
   const [readerFallback, setReaderFallback] = useState<DocumentReaderView | undefined>(undefined);
   // ADR-093: every node selected on the canvas, for the Inspector's list.
   const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([]);
+  // The selection made where no canvas is drawn (the Matrix view): the same state the canvas reports
+  // to, so the Inspector shows it and the canvas opens with it. Selecting nodes clears the link and
+  // the other way round, as on the canvas.
+  const selectNodesOffCanvas = (nodeIds: string[]) => {
+    const graph = workingSetRef.current.graph;
+    const present = nodeIds.filter((id) => graph.hasNode(id));
+    setSelectedNodeIds(present);
+    setSelectedLink(null);
+    setSelectedNode(present[0] ? graph.getNodeAttribute(present[0], "data") : null);
+  };
+  const selectLinkOffCanvas = (edgeId: string | null) => {
+    const graph = workingSetRef.current.graph;
+    setSelectedNodeIds([]);
+    setSelectedNode(null);
+    setSelectedLink(edgeId && graph.hasEdge(edgeId) ? graph.getEdgeAttribute(edgeId, "data") : null);
+  };
+  const showOnGraph = (nodeId: string) => {
+    selectNodesOffCanvas([nodeId]);
+    pendingCanvasAction.current = { kind: "show", nodeId };
+    setView("graph");
+  };
+  const expandOnGraph = (nodeId: string) => {
+    selectNodesOffCanvas([nodeId]);
+    pendingCanvasAction.current = { kind: "expand", nodeId };
+    setView("graph");
+  };
   const [mapConfig, setMapConfig] = useState<PublicMapConfig | null>(null);
   const [siteWizardOpen, setSiteWizardOpen] = useState(false);
   const [boundaryToolOpen, setBoundaryToolOpen] = useState(false);
@@ -759,6 +804,24 @@ export function App() {
       current = false;
     };
   }, [bearerToken, investigationId, linkTypesRead]);
+
+  useEffect(() => {
+    if (!bearerToken || !investigationId) {
+      setStrengthLegend(null);
+      return;
+    }
+    let current = true;
+    fetchCaseInfluencers(API_BASE_URL, bearerToken, investigationId)
+      .then((found) => {
+        if (current) setStrengthLegend(found.legend);
+      })
+      .catch(() => {
+        if (current) setStrengthLegend(null);
+      });
+    return () => {
+      current = false;
+    };
+  }, [bearerToken, investigationId, strengthRead]);
 
   useEffect(() => {
     // Persisting an already-resolved id makes no network call and must run regardless of auth
@@ -1123,10 +1186,11 @@ export function App() {
   // the map, not over Reports, a Superset board or the Admin area, and not to an account that may
   // not investigate (opened under an embedded board, the timeline overlapped it).
   const showsWorkingSetTools =
-    showsInspector(rights) && !["ingest", "dossier", "watches", "reports", "dashboards", "admin"].includes(view);
+    showsInspector(rights) && !["ingest", "dossier", "reports", "dashboards", "admin"].includes(view);
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100vh" }}>
+    // ADR-132: the window less whatever the brand frame shows above (`brand/BrandFrame.tsx`).
+    <div style={{ display: "flex", flexDirection: "column", height: "var(--workspace-height, 100vh)" }}>
       {/* ADR-097 step 1 (design review item 16): the protective marking of what is on screen. */}
       <ClassificationStrip marking={marking} />
       <TopBar
@@ -1171,6 +1235,8 @@ export function App() {
                 ...[
                   { id: "graph", label: "Graph", pressed: view === "graph", onSelect: () => setView("graph") },
                   { id: "map", label: "Map", pressed: view === "map", onSelect: () => setView("map") },
+                  // `02_GLASS_FRONTEND.md` §6: the screen-reader-navigable rendering of the same data.
+                  { id: "matrix", label: "Matrix", pressed: view === "matrix", onSelect: () => setView("matrix") },
                   // ADR-111: the case's figures for people who read rather than investigate.
                   { id: "reports", label: "Reports", pressed: view === "reports", onSelect: () => setView("reports") },
                 ].filter((v) => (viewsFor(rights) as string[]).includes(v.id)),
@@ -1207,9 +1273,11 @@ export function App() {
           ...(app === "glass"
             ? [
                 { id: "cases", label: "Cases", icon: "cases" as const, onSelect: () => setCasesOpen(true), pressed: casesOpen },
-                { id: "watches", label: "Watches", icon: "watches" as const, onSelect: () => setView("watches"), pressed: view === "watches" },
-                // ADR-109 ruling 5: the case team's alert queue, its rules, held rows and audit.
-                { id: "alerts", label: "Alerts", icon: "alerts" as const, onSelect: () => setView("alerts"), pressed: view === "alerts", badge: alertCount },
+                // ADR-133 decision 5 (ADR-109 ruling 5 before it, as Alerts): the Monitoring place —
+                // the one alert queue for every kind, rules and templates, watches, held rows, audit.
+                // The owner's answer of 1 November 2026: watches are reached from its Watches tab
+                // alone; the rail has no Watches entry.
+                { id: "alerts", label: "Monitoring", icon: "alerts" as const, onSelect: () => setView("alerts"), pressed: view === "alerts", badge: alertCount },
                 // ADR-109 ruling 5: enhanced due diligence — ultimate beneficial ownership.
                 { id: "ownership", label: "Ownership", icon: "ownership" as const, onSelect: () => setView("ownership"), pressed: view === "ownership" },
                 { id: "history", label: "History", icon: "history" as const, onSelect: () => setHistoryOpen(true), pressed: historyOpen },
@@ -1304,38 +1372,6 @@ export function App() {
             }}
           />
         )}
-        {view === "watches" && (
-          // Owner-only, not investigation-scoped — the same reasoning `/v1/patterns/*` already
-          // gives (`patterns/api.ts`'s own module docstring) — so this view, like "ingest" and
-          // "dossier", opts out of the investigation-scoped side panel/timeline/status bar below
-          // rather than being squeezed into `view === "graph"`'s own 320px column.
-          <div
-            style={{
-              flex: 1,
-              display: "flex",
-              flexDirection: "column",
-              gap: "var(--sp-8)",
-              overflowY: "auto",
-              padding: "var(--sp-8)",
-            }}
-          >
-            <HotlistPanel apiBaseUrl={API_BASE_URL} bearerToken={bearerToken} investigationId={investigationId} />
-            <MonitorPanel apiBaseUrl={API_BASE_URL} bearerToken={bearerToken} investigationId={investigationId} />
-            <AlertInbox
-              apiBaseUrl={API_BASE_URL}
-              bearerToken={bearerToken}
-              investigationId={investigationId}
-              onOpenInvestigation={(newInvestigationId) => {
-                sessionStorage.setItem(
-                  INVESTIGATION_ID_SESSION_KEY,
-                  newInvestigationId,
-                );
-                setInvestigationId(newInvestigationId);
-                setView("graph");
-              }}
-            />
-          </div>
-        )}
         {view === "alerts" && (
           <AlertsPlace
             apiBaseUrl={API_BASE_URL}
@@ -1343,9 +1379,19 @@ export function App() {
             investigationId={investigationId}
             accountId={principal?.sub ?? null}
             isAdministrator={principal?.roles?.includes("osprey-admin") ?? false}
+            canManageLists={rights?.has("load_screening_lists") ?? false}
+            canManageInfluencers={rights?.has("manage_strength_influencers") ?? false}
+            entityTypes={ontologySchema?.entity_types ?? []}
+            edgeTypes={edgeTypes}
+            onInfluencersChanged={() => setStrengthRead((n) => n + 1)}
             onCanvas={(outcome, nodeIds) => {
               applyStarterDelta(outcome.delta);
               pendingHighlight.current = nodeIds;
+              setView("graph");
+            }}
+            onOpenInvestigation={(newInvestigationId) => {
+              sessionStorage.setItem(INVESTIGATION_ID_SESSION_KEY, newInvestigationId);
+              setInvestigationId(newInvestigationId);
               setView("graph");
             }}
           />
@@ -1371,7 +1417,7 @@ export function App() {
             }}
           />
         )}
-        {view !== "ingest" && view !== "dossier" && view !== "watches" && view !== "alerts" && view !== "ownership" && view !== "reports" && view !== "admin" && view !== "dashboards" && (
+        {view !== "ingest" && view !== "dossier" && view !== "alerts" && view !== "ownership" && view !== "reports" && view !== "admin" && view !== "dashboards" && (
           <div style={{ flex: 1, position: "relative" }}>
             {view === "graph" && welcomeOpen && (
               <WorkspaceWelcome
@@ -1402,6 +1448,7 @@ export function App() {
                 bearerToken={bearerToken}
                 dimmedNodeIds={dimmedNodeIds}
                 dimmedEdgeIds={dimmedEdgeIds}
+                strengthLegend={strengthLegend}
                 onGroupedCountChange={setGroupedCount}
                 judgementCounts={judgementCounts}
                 degreeMarks={degreeMarks}
@@ -1435,6 +1482,29 @@ export function App() {
                   setView("dossier");
                 }}
                 onSetPicture={() => setPictureOpenSignal((n) => n + 1)}
+                // §2 rule 1: switching view never loses selection — the Matrix's, or what was
+                // selected before the Map opened, is the canvas's when it is drawn again.
+                initialSelectedNodeIds={selectedNodeIds}
+                initialSelectedEdgeId={selectedLink?.id ?? null}
+              />
+            )}
+            {view === "matrix" && (
+              <MatrixView
+                graph={workingSetRef.current.graph}
+                store={workingSetRef.current.store}
+                edgeTypes={edgeTypes}
+                visualFor={(type) => ontology.visualFor(type)}
+                dimmedNodeIds={dimmedNodeIds}
+                dimmedEdgeIds={dimmedEdgeIds}
+                selectedNodeIds={selectedNodeIds}
+                selectedEdgeId={selectedLink?.id ?? null}
+                onSelectNodes={selectNodesOffCanvas}
+                onSelectLink={selectLinkOffCanvas}
+                onExpand={expandOnGraph}
+                onShowOnGraph={showOnGraph}
+                strength={
+                  investigationId ? { apiBaseUrl: API_BASE_URL, bearerToken, investigationId } : undefined
+                }
               />
             )}
             {/* ADR-100: an empty canvas offers where to start, until something is drawn. */}
@@ -1444,9 +1514,9 @@ export function App() {
                 style={{
                   position: "absolute",
                   top: "var(--sp-40)",
-                  left: "50%",
+                  // Beside the welcome panel when it is open, never under it.
+                  ...exploreOverlayPlace(welcomeOpen),
                   transform: "translateX(-50%)",
-                  width: "min(28rem, calc(100% - var(--sp-32)))",
                   maxHeight: "calc(100% - var(--sp-56) - var(--sp-24))",
                   overflowY: "auto",
                   padding: "var(--sp-16)",
@@ -1597,7 +1667,7 @@ export function App() {
               })()}
           </div>
         )}
-        {view !== "ingest" && view !== "dossier" && view !== "watches" && view !== "dashboards" && showsInspector(rights) && (
+        {view !== "ingest" && view !== "dossier" && view !== "dashboards" && showsInspector(rights) && (
           <SidePanelFrame name="Inspector">
             <SidePanelStack
               panels={[
@@ -1609,15 +1679,19 @@ export function App() {
                     <Inspector
                       node={selectedNode}
                       // ADR-115 E4: the Inspector's Expand, through the canvas's own preview.
-                      onExpand={(id) => glassCanvasRef.current?.expandNode(id)}
+                      // With no canvas drawn (the Matrix, the Map), the Graph opens and expands it.
+                      onExpand={(id) => (glassCanvasRef.current ? glassCanvasRef.current.expandNode(id) : expandOnGraph(id))}
                       // ADR-097 step 1: several selected are shown together (the list of ADR-093
                       // is one of their parts), not the first alone.
                       selection={{
                         nodes: selectedNodeIds
                           .filter((id) => workingSetRef.current.graph.hasNode(id))
                           .map((id) => workingSetRef.current.graph.getNodeAttribute(id, "data")),
-                        onCentre: (id) => glassCanvasRef.current?.centreOn(id),
-                        onRemove: (id) => glassCanvasRef.current?.deselect(id),
+                        onCentre: (id) => (glassCanvasRef.current ? glassCanvasRef.current.centreOn(id) : showOnGraph(id)),
+                        onRemove: (id) =>
+                          glassCanvasRef.current
+                            ? glassCanvasRef.current.deselect(id)
+                            : selectNodesOffCanvas(selectedNodeIds.filter((n) => n !== id)),
                       }}
                       visualFor={(type) => ontology.visualFor(type)}
                       neighbourhoodRisk={
