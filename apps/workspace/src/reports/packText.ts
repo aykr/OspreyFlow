@@ -2,6 +2,7 @@
 // the two never say different things (ADR-113 stage 5). Pure: no DOM, no fetch.
 import type { AlertEntitySnapshot, AlertSnapshot, PackItem, TrendFigures } from "../../../../packages/schemas/generated";
 import { closingReasonLabel } from "../alerts/closingReasons";
+import { TYPOLOGY_LABELS } from "../alerts/names";
 
 const NUMBER = new Intl.NumberFormat("en-GB");
 const DAY = new Intl.DateTimeFormat("en-GB", { dateStyle: "long", timeZone: "UTC" });
@@ -20,9 +21,16 @@ export function formatDay(iso: string): string {
   return Number.isNaN(when.getTime()) ? iso : DAY.format(when);
 }
 
-/** That some of the pack's items are withheld from this reader, said once, with no number and never
- * which (ADR-124 decision 9). */
-export const WITHHELD_ITEMS_SENTENCE = "Some items of this pack are withheld from you.";
+/** That some of the pack's items are not shown to this reader, said once, with no number and never
+ * which (ADR-124 decision 9). Two reasons put an item out of sight, and the sentence names both without
+ * saying which applies: the reader may not see something it rests on, or something it cites has since
+ * been taken back for everyone (a load's revert takes back the alerts its rules raised: build order
+ * step 15, where "withheld from you" told an analyst she had been denied her own item). */
+export const WITHHELD_ITEMS_SENTENCE =
+  "Some items of this pack are not shown to you: you may not see something they rest on, or it has since been taken back.";
+
+/** A publication refused because the draft holds such an item. */
+export const WITHHELD_REFUSAL_SENTENCE = "Some items of this pack are not shown to you, so you cannot publish it.";
 
 export const KIND_LABEL: Record<PackItem["kind"], string> = {
   trend: "Trend",
@@ -99,9 +107,11 @@ export function periodsOf(figures: TrendFigures): string[] {
 const SEVERITY_WORD: Record<AlertSnapshot["severity"], string> = { high: "High", medium: "Medium", low: "Low" };
 const KIND_WORD: Record<AlertSnapshot["kind"], string> = { typology: "Typology alert", hotlist: "Hotlist match", monitor: "Monitor match" };
 
-/** "Typology alert (rapid_movement) · High severity · raised 29 September 2026". */
+/** "Typology alert (Rapid movement) · High severity · raised 29 September 2026": the typology by its
+ * label, as the queue names it, never its stored key (build order step 18c, D10). */
 export function alertLine(alert: AlertSnapshot): string {
-  const what = alert.typology ? `${KIND_WORD[alert.kind]} (${alert.typology})` : KIND_WORD[alert.kind];
+  const label = alert.typology ? TYPOLOGY_LABELS[alert.typology] : undefined;
+  const what = label ? `${KIND_WORD[alert.kind]} (${label})` : KIND_WORD[alert.kind];
   return `${what} · ${SEVERITY_WORD[alert.severity]} severity · raised ${formatDay(alert.raised_at)}`;
 }
 
@@ -110,9 +120,13 @@ export function alertLine(alert: AlertSnapshot): string {
 export function alertStatusSentence(alert: AlertSnapshot): string {
   if (alert.status === "open") return "Open: not yet decided when this was added.";
   if (alert.status === "claimed") return "Open, being worked on, when this was added.";
-  const reason = alert.reason ? `: ${alert.reason}` : "";
-  if (alert.outcome) return `Closed as ${closingReasonLabel(alert.outcome)}${reason}.`;
-  return `Closed without an outcome${reason}.`;
+  // The reason as it was typed, ended once: a reason that already ends a sentence ("…through
+  // Crescent.") is not given a second full stop (build order step 15).
+  const typed = (alert.reason ?? "").trim();
+  const reason = typed ? `: ${typed}` : "";
+  const end = /[.!?…]$/.test(typed) ? "" : ".";
+  if (alert.outcome) return `Closed as ${closingReasonLabel(alert.outcome)}${reason}${end}`;
+  return `Closed without an outcome${reason}${end}`;
 }
 
 /** Rule 5: a match no person has confirmed is inferred, and the pack says so. */

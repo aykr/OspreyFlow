@@ -10,6 +10,7 @@ injectable, which is how the tests drive it without Docker.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import getpass
 import json
 import os
@@ -29,9 +30,16 @@ import yaml
 from . import demo, starters
 from . import deployments as named
 from . import models as engine_keys
-from .answers import MODES, Answers, AnswersRefused, load_answers, osprey_config
+from .answers import (
+    MODES,
+    ORGANISATION_SECRET_VARIABLE,
+    Answers,
+    AnswersRefused,
+    load_answers,
+    osprey_config,
+)
 from .cloud import build_enterprise, build_small
-from .doctor import Check, Probes, SystemProbes, format_check, run_doctor
+from .doctor import Check, Probes, ServerPlan, SystemProbes, format_check, run_doctor
 from .home import (
     CommandRefused,
     deployment_dir,
@@ -206,6 +214,10 @@ def _parser() -> argparse.ArgumentParser:
     doctor = verbs.add_parser("doctor", help="check the machine's prerequisites")
     doctor.add_argument("--mode", choices=MODES, default="lite")
     doctor.add_argument("--cloud", choices=("aws", "azure"))
+    doctor.add_argument(
+        "--config", type=Path,
+        help="small, on a server of your own: the answers file whose server: section to check",
+    )  # fmt: skip
 
     install = verbs.add_parser("install", help="install a deployment")
     install.add_argument("--mode", choices=MODES)
@@ -344,8 +356,38 @@ def _print_checks(checks: list[Check]) -> bool:
 
 
 def _doctor(args: argparse.Namespace, probes: Probes, product: Path) -> int:
-    ok = _print_checks(run_doctor(args.mode, probes, product=product, cloud=args.cloud))
+    server = None
+    if args.config is not None:
+        raw = _file_or_default_answers(args)
+        answers = load_answers(raw, packs=[str(p) for p in raw.get("demo_packs") or ()])
+        server = server_plan(answers)
+    ok = _print_checks(
+        run_doctor(args.mode, probes, product=product, cloud=args.cloud, server=server)
+    )
     return 0 if ok else 1
+
+
+def server_plan(answers: Answers) -> ServerPlan | None:
+    """ADR-114 Amendment 33: what the server's own checks need from `server:`, or None."""
+    if not answers.server:
+        return None
+    from urllib.parse import urlsplit
+
+    origin = urlsplit(answers.server["public_origin"])
+    tls = answers.server.get("tls") or {}
+    return ServerPlan(
+        host=origin.hostname or "",
+        port=origin.port or 443,
+        dashboards=answers.dashboards,
+        certificate=tls.get("certificate"),
+        key=tls.get("key"),
+        ca=tls.get("ca"),
+        redirect_http=bool(answers.server.get("redirect_http")),
+        govuk=answers.appearance.get("brand") == "govuk",
+        backups=str(answers.backups) if answers.backups is not None else None,
+        organisation=dict(answers.organisation) or None,
+        organisation_secret_given=bool(os.environ.get(ORGANISATION_SECRET_VARIABLE)),
+    )
 
 
 def _govuk_flags(args: argparse.Namespace) -> dict[str, str]:
@@ -571,6 +613,14 @@ def _install(args: argparse.Namespace, ctx: _Context) -> int:
     # ADR-114 Amendment 10 point 1: Small is built from the operator's machine (`--cloud`), and
     # installed on the server by its first boot, whose answers name the managed services.
     on_server = args.mode == "small" and not args.cloud and bool(answers.external)
+    # ADR-114 Amendment 33 decision 1: or installed onto a server of your own (`server:`), every
+    # store in a container.
+    own_server = args.mode == "small" and bool(answers.server)
+    if own_server and args.cloud:
+        raise CommandRefused(
+            "Build a server with --cloud, or install onto one you have with server: in the "
+            "answers file, not both. Nothing was installed."
+        )
     if args.mode == "enterprise" and not answers.external and not args.cloud:
         raise CommandRefused(
             "enterprise runs on the cloud's managed services: name them under external: in the "
@@ -578,11 +628,12 @@ def _install(args: argparse.Namespace, ctx: _Context) -> int:
             "shared_storage_class under cluster: — or give --cloud aws or --cloud azure to build "
             "the cluster and its services with OpenTofu"
         )
-    if args.mode == "small" and not args.cloud and not on_server:
+    if args.mode == "small" and not args.cloud and not on_server and not own_server:
         raise CommandRefused(
-            "small runs on a cloud server: give --cloud aws or --cloud azure here to build it, or "
-            "run this on the server with the answers its first boot wrote (they name its managed "
-            "services)"
+            "small needs one of three: a server: section in the answers file, to install onto a "
+            "server of your own with every store in a container (section 5a of the administration "
+            "guide); --cloud aws or --cloud azure here, to build a cloud server; or, on that cloud "
+            "server, the answers its first boot wrote, whose external: names its managed services"
         )
     named_ports: tuple[int, ...] | None = None
     if ctx.target.named:
@@ -590,14 +641,15 @@ def _install(args: argparse.Namespace, ctx: _Context) -> int:
     # The server runs the stack as Lite does, so it needs what Lite needs (Docker and its ports).
     doctor_mode = "lite" if on_server else args.mode
     checks = run_doctor(
-        doctor_mode, ctx.probes, product=ctx.product, cloud=args.cloud, ports=named_ports
-    )
+        doctor_mode, ctx.probes, product=ctx.product, cloud=args.cloud, ports=named_ports,
+        server=server_plan(answers) if own_server else None,
+    )  # fmt: skip
     if not _print_checks(checks):
         print("Nothing was installed. Fix the above and run ospreyflow install again.")
         return 1
     if args.mode == "small" and args.cloud:
         return build_small(ctx, args, answers)
-    if on_server:
+    if on_server or own_server:
         return _install_on_server(ctx, args, answers)
     if args.mode == "enterprise" and args.cloud:
         return build_enterprise(ctx, args, answers)
@@ -728,7 +780,12 @@ def _apply_argv(ctx: _Context, args: argparse.Namespace) -> list[str]:
 def _install_on_server(ctx: _Context, args: argparse.Namespace, answers: Answers) -> int:
     """A Small server's install, run by its first boot (ADR-114 Amendment 10 points 1 and 4): onto
     the managed services, with no demo accounts — its first administrator signs in by a one-time
-    code, which goes to `--first-admin-code-file` for the first boot to hand to the secret store."""
+    code, which goes to `--first-admin-code-file` for the first boot to hand to the secret store.
+
+    Or run by hand on a server of your own (Amendment 33): the same steps, every store in a
+    container; without `--first-admin-code-file` the code is printed once, on this terminal."""
+    if answers.memory_gib == "auto":
+        answers = dataclasses.replace(answers, memory_gib=_measured_memory_gib(ctx))
     _write_config(ctx, answers, args.force)
     ctx.step("build and start the deployment", _apply_argv(ctx, args))
     # ADR-114 Amendment 16: the identity provider's settings beyond its realm import — Superset's
@@ -738,14 +795,49 @@ def _install_on_server(ctx: _Context, args: argparse.Namespace, answers: Answers
         [*ctx.python, "-m", "harness.register_sign_in", "--profile", "small", "--no-demo-accounts"],
     )
     admin = [*ctx.python, "-m", "harness.first_admin", "--deployment", str(ctx.deployment)]
-    if answers.cloud.get("admin_email"):
-        admin += ["--email", answers.cloud["admin_email"]]
+    email = answers.cloud.get("admin_email") or answers.admin_email
+    if email:
+        admin += ["--email", email]
     if args.first_admin_code_file is not None:
         admin += ["--code-file", str(args.first_admin_code_file)]
     ctx.step("make the first administrator", admin)
     print()
     print(f"OspreyFlow is installed. It answers at {public_origin(ctx.product)}")
+    plan = server_plan(answers)
+    if plan is not None:
+        print(
+            f"In the organisation's DNS, point {', '.join(plan.names)} at this server. Port "
+            f"{plan.port} is the only one other machines reach; who may reach it is set in front "
+            "of the server (its firewall or security group), not with ufw."
+        )
+        if plan.organisation:
+            redirect, logout = plan.organisation_uris
+            print(
+                "For sign-in through the organisation, its identity team registers OspreyFlow's "
+                f"application with the redirect URI {redirect} and the post-logout redirect URI "
+                f"{logout}, assigned to the people who may sign in. A person signing in that way "
+                "has no role until an administrator grants one in Admin, People and roles."
+            )
     return 0
+
+
+def _measured_memory_gib(ctx: _Context) -> int:
+    """ADR-114 Amendment 33 decision 6: the memory Docker reports, in whole GiB, measured once, at
+    install, and written to `resources.memory_gib`; the render then reads the number, never the
+    machine."""
+    info = ctx.probes.docker_info() or {}
+    total = info.get("MemTotal")
+    if not isinstance(total, int | float) or total <= 0:
+        raise CommandRefused(
+            "server.memory_gib is auto, and Docker did not say how much memory it has. Give the "
+            "number of GiB instead (for example memory_gib: 64). Nothing was installed."
+        )
+    gibibytes = int(total // 2**30)
+    print(
+        f"The stores are sized to {gibibytes} GiB of memory, as Docker reports it "
+        "(resources.memory_gib in osprey.yaml; change it and run ospreyflow apply to resize)."
+    )
+    return gibibytes
 
 
 def _install_on_cluster(

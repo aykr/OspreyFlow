@@ -5522,10 +5522,12 @@ async def ask_question_route(
     principal: PrincipalDep,
     questions: QuestionsDep,
     audit: AuditDep,
+    principal_names: PrincipalNamesDep,
 ) -> QuestionAnswer:
     """Asks the model about the case's Documents and graph facts the analyst can see (ADR-098
     decision 4, ADR-129 decision 1): the selection and one link around it, or the whole view. What
-    it proposes is pending until a person accepts it."""
+    it proposes is pending until a person accepts it. The answer names its author as the case's
+    conversation does (ADR-106; build order step 18c: it showed the identity provider's id)."""
     answer = await questions.ask(
         investigation.id,
         body.question,
@@ -5542,7 +5544,8 @@ async def ask_question_route(
         resolved_query={"question_id": answer.id},
         result_cardinality=len(answer.candidates),
     )
-    return answer
+    names = await principal_names.display_names([answer.author])
+    return answer.model_copy(update={"author_name": names.get(answer.author)})
 
 
 @app.get(
@@ -8838,18 +8841,28 @@ async def read_alert_assignees(
     principal_names: PrincipalNamesDep,
 ) -> list[AlertAssignee]:
     """ADR-133 stage (a): whom an alert may be given to — the case's Editors and Authors by grant,
-    by name. Read at Editor, by those who triage; a Viewer is not shown the case's member list."""
-    ids = await _alert_assignee_ids(investigations, investigation.id, principal)
+    by name. Read at Editor, by those who triage; a Viewer is not shown the case's member list.
+    People only (build order step 15): never a seed's own principal or a service account."""
+    ids = await _alert_assignee_ids(investigations, investigation.id, principal, principal_names)
     names = await principal_names.display_names(sorted(ids))
     return [AlertAssignee(id=i, name=names.get(i)) for i in sorted(ids)]
 
 
 async def _alert_assignee_ids(
-    investigations: InvestigationStore, investigation_id: str, principal: Principal
+    investigations: InvestigationStore,
+    investigation_id: str,
+    principal: Principal,
+    principal_names: PrincipalNameDirectory,
 ) -> set[str]:
+    """The case's Editors and Authors, and the caller, that the identity provider holds as people:
+    a grant held by a seed's own principal (the account that made the case) or by a service
+    account is no one to give an alert to. A deployment with no directory cannot tell, and keeps
+    them all."""
     grants = await investigations.list_grants(investigation_id)
     ids = {i for i, level in grants.items() if level.rank >= AccessLevel.EDITOR.rank}
-    return ids | {principal.id}
+    ids |= {principal.id}
+    people = await principal_names.people(sorted(ids))
+    return ids if people is None else ids & people
 
 
 @app.get(
@@ -9043,10 +9056,14 @@ async def assign_alert(
     graph: GraphDep,
     alerts_store: AlertsStoreDep,
     audit: AuditDep,
+    principal_names: PrincipalNamesDep,
 ) -> Alert:
-    """ADR-133 stage (a): give an open or claimed alert to an Editor or Author of the case. Only a
-    case (typology) alert is given to someone else; one shared with a team is claimed."""
-    allowed = await _alert_assignee_ids(investigations, investigation.id, principal)
+    """ADR-133 stage (a): give an open or claimed alert to an Editor or Author of the case who is a
+    person (never a service account). Only a case (typology) alert is given to someone else; one
+    shared with a team is claimed."""
+    allowed = await _alert_assignee_ids(
+        investigations, investigation.id, principal, principal_names
+    )
     alert = await alert_queue.assign(
         alerts_store, graph, investigation.id, alert_id, principal, assignee=body.assignee,
         allowed=allowed,
