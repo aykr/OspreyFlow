@@ -14,10 +14,14 @@ is made from the deployment's own schema, and is checked against it on every cha
 <!-- document-control:begin -->
 ## Document control
 
-**Version 1.33** · 2026-11-04 · For OspreyFlow v0.4.6 · Issued
+**Version 1.37** · 2026-11-04 · For OspreyFlow v0.4.7 · Issued
 
 | Version | Date | What changed |
 | --- | --- | --- |
+| 1.37 | 2026-11-04 | Describes v0.4.7. No change to its content. |
+| 1.36 | 2026-11-04 | The owner's ruling (ADR-114 Amendment 33): the first administrator holds the Admin and the Analyst roles from the start, whether or not demo packs load, so the cases they author open for them. §1a and §11 no longer ask anyone to give them the Analyst role; §5 and §5a say which roles the account is made with; §9.2 says so too, and that an `admin` made by v0.4.6 or earlier needs the Analyst role added. |
+| 1.35 | 2026-11-04 | Found installing Small on the first server of its own (ADR-114 Amendment 33): §1a and §11 a demo pack on a deployment with no demo accounts — its case's Author is the first administrator, in their own unit, with no Editor, and the Admin role does not open a case's graph until someone holds the Analyst role; §5a the answers' `demo_packs` load after the first administrator exists, the installing account's umask does not matter, and `ca` must be readable by every account; §13 a fresh deployment's first backup, its empty items, and a failed backup leaving no partial set; §16 an unreadable CA. |
+| 1.34 | 2026-11-04 | The local engine on an NVIDIA GPU (ADR-135 Amendment 1): §2.2a the NVIDIA driver and Container Toolkit, installed by the server's administrator; §2.4 and §5a the doctor's GPU checks; §5a the answers file's `server.gpu`; new §5a.4, what the GPU changes (the model server alone reserves it; the 14b extraction model unless one is named), what is checked before anything starts, and Lite on a Linux computer; §7 `server.gpu`; §16 a refused GPU. Appendix A: `resources.gpu`, and `models.extraction`'s default on a GPU. |
 | 1.33 | 2026-11-04 | Describes v0.4.6. No change to its content. |
 | 1.32 | 2026-11-04 | §5a: a `DOCKER-USER` rule that matches only arriving connections (`--ctdir ORIGINAL`), found on the first Linux server. |
 | 1.31 | 2026-11-04 | Describes v0.4.5. No change to its content. |
@@ -227,6 +231,11 @@ ticked, to change if you wish.
 **In an answers file** (section 7): `starter: govuk-aml`, with `appearance.service_name`,
 `appearance.organisation` and `appearance.phase`.
 
+**On a deployment with no demo accounts** — Small, on a cloud server or your own — a starter's demo
+packs still load, each into its own case, with the first administrator (`admin`) as its Author, in
+the administrator's own unit, and no Editor. The first administrator holds the Analyst role as well
+as Admin (section 9.2), so the case opens for them; they can share it from there.
+
 ### 1a.1 Several deployments side by side
 
 `--name` keeps a deployment of its own beside any other on the same computer:
@@ -363,6 +372,10 @@ On the server itself (section 5a):
   **registered with it** (the install prints the two addresses), a **group of the people** who may
   sign in assigned to it, and **outbound access from the server to the provider** — for Entra ID,
   `login.microsoftonline.com` on 443 (or through the organisation's proxy);
+- for the local engine on the server's **NVIDIA GPU** (optional, `server.gpu: nvidia`, section
+  5a.4): the **NVIDIA driver** for the GPU, and the **NVIDIA Container Toolkit** with Docker
+  configured to use it, both installed by the server's administrator — OspreyFlow checks them and
+  installs neither;
 - recommended: `vm.max_map_count` at least 262144 (for OpenSearch).
 
 ### 2.3 Enterprise
@@ -382,10 +395,12 @@ it.
 ### 2.4 Checking a machine: `ospreyflow doctor`
 
 `ospreyflow doctor --mode lite` checks, in the order to fix them: Docker installed, Docker running,
-Compose v2, memory, free disk, Git, uv and port 80. `ospreyflow doctor --mode small --cloud aws`
+Compose v2, memory, free disk, Git, uv and port 80, and the GPU when `osprey.yaml` sets
+`resources.gpu: nvidia` (section 5a.4). `ospreyflow doctor --mode small --cloud aws`
 (or `azure`) checks Git, uv, OpenTofu and the cloud's command line. `ospreyflow doctor --mode
 small --config install.yaml`, with a `server:` section in the answers, checks the server you are on
-instead (section 5a): Docker, memory, disk, 443, the certificate, the clock and the rest; a warning
+instead (section 5a): Docker, memory, disk, 443, the certificate, the clock and the rest, and the
+GPU with `server.gpu: nvidia` (section 5a.4); a warning
 (⚠) says what to change but does not stop an install. `ospreyflow doctor --mode
 enterprise --cloud aws` adds kubectl and Helm (and on Azure kubelogin); without `--cloud` it checks
 kubectl, Helm and that a cluster answers. Each line is a tick, or a cross
@@ -483,11 +498,11 @@ What happens:
    database password (and on Azure the storage key) with **its own cloud identity**, installs onto
    the managed services, and gets its HTTPS certificate. The command waits — up to 45 minutes — until
    `https://<domain>` answers. The server's own log is `/var/log/ospreyflow-first-boot.log`.
-5. **The first administrator.** The server makes an account `admin` holding the Admin role and the
-   highest clearance, with a **one-time code** instead of a password, and leaves the code in the
-   cloud's secret store. The command reads it, **shows it once**, and deletes it from the store. At
-   their first sign-in the administrator chooses their own password. Then they invite everyone
-   else from the Admin area (section 9).
+5. **The first administrator.** The server makes an account `admin` holding the Admin and Analyst
+   roles and the highest clearance, with a **one-time code** instead of a password, and leaves the
+   code in the cloud's secret store. The command reads it, **shows it once**, and deletes it from
+   the store. At their first sign-in the administrator chooses their own password. Then they invite
+   everyone else from the Admin area (section 9).
 
 ### 5.1 What is made in your account
 
@@ -544,6 +559,7 @@ server:
   # listen_address: 192.0.2.10                    # optional: one interface of a server with several
   backups: /srv/ospreyflow/backups                # where `ospreyflow backup` writes
   memory_gib: auto                                # or a number of GiB: what the stores are sized to
+  # gpu: nvidia                                   # optional: the local engine on the server's GPU (5a.4)
 sign_in:                                          # optional: the organisation's identity provider
   organisation:
     alias: org                                    # part of the address the organisation registers
@@ -576,7 +592,8 @@ tokens are checked against it); port 443 free on **every** interface (and 80 wit
 port 2480 free; 20 GB free where backups are written (`server.backups`); with `sign_in`, that
 `OSPREY_ORG_SIGN_IN_SECRET` is set (it also prints the two addresses the organisation registers);
 and warns for `vm.max_map_count` below 262144, running as root, names that do not yet resolve from
-the server, and an identity provider whose name does not resolve from it.
+the server, and an identity provider whose name does not resolve from it. With `server.gpu:
+nvidia` it also checks the GPU (section 5a.4).
 
 **What it publishes.** Port 443 (the address's own port), on every interface or on `listen_address`;
 port 80 only with `redirect_http: true`, and then it only redirects; the graph store's door, 2480,
@@ -600,10 +617,18 @@ iptables -I DOCKER-USER -i eth0 -p tcp -m conntrack --ctdir ORIGINAL --ctorigdst
 The chain is emptied when Docker restarts, so put the rule in a unit that runs after
 `docker.service`.
 
-**The first administrator.** The install makes an account `admin` with the Admin role and the
-highest clearance, and prints its **one-time code once**, on the terminal; there are no demo
+**The first administrator.** The install makes an account `admin` with the Admin and Analyst roles
+and the highest clearance, and prints its **one-time code once**, on the terminal; there are no demo
 accounts. At their first sign-in they choose their own password, then invite everyone else from the
-Admin area (section 9). The install's own tools reach the three names on the server itself and
+Admin area (section 9). The answers' `demo_packs` are loaded after the administrator is made, each
+into its own case with `admin` as its Author (section 1a says what that means for opening it).
+
+**The installing account's umask.** A server hardened to `umask 077` or `027` is fine: every file
+the deployment's containers read from its folder is written readable by every account whatever the
+umask, and `deployment.env`, which holds the secrets, stays readable by its owner alone. The
+organisation's root, `ca`, is mounted into the identity provider, which runs as another account:
+`doctor`, `install` and `apply` refuse one that not every account can read (`chmod 644` it; it holds
+no secret). The key stays `600`. The install's own tools reach the three names on the server itself and
 trust the deployment's certificate (and `ca`), so they work before the organisation's DNS does.
 
 **Renewing the certificate.** Replace the two files (same paths), then run `ospreyflow apply`. It
@@ -687,6 +712,56 @@ Old sets are not removed: remove them by hand, or with the organisation's own re
 and updating are as for Lite (sections 13 and 14).
 
 The guided page (`--gui`) does not install this kind of Small.
+
+### 5a.4 The local engine on an NVIDIA GPU
+
+Without a GPU the local engine (Ollama) runs on the server's processors, so a question to Ask the
+case on the local engine is slow, and material that may not leave the deployment can only ever run
+there. A server with an NVIDIA GPU can give the local engine the GPU. The decision is ADR-135
+Amendment 1.
+
+**Before the install**, the server's administrator installs, and OspreyFlow checks but never
+installs:
+
+- the **NVIDIA driver** for the GPU (on Ubuntu, `sudo ubuntu-drivers install`, then restart the
+  server), until `nvidia-smi` lists the GPU;
+- the **NVIDIA Container Toolkit**, with Docker configured to use it:
+
+```
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+Then add `gpu: nvidia` under `server:` in `install.yaml`; it is written to `osprey.yaml` as
+`resources.gpu: nvidia`. Lite on a Linux computer with an NVIDIA GPU may set `resources.gpu: nvidia`
+in `osprey.yaml` itself and run `ospreyflow apply`. It is refused for Small in a cloud and for
+Enterprise, whose servers are sized without a GPU, and on macOS and Windows, where Docker Desktop
+gives a container no NVIDIA GPU.
+
+**What changes.** The model server alone reserves every NVIDIA GPU on the server; its image, the
+models' pinned weights and the gateway are the same. Image descriptions and embeddings run in the
+same model server, so they use the GPU too; transcription stays on the processors. The extraction
+model, which also answers Ask the case and Ask to search on the local engine, becomes
+`qwen2.5:14b-instruct` (about 9 GB, downloaded once) instead of `qwen2.5:7b-instruct`, unless
+`osprey.yaml` names one under `models.extraction`, which always wins. An `osprey.yaml` saved by the
+guided page (`--gui`) names every model, `models.extraction: qwen2.5:7b-instruct` among them, so it
+keeps the 7b on the GPU until that line is removed. Without a GPU nothing changes.
+
+**What is checked before anything starts.** `doctor`, `install` and `apply` refuse, in words and
+with nothing changed: a computer that is not Linux; `nvidia-smi` not installed, or not answering
+("NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver": install the
+driver, or restart after installing it); and Docker listing neither the toolkit's `nvidia` runtime
+nor an NVIDIA CDI device (`docker info`). With the 14b model, less than 12 GiB of GPU memory is a
+warning naming the 7b: set `models.extraction: qwen2.5:7b-instruct` in `osprey.yaml` and run
+`ospreyflow apply`. The doctor names the GPU, its memory and its driver, for example:
+
+```
+✔ The NVIDIA GPU is NVIDIA GeForce RTX 5060 Ti, 15.9 GiB (driver 595.99.02).
+✔ Docker can run a container on the GPU (the nvidia runtime of the NVIDIA Container Toolkit).
+✔ The GPU has 15.9 GiB of memory; qwen2.5:14b-instruct asks for at least 12 GiB.
+```
+
+To turn it off, set `resources.gpu: none` in `osprey.yaml` and run `ospreyflow apply`.
 
 ## 6. Installing Enterprise
 
@@ -772,7 +847,7 @@ Every question `install` asks can be answered in this file; unknown settings are
 | `cloud.provider`, `cloud.region`, `cloud.domain`, `cloud.size`, `cloud.dns_zone`, `cloud.admin_email` | Small (section 5) and Enterprise (section 6) |
 | `cloud.api_cidrs` | Enterprise with `--cloud`: the addresses the cluster's API answers (section 6) |
 | `cluster.namespace`, `cluster.storage_class`, `cluster.shared_storage_class` | Enterprise: the namespace, and onto a cluster you already have its storage classes (section 6) |
-| `server`: `server.address`, `server.certificate`, `server.key`, `server.ca`, `server.ingest`, `server.redirect_http`, `server.listen_address`, `server.backups`, `server.memory_gib` | Small on your own server (section 5a); refused with `cloud` or `external`, and for Lite and Enterprise. `server.backups` is where backups are written (default `~/OspreyFlow/backups`); `server.memory_gib` is `auto` or a number of GiB, at least 16 (section 5a.2) |
+| `server`: `server.address`, `server.certificate`, `server.key`, `server.ca`, `server.ingest`, `server.redirect_http`, `server.listen_address`, `server.backups`, `server.memory_gib`, `server.gpu` | Small on your own server (section 5a); refused with `cloud` or `external`, and for Lite and Enterprise. `server.backups` is where backups are written (default `~/OspreyFlow/backups`); `server.memory_gib` is `auto` or a number of GiB, at least 16 (section 5a.2); `server.gpu` is `none` (the default) or `nvidia`, the local engine on the server's NVIDIA GPU (section 5a.4) |
 | `admin_email` | Small on your own server: the first administrator's email |
 | `sign_in.organisation`: `alias`, `label`, `issuer`, `client_id` | Small on your own server: sign-in through the organisation's identity provider (section 5a.1). `alias` defaults to `org`; `issuer` is `https://`. Its client secret is never here — `OSPREY_ORG_SIGN_IN_SECRET` in the terminal — and a setting naming a secret is refused |
 | `external` | The managed services the deployment runs on — written by OpenTofu, or by you for a cluster you already have |
@@ -785,7 +860,8 @@ The answers become `osprey.yaml` (appendix A): `mode` sets `profile`, `component
 both `reporting.sync` and `reporting.superset`, and the address is `http://ospreyflow.localhost` for
 Lite, `https://<domain>` for Small and Enterprise, and `server.address` for Small on your own
 server (with `server.certificate`, `key` and `ca` as `network.tls`, `server.backups` as
-`components.storage.backups`, `server.memory_gib` as `resources.memory_gib`, and
+`components.storage.backups`, `server.memory_gib` as `resources.memory_gib`, `server.gpu` as
+`resources.gpu`, and
 `sign_in.organisation` as `governance.organisation_sign_in` and `governance.organisation_provider`).
 
 ## 8. Running it
@@ -903,6 +979,12 @@ holding its right:
 
 A single right can be given on its own. **Nobody can be given more than the person giving it
 holds** — clearance included — which is why the first administrator holds the highest clearance.
+
+**The first administrator** (`admin`, on a deployment with no demo accounts) holds both the
+**Admin** and the **Analyst** roles from the start, whether or not demo packs are loaded. The Admin
+role alone does not open a case's graph, and the first administrator is the Author of every demo
+pack's case there. An `admin` made by v0.4.6 or earlier holds Admin alone: add the Analyst role in
+People and roles.
 
 ### 9.3 Inviting someone
 
@@ -1157,7 +1239,10 @@ set to its domain's packs. A **public dataset** of your own choosing, such as a 
 dataset, is added with `ospreyflow demo add public` (section 1a.2).
 
 Choose them at install (`demo_packs`), or later: `ospreyflow demo list`, `ospreyflow demo add
-<id>`. Each loads into its own case, with the installing administrator as Author. Adding **HMP**
+<id>`. Each loads into its own case, with the installing administrator as Author: the demo
+administrator where there are demo accounts (the demo analyst its Editor), and otherwise the first
+administrator, `admin`, in their own unit, with no Editor (section 1a); they hold the Analyst role
+as well as Admin, so the case opens for them. Adding **HMP**
 again is safe: a deployment that loaded it before v0.2.0 gains only its prison network, in the same
 case, and one that already has the network is left as it is. **PaySim** is a
 download: get `PS_20174392719_1491204439457_log.csv` from its Kaggle page and pass it with
@@ -1259,6 +1344,11 @@ never in it. Schedule it with a cron line, for example
 organisation's identity provider is restored still linked to it. OpenSearch is rebuilt, not
 restored, as on Lite.
 
+**A fresh deployment** has no published recipes and no analytics events yet: its first set records
+them as **empty** (the manifest's `empty` list, and the backup's last lines say so), and a restore
+of it restores nothing for them. **A backup that fails** removes the set it had started, and says
+so, so no half-written set is left beside the good ones.
+
 **Enterprise.** The cloud protects its managed services as for Small. **The graph store and the
 analytics database run in the cluster, and nothing backs them up yet**: `ospreyflow backup` drives
 a Compose deployment and does not reach a cluster. Until it does, take snapshots of their volumes
@@ -1329,11 +1419,12 @@ Admin → Schedules and runs lists every one.
 | The page does not open | `ospreyflow status`; that port 80 (Lite) or the DNS records (Small) are right |
 | Nobody can sign in | `ospreyflow logs keycloak`; that the address in `osprey.yaml` is the one in the browser; then `ospreyflow repair-sign-in` |
 | Rules say "the rule's deployer could not be resolved", a hotlist reads **Stopped**, or a list refresh re-screens 0 customers — typically after the stores were wiped | The Conduit cannot act for people: the identity provider no longer holds its client secret. Run `ospreyflow repair-sign-in`, then run the rule again |
-| `doctor`, `install` or `apply` says "the certificate is refused" | Each reason is named, and nothing was changed. "does not match": the key is another certificate's. "encrypted with a passphrase": write the key unencrypted (`openssl pkey -in <encrypted> -out <key>`), mode 600. "does not cover id.…": a wildcard for the parent domain covers one label only; ask for `id.<host>` and `bi.<host>`, or `*.<host>` (section 5a). "expired" or "not valid until": a new certificate, or the server's clock. "does not reach the organisation's root": put the intermediates after the server certificate. Then run the command again |
+| `doctor`, `install` or `apply` says "the certificate is refused" | Each reason is named, and nothing was changed. "does not match": the key is another certificate's. "encrypted with a passphrase": write the key unencrypted (`openssl pkey -in <encrypted> -out <key>`), mode 600. "does not cover id.…": a wildcard for the parent domain covers one label only; ask for `id.<host>` and `bi.<host>`, or `*.<host>` (section 5a). "expired" or "not valid until": a new certificate, or the server's clock. "does not reach the organisation's root": put the intermediates after the server certificate. "the identity provider … cannot" read the root: `chmod 644` the `ca` file. Then run the command again |
 | Nobody can sign in through the organisation (Small on your own server) | The organisation's page says the redirect URI is not registered: register exactly the address `ospreyflow doctor --mode small --config install.yaml` prints (section 5a.1). The sign-in comes back with "Unexpected error when authenticating with identity provider": the client secret is wrong (put the right one in `deployment.env`, then `ospreyflow repair-sign-in`) or the server cannot reach the provider (`login.microsoftonline.com` for Entra ID). `repair-sign-in` says "could not read the organisation's sign-in settings": the issuer is wrong, the provider cannot be reached, or — for a provider on the organisation's own certificates — `server.ca` is missing |
 | Someone signed in through the organisation and sees nothing | As intended until an administrator grants them roles and access in Admin → People and roles (section 5a.1) |
 | `doctor` says too little disk where backups are written | Give `server.backups` more room, or name another folder; remove old sets |
 | People on the network cannot connect to Small on your own server | Port 443 is open in front of the server — its firewall or security group, or the `DOCKER-USER` chain; `ufw` does not filter a port Docker publishes — and the three names resolve to the server in the organisation's DNS |
+| `doctor`, `install` or `apply` refuses the GPU | Each reason is named, and nothing was changed: install the NVIDIA driver and restart until `nvidia-smi` lists the GPU; install the NVIDIA Container Toolkit and run `sudo nvidia-ctk runtime configure --runtime=docker` and `sudo systemctl restart docker`; on macOS or Windows, set the GPU to `none` (section 5a.4) |
 | A Small server never answered | Its log, `/var/log/ospreyflow-first-boot.log` (Session Manager on AWS) |
 | An update rolled back | Its own words say why, and where its backup is |
 | The model download stopped with `rename …-partial …: no such file or directory` | A model server restarted mid-download and removed the half-fetched file (fixed from the release after 15 October 2026). Run `ospreyflow start` while the deployment is up: it starts the download again and the server keeps running, so it completes |
@@ -1379,7 +1470,7 @@ Made from the deployment's own schema. Settings marked *section* hold the settin
 | `models.providers.privacy_contract` | bool | false | True when the deployment's organisation holds a data-processing agreement with the provider covering this key. A dataset whose egress is `contracted` is sent only to a provider marked so. Default: false. |
 | `models.providers.contract_reference` | str or none | none | The agreement's reference, in words (for example DPA 2026/07); never a secret. Shown beside the mark. |
 | `models.defaults` | mapping | — | Each role's default engine, `local` or an enabled provider's name. A role not named runs on `local` (for the single `provider`, on it). |
-| `models.extraction` | `qwen2.5:7b-instruct` \| `qwen2.5:14b-instruct` | `qwen2.5:7b-instruct` | The local model that extracts entities from text. Default: qwen2.5:7b-instruct, the model the product ships with. |
+| `models.extraction` | `qwen2.5:7b-instruct` \| `qwen2.5:14b-instruct` | `qwen2.5:7b-instruct` | The local model that extracts entities from text. Default: qwen2.5:7b-instruct, the model the product ships with; with resources.gpu: nvidia and this not named, qwen2.5:14b-instruct. |
 | `models.vision` | `moondream:1.8b-v2-q4_K_M` | `moondream:1.8b-v2-q4_K_M` | The local model that describes an image and reads its text. |
 | `models.transcription` | `Systran/faster-whisper-tiny.en` | `Systran/faster-whisper-tiny.en` | The local model that transcribes a video's speech. |
 | `models.embedding` | `all-minilm:22m-l6-v2-fp16` | `all-minilm:22m-l6-v2-fp16` | The local model that turns text into vectors. |
@@ -1490,9 +1581,10 @@ Made from the deployment's own schema. Settings marked *section* hold the settin
 | `external.valkey.tls` | bool | true | Whether it is reached over TLS |
 | `external.search` | section or none | none | A cloud's managed OpenSearch (cluster on AWS only). |
 | `external.search.url` | str | required | The domain's HTTPS address |
-| `resources` | section | — | Small on a server of your own: the stores sized to the server's memory (section 5a.2). |
+| `resources` | section | — | Small on a server of your own: the stores sized to the server's memory (section 5a.2); and, on Lite or such a Small on Linux, the local engine on an NVIDIA GPU (section 5a.4). |
 | `resources.memory_gib` | int or none | none | The memory the stores are sized to, in GiB (as Docker reports it). Default: none — the stores keep their fixed sizes. |
 | `resources.graph_heap_gib` | int or none | none | Overrides the graph store's heap (-Xmx), in GiB; at most 31. |
 | `resources.search_heap_gib` | float or none | none | Overrides OpenSearch's heap (-Xms and -Xmx), in GiB. |
 | `resources.postgres_shared_buffers_gib` | float or none | none | Overrides PostgreSQL's shared_buffers, in GiB. |
+| `resources.gpu` | `none` \| `nvidia` | `none` | The local engine runs on the CPU. nvidia: the ollama service reserves every NVIDIA GPU, and the extraction model is qwen2.5:14b-instruct unless models.extraction names one. The NVIDIA driver and Container Toolkit are the administrator's to install. |
 <!-- options:end -->

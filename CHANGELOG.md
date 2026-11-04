@@ -6,6 +6,35 @@ update. Work not yet in a release is listed under *Unreleased*.
 
 ## Unreleased
 
+## v0.4.7 — 2026-11-04
+
+- **Installing on a hardened server works.** On a server whose installing account has a strict
+  umask (077, or a CIS-hardened 027), the identity provider could not read its own settings and the
+  install stopped at "build and start the deployment". Every file a service reads from the
+  deployment's folder is now readable by it, whatever the umask; `deployment.env` stays readable by
+  its owner alone. `ospreyflow doctor` and `install` refuse, in words, an organisation's root
+  certificate (`server.ca`) that the identity provider could not read.
+- **Demo packs load on Small.** The answers' `demo_packs` were accepted and silently not loaded on a
+  server of your own; they now load once the first administrator exists. And `ospreyflow demo add`
+  refused every pack on a deployment with no demo accounts; each now loads into its own case with
+  the first administrator, `admin`, as its Author.
+- **The first administrator can open the cases they author.** On a deployment without demo
+  accounts (Small, and Enterprise), the first administrator, `admin`, is now made with both the
+  Admin and the Analyst roles, whether or not demo packs load. The Admin role alone does not open a
+  case's graph. An `admin` made by an earlier release keeps Admin alone: add the Analyst role in
+  Admin, People and roles.
+- **The local engine on an NVIDIA GPU.** On Small on a server of your own, or Lite on a Linux
+  computer, the deployment's own model can run on the server's NVIDIA GPU: `gpu: nvidia` under
+  `server:` in the answers file, or `resources.gpu: nvidia` in `osprey.yaml`. It answers much faster,
+  and uses the larger `qwen2.5:14b-instruct` unless `models.extraction` names another. `ospreyflow
+  doctor`, `install` and `apply` check the NVIDIA driver, Docker's NVIDIA Container Toolkit and the
+  GPU's memory before anything starts; OspreyFlow installs neither. Off by default; not for Small
+  in a cloud or Enterprise. See the administration guide, §5a.4.
+- **The first backup of a new deployment works.** `ospreyflow backup` failed on 'recipes' before
+  any recipe had been published, and left a half-written set behind. Items a new deployment does
+  not have yet are now recorded as empty, and a backup that fails removes what it had started.
+- Update with `ospreyflow update`.
+
 ## v0.4.6 — 2026-11-04
 
 - **Installing and updating on a Linux server works.** Earlier releases refused every install and

@@ -145,7 +145,7 @@ def render_ollama_pull_script(config: OspreyConfig) -> str:
     pulled and digest-verified the same way (`06_DECISIONS.md` ADR-095 decision 1). The developer
     stack and CI keep pulling the small pinned models only; `test_deployment_models.py` holds the
     rendered script to exactly that."""
-    model = config.models.extraction
+    model = config.extraction_model
     line = f"pull_and_verify {model} {EXTRACTION_MODELS[model]}\n"
     return _OLLAMA_PULL_SCRIPT.replace("wait\n", line + "wait\n")
 
@@ -262,7 +262,7 @@ def render_litellm_config(config: OspreyConfig) -> str:
     ADR-020 pins the model weights themselves, verified at the `ollama` service's own startup.
     This file only wires names to backends, so the pin stays in one place.
     """
-    extraction = config.models.extraction
+    extraction = config.extraction_model
     table = yaml.safe_load(_local_model_table(config, extraction))
     table["model_list"] += provider_model_entries(config)
     return yaml.safe_dump(table, sort_keys=False)
@@ -1084,6 +1084,12 @@ def compose_services(config: OspreyConfig, images: Sequence[ServiceImage]) -> di
             # ...-partial ...: no such file or directory", a user's install, 15 October 2026). It
             # never pulls, so it never needs to prune.
             service["environment"] = {"OLLAMA_NOPRUNE": "1"}
+            if config.resources.gpu == "nvidia":
+                # ADR-135 Amendment 1 decision 2: this server alone reserves every NVIDIA GPU; the
+                # same pinned image carries CUDA. `ollama-models` only downloads, so it has none.
+                service["deploy"] = {"resources": {"reservations": {"devices": [
+                    {"driver": "nvidia", "count": "all", "capabilities": ["gpu"]}
+                ]}}}  # fmt: skip
             services["ollama-models"] = _model_download_step(
                 str(service["image"]),
                 volume="ollama-models:/root/.ollama",
@@ -1331,7 +1337,7 @@ def _render_env(config: OspreyConfig) -> str:
         f"OSPREY_REAL_DATA_EXCEPTIONS={config.governance.real_data_exceptions}",
         f"OSPREY_MODELS_LOCAL_ONLY={'true' if config.models.local_only else 'false'}",
         # ADR-095: the models the Conduit uses for analysts' work, chosen on the Models screen.
-        f"OSPREY_EXTRACTION_MODEL={config.models.extraction}",
+        f"OSPREY_EXTRACTION_MODEL={config.extraction_model}",
         f"OSPREY_VISION_MODEL={config.models.vision}",
         f"OSPREY_TRANSCRIPTION_MODEL={config.models.transcription}",
         f"OSPREY_EMBEDDING_MODEL={config.models.embedding}",
@@ -1681,6 +1687,36 @@ def write_private(path: Path, text: str) -> None:
         handle.write(text)
 
 
+#: What a rendered file that holds no secret is written as, and a folder of them, whatever the
+#: installer's umask: readable by every account, because a container that does not run as the
+#: installer reads it through a bind mount (Keycloak as uid 1000, the workspace as `nginx`, the
+#: Conduit as `osprey`). Found on the first server, 4 November 2026 (ADR-114 Amendment 33): an
+#: install under `umask 077` wrote `realm.json` 600 and Keycloak could not import it.
+SHARED_FILE_MODE = 0o644
+SHARED_FOLDER_MODE = 0o755
+
+
+def write_shared(path: Path, text: str) -> None:
+    """`text` into `path`, readable by every account (`644`) whatever the umask, whether the file is
+    new or was tighter before. Only for a file that holds no secret: `write_private` is the other
+    half, for `deployment.env`."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, SHARED_FILE_MODE)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        os.fchmod(handle.fileno(), SHARED_FILE_MODE)
+        handle.write(text)
+
+
+def make_shared_folder(path: Path, *, under: Path) -> None:
+    """`path` and every folder between `under` and it made, each `755` whatever the umask, so a
+    container mounting any of them can walk it. `under` itself keeps its own mode: a named
+    deployment's folder is `700` (ADR-138), which a file's bind mount never walks."""
+    path.mkdir(parents=True, exist_ok=True)
+    for folder in (path, *path.parents):
+        if folder == under or under not in folder.parents:
+            break
+        folder.chmod(SHARED_FOLDER_MODE)
+
+
 def write(result: RenderResult, out_dir: Path) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     written = []
@@ -1689,7 +1725,7 @@ def write(result: RenderResult, out_dir: Path) -> list[Path]:
         if name == SECRETS_FILE:
             write_private(target, content)
         else:
-            target.write_text(content, encoding="utf-8")
+            write_shared(target, content)
         written.append(target)
     return written
 
@@ -1714,7 +1750,8 @@ def write_config_copy(config_path: Path, out_dir: Path) -> Path:
         content = yaml.safe_dump(
             OspreyConfig().model_dump(mode="json", exclude_none=True), sort_keys=False
         )
-    target.write_text(content, encoding="utf-8")
+    # The Conduit mounts it, and it holds no secret (05_DEPLOYMENT.md §7: never in osprey.yaml).
+    write_shared(target, content)
     return target
 
 

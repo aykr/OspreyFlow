@@ -12,6 +12,10 @@ deletes it. It is made with Keycloak's own admin tool inside its container (`KCA
 their own (B4's ceiling), so a first administrator below the top would cap every account the
 deployment ever has.
 
+**Roles:** Admin and Analyst, from the start, whether or not demo packs load (the owner's ruling of
+4 November 2026, ADR-114 Amendment 33). The Admin role alone has no right to investigate
+(`schemas.rights.ADMIN`), so a case the first administrator authors would be listed but not open.
+
     python -m harness.first_admin --deployment deploy/generated/small --code-file /run/…/code
 """
 
@@ -34,6 +38,15 @@ from ontology.handling import HandlingScheme, load_uk_le_scheme
 #: 1/I, sixteen letters in four groups, 80 bits.
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
+#: The first administrator's username, unless `--username` names another. A demo pack loaded on a
+#: deployment with no demo accounts makes this account its case's Author (`scripts.seed_internal`).
+FIRST_ADMIN_USERNAME = "admin"
+
+#: The first administrator's roles, by the names `schemas.rights.ROLE_RIGHTS` gives them: Admin,
+#: and Analyst so that the cases they author open (ADR-114 Amendment 33, the owner's ruling of
+#: 4 November 2026).
+FIRST_ADMIN_ROLES = (ADMIN_ROLE, "analyst")
+
 
 def one_time_code() -> str:
     letters = "".join(secrets.choice(CODE_ALPHABET) for _ in range(16))
@@ -51,7 +64,7 @@ def first_administrator(
             "clearance": [scheme.classification[-1]],
             "org_unit": ["administration"],
             "receivable_handling_codes": list(scheme.handling_codes),
-            "roles": [ADMIN_ROLE],
+            "roles": list(FIRST_ADMIN_ROLES),
         },
         "requiredActions": ["UPDATE_PASSWORD"],
         "credentials": [{"type": "password", "value": code, "temporary": True}],
@@ -84,7 +97,7 @@ def create_first_administrator(
     *,
     keycloak: str = "keycloak",
     realm: str = "osprey",
-    username: str = "admin",
+    username: str = FIRST_ADMIN_USERNAME,
     email: str | None = None,
 ) -> str:
     """Makes the account and returns its one-time code; refuses, in words, if it was not made."""
@@ -106,7 +119,7 @@ def create_first_administrator(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="harness.first_admin", description=__doc__)
     parser.add_argument("--deployment", type=Path, required=True, help="the deployment folder")
-    parser.add_argument("--username", default="admin")
+    parser.add_argument("--username", default=FIRST_ADMIN_USERNAME)
     parser.add_argument("--email")
     parser.add_argument(
         "--code-file", type=Path,
