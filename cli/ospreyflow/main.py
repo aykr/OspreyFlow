@@ -238,7 +238,7 @@ def _parser() -> argparse.ArgumentParser:
     install.add_argument(
         "--list-starters", action="store_true", help="list the starters; install nothing"
     )
-    install.add_argument("--service-name", help="GOV.UK: the service's name in its header")
+    install.add_argument("--service-name", help="GOV.UK: the service's name, in the page title")
     install.add_argument("--organisation", help="GOV.UK: the organisation in its footer")
     install.add_argument("--phase", choices=starters.PHASES, help="GOV.UK: the phase banner")
     install.add_argument(
@@ -435,7 +435,7 @@ def _prompted_answers(
             # phase. The name offered names the whole service, never one case (step 9d finding 3).
             raw["appearance"] = {
                 "service_name": flags.get("service_name")
-                or ctx.ask("The service's name (GOV.UK header)", starter.domain.service_name or ""),
+                or ctx.ask("The service's name (page title)", starter.domain.service_name or ""),
                 "organisation": flags.get("organisation")
                 or ctx.ask("The organisation (GOV.UK footer)", ""),
                 "phase": flags.get("phase")
@@ -919,8 +919,18 @@ def _start(args: argparse.Namespace, ctx: _Context) -> int:
             env=ctx.named_env(),
         )
     else:
+        _uploads_ready(ctx, directory)
         ctx.step("start the deployment", [*compose(directory), "up", "-d", "--wait"])
     return 0
+
+
+def _uploads_ready(ctx: _Context, directory: Path) -> None:
+    """ADR-114 Amendment 33, "as found on the first server": the Ingest Studio's upload folder the
+    Conduit's to write before `up` (`harness.ingest_uploads`, which says why when it cannot)."""
+    ctx.step(
+        "prepare the upload folder",
+        [*ctx.python, "-m", "harness.ingest_uploads", str(directory / "compose.yaml")],
+    )
 
 
 def _apply_settings(ctx: _Context) -> int:
@@ -1025,6 +1035,7 @@ def _switch(args: argparse.Namespace, ctx: _Context) -> int:
         if running and folder.resolve() != own:
             print(f"Stopping {name}, so this one has the machine to itself.")
             ctx.step(f"stop {name}", [*compose(folder), "stop"])
+    _uploads_ready(ctx, ctx.deployed())
     ctx.step("start the deployment", [*compose(ctx.deployed()), "up", "-d", "--wait"])
     named.remember(ctx.env, ctx.target.name)
     address = ctx.origin()

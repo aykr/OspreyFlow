@@ -30,6 +30,7 @@ from typing import Any
 
 import yaml
 
+from harness import ingest_uploads, model_downloads
 from harness.keycloak_theme import clear_theme_cache
 from harness.release import (
     GITHUB_API,
@@ -405,6 +406,13 @@ def apply_update(
     ):
         print("Nothing was changed.")
         return 1
+    # ADR-114 Amendment 33, "as found on the first server": the upload folder the Conduit's to write
+    # before anything is changed, by the running version's own Conduit image, which is here.
+    try:
+        ingest_uploads.prepare(directory / "compose.yaml", run=host.run)
+    except ingest_uploads.UploadFolderRefused as refused:
+        print(f"ospreyflow: {refused} Nothing was changed.", file=sys.stderr)
+        return 1
     commit = _ok(host, ["git", "-C", str(repo), "rev-parse", "HEAD"], "read the checkout").strip()
     try:
         backup = host.backup()
@@ -419,10 +427,17 @@ def apply_update(
     up = [*compose, "up", "-d", "--wait", *([] if prepared.pull else ["--pull", "never"])]
     try:
         _ok(host, ["git", "-C", str(repo), "checkout", "--quiet", tag], "check out the release")
+        pulls_before = model_downloads.commands(directory / "compose.yaml")
         changed = host.files_up_to_date()
         pin_images(directory, prepared.lock, prepared.references)
         if prepared.pull:
             _ok(host, [*compose, "pull"], "pull the release's images")
+        # Defect 9 (ADR-114 Amendment 33): the release's `up` would make `ollama-models` again for
+        # a changed pull, but start the gateway and the Conduit on the new model beside it.
+        steps = model_downloads.steps_to_fetch(pulls_before, directory / "compose.yaml")
+        never = () if prepared.pull else ("--pull", "never")
+        for argv in model_downloads.fetch_argvs(compose, steps, force=False, extra=never):
+            _ok(host, argv, f"fetch the new model ({', '.join(steps)}; ospreyflow logs has why)")
         _ok(host, up, "start the release")
         # `proxy_changed` names the models' proxy (LiteLLM); `routing_changed` the front proxy's
         # routing table (ADR-132 Amendment 2).

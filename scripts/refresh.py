@@ -24,7 +24,8 @@ the checkout's version is not touched, so an operator's edit to it is theirs.
 
 It also brings the deployment's models up to date with its own `osprey.yaml` (ADR-095): the chosen
 extraction model's pull line in `compose.yaml`, the proxy's routing table `litellm.yaml`, and the
-model lines of `deployment.env`, each exactly as `harness.render` writes them, and restarts the
+model lines of `deployment.env`, each exactly as `harness.render` writes them, fetches a newly
+chosen model before anything that uses it starts (`harness.model_downloads`), and restarts the
 proxy when its table changed. Nothing else in those files is touched, and no secret changes. The
 Glass's `/deployment.json` (`glass.json`, no secret in it) is written as the checkout renders it.
 
@@ -44,7 +45,7 @@ from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 import yaml
-from harness import register_sign_in
+from harness import ingest_uploads, model_downloads, register_sign_in
 from harness.apply import _compose, release_registry
 from harness.keycloak_theme import (
     THEME_DIRECTORY,
@@ -532,6 +533,23 @@ def _files_up_to_date(directory: Path, repo_root: Path) -> dict[str, bool]:
     }
 
 
+def _uploads_ready(compose_file: Path, run: Callable[[Sequence[str]], None]) -> None:
+    """The Ingest Studio's upload folder the Conduit's to write, before `up` (ADR-114 Amendment 33,
+    "as found on the first server"; `harness.ingest_uploads`)."""
+
+    def run_it(argv: Sequence[str]) -> tuple[int, str]:
+        try:
+            run(argv)
+        except RefreshFailed as failed:
+            return 1, str(failed)
+        return 0, ""
+
+    try:
+        ingest_uploads.prepare(compose_file, run=run_it)
+    except ingest_uploads.UploadFolderRefused as refused:
+        raise RefreshFailed(str(refused)) from refused
+
+
 def refresh(
     repo_root: Path = REPO_ROOT,
     *,
@@ -540,9 +558,19 @@ def refresh(
 ) -> None:
     directory = _deployment_dir(repo_root)
     compose = _compose(directory / "compose.yaml")
+    pulls_before = model_downloads.commands(directory / "compose.yaml")
     changed = files_up_to_date(repo_root)
     theme_changed, proxy_changed = changed["theme_changed"], changed["proxy_changed"]
     run([*compose, "build", "--pull"])
+    _uploads_ready(directory / "compose.yaml", run)
+    # Defect 9 (ADR-114 Amendment 33): `up` alone would start `ollama-models` again for its changed
+    # command, but start the gateway and the Conduit on the new model beside it, before it is there.
+    steps = model_downloads.steps_to_fetch(pulls_before, directory / "compose.yaml")
+    try:
+        for argv in model_downloads.fetch_argvs(compose, steps, force=False):
+            run(argv)
+    except RefreshFailed as failed:
+        raise RefreshFailed(f"{model_downloads.failed_words(steps)} ({failed})") from failed
     run([*compose, "up", "-d", "--wait"])
     if proxy_changed:
         # The proxy reads its routing table at start; `up` recreates the Ollama and API

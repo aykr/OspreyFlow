@@ -14,10 +14,14 @@ is made from the deployment's own schema, and is checked against it on every cha
 <!-- document-control:begin -->
 ## Document control
 
-**Version 1.38** · 2026-11-04 · For OspreyFlow v0.4.8 · Issued
+**Version 1.42** · 2026-11-04 · For OspreyFlow v0.4.9 · Issued
 
 | Version | Date | What changed |
 | --- | --- | --- |
+| 1.42 | 2026-11-04 | Describes v0.4.9. No change to its content. |
+| 1.41 | 2026-11-04 | The owner's ruling (ADR-132 Amendment 5): §1a, the GOV.UK service's name is shown in the page title on every page, the sign-in page's included; no band under the GOV.UK header names it any more. Appendix A: `appearance` and `appearance.service_name` say the same. |
+| 1.40 | 2026-11-04 | As measured and found on the first server (ADR-135 Amendment 1, ADR-114 Amendment 33): §5a.4 the model server's KV cache at q8_0 with flash attention on a GPU, the measured times, the doctor's 14 GiB for the 14b (was 12), and `apply` fetching a newly chosen model; §13 the object store copied as the account that runs the backup, and a failed backup's set it cannot remove marked incomplete; §16 a backup refused with "Permission denied", and Ask failing after the extraction model changed. |
+| 1.39 | 2026-11-04 | Found on the first server (ADR-114 Amendment 33): §5a the Ingest Studio's upload folder, given to the Conduit's user (uid 10001) before anything starts, and never writable by every account; §16 an upload or a demo pack refused with "Permission denied" on Linux. |
 | 1.38 | 2026-11-04 | Describes v0.4.8. No change to its content. |
 | 1.37 | 2026-11-04 | Describes v0.4.7. No change to its content. |
 | 1.36 | 2026-11-04 | The owner's ruling (ADR-114 Amendment 33): the first administrator holds the Admin and the Analyst roles from the start, whether or not demo packs load, so the cases they author open for them. §1a and §11 no longer ask anyone to give them the Analyst role; §5 and §5a say which roles the account is made with; §9.2 says so too, and that an `admin` made by v0.4.6 or earlier needs the Analyst role added. |
@@ -220,9 +224,9 @@ ospreyflow install --mode lite --starter govuk-blank --service-name "<your servi
 **The GOV.UK theme** asks for the service's name, organisation and phase (`--service-name`,
 `--organisation`, `--phase alpha|beta|live|none`; the phase offered first is `beta`). Without a
 service name the install is refused, in words, before anything is changed. **Name the service, not a
-case:** the GOV.UK header shows the name on every page of every case, so the names offered above
-describe the whole deployment; "Prison Intelligence" in the header of the Ledger's case is the
-mistake this avoids. `blank` offers no name: a real service names itself.
+case:** the name is the page title (the browser tab's "<name> – GOV.UK") on every page of every
+case, so the names offered above describe the whole deployment; "Prison Intelligence" over the
+Ledger's case is the mistake this avoids. `blank` offers no name: a real service names itself.
 
 **On the guided page** (`ospreyflow install --gui`, section 4.1) the starter is on the first screen,
 Mode, under **Starter (optional)**; a GOV.UK starter shows the service's name (filled in with the
@@ -632,6 +636,15 @@ organisation's root, `ca`, is mounted into the identity provider, which runs as 
 no secret). The key stays `600`. The install's own tools reach the three names on the server itself and
 trust the deployment's certificate (and `ca`), so they work before the organisation's DNS does.
 
+**The upload folder.** Files an analyst uploads in the Ingest Studio, and the demo packs' own
+files, are written to `uploaded/` inside `server.ingest` by the Conduit, which runs as uid 10001.
+Before anything starts, `install`, `apply`, `start` and `update` make that folder and, when uid
+10001 cannot write it, give it to `10001:10001` with a short-lived container of the Conduit's own
+image, so the service account needs no root for it. It is never made writable by every account, and
+an arrangement of your own that already lets uid 10001 write (its group, and mode `2775`, say) is
+left as it is. If it cannot be given over, the command says why and starts nothing (section 16).
+Lite on a Linux computer does the same.
+
 **Renewing the certificate.** Replace the two files (same paths), then run `ospreyflow apply`. It
 checks the new certificate, and only the front proxy is started again.
 
@@ -744,22 +757,32 @@ models' pinned weights and the gateway are the same. Image descriptions and embe
 same model server, so they use the GPU too; transcription stays on the processors. The extraction
 model, which also answers Ask the case and Ask to search on the local engine, becomes
 `qwen2.5:14b-instruct` (about 9 GB, downloaded once) instead of `qwen2.5:7b-instruct`, unless
-`osprey.yaml` names one under `models.extraction`, which always wins. An `osprey.yaml` saved by the
+`osprey.yaml` names one under `models.extraction`, which always wins. `ospreyflow apply` fetches
+a newly chosen model, and waits for it, before the services that use it start again. An `osprey.yaml` saved by the
 guided page (`--gui`) names every model, `models.extraction: qwen2.5:7b-instruct` among them, so it
-keeps the 7b on the GPU until that line is removed. Without a GPU nothing changes.
+keeps the 7b on the GPU until that line is removed. On the GPU the model server also keeps its
+working memory for a question at reduced precision (`OLLAMA_FLASH_ATTENTION=1` and
+`OLLAMA_KV_CACHE_TYPE=q8_0`), which is what fits the 14b, with the long context it is given, wholly
+on a 16 GB card. Without a GPU nothing changes.
+
+**As measured, 4 November 2026**, on the first server (an RTX 5060 Ti, 16 GB), the same question
+through the product's own route: the 14b on the GPU without those two settings used 18 GB, ran 15%
+on the processors and 85% on the GPU, and took 9–11 s an answer of about 120 tokens; with them it
+used 14 GB, ran wholly on the GPU (12.0 GiB, per `nvidia-smi`), and took 3.3–3.6 s. The 7b on the
+processors took 17.3 s.
 
 **What is checked before anything starts.** `doctor`, `install` and `apply` refuse, in words and
 with nothing changed: a computer that is not Linux; `nvidia-smi` not installed, or not answering
 ("NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver": install the
 driver, or restart after installing it); and Docker listing neither the toolkit's `nvidia` runtime
-nor an NVIDIA CDI device (`docker info`). With the 14b model, less than 12 GiB of GPU memory is a
+nor an NVIDIA CDI device (`docker info`). With the 14b model, less than 14 GiB of GPU memory is a
 warning naming the 7b: set `models.extraction: qwen2.5:7b-instruct` in `osprey.yaml` and run
 `ospreyflow apply`. The doctor names the GPU, its memory and its driver, for example:
 
 ```
 ✔ The NVIDIA GPU is NVIDIA GeForce RTX 5060 Ti, 15.9 GiB (driver 595.99.02).
 ✔ Docker can run a container on the GPU (the nvidia runtime of the NVIDIA Container Toolkit).
-✔ The GPU has 15.9 GiB of memory; qwen2.5:14b-instruct asks for at least 12 GiB.
+✔ The GPU has 15.9 GiB of memory; qwen2.5:14b-instruct asks for at least 14 GiB.
 ```
 
 To turn it off, set `resources.gpu: none` in `osprey.yaml` and run `ospreyflow apply`.
@@ -1348,7 +1371,13 @@ restored, as on Lite.
 **A fresh deployment** has no published recipes and no analytics events yet: its first set records
 them as **empty** (the manifest's `empty` list, and the backup's last lines say so), and a restore
 of it restores nothing for them. **A backup that fails** removes the set it had started, and says
-so, so no half-written set is left beside the good ones.
+so, so no half-written set is left beside the good ones. If it cannot remove all of it, it says what
+it could not remove, renames the set `<set>.incomplete` with a file `INCOMPLETE` in it, and
+`ospreyflow restore` refuses it; remove it as root (`sudo rm -rf <set>.incomplete`).
+
+**Once the object store holds files** (a demo pack or an upload has put some there), it is copied
+as the account that runs `ospreyflow backup`, so that account can remove its working copy. With
+v0.4.8 and earlier on Linux such a backup failed with "Permission denied" (section 16).
 
 **Enterprise.** The cloud protects its managed services as for Small. **The graph store and the
 analytics database run in the cluster, and nothing backs them up yet**: `ospreyflow backup` drives
@@ -1426,6 +1455,9 @@ Admin → Schedules and runs lists every one.
 | `doctor` says too little disk where backups are written | Give `server.backups` more room, or name another folder; remove old sets |
 | People on the network cannot connect to Small on your own server | Port 443 is open in front of the server — its firewall or security group, or the `DOCKER-USER` chain; `ufw` does not filter a port Docker publishes — and the three names resolve to the server in the organisation's DNS |
 | `doctor`, `install` or `apply` refuses the GPU | Each reason is named, and nothing was changed: install the NVIDIA driver and restart until `nvidia-smi` lists the GPU; install the NVIDIA Container Toolkit and run `sudo nvidia-ctk runtime configure --runtime=docker` and `sudo systemctl restart docker`; on macOS or Windows, set the GPU to `none` (section 5a.4) |
+| `ospreyflow demo add` or an upload fails with "Permission denied: '/var/lib/osprey/ingest/uploaded/…'", or `install`, `apply`, `start` or `update` says "the Conduit (uid 10001) cannot write …/uploaded" | Linux only: the Conduit's upload folder in `server.ingest` (Lite: `components.storage.ingest`) is not its own. A deployment installed or updated with v0.4.8 or earlier has it so: run `ospreyflow apply` or `ospreyflow start` once with a later version, which gives the folder over (section 5a). When giving it over fails, the command names Docker's reason; or give it over yourself, `sudo chown 10001:10001 <server.ingest>/uploaded`, and run the command again |
+| `ospreyflow backup` fails with "Permission denied" on a file under `.objects-staging`, or a folder named `….incomplete` is left where backups are written | Linux, v0.4.8 or earlier, once the object store holds files: the object store's copy belonged to the Conduit's user. Update, then back up again. Remove what was left as root (`sudo rm -rf <folder>`); a folder with an `INCOMPLETE` file in it is not a backup, and `restore` refuses it (section 13) |
+| Ask on the local engine fails after the extraction model was changed (the GPU switched on, or `models.extraction`) | `ospreyflow apply` fetches the newly chosen model, and waits for it, before anything that uses it starts again; if the download fails it stops with nothing changed, saying "the model download (ollama-models) did not finish": `ospreyflow logs ollama-models` says why, then run `ospreyflow apply` again. With v0.4.8 or earlier, `apply` never fetched it: `docker compose --env-file <deployment>/deployment.env -f <deployment>/compose.yaml up -d --force-recreate --no-deps ollama-models` fetches it (the 14b is about 9 GB) |
 | A Small server never answered | Its log, `/var/log/ospreyflow-first-boot.log` (Session Manager on AWS) |
 | An update rolled back | Its own words say why, and where its backup is |
 | The model download stopped with `rename …-partial …: no such file or directory` | A model server restarted mid-download and removed the half-fetched file (fixed from the release after 15 October 2026). Run `ospreyflow start` while the deployment is up: it starts the download again and the server keeps running, so it completes |
@@ -1556,9 +1588,9 @@ Made from the deployment's own schema. Settings marked *section* hold the settin
 | `deployment` | section | — | Which deployment this is, on a machine that runs more than one. |
 | `deployment.name` | str or none | none | Names this deployment's Compose project, its volumes and its rendered folder, so a second deployment on the same machine shares none of them. |
 | `deployment.graph_port` | int or none | none | The port on this machine (127.0.0.1 only) the graph store's own tools reach it at. A deployment installed beside another with ospreyflow install --name is given one of its own, so the two share no port. |
-| `appearance` | section | — | How every page looks: the deployment's brand, and what a GOV.UK header names. |
+| `appearance` | section | — | How every page looks: the deployment's brand, and what its page title names. |
 | `appearance.brand` | `ospreyflow` \| `govuk` | `ospreyflow` | The GOV.UK look, for a service on a gov.uk domain only. |
-| `appearance.service_name` | str or none | none | The service's name in the GOV.UK header and the page title. |
+| `appearance.service_name` | str or none | none | The service's name, in the page title. |
 | `appearance.organisation` | str or none | none | The organisation in the GOV.UK footer and the page title. |
 | `appearance.phase` | `alpha` \| `beta` \| `live` \| `none` | `none` | The phase banner shows at alpha or beta. |
 | `external` | section | — | What a cloud runs for the deployment instead of a container (Small). |

@@ -6,6 +6,42 @@ update. Work not yet in a release is listed under *Unreleased*.
 
 ## Unreleased
 
+## v0.4.9 — 2026-11-04
+
+- **No service-name band under the GOV.UK header.** Under the GOV.UK theme the band that named the
+  service below the GOV.UK header is gone, on the workspace, the start and welcome pages and the
+  sign-in page alike, so the workspace gets that height back (the owner's ruling, ADR-132
+  Amendment 5). The service's name is in the page title, "<service> – GOV.UK", now on the sign-in
+  page too. The "Beta" banner is unchanged: `appearance.phase: none` turns it off.
+- **Uploads and demo packs work on Linux.** On a Linux server or computer, the folder the Ingest
+  Studio's uploads and the demo packs' files go to (`uploaded/` in the ingest folder) was made by
+  Docker, owned by root, and the Conduit could not write it: `ospreyflow demo add` and every upload
+  failed with "Permission denied". Before anything starts, `install`, `apply`, `start` and `update`
+  now make that folder and give it to the Conduit's user (uid 10001) when it cannot write it, with
+  the Conduit's own image; it is never made writable by every account, and a folder the Conduit can
+  already write is left as it is. A deployment updated from v0.4.8 or earlier is put right by its
+  first `ospreyflow apply` or `ospreyflow start` afterwards.
+- **The local engine fits the 14b wholly on a 16 GB GPU.** With `resources.gpu: nvidia`, the model
+  server now keeps its KV cache at q8_0 with flash attention (`OLLAMA_FLASH_ATTENTION=1`,
+  `OLLAMA_KV_CACHE_TYPE=q8_0`). Measured on the first server (RTX 5060 Ti, 16 GB), the same question:
+  before, 18 GB, 15%/85% CPU/GPU, 9–11 s an answer; now 14 GB, 100% GPU, 3.3–3.6 s. The doctor now
+  asks for at least 14 GiB of GPU memory for the 14b (12 before); below that it warns and names the
+  7b. Without a GPU nothing changes. Run `ospreyflow apply` on a GPU deployment to take it.
+- **`ospreyflow apply` fetches a newly chosen model.** Switching the GPU on (which chooses the 14b)
+  or changing `models.extraction` re-rendered the deployment and restarted the gateway and the
+  Conduit, but never fetched the new model, so every Ask on the local engine went to a model that
+  was not there. `apply` now fetches it, and waits, before anything that uses it starts again; if
+  the download fails, nothing is changed and it says so. `ospreyflow start --build` and
+  `ospreyflow update` also wait for a changed model before starting the rest.
+- **`ospreyflow backup` works once the object store holds files.** On Linux, after a demo pack or an
+  upload, every backup failed with "Permission denied": the object store's working copy belonged
+  to the Conduit's user, and the installing account could not remove it. It is now made as the
+  account that runs the backup. A failed backup that cannot remove its partial set says so, renames
+  it `<set>.incomplete` with an `INCOMPLETE` file in it, and `ospreyflow restore` refuses it. A
+  partial set left by v0.4.8 or earlier has to be removed as root (`sudo rm -rf <set>`).
+- Update with `ospreyflow update`. On a Linux server updating from v0.4.8 or earlier, run
+  `ospreyflow apply` once afterwards, so the Conduit is given its upload folder.
+
 ## v0.4.8 — 2026-11-04
 
 - **`ospreyflow update` works for an install from a release.** Every earlier release's update
