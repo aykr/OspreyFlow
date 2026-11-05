@@ -347,6 +347,8 @@ export const SIGN_IN_ACTIONS = defineActionRegistry("SIGN_IN_ACTIONS", [
   "submit-sign-in",
   // ADR-115 E2: the welcome page.
   "continue-with-organisation-sign-in",
+  // ADR-115 Amendment 5: the same button, named by the provider's label.
+  "continue-with-the-organisations-named-provider",
   // ADR-114 Amendment 33 decision 4: beside the organisation's sign-in, the deployment's own
   // accounts (the first administrator's among them) sign in without the provider hint.
   "sign-in-with-an-account-beside-the-organisation",
@@ -750,6 +752,9 @@ export const ADMIN_ACTIONS = defineActionRegistry("ADMIN_ACTIONS", [
   "edit-a-persons-access-by-keyboard",
   "disable-and-enable-a-person-by-keyboard",
   "reset-a-persons-sign-in-by-keyboard",
+  // ADR-112 Amendment 3 (build order step 33): remove a person.
+  "remove-a-person-by-keyboard",
+  "join-an-organisation-arrival-by-keyboard",
   // ADR-114 Amendment 5 (B4d): the Demo packs tab.
   "copy-a-demo-pack-command-by-keyboard",
   // ADR-110 decision 8 (D4): Schedules and runs.

@@ -26,7 +26,8 @@ from typing import Any
 
 #: `manage-users` and `manage-clients` (ADR-112 Amendment 1): the Admin area's People and roles and
 #: Dashboards, through the Conduit's own account so every change passes its right check and audit.
-REQUIRED_ROLES = ("impersonation", "view-users", "manage-users", "manage-clients")
+#: `view-events` (Amendment 3 (b)): the refused organisation arrivals People offers to join.
+REQUIRED_ROLES = ("impersonation", "view-users", "manage-users", "manage-clients", "view-events")
 
 
 class RealmConfigurationFailed(RuntimeError):
@@ -99,14 +100,16 @@ def ensure_client(*, issuer: str, realm: str, token: str, client: dict[str, Any]
     """Create a client unless it exists. Keycloak's 409 for a duplicate is the expected answer on
     a second run, not a failure. An existing client keeps everything it has except the addresses it
     redirects to, which are brought up to date: they are exact-match, so a client registered at an
-    address that has since moved would fail at Keycloak's own error page."""
+    address that has since moved would fail at Keycloak's own error page. `use.refresh.tokens` is
+    brought into line too, where the rendered client names it (the Glass's, ADR-050 Amendment 2):
+    a realm imported before it keeps Keycloak's default, which gives a refresh token."""
     status, found = _call(
         f"{issuer}/admin/realms/{realm}/clients?clientId={client['clientId']}", token=token
     )
     if status == 200 and found:
         existing = found[0]
         attributes = {**existing.get("attributes", {})}
-        for key in ("post.logout.redirect.uris",):
+        for key in ("post.logout.redirect.uris", "use.refresh.tokens"):
             if key in client.get("attributes", {}):
                 attributes[key] = client["attributes"][key]
         wanted = {
@@ -577,3 +580,165 @@ def ensure_identity_provider(
         f"organisation sign-in {alias}: {done}, its client credential set from the deployment's "
         "settings; people arriving through it have no role until an administrator grants one"
     )
+
+
+def ensure_arrival_events(*, issuer: str, realm: str, token: str) -> str:
+    """The realm keeps its record of a refused first sign-in through the organisation (ADR-112
+    Amendment 3 (b); `realm.ARRIVAL_EVENT`), for `realm.ARRIVAL_EVENTS_SECONDS`, so Admin -> People
+    can offer the join. A realm whose events were off keeps that one type and no other — it does
+    not start recording everyone's sign-ins; one whose events an administrator turned on keeps its
+    own choice, with this type added. Safe to repeat: a realm already so is not written."""
+    from harness.realm import ARRIVAL_EVENT, ARRIVAL_EVENTS_SECONDS
+
+    url = f"{issuer}/admin/realms/{realm}/events/config"
+    status, held = _call(url, token=token)
+    if status != 200 or not isinstance(held, dict):
+        raise RealmConfigurationFailed(
+            f"Keycloak did not give the realm's events settings ({status})"
+        )
+    wanted = dict(held)
+    if not held.get("eventsEnabled"):
+        wanted.update(eventsEnabled=True, enabledEventTypes=[ARRIVAL_EVENT])
+    elif ARRIVAL_EVENT not in (held.get("enabledEventTypes") or [ARRIVAL_EVENT]):
+        wanted["enabledEventTypes"] = [*held["enabledEventTypes"], ARRIVAL_EVENT]
+    if not held.get("eventsExpiration"):
+        wanted["eventsExpiration"] = ARRIVAL_EVENTS_SECONDS
+    if wanted == held:
+        return "refused organisation sign-ins: already recorded"
+    status, _ = _call(url, token=token, data=wanted, method="PUT")
+    if status not in (200, 204):
+        raise RealmConfigurationFailed(
+            f"Keycloak refused the realm's events settings ({status}); refused organisation "
+            "sign-ins would not be offered for joining in Admin, People and roles"
+        )
+    return "refused organisation sign-ins: recorded for seven days, for Admin to join"
+
+
+def remove_first_sign_in_flow(*, issuer: str, realm: str, token: str, alias: str) -> str | None:
+    """The flow `alias` removed from the realm, if it is there (ADR-114 Amendment 33, "Step 33":
+    the join-by-email flow, once joining by email is turned off — run after the provider names the
+    other flow, as Keycloak refuses to remove a flow a provider names). None when there was none."""
+    base = f"{issuer}/admin/realms/{realm}/authentication/flows"
+    status, flows = _call(base, token=token)
+    if status != 200 or not isinstance(flows, list):
+        raise RealmConfigurationFailed(f"Keycloak did not list the sign-in flows ({status})")
+    held = [f for f in flows if f.get("alias") == alias]
+    if not held:
+        return None
+    status, _ = _call(f"{base}/{held[0]['id']}", token=token, method="DELETE")
+    if status not in (200, 204):
+        raise RealmConfigurationFailed(
+            f"Keycloak refused to remove the sign-in flow {alias!r} ({status}); remove it in "
+            "Keycloak's console, under Authentication"
+        )
+    return f"the sign-in flow {alias!r}: removed"
+
+
+def ensure_first_sign_in_flow(*, issuer: str, realm: str, token: str, flow: dict[str, Any]) -> str:
+    """The flow a person's first sign-in through the organisation's provider runs (ADR-114
+    Amendment 33, "Step 28 (e)"; `realm.organisation_first_sign_in_flow`), made or put back as
+    rendered: each step present, at its requirement, with its settings. Safe to repeat: a flow
+    already as rendered is not written. A step added by hand is left where it is; a step of ours
+    is never moved. Raises `RealmConfigurationFailed` naming the flow when Keycloak refuses any of
+    it — the provider must not then be registered naming a flow that is not there."""
+    base = f"{issuer}/admin/realms/{realm}/authentication"
+    alias = flow["alias"]
+    changed: list[bool] = []
+
+    def refused(what: str, status: int) -> RealmConfigurationFailed:
+        return RealmConfigurationFailed(
+            f"Keycloak refused the organisation's first sign-in flow ({what}: {status}); people "
+            "arriving through the organisation would meet Keycloak's own pages"
+        )
+
+    status, flows = _call(f"{base}/flows", token=token)
+    if status != 200 or not isinstance(flows, list):
+        raise refused("listing the flows", status)
+    if alias not in {f.get("alias") for f in flows}:
+        status, _ = _call(
+            f"{base}/flows",
+            token=token,
+            data={"alias": alias, "description": flow.get("description", ""),
+                  "providerId": "basic-flow", "topLevel": True, "builtIn": False},
+        )  # fmt: skip
+        if status not in (201, 409):
+            raise refused("making it", status)
+        changed.append(True)
+
+    def children(parent: str) -> list[dict[str, Any]]:
+        status, listed = _call(
+            f"{base}/flows/{urllib.parse.quote(parent, safe='')}/executions", token=token
+        )
+        if status != 200 or not isinstance(listed, list):
+            raise refused(f"reading {parent!r}", status)
+        return [e for e in listed if e.get("level") == 0]
+
+    def matches(execution: dict[str, Any], step: dict[str, Any]) -> bool:
+        if "flow" in step:
+            return bool(execution.get("authenticationFlow")) and (
+                str(execution.get("displayName")) == step["flow"]
+            )
+        return bool(execution.get("providerId") == step["provider"])
+
+    def ensure_steps(parent: str, steps: list[dict[str, Any]]) -> None:
+        quoted = urllib.parse.quote(parent, safe="")
+        for step in steps:
+            found = [e for e in children(parent) if matches(e, step)]
+            if not found:
+                if "flow" in step:
+                    status, _ = _call(
+                        f"{base}/flows/{quoted}/executions/flow", token=token,
+                        data={"alias": step["flow"], "type": "basic-flow", "description": ""},
+                    )  # fmt: skip
+                else:
+                    status, _ = _call(
+                        f"{base}/flows/{quoted}/executions/execution", token=token,
+                        data={"provider": step["provider"]},
+                    )  # fmt: skip
+                if status not in (200, 201, 204):
+                    raise refused(f"adding {step.get('flow') or step['provider']!r}", status)
+                changed.append(True)
+                found = [e for e in children(parent) if matches(e, step)]
+                if not found:
+                    raise refused(f"adding {step.get('flow') or step['provider']!r}", status)
+            execution = found[0]
+            if execution.get("requirement") != step["requirement"]:
+                status, _ = _call(
+                    f"{base}/flows/{quoted}/executions", token=token, method="PUT",
+                    data={**execution, "requirement": step["requirement"]},
+                )  # fmt: skip
+                if status not in (200, 204):
+                    raise refused(f"setting {step.get('flow') or step['provider']!r}", status)
+                changed.append(True)
+            wanted = step.get("config")
+            if wanted is not None:
+                config_id = execution.get("authenticationConfig")
+                if not config_id:
+                    status, _ = _call(
+                        f"{base}/executions/{execution['id']}/config", token=token, data=wanted
+                    )
+                    if status not in (200, 201, 204):
+                        raise refused(f"configuring {step['provider']!r}", status)
+                    changed.append(True)
+                else:
+                    status, held = _call(f"{base}/config/{config_id}", token=token)
+                    if status != 200 or not isinstance(held, dict):
+                        raise refused(f"reading {step['provider']!r}'s settings", status)
+                    if (held.get("config") or {}) != wanted["config"]:
+                        status, _ = _call(
+                            f"{base}/config/{config_id}", token=token, method="PUT",
+                            data={**held, "config": wanted["config"]},
+                        )  # fmt: skip
+                        if status not in (200, 204):
+                            raise refused(f"configuring {step['provider']!r}", status)
+                        changed.append(True)
+            if "flow" in step:
+                ensure_steps(step["flow"], step["steps"])
+
+    made = bool(changed)
+    ensure_steps(alias, flow["steps"])
+    if made:
+        return "the organisation's first sign-in: made"
+    if changed:
+        return "the organisation's first sign-in: brought up to date"
+    return "the organisation's first sign-in: already in place"

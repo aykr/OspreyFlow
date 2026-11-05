@@ -60,7 +60,7 @@ import yaml
 from pydantic import ValidationError
 
 from demo_fixtures.datasets import domains_for
-from harness import ingest_uploads, model_downloads, tls_check
+from harness import ingest_uploads, model_downloads, store_volumes, tls_check
 from harness.keycloak_admin import (
     grant_service_account_roles,
     set_demo_admin_password,
@@ -74,6 +74,7 @@ from harness.realm import (
     DEMO_ADMIN_SUBJECT,
     DEMO_ANALYST_SUBJECT,
     generate_client_secret,
+    organisation_provider,
     render_realm_json,
 )
 from harness.render import (
@@ -279,6 +280,26 @@ def uploads_ready(compose_file: Path) -> str:
         return ingest_uploads.prepare(compose_file, run=run)
     except ingest_uploads.UploadFolderRefused as refused:
         raise ApplyFailed("uploads", str(refused)) from refused
+
+
+def stores_moved(compose_file: Path, held: store_volumes.FilesHeld) -> store_volumes.Moved:
+    """`harness.store_volumes.move` through this module's own runner, before an `up` (ADR-114
+    Amendment 35): a deployment rendered before the stores had named volumes has their data moved
+    into them once; otherwise it only looks. `held`: the deployment's files as they were before
+    this run wrote them, put back when the move is refused (Amendment 35 point 7), so the compose
+    file never names volumes the stores' data is not in."""
+
+    def run(argv: Sequence[str]) -> tuple[int, str]:
+        try:
+            return 0, _run(list(argv), stage="stores", timeout=7200)
+        except ApplyFailed as failed:
+            return 1, failed.detail
+
+    try:
+        return store_volumes.move(compose_file, run=run)
+    except store_volumes.StoresNotMoved as failed:
+        held.put_back()
+        raise ApplyFailed("stores", failed.words(files_put_back=True)) from failed
 
 
 def compose_services(compose_file: Path) -> list[str]:
@@ -934,6 +955,30 @@ def _fetch_models(before: Mapping[str, Any], staged: Path) -> None:
         ) from failed
 
 
+def _wait_for_models(compose_file: Path, config: OspreyConfig) -> str:
+    """Waits for the download steps `up` has just started, saying first which extraction model is
+    downloading, and its size. The model server's health check is not lengthened to cover it: that
+    check gates every `up --wait` (a start, an `apply`'s restarts, an update and its rollback), the
+    model server would be unhealthy for as long as a 9 GB download takes, and a slow link would
+    fail the start outright, as the vision model once did (`harness.render._OLLAMA_HEALTHCHECK`).
+    The step's own script pulls and digest-verifies `config.extraction_model` before it idles, so
+    an idle step is the model present; a refused pull exits the step and fails the wait."""
+    steps = list(model_downloads.commands(compose_file))
+    if not steps:
+        return "no local model to download"
+    print(f"apply: {model_downloads.downloading_words(config.extraction_model)}", flush=True)
+    try:
+        for argv in model_downloads.wait_argvs(_compose(compose_file), steps):
+            _run(argv, stage="models", timeout=model_downloads.FETCH_TIMEOUT_SECONDS)
+    except (ApplyFailed, subprocess.TimeoutExpired) as failed:
+        raise ApplyFailed(
+            "models",
+            f"{model_downloads.failed_words(steps)}. Everything else is installed; run the install "
+            "again once it can be fetched.",
+        ) from failed
+    return f"{config.extraction_model} downloaded and verified"
+
+
 def reapply(
     config_path: Path,
     out_root: Path,
@@ -970,6 +1015,9 @@ def reapply(
         )
     previous_env = (out_dir / SECRETS_FILE).read_text(encoding="utf-8")
     held = _env_pairs(previous_env)
+    # ADR-114 Amendment 33, "Step 33": the organisation's sign-in as installed, read before the
+    # deployment's own copy of `osprey.yaml` is replaced.
+    signed_in_through = _installed_organisation_sign_in(out_dir)
     config, images_from = _like_the_installed(config, out_dir)
     keys = _keys_for_new_providers(config, environ, held, ask_secret)
     stage = out_dir.parent / f".{out_dir.name}.staging"
@@ -996,6 +1044,8 @@ def reapply(
         # and waited on, before anything that uses it starts again. From the staged files, so a
         # refused download changes nothing and the next apply sees the same change.
         _fetch_models(model_downloads.commands(compose_file), stage / "compose.yaml")
+        # ADR-114 Amendment 35 point 7: held, so a refused move of the stores puts them back.
+        held = store_volumes.FilesHeld(out_dir)
         # `copytree` copies each file's mode with it, so `deployment.env` arrives `600` (ADR-137
         # decision 2) over a file that was looser.
         move_into_place(stage, out_dir)
@@ -1004,6 +1054,9 @@ def reapply(
     # Whether or not anything restarts: a deployment installed before the upload folder was made the
     # Conduit's has the folder Docker made, root's, and the Conduit sees a change of owner at once.
     uploads_ready(compose_file)
+    # ADR-114 Amendment 35: the stores' data moved into their named volumes once; the move stops
+    # the whole deployment, so all of it is started again afterwards.
+    moved = stores_moved(compose_file, held)
     if restart or removed:
         _run(
             _compose(compose_file)
@@ -1012,7 +1065,42 @@ def reapply(
             + sorted(restart),
             stage="up",
         )
+    if moved.services:
+        _run(_compose(compose_file) + ["up", "-d", "--wait"], stage="up")
+    wanted = organisation_provider(config)
+    if wanted is not None and wanted != signed_in_through:
+        # ADR-114 Amendment 33, "Step 33": a changed organisation sign-in (joining by email turned
+        # on or off, among others) reaches Keycloak, which reads none of the rendered files.
+        _register_organisation_sign_in(config_path, out_root, out_dir.name, realm)
     return restart
+
+
+def _installed_organisation_sign_in(out_dir: Path) -> dict[str, Any] | None:
+    """The organisation's provider as the installed deployment's own `osprey.yaml` names it, or None
+    (none, or a file this checkout cannot read, which counts as changed)."""
+    try:
+        return organisation_provider(load_config(out_dir / "osprey.yaml"))
+    except (OSError, yaml.YAMLError, ValidationError):
+        return None
+
+
+def _register_organisation_sign_in(
+    config_path: Path, out_root: Path, folder: str, realm: str
+) -> None:
+    """What `ospreyflow repair-sign-in --no-demo-accounts` runs: the identity provider's settings
+    only — no demo account is made or changed."""
+    from harness import register_sign_in
+
+    status = register_sign_in.main(
+        ["--config", str(config_path), "--out-root", str(out_root), "--profile", folder,
+         "--realm", realm, "--no-demo-accounts"]
+    )  # fmt: skip
+    if status != 0:
+        raise ApplyFailed(
+            "sign-in",
+            "the settings are applied, but the organisation's sign-in could not be brought up to "
+            "date with them (said above); run ospreyflow repair-sign-in once Keycloak answers",
+        )
 
 
 def reapply_main(
@@ -1339,6 +1427,8 @@ def main(
         # is touched (ADR-132, ruling 6).
         try:
             preflight(PreflightContext(config=config, out_dir=stage))
+            # ADR-114 Amendment 35 point 7: held, so a refused move of the stores puts them back.
+            held = store_volumes.FilesHeld(out_dir)
             move_into_place(stage, out_dir)
         finally:
             shutil.rmtree(stage, ignore_errors=True)
@@ -1363,10 +1453,21 @@ def main(
         # (Amendment 33, "as found on the first server"): left to `up`, Docker made it root's.
         result.record("uploads", uploads_ready(compose_file))
 
+        # 3c. A deployment rendered before the stores had named volumes (ADR-114 Amendment 35):
+        # their data moved into them once, before anything starts on them.
+        moved = stores_moved(compose_file, held)
+        if moved.services:
+            result.record("stores", f"moved to named volumes: {', '.join(moved.services)}")
+
         # 4. Up, then a per-service wait that names what did not make it.
         _run(_compose(compose_file) + ["up", "-d", "--wait"], stage="up")
         health = wait_for_health(compose_file, timeout_seconds=args.health_timeout)
         result.record("up", f"{len(health)} service(s) healthy")
+
+        # 4a. The deployment's extraction model downloaded before the install says it is ready
+        # (build order step 25 (a), found on the first server: a fresh Small reported ready while
+        # `ollama-models` was still fetching the 14b, and Ask answered 404 for two minutes).
+        result.record("models", _wait_for_models(compose_file, config))
 
         # 4b. The two service-account grants a realm import cannot express, because it would need
         # client ids that do not exist until the import has run. Separate grants on purpose: the

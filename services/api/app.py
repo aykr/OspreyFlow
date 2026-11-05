@@ -125,6 +125,8 @@ from schemas.admin import (
     DemoPackStatus,
     EmbeddedDashboard,
     InviteInput,
+    OrganisationArrival,
+    OrganisationLinkInput,
     PauseScheduleInput,
     PersonAccount,
     RegisteredDashboard,
@@ -457,6 +459,7 @@ from .identity_admin import (
     DashboardExistsError,
     IdentityAdmin,
     IdentityAdminRefused,
+    PersonActionRefused,
     PersonExistsError,
     UnknownRoleError,
 )
@@ -622,6 +625,12 @@ from .rule_sentences import (
     sentence_of,
 )
 from .run_resources import RECIPES_REPO_ROOT, build_run_resources
+from .run_source import (
+    SourceChangedSinceVerifyError,
+    changed_since_verify,
+    files_a_run_reads,
+    identify,
+)
 from .scheduler import (
     DEFAULT_TIMEZONE,
     ScheduleExecutor,
@@ -1028,8 +1037,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ADR-112: the Admin area's people and dashboards, through the Conduit's own account.
     # ADR-114 Amendment 5: invitations by the identity provider's own email when the deployment has
     # a mail server (rendered from the install answers), else by a one-time code.
+    # ADR-112 Amendment 3 (b): the organisation's sign-in, whose refused arrivals can be joined.
     app.state.identity_admin = IdentityAdmin(
-        config, by_email=os.environ.get("OSPREY_SIGN_IN_EMAIL", "").lower() == "true"
+        config,
+        by_email=os.environ.get("OSPREY_SIGN_IN_EMAIL", "").lower() == "true",
+        organisation=os.environ.get("OSPREY_ORGANISATION_SIGN_IN") or None,
     )
     # ADR-111 Amendment 3: Superset dashboards inside the Glass; None when not configured.
     superset_settings = SupersetSettings.from_env()
@@ -2548,6 +2560,17 @@ async def _connector_not_available_handler(
     )
 
 
+@app.exception_handler(SourceChangedSinceVerifyError)
+async def _source_changed_since_verify_handler(
+    request: Request, exc: SourceChangedSinceVerifyError
+) -> JSONResponse:
+    """Build order step 30: a *Run now* whose file is not the one Verify checked, in words."""
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={"error": "source_changed_since_verify", "detail": str(exc)},
+    )
+
+
 @app.exception_handler(SourceUnreadableError)
 async def _source_unreadable_handler(request: Request, exc: SourceUnreadableError) -> JSONResponse:
     return JSONResponse(
@@ -2629,7 +2652,7 @@ async def create_investigation(
     name = (body.name if body is not None else None) or DEFAULT_CASE_NAME
     named = body.dataset_ids if body is not None else None
     if named:
-        own = {d.id for d in await datasets.list_for_unit(principal.org_unit)}
+        own = {d.id for d in await datasets.list_for(principal)}
         if not set(named) <= own:
             raise DatasetRefusedError("not every dataset is one of this unit's")
     investigation = await investigations.create(
@@ -2650,8 +2673,9 @@ async def create_investigation(
 
 @app.get("/v1/datasets")
 async def list_datasets_route(principal: PrincipalDep, datasets: DatasetsDep) -> list[Dataset]:
-    """The datasets of the caller's unit, for a new case to name (ADR-099)."""
-    return await datasets.list_for_unit(principal.org_unit)
+    """The datasets of the caller's unit, for a new case to name (ADR-099); none to a caller holding
+    no right (Amendment 11: the store's query answers them nothing)."""
+    return await datasets.list_for(principal)
 
 
 @app.post(
@@ -2675,10 +2699,10 @@ async def create_dataset_route(
 
 @app.get("/v1/investigations/{investigation_id}/datasets")
 async def case_datasets_route(
-    investigation: InvestigationViewerDep, datasets: DatasetsDep
+    investigation: InvestigationViewerDep, principal: PrincipalDep, datasets: DatasetsDep
 ) -> list[Dataset]:
-    """The datasets this case reads (ADR-099)."""
-    return await datasets.of_case(investigation.id)
+    """The datasets this case reads (ADR-099); none to a caller holding no right (Amendment 11)."""
+    return await datasets.of_case(investigation.id, principal)
 
 
 @app.put(
@@ -2748,7 +2772,7 @@ async def list_investigations(
             dataset_ids=[d.id for d in reads],
         )
         for case, level in await investigations.list_for(principal)
-        for reads in [await datasets.of_case(case.id)]
+        for reads in [await datasets.of_case(case.id, principal)]
     ]
 
 
@@ -7869,6 +7893,7 @@ async def verify_studio_recipe(
     hotlists_store: HotlistsStoreDep,
     screening_lists: ScreeningListsDep,
     compute: ComputeDep,
+    repo_root: RecipesRepoRootDep,
     influencers_store: OptionalStrengthInfluencersDep = None,
 ) -> VerifyReport:
     """§5: the dry run. No persistent write of any kind happens here — no
@@ -7899,6 +7924,11 @@ async def verify_studio_recipe(
     ) -> tuple[list[WouldRaise], list[CheckNotJudged], int]:
         return await would_raise(gate, written, shown)
 
+    # Build order step 30: Verify reads the files a run of this recipe reads (a pipeline's source
+    # node may name its own), and records each with the hash of its bytes, which *Run now* is held
+    # to. Hashed before the read, so a file changed during Verify reads as changed at the run.
+    locations = files_a_run_reads(recipe, repo_root=repo_root)
+    checked = [await asyncio.to_thread(identify, location) for location in locations]
     report = await run_verify(
         recipe,
         principal,
@@ -7908,12 +7938,15 @@ async def verify_studio_recipe(
         row_keys=recipe_runs,
         investigation_id=investigation.id,
         checks=judge_checks,
+        locations=locations,
     )
     # §5: "Verify must pass before publish" — recorded here, against a
     # *completed* run (rejections included, per §5's own "a run with
     # rejections can be published"), so `publish` below can gate on this
     # flag alone rather than re-running the dry run itself.
-    await studio_recipes.mark_verified(recipe.recipe_id, recipe.version, now=datetime.now(UTC))
+    await studio_recipes.mark_verified(
+        recipe.recipe_id, recipe.version, now=datetime.now(UTC), sources=checked
+    )
     await audit.record(
         principal=principal,
         action="verify_studio_recipe",
@@ -8288,12 +8321,20 @@ async def run_studio_recipe(
     compute: ComputeDep,
     kyc_expiries: KycExpiriesDep,
     recipe_runs: RecipeRunsDep,
+    studio_recipes: StudioRecipesDep,
     influencers: OptionalStrengthInfluencersDep = None,
 ) -> LoadReportView | PipelineRunReportView:
     """§8: "Loader: run a published recipe against a file at or below
     their own clearance" — `body.source_location`, when given, is that
     file; omitted, this repeats against the recipe's own recorded location
     (§6: "re-runnable... the deduplication key makes a re-run idempotent").
+
+    **Run reads exactly the file Verify checked (§5, build order step 30).** When Verify recorded
+    what it read for this version, the files this run would read are hashed first and must be
+    those files, byte for byte; otherwise nothing is read into a store and the answer is a 409
+    `source_changed_since_verify` saying what changed and asking for Verify again. A version Verify
+    recorded nothing for (published before the rule, or by a seed) runs as before. Scheduled and
+    watched runs do not come here: they read each new export by design (ADR-110).
     `investigation_id` is carried onto the produced `EventRecord`s'
     `investigation_scope` for analytics filtering (`schemas.analytics.
     EventRecord`) — it is not an access-control scope for the loaded
@@ -8328,6 +8369,17 @@ async def run_studio_recipe(
     ingest response itself — the load already happened; a failure to also check watches against it
     is a narrower, disclosed problem, not a reason to tell the caller their load failed when it
     didn't."""
+    verified = await studio_recipes.verified_sources(recipe.recipe_id, recipe.version)
+    if verified is not None:
+        now = [
+            await asyncio.to_thread(identify, location)
+            for location in files_a_run_reads(
+                recipe, repo_root=repo_root, source_location=body.source_location
+            )
+        ]
+        changed = changed_since_verify(verified, now, asked=body.source_location)
+        if changed is not None:
+            raise SourceChangedSinceVerifyError(changed)
     report = await run_recipe_as(
         RecipeRunDeps(
             graph=graph,
@@ -10194,6 +10246,64 @@ async def reset_person_sign_in_route(
     return reset
 
 
+@app.delete(
+    "/v1/admin/people/{user_id}", dependencies=[Depends(require_right(Right.MANAGE_PEOPLE))]
+)
+async def remove_person_route(
+    user_id: str, principal: PrincipalDep, identity_admin: IdentityAdminDep, audit: AuditDep
+) -> PersonAccount:
+    """The person's account removed from the identity provider (ADR-112 Amendment 3). Never one's
+    own; never an account OspreyFlow itself uses, nor the last person who can manage people — each
+    refused in words before anything changes. The audit record keeps who the id was: what they
+    made keeps their id, which ADR-106 shows in place of a name once the account is gone."""
+    if user_id == principal.id:
+        raise HTTPException(status_code=409, detail={"error": "cannot_remove_yourself"})
+    person = await identity_admin.remove_person(user_id)
+    await audit.record(principal=principal, action="remove_person",
+                       resolved_query={"user_id": user_id, "username": person.username,
+                                       "name": person.name, "email": person.email},
+                       result_cardinality=1)  # fmt: skip
+    return person
+
+
+@app.get(
+    "/v1/admin/organisation-arrivals", dependencies=[Depends(require_right(Right.MANAGE_PEOPLE))]
+)
+async def list_organisation_arrivals_route(
+    principal: PrincipalDep, identity_admin: IdentityAdminDep, audit: AuditDep
+) -> list[OrganisationArrival]:
+    """Who the organisation's sign-in refused for a held email address and who is not yet joined
+    to an account (ADR-112 Amendment 3 (b)), from the identity provider's own record; empty on a
+    deployment with no sign-in through an organisation."""
+    arrivals = await identity_admin.list_arrivals()
+    await audit.record(principal=principal, action="list_organisation_arrivals",
+                       resolved_query={}, result_cardinality=len(arrivals))  # fmt: skip
+    return arrivals
+
+
+@app.post(
+    "/v1/admin/people/{user_id}/organisation-link",
+    dependencies=[Depends(require_right(Right.MANAGE_PEOPLE))],
+)
+async def link_organisation_account_route(
+    user_id: str,
+    body: OrganisationLinkInput,
+    principal: PrincipalDep,
+    identity_admin: IdentityAdminDep,
+    audit: AuditDep,
+) -> PersonAccount:
+    """A refused organisation arrival joined, deliberately, to this account (ADR-112 Amendment 3
+    (b)): their next sign-in through the organisation lands here, with its roles. Refused in words:
+    an account already joined, an account OspreyFlow itself uses, an id no refused arrival holds."""
+    person, arrival = await identity_admin.link_organisation(user_id, body.subject)
+    await audit.record(principal=principal, action="link_organisation_account",
+                       resolved_query={"user_id": user_id, "username": person.username,
+                                       "subject": arrival.subject,
+                                       "provider_username": arrival.provider_username},
+                       result_cardinality=1)  # fmt: skip
+    return person
+
+
 @app.get("/v1/admin/demo-packs", dependencies=[Depends(require_right(Right.ADMINISTER_SYSTEM))])
 async def list_demo_packs_route(
     principal: PrincipalDep, investigations: InvestigationsDep, audit: AuditDep
@@ -10731,6 +10841,13 @@ async def resume_schedule_route(
     return await _admin_schedule(recipe, recipe_runs, principal, handling_scheme)
 
 
+#: ADR-114 Amendment 36: Admin -> System's words for the Conduit's own credential.
+CREDENTIAL_NOTICES = {
+    "refused": "The Conduit cannot act for people: run `ospreyflow repair-sign-in`",
+    "unreachable": "Not known: the identity provider did not answer",
+}
+
+
 @app.get("/v1/admin/system", dependencies=[Depends(require_right(Right.ADMINISTER_SYSTEM))])
 async def system_status_route(
     principal: PrincipalDep,
@@ -10759,13 +10876,22 @@ async def system_status_route(
             raise RuntimeError(found.problem or "a model is not yet present")
 
     nobody = principal.model_copy(update={"datasets": []})
+    # ADR-114 Amendment 36: one client-credentials request (kept half a minute) answers both the
+    # identity provider's line and whether the Conduit can act for people; a refusal is Keycloak
+    # answering, so the identity provider's line stays green and the next line says what to run.
+    credential = await identity_admin.credential_check()
     components = [
         await check("Graph store", lambda: graph.type_counts(nobody)),
         await check("Case and rule stores (Postgres)", lambda: investigations.list_for(principal)),
         await check("Working-set cache (Valkey)", lambda: valkey.ping()),
         await check("Model server", models),
-        await check("Identity provider", identity_admin.reachable),
-    ]
+        ComponentHealth(name="Identity provider", ok=credential.state != "unreachable",
+                        millis=credential.millis,
+                        detail=credential.detail if credential.state == "unreachable" else None),
+        ComponentHealth(name="Acting for people", ok=credential.state == "accepted",
+                        millis=credential.millis, detail=credential.detail,
+                        notice=CREDENTIAL_NOTICES.get(credential.state)),
+    ]  # fmt: skip
     # ADR-114 decision 11, ADR-135: each role's model and where it runs, each engine and whether
     # its key is present, from names only — never a key.
     statuses, engines, notice = model_status(model_routes)
@@ -11720,6 +11846,11 @@ async def _identity_admin_refused(request: Request, exc: IdentityAdminRefused) -
     )
 
 
+@app.exception_handler(PersonActionRefused)
+async def _person_action_refused(request: Request, exc: PersonActionRefused) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"error": exc.error, "detail": exc.words})
+
+
 @app.exception_handler(UnknownRoleError)
 async def _unknown_role(request: Request, exc: UnknownRoleError) -> JSONResponse:
     return JSONResponse(status_code=422, content={"error": "not_allowed", "detail": str(exc)})
@@ -11759,14 +11890,21 @@ async def model_engines_route(principal: PrincipalDep, routes: ModelRoutesDep) -
 
 @app.get("/v1/investigations/{investigation_id}/models/engines")
 async def case_model_engines_route(
-    investigation: InvestigationViewerDep, routes: ModelRoutesDep, datasets: DatasetsDep
+    investigation: InvestigationViewerDep,
+    principal: PrincipalDep,
+    routes: ModelRoutesDep,
+    datasets: DatasetsDep,
 ) -> OfferedEngines:
     """ADR-136 decision 3: the engines offered, as for `GET /v1/models/engines`, with each one's
     contract mark, and an engine the case's data may not reach listed unavailable with the reason in
     words. The case's datasets are read from the store, as the routing reads them for Ask the case;
     a Viewer of the case may ask (anyone else is told the case is not there). Each request is still
-    decided by the route, by its own handling code and datasets."""
-    case_datasets = await datasets.ids_of_case(investigation.id)
+    decided by the route, by its own handling code and datasets.
+
+    ADR-099 Amendment 11: the datasets are those the store names to the caller, so a caller holding
+    no right is given the reason for data not known — no name, and no count. For anyone else that is
+    every dataset of the case (`investigation_datasets` refers only to registered datasets)."""
+    case_datasets = [d.id for d in await datasets.of_case(investigation.id, principal)]
     held = await datasets.egress_of(case_datasets)
     return OfferedEngines(engines=routes.offered(case_datasets, held))
 

@@ -14,10 +14,14 @@ engineers. The screenshots show the synthetic demonstration cases; no real data 
 <!-- document-control:begin -->
 ## Document control
 
-**Version 1.33** · 2026-11-04 · For OspreyFlow v0.4.10 · Issued
+**Version 1.37** · 2026-11-05 · For OspreyFlow v0.4.11 · Issued
 
 | Version | Date | What changed |
 | --- | --- | --- |
+| 1.37 | 2026-11-05 | Describes v0.4.11. No change to its content. |
+| 1.36 | 2026-11-05 | The owner's rulings (build order step 33; ADR-112 Amendment 3): §2, when the sign-in page says your email already belongs to an OspreyFlow account, your administrator can join your organisation account to it, after which your organisation's sign-in takes you straight into that account. |
+| 1.35 | 2026-11-04 | The owner's ruling (ADR-091 Amendment 1; build order step 30): §5.6, the Inspector shows no identifier meant for a machine — no node id, no link Type ID, and no internal reference such as a place's site reference; properties are named as you read them ("Prison number"); a link's end that is not on the canvas is named in words. Held rows name their source file by its file name. |
+| 1.34 | 2026-11-04 | The owner's rulings (ADR-115 Amendment 5, ADR-050 Amendment 2, ADR-114 Amendment 33; build order step 28): §2, the organisation's sign-in button names the organisation's provider; what it means when the sign-in page says your email already belongs to an OspreyFlow account; staying signed in — a window renews its sign-in only while you are working in it, so one left alone asks you to sign in again when you come back, the page kept. |
 | 1.33 | 2026-11-04 | Describes v0.4.10. No change to its content. |
 | 1.32 | 2026-11-04 | Describes v0.4.9. No change to its content. |
 | 1.31 | 2026-11-04 | The owner's ruling (ADR-132 Amendment 5): §4, under the GOV.UK theme the service's name is in the browser tab's title; the band under the GOV.UK header that named it is gone, giving the workspace its height back. |
@@ -90,11 +94,19 @@ to the deployment's own sign-in page, at `id.` in front of the same address.
 Your administrator invites you. With email set up, you get a link to choose a password; otherwise
 they give you a **one-time code** in person, and you choose your password the first time you sign
 in. If you forget it, ask your administrator to reset your sign-in. Where your organisation's own
-sign-in is set up, the welcome page offers it too.
+sign-in is set up, the welcome page offers it first, by its name — for example **Continue with
+Example Department account** — and goes straight to your organisation's sign-in page. If that page
+comes back saying "This email address already belongs to an OspreyFlow account", your administrator
+has already made you an account with that address: sign in with it (**Sign in with an OspreyFlow
+account**), or ask them to join your organisation account to it — from then on your organisation's
+sign-in takes you straight into that account, with everything it holds.
 
-**Staying signed in**: a window renews its sign-in by itself while it is open, so you can leave it and
-come back to it as you left it. When your session has ended (you have been away for a long time, or
-your administrator has ended it), the window says **Your session has ended** over the page and offers
+**Staying signed in**: while you are working in a window — typing, clicking, scrolling — it renews
+its sign-in by itself, so it never stops you mid-task. A window left alone does not renew, so it does
+not keep your session alive for you: after a while away (about half an hour, as your administrator
+sets it) you are asked to sign in again when you come back, and the page stays as you left it. When
+your session has ended (you have been away, or your administrator has ended it), the window says
+**Your session has ended** over the page and offers
 **Sign in again**, which signs you in in a small window of its own: the page behind it, with the tab,
 the selection, the map and anything you have typed, stays as it is. If the sign-in service cannot be
 reached, it says so and offers **Try again**.
@@ -362,6 +374,14 @@ seen — its **source**, the file and row it came from (its file name, never the
 this value** where the type has one (section 5.2), and the **judgements** that cite it. With several selected it summarises them and the links
 between them; with a link selected it shows the link's details, notes, events and history, and lets
 an Editor **change the link** (with a reason, and what stands behind it).
+
+**What you read, not what a machine stores.** A property is named as you read it ("Prison number",
+not `prison_number`), and a link by its name ("Shared cell with"). The Inspector shows no node id and
+no link *Type ID*, and it leaves out references that mean something only to a store or to the system
+a record came from: a place's site reference, an organisation's or incident's internal reference, an
+email's message id, and where its picture or geometry is kept. They are still on the record, and
+search and the map still use them; they are only not shown. A link whose other end is not on the
+canvas names that end "an entity not in this view" rather than by its id.
 
 **Sources withheld.** A record can belong to more than one dataset, and a case reads only some. Its
 sources are named only if the case reads every dataset the record belongs to. When it does not, where

@@ -46,8 +46,11 @@ from .doctor import (
     ServerPlan,
     SystemProbes,
     format_check,
+    TRUST_EMAIL_FIX,
+    TRUST_EMAIL_SAYS,
     gpu_checks,
     gpu_plan,
+    joins_by_email,
     run_doctor,
 )
 from .home import (
@@ -375,8 +378,13 @@ def _doctor(args: argparse.Namespace, probes: Probes, product: Path) -> int:
         server = server_plan(answers)
         gpu = _gpu_of(answers, base)
     ok = _print_checks(
-        run_doctor(args.mode, probes, product=product, cloud=args.cloud, server=server, gpu=gpu)
-    )
+        run_doctor(
+            args.mode, probes, product=product, cloud=args.cloud, server=server, gpu=gpu,
+            # ADR-114 Amendment 33, "Step 33": the installed deployment's own setting, when the
+            # answers are not given (their own setting is checked with the server's).
+            joins_by_email=server is None and joins_by_email(base),
+        )
+    )  # fmt: skip
     return 0 if ok else 1
 
 
@@ -397,13 +405,13 @@ def server_plan(answers: Answers) -> ServerPlan | None:
     from urllib.parse import urlsplit
 
     origin = urlsplit(answers.server["public_origin"])
-    tls = answers.server.get("tls") or {}
+    tls = answers.server["tls"]
     return ServerPlan(
         host=origin.hostname or "",
         port=origin.port or 443,
         dashboards=answers.dashboards,
-        certificate=tls.get("certificate"),
-        key=tls.get("key"),
+        certificate=tls["certificate"],
+        key=tls["key"],
         ca=tls.get("ca"),
         redirect_http=bool(answers.server.get("redirect_http")),
         govuk=answers.appearance.get("brand") == "govuk",
@@ -528,6 +536,7 @@ def _write_config(ctx: _Context, answers: Answers, force: bool) -> None:
     config = osprey_config(answers, read_config(ctx.product))
     header = starters.comment(answers.starter, answers.demo_packs) if answers.starter else ""
     if config == read_config(ctx.product) and (not header or _begins_with(path, header)):
+        _say_resolution_off(answers)
         return  # what the answers make is what is there, or the owner's own file used as it is
     if not force:
         raise CommandRefused(
@@ -537,6 +546,7 @@ def _write_config(ctx: _Context, answers: Answers, force: bool) -> None:
         )
     path.write_text(header + yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     print(f"Wrote {path}.")
+    _say_resolution_off(answers)
 
 
 def _begins_with(path: Path, header: str) -> bool:
@@ -721,8 +731,32 @@ def _add_demo_packs(ctx: _Context, answers: Answers) -> None:
         file = answers.paysim_file if pack == "paysim" else None
         demo.add_pack(
             ctx.product, ctx.run, ctx.env, pack, file,
-            case_domains=answers.case_domains, deployment_env=ctx.named_env(),
+            case_domains=answers.case_domains, **_pack_target(ctx),
         )  # fmt: skip
+
+
+def _pack_target(ctx: _Context) -> dict[str, Any]:
+    """Where a demo pack loads: the deployment, its `osprey.yaml` and the `apply` that applies it
+    (for the Prison Intelligence pack's resolution check, ADR-127 Amendment 46)."""
+    name = f" --name {ctx.target.name}" if ctx.target.named else ""
+    return {
+        "deployment_env": ctx.named_env(),
+        "deployment": ctx.deployment,
+        "settings": ctx.config_path,
+        "apply_command": f"ospreyflow apply{name}",
+    }
+
+
+def _say_resolution_off(answers: Answers) -> None:
+    """ADR-127 Amendment 46: said whenever the answers' packs turn post-ingest resolution off."""
+    packs = sorted(set(answers.demo_packs) & set(demo.RESOLUTION_OFF_PACKS))
+    if packs:
+        print(
+            f"Post-ingest resolution is off (components.post_ingest_resolution: false), because "
+            f"{', '.join(packs)} needs it off: its live loads must not add automatic \"same as\" "
+            "links. An analyst's own Resolve now still works (section 11 of the administration "
+            "guide)."
+        )
 
 
 def _docker_projects(ctx: _Context) -> dict[str, list[Path]]:
@@ -789,6 +823,7 @@ def _write_named_config(ctx: _Context, args: argparse.Namespace, answers: Answer
     named.private_folder(ctx.target.folder)
     path.write_text(text, encoding="utf-8")
     print(f"Wrote {path}.")
+    _say_resolution_off(answers)
 
 
 def _apply_argv(ctx: _Context, args: argparse.Namespace) -> list[str]:
@@ -851,6 +886,9 @@ def _install_on_server(ctx: _Context, args: argparse.Namespace, answers: Answers
                 f"{logout}, assigned to the people who may sign in. A person signing in that way "
                 "has no role until an administrator grants one in Admin, People and roles."
             )
+            if plan.organisation.get("trust_email") == "true":
+                # ADR-114 Amendment 33, "Step 33": said again as the install ends.
+                print(f"WARNING: {TRUST_EMAIL_SAYS} {TRUST_EMAIL_FIX}")
     return 0
 
 
@@ -920,6 +958,7 @@ def _start(args: argparse.Namespace, ctx: _Context) -> int:
         )
     else:
         _uploads_ready(ctx, directory)
+        _stores_named(ctx, directory)
         ctx.step("start the deployment", [*compose(directory), "up", "-d", "--wait"])
     return 0
 
@@ -930,6 +969,16 @@ def _uploads_ready(ctx: _Context, directory: Path) -> None:
     ctx.step(
         "prepare the upload folder",
         [*ctx.python, "-m", "harness.ingest_uploads", str(directory / "compose.yaml")],
+    )
+
+
+def _stores_named(ctx: _Context, directory: Path) -> None:
+    """ADR-114 Amendment 35: a deployment whose stores' data is not yet in their named volumes has
+    it moved there once, before `up` (`harness.store_volumes`, which says why when it cannot; the
+    stores are then never started on empty named volumes beside their data)."""
+    ctx.step(
+        "move the stores' data to named volumes",
+        [*ctx.python, "-m", "harness.store_volumes", str(directory / "compose.yaml")],
     )
 
 
@@ -1036,6 +1085,7 @@ def _switch(args: argparse.Namespace, ctx: _Context) -> int:
             print(f"Stopping {name}, so this one has the machine to itself.")
             ctx.step(f"stop {name}", [*compose(folder), "stop"])
     _uploads_ready(ctx, ctx.deployed())
+    _stores_named(ctx, ctx.deployed())
     ctx.step("start the deployment", [*compose(ctx.deployed()), "up", "-d", "--wait"])
     named.remember(ctx.env, ctx.target.name)
     address = ctx.origin()
@@ -1229,8 +1279,7 @@ def _dispatch(args: argparse.Namespace, ctx: _Context) -> int:
             return 0
         demo.add_pack(
             ctx.product, ctx.run, ctx.env, args.pack, args.file,
-            ask=ctx.ask, accept_real_data=args.accept_real_data,
-            deployment_env=ctx.named_env(),
+            ask=ctx.ask, accept_real_data=args.accept_real_data, **_pack_target(ctx),
         )  # fmt: skip
         return 0
     if verb == "uninstall":

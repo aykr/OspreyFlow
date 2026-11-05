@@ -13,11 +13,11 @@ export type HandlingScheme = string;
  */
 export type Ontology = string;
 /**
- * The alias of an organisation's own identity provider brokered by Keycloak. When set, the welcome page offers *Continue with organisation sign-in*, which goes straight to it (ADR-115 decision 3). Default: none — one *Sign in* to the OspreyFlow form.
+ * The alias of an organisation's own identity provider brokered by Keycloak. When set, the welcome page offers *Continue with organisation sign-in* (*Continue with <label>* when `organisation_provider` names one), which goes straight to it (ADR-115 decision 3, Amendment 5). Default: none — one *Sign in* to the OspreyFlow form.
  */
 export type OrganisationSignIn = string | null;
 /**
- * The provider's name as people know it, shown on the identity provider's own sign-in pages (for example 'Example Department account').
+ * The provider's name as people know it, shown on the welcome page's button (Continue with <label>) and on the identity provider's own sign-in pages (for example 'Example Department account').
  */
 export type Label = string;
 /**
@@ -28,6 +28,10 @@ export type Issuer = string;
  * The application (client) id the organisation registered for OspreyFlow.
  */
 export type ClientId = string;
+/**
+ * ADR-114 Amendment 33, 'Step 33': true joins a person arriving through the organisation to the OspreyFlow account holding the same email address, automatically, with its roles and clearance. Off by default: a person whose email an account holds is refused in words, and an administrator joins them in Admin, People and roles. Turn it on only with the organisation's security officer's written sign-off that every address its provider gives is verified and cannot be set by the person who holds it: anyone who can make the provider give an address takes over the account that holds it (the 2023 'nOAuth' account takeovers).
+ */
+export type TrustEmail = boolean;
 /**
  * The protective marking shown where no case data is on screen: the welcome page, Home, the Ingest Studio and the Admin area; inside a case, the strip shows this or the highest marking on screen, whichever is higher (ADR-115 decision 2). One of the handling scheme's classifications. Default: the scheme's lowest.
  */
@@ -72,4 +76,5 @@ export interface OrganisationProvider {
   label: Label;
   issuer: Issuer;
   client_id: ClientId;
+  trust_email?: TrustEmail;
 }

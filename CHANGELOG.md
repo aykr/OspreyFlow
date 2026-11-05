@@ -6,6 +6,123 @@ update. Work not yet in a release is listed under *Unreleased*.
 
 ## Unreleased
 
+## v0.4.11 — 2026-11-05
+
+- **Remove a person in Admin → People.** *Remove*, once confirmed in words, deletes the account
+  from the identity provider: they can no longer sign in, and their sign-in name and email address
+  are free again. What they made keeps their id, shown in place of their name; the audit log says
+  whose id it was. Your own account, an account OspreyFlow itself uses and the last enabled person
+  who can manage people are refused in words.
+- **Join someone the organisation's sign-in refused to their account.** A person arriving through
+  the organisation whose email an OspreyFlow account already holds is still refused in words, and
+  is now listed in Admin → People's *Refused organisation sign-ins* (the last seven days, by their
+  name at the organisation). An administrator chooses the account that is theirs and confirms; their
+  next sign-in through the organisation lands in it, with its roles. Audited. Run `ospreyflow
+  repair-sign-in` once after updating: it lets the identity provider record the refusals, and gives
+  the Conduit's account the `view-events` it needs to read them.
+- **Joining by email, for an organisation that verifies every address.** A new answer,
+  `sign_in.organisation.trust_email: true` (`governance.organisation_provider.trust_email`; off by
+  default), joins an organisation arrival to the account holding the same email automatically. It
+  hands that account to whoever the organisation's provider gives the address (the 2023 "nOAuth"
+  takeovers), so it is for an organisation whose security officer signs off that every address is
+  verified; `ospreyflow doctor`, the install and `repair-sign-in` warn of it each time. `ospreyflow
+  apply` now also brings the identity provider up to date when the organisation's sign-in settings
+  change.
+
+- **Run now runs on exactly the file Verify checked.** Verify now reads the file a run will read
+  (a pipeline's source that names its own file included; it used to read the file chosen at
+  Connect, so a file could pass Verify while the run loaded another) and records it with a hash of
+  its contents. *Run now* checks that file first and, if it has changed since Verify or another
+  file is named, loads nothing and says so in words, asking for Verify again. The Studio's Run
+  panel no longer takes a file. A recipe published before this, or by a demonstration pack's seed,
+  runs as before; scheduled and watched runs are unchanged. A run's answer no longer carries the
+  server's path to the file it read.
+- **No identifiers meant for a machine in the Inspector or the Studio's Map.** The Inspector no
+  longer shows a node's id, a link's Type ID, or internal references such as a place's site
+  reference, and names properties as a person reads them ("Prison number"); a link's end that is
+  not on the canvas is named in words. The Map names link types by their labels ("Held at"), not
+  their keys. Held rows name their source file by its file name.
+- **An offline bundle for another platform.** `ospreyflow update --make-bundle FILE` now carries
+  the `linux/amd64` images, the platform a release is run on, whatever the machine making it runs
+  on; `--platform linux/arm64` carries the other platform a release is built for, and any other is
+  refused. A bundle made on an Apple-silicon Mac used to carry the Mac's own arm64 images, and an
+  amd64 server's `update --from` refused it. Each image is now pulled by the manifest its signed
+  index names for the platform, and Docker is asked its platform before it is saved; cosign's own
+  image is the platform's too. `update --from` refuses a bundle for another platform than its
+  machine's, in words, before anything is checked or loaded.
+- **An install is ready only once its extraction model is in.** A fresh install said it was ready
+  while the model server was still downloading the extraction model (the 14b on a GPU is about
+  9 GB), and Ask answered "not found" for a minute or two. The install now says which model is
+  downloading, and its size, waits until it is downloaded and its digest checked, and only then
+  says it is installed. A refused download stops the install, naming `ospreyflow logs
+  ollama-models`.
+- **A server of your own needs its certificate and key.** An answers file whose `server:` gives
+  no `certificate` or no `key` is now refused, in words naming both and section 5a of the
+  administration guide, before anything is installed. It used to fall back to a certificate the
+  front proxy obtains itself, which needs port 80 and a public name a server inside an
+  organisation's network does not have. A cloud's server is unchanged.
+- **The Prison Intelligence pack looks after post-ingest resolution itself.** An install that
+  chooses it (the `crime` starter does) now writes `components.post_ingest_resolution: false` and
+  says so, so a fresh install no longer turns resolution back on under the pack. Added later with
+  `ospreyflow demo add prison-intelligence`, it refuses, in words and with nothing added, while
+  resolution is on, naming the setting and `ospreyflow apply`. Resolution is the whole
+  deployment's setting: the deployment's other demo cases gain no automatic "same as" links either;
+  an analyst's own Resolve now still works.
+- **The stores keep their data in named volumes.** PostgreSQL, ArcadeDB (its databases and its
+  settings), Valkey and OpenSearch now each have a volume of their own (`<project>_postgres-data`
+  and so on), on Lite and on Small on a server of your own. Their data had been in unnamed volumes,
+  and OpenSearch's inside its container: kept across a restart, `apply` and `update`, but not by
+  `docker compose down` then `up`, and `uninstall --keep-data` kept volumes a later install never
+  found. Now `uninstall --keep-data` keeps data the next install finds.
+- **An existing deployment's data is moved into them once.** The first `update` (after its
+  backup), `start`, `start --build`, `apply` or install from a newer checkout stops the deployment,
+  copies each store's data with the store's own image keeping every owner and permission, checks the
+  copy file by file, and starts each store on its named volume only once it holds the same
+  databases (or keys) as before. It needs room for a second copy of the stores' data. The old
+  volumes are kept, and named, with the command to remove them once the deployment works as before
+  (administration guide §14.1). Valkey's data, which its image keeps inside its container, is
+  copied from the stopped container and checked like the rest, so its working sets and queues
+  (which no backup holds) are kept. A move that fails removes nothing, says why, and puts back
+  every file the command wrote, so `ospreyflow start` runs the deployment on its old data; an
+  update then rolls back to the previous release on its own, untouched data.
+- **A restore starts the identity provider again before it brings the accounts back.** A Keycloak
+  left running while its database was replaced refused the restore ("could not authenticate to
+  Keycloak: 500").
+- **No role, no dataset list.** A person given a unit before a role — someone arriving through the
+  organisation's sign-in, say — was shown that unit's list of datasets by name (never their data).
+  A person holding no role is now told no dataset's name or id anywhere: the unit's list and a
+  case's datasets come back empty, and a model engine's reason for being unavailable names none.
+  Nothing changes for anyone with a role. Home says *No cases to show* rather than drawing an empty
+  table.
+- **The organisation's sign-in button names the provider.** Where `sign_in.organisation.label` is
+  given, the welcome page reads *Continue with* and that name (for example *Continue with Example
+  Department account*); without a label it still reads *Continue with organisation sign-in*.
+- **A window left alone no longer keeps its sign-in alive.** A window renews its sign-in only after
+  the person has pressed a key, clicked or scrolled since the last renewal. Each renewal counted as
+  activity at the identity provider, so an open window nobody touched stayed signed in for up to
+  10 hours; it now reaches the identity provider's idle limit (30 minutes by default), and the
+  person is asked to sign in again when they come back, the page kept. Their first action renews at
+  once, so someone working is never interrupted.
+- **No refresh token for the workspace.** The workspace's sign-in client is given no refresh token
+  (it never used one: its renewal asks the identity provider's own session). `ospreyflow
+  repair-sign-in` switches it off on an existing deployment.
+- **System health says when the Conduit cannot act for people.** After a wipe or a re-import, when
+  the identity provider refuses the Conduit's own credential (rules, hotlists and list screening
+  then fail), Admin → System's new *Acting for people* line says "The Conduit cannot act for people:
+  run `ospreyflow repair-sign-in`", and Home says it too. Checked at most once every 30 seconds,
+  and never shows the secret.
+- **An organisation arrival whose email an account already holds is told so.** Someone signing in
+  through the organisation for the first time, whose email an OspreyFlow account already holds, met
+  the identity provider's own "Account already exists" page, which offered to join the two. They
+  are now told, in OspreyFlow's words on the sign-in page, that the address already belongs to an
+  OspreyFlow account and to sign in with it or ask their administrator. Nothing is made, and the
+  accounts are never joined by email: an organisation's email is not proof of owning the account.
+  `ospreyflow repair-sign-in` puts this in place on an existing deployment.
+- Update with `ospreyflow update`. The first update moves the stores' data to named volumes once,
+  after its backup, and prints the old volumes it leaves in place; remove them once the deployment
+  works as before. Run `ospreyflow repair-sign-in` afterwards on a deployment that signs in through
+  an organisation, so its realm gains the new sign-in settings.
+
 ## v0.4.10 — 2026-11-04
 
 - **On a GPU the model stays loaded.** The first question after a few idle minutes no longer
