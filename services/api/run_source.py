@@ -110,12 +110,12 @@ def files_a_run_reads(
     return list(dict.fromkeys(location for location in locations if location))
 
 
-def identify(location: str) -> VerifiedSource:
+def identify(location: str, dataset_id: str | None) -> VerifiedSource:
     """The file at `location` as it is now: read through the same confinement every source read
-    passes (`studio_profile._confined`), its bytes hashed in chunks."""
+    passes (`studio_profile._confined`, for the recipe's dataset), its bytes hashed in chunks."""
     digest = hashlib.sha256()
     try:
-        with Path(_confined(location)).open("rb") as handle:
+        with Path(_confined(location, dataset_id)).open("rb") as handle:
             while chunk := handle.read(_CHUNK):
                 digest.update(chunk)
     except OSError as exc:
@@ -147,15 +147,15 @@ def changed_since_verify(
     for source in now:
         if source.location in checked and checked[source.location] != source.sha256:
             return (
-                f"{_name(source.location)} has changed since Verify checked it. Nothing was "
-                "loaded. Run Verify again, then run."
+                f"{_name(source.location)} has changed since Test checked it. Nothing was "
+                "loaded. Run Test again, then run."
             )
     return _another_file(was, ", ".join(_name(s.location) for s in now) or "no file")
 
 
 def _another_file(was: str, would: str) -> str:
     return (
-        f"Verify checked {was}; this run would read {would}. Nothing was loaded. A run reads "
-        "only the file Verify checked: choose this file as the source and run Verify again, "
+        f"Test checked {was}; this run would read {would}. Nothing was loaded. A run reads "
+        "only the file Test checked: choose this file as the source and run Test again, "
         "then run."
     )

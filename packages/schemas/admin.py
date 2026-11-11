@@ -3,10 +3,13 @@ and dashboard identities. Generated into TypeScript for the Glass's Admin area."
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Literal
+from datetime import date, datetime
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .ingest import RunMetering
+from .rights import Right
 
 
 class PersonAccount(BaseModel):
@@ -180,6 +183,13 @@ class EngineStatus(BaseModel):
 #: provider. The handling code must still be sendable.
 DatasetEgress = Literal["none", "contracted", "any"]
 
+#: ADR-145 Amendment 4 decision 6: the kinds Admin › Datasets shows (*Source*, *Composite*,
+#: *Drawn*).
+AdminDatasetKind = Literal["source", "composite", "drawn"]
+
+#: ADR-145 decision 8: *Author promotes*, or *Second person reviews*.
+PromotionPolicy = Literal["author_promotes", "second_person_reviews"]
+
 
 class AdminDataset(BaseModel):
     """One dataset as the Admin area's Datasets screen shows it (ADR-136 decision 2): its name, the
@@ -189,6 +199,98 @@ class AdminDataset(BaseModel):
     name: str
     owning_unit: str
     egress: DatasetEgress
+    #: The highest marking the dataset may hold (ADR-145 decision 8, Amendment 3; ADR-143 Amendment
+    #: 2 decision 3). Set when the dataset is made: a drawn dataset's maker chooses it within their
+    #: own clearance; every other dataset has the deployment's highest marking, which the Conduit
+    #: fills in (L3.1b step 5); `None` until then, read as that. Read by the Glass's Admin ›
+    #: Datasets column *Highest marking it may hold* (L2.4 part 2); enforced on what is written
+    #: into the dataset and its cases' layers by L3.3.
+    highest_marking: str | None = None
+    #: ADR-145 Amendment 4 decision 6: what kind of dataset this is. An analyst layer is never a
+    #: row of its own; it is counted under the case it belongs to (`AdminLinkedCase`).
+    kind: AdminDatasetKind = "source"
+    #: ADR-145 decision 8: how a drawn item is promoted into the dataset. Enforced by the
+    #: promotion itself (L3.4); set here, audited.
+    promotion_policy: PromotionPolicy = "author_promotes"
+
+
+class DatasetPromotionPolicyInput(BaseModel):
+    """`PUT /v1/admin/datasets/{dataset_id}/promotion-policy`: an administrator's change,
+    audited."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    promotion_policy: PromotionPolicy
+
+
+class DatasetAuthor(BaseModel):
+    """One of a dataset's Authors, as Admin › Datasets shows them: the account and its name."""
+
+    id: str
+    #: The directory's name for the account; `None` when the directory has none to give.
+    name: str | None = None
+    #: Holds `review_promotions` (ADR-112 Amendment 4), so may approve another's promotion when
+    #: the policy is *Second person reviews*.
+    approves: bool = False
+
+
+class AdminDatasetAuthors(BaseModel):
+    """A dataset's Authors (ADR-145 Amendment 4 decision 3): its home case's Authors. Names and
+    accounts only, never the home case's contents."""
+
+    dataset_id: str
+    #: `False` until the dataset's first *Make live* made its home case, which names the first
+    #: Authors; *Change owner…* changes them after that.
+    has_home_case: bool
+    people: list[DatasetAuthor] = Field(default_factory=list)
+    #: A team (ADR-112 Amendment 5), when teams are built; `None` until then.
+    team: str | None = None
+
+
+class AdminLinkedCase(BaseModel):
+    """One case linked to a dataset, as an administrator sees it (ADR-143 Amendment 2 decision 2):
+    its name, its state and its layer as counts. Never the layer's contents: no item, label or
+    property (rule 7). An open and a removed case carry exactly the same fields."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    investigation_id: str
+    name: str
+    state: Literal["open", "removed"]
+    #: The dataset's own home case (ADR-145 Amendment 4 decision 2).
+    home_case: bool = False
+    #: The composite the case reads this dataset through; `None` when it chose this dataset.
+    through: str | None = None
+    #: The layer's live items and links, counted by the graph store.
+    items: int = Field(ge=0)
+    links: int = Field(ge=0)
+    #: The bytes the layer holds: its items' and links' stored properties and their pictures,
+    #: counted by the stores (the owner's ruling of 8 November 2026, Q1 (a)).
+    size_bytes: int = Field(ge=0)
+
+
+class AdminDatasetCases(BaseModel):
+    dataset_id: str
+    cases: list[AdminLinkedCase]
+
+
+#: ADR-143 Amendment 2 decision 1: what may happen to a removed case's layer.
+LayerAction = Literal["merge", "delete"]
+
+
+class LayerDryRun(BaseModel):
+    """A removed case's *Merge into the dataset* or *Delete*, run dry: what it would touch, in
+    counts, and nothing written. The action itself is the promotion's (L3.4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    investigation_id: str
+    action: LayerAction
+    items: int = Field(ge=0)
+    links: int = Field(ge=0)
+    size_bytes: int = Field(ge=0)
+    #: What the action would do, in words.
+    would: str
 
 
 class DatasetEgressInput(BaseModel):
@@ -211,6 +313,17 @@ class UpdateNotice(BaseModel):
     problem: str | None
 
 
+class ConvertedViews(BaseModel):
+    """ADR-144 decision 6 on *Admin › System*: how many cases made from another became views, in how
+    many cases; the migration's dry-run report names any it did not place. Counted in the
+    administrator's own unit only (rule 7)."""
+
+    views: int = 0
+    cases: int = 0
+    #: Said in words when the count could not be read, so the screen never draws nothing for it.
+    problem: str | None = None
+
+
 class SystemStatus(BaseModel):
     """The Admin area's *System* screen (ADR-110 Amendment 1): each component, asked as the screen
     opens — what the harness's preflight showed before launch, for a running deployment."""
@@ -225,6 +338,12 @@ class SystemStatus(BaseModel):
     model_notice: str | None = None
     #: ADR-114 Amendment 8: the last update check; none when there has been none.
     update: UpdateNotice | None = None
+    #: ADR-144 decision 6: what the migration made of cases made from another, in the
+    #: administrator's own unit; none when the case views' store is not reachable.
+    converted_views: ConvertedViews | None = None
+    #: ADR-148 decision 10: the highest marking this deployment may hold; a load or an import marked
+    #: above it is refused. None only from a Conduit that predates the setting.
+    highest_marking: str | None = None
 
 
 class EmbeddedDashboard(BaseModel):
@@ -270,7 +389,7 @@ class ScheduleRunView(BaseModel):
     left out: a count of what a load wrote is a read (rule 3)."""
 
     run_id: str
-    trigger: Literal["manual", "schedule", "watch", "release"]
+    trigger: Literal["manual", "schedule", "watch", "release", "source_refresh", "external"]
     slot: datetime | None = None
     started_at: datetime
     finished_at: datetime | None = None
@@ -287,6 +406,8 @@ class ScheduleRunView(BaseModel):
     failure: str | None = None
     #: ADR-110 Amendment 4: the name of the file a watched run took; withheld like the counts.
     file: str | None = None
+    #: ADR-110 Amendment 6 point 9: what the run cost; withheld like the counts.
+    metering: RunMetering | None = None
 
 
 class AdminSchedule(BaseModel):
@@ -336,11 +457,321 @@ class PauseScheduleInput(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
 
 
+# --- Roles, teams and Disable (ADR-145 decisions 6-7, Amendments 4 and 5; ADR-112 Amendments 4 and
+# 5; ADR-146 Amendment 1) ------------------------------------------------------------------------
+
+
+class BuiltInRole(BaseModel):
+    """A built-in role or the *Super user* preset (ADR-145 decision 7): listed with its rights,
+    copied into a custom role, never edited. A preset is given as the roles it names."""
+
+    id: str
+    label: str
+    rights: list[Right]
+    #: The roles the preset gives together (`SUPER_USER_PRESET`); empty for a role.
+    gives: list[str] = Field(default_factory=list)
+
+
+class TeamInput(BaseModel):
+    """*Make this role a team* (ADR-112 Amendment 5 decision 3): a display name and a contact
+    mailbox, a distribution list that is a contact, never a sign-in."""
+
+    display_name: str = Field(min_length=1, max_length=80)
+    mailbox: str = Field(pattern=EMAIL_PATTERN, max_length=254)
+
+
+class TeamMember(BaseModel):
+    id: str
+    name: str | None = None
+
+
+class Team(BaseModel):
+    """A team: a custom role's holders (the owner's L2.5 Q4 (a)), its lead, and a cover until a
+    date. `acting_lead` is the cover while the cover lasts, else the lead: the shape ADR-146
+    Amendment 1's queue tools read (rules' L2.10, `services/api/teams.py::acting_lead`)."""
+
+    role_id: str
+    display_name: str
+    mailbox: str
+    lead: str | None = None
+    cover: str | None = None
+    #: The last day the cover acts (inclusive); after it, the lead acts again with no action.
+    cover_until: date | None = None
+    acting_lead: str | None = None
+    members: list[TeamMember] = Field(default_factory=list)
+
+
+class CustomRoleInput(BaseModel):
+    """A custom role (ADR-112 Amendment 4): a name and a set of existing rights. Refused at the
+    route: a name already used, no rights, a right the giver does not hold, a forbidden pair
+    (ADR-145 decision 7), and a change that leaves no enabled person holding `manage_people`
+    (ADR-145 Amendment 5)."""
+
+    name: str = Field(min_length=1, max_length=60)
+    rights: list[str] = Field(max_length=64)
+
+
+class CustomRoleVersion(BaseModel):
+    version: int
+    name: str
+    rights: list[Right]
+    changed_by: str
+    changed_at: datetime
+
+
+class CustomRole(BaseModel):
+    """A custom role's current version, held in the token as `role:<id>`."""
+
+    id: str
+    name: str
+    version: int
+    rights: list[Right]
+    changed_by: str
+    changed_at: datetime
+    #: How many people hold it now.
+    holders: int = 0
+    team: Team | None = None
+
+
+class RolesCatalogue(BaseModel):
+    """`GET /v1/admin/roles`: the built-in roles, the preset and every custom role."""
+
+    built_in: list[BuiltInRole]
+    custom: list[CustomRole]
+
+
+class TeamLeadInput(BaseModel):
+    """Name a team's lead, or hand the role over (ADR-112 Amendment 5 decision 4): a member."""
+
+    lead: str = Field(min_length=1, max_length=200)
+
+
+class TeamCoverInput(BaseModel):
+    """Name a cover until a date (inclusive), a member other than the lead; `cover: null` ends
+    it."""
+
+    cover: str | None = Field(default=None, min_length=1, max_length=200)
+    until: date | None = None
+
+
+OwnedKind = Literal[
+    "case_author", "home_case_author", "team_lead", "hotlist", "monitor", "saved_pattern",
+    "typology_rule", "pipeline_schedule", "list_schedule",
+    # L2.5b: the kinds L3.8's ownership route reads (`person_ownership.py`, ADR-145 Amendment 8).
+    "view", "board", "link_type_proposal", "drawn_watch",
+]
+
+
+class OwnedItem(BaseModel):
+    """One thing a person answers for, as *Disable…* lists it (ADR-145 decision 6): each needs a
+    *Transfer to…* before *Transfer and disable* is accepted."""
+
+    kind: OwnedKind
+    id: str
+    #: What it is, in words ("Kestrel (case)"), only what the administrator may already see.
+    label: str
+    #: The case a view, a board, a proposed type or a watch is in (L3.8's items); none otherwise.
+    investigation_id: str | None = None
+    #: The marking its recipient must clear (ADR-145 Amendment 9): a view's or a board's case's
+    #: highest, a proposal's or a watch's dataset's; *Transfer to…* offers only people who do.
+    needs_clearance: str | None = None
+
+
+class DisablePlan(BaseModel):
+    """`GET /v1/admin/people/{user_id}/disable-plan`: everything the person owns today, and the
+    kinds not yet listed because their owner route is not built (L2.5b, L3.8's ownership route)."""
+
+    person: str
+    items: list[OwnedItem]
+    not_yet_listed: list[str] = Field(default_factory=list)
+
+
+class OwnedTransfer(BaseModel):
+    kind: OwnedKind
+    id: str
+    to: str = Field(min_length=1, max_length=200)
+
+
+class DisableInput(BaseModel):
+    """*Transfer and disable*: a recipient for every item of the plan; refused, in words, while any
+    item has none (409 `untransferred`), nothing changed."""
+
+    transfers: list[OwnedTransfer] = Field(default_factory=list, max_length=2000)
+
+
+class PersonCaseLevel(BaseModel):
+    """One of a person's case levels, as their row says it (R3): "Author of Kestrel"; `through`
+    names the team that gives it, when a team does."""
+
+    investigation_id: str
+    name: str
+    level: Literal["viewer", "editor", "author"]
+    through: str | None = None
+
+
+class AdminPersonRow(BaseModel):
+    """`GET /v1/admin/people/rows` (R3): each person's case levels and the cases with no Author
+    (R1), only of cases in the administrator's own unit (ADR-052)."""
+
+    id: str
+    levels: list[PersonCaseLevel] = Field(default_factory=list)
+
+
+class CaseWithoutAuthor(BaseModel):
+    investigation_id: str
+    name: str
+
+
+class AdminPeopleRows(BaseModel):
+    rows: list[AdminPersonRow]
+    without_author: list[CaseWithoutAuthor]
+
+
+#: ADR-145 decision 10 (O2): which record an Audit entry is held in. `case_and_admin` is the audit
+#: stream every route writes (`audit_log`: the case audit, the people, roles and dataset audits, and
+#: loads); `rules` the case's rule audit (ADR-109 ruling 1, read as its own read withholds it);
+#: `models` the engines' history (ADR-112 Amendment 7 decision 7).
+AuditRecord = Literal["case_and_admin", "rules", "models"]
+#: Decision 10's kinds, with the rule audit's and the engines' history as kinds of their own, and
+#: every other action (reads, refusals) as `reads_and_other`.
+AuditKind = Literal[
+    "assertions", "loads_and_promotions", "types", "people_and_roles", "datasets", "rules",
+    "models", "reads_and_other",
+]  # fmt: skip
+
+
+class AuditSectionEntry(BaseModel):
+    """One entry of Admin › Audit, read under the reader's own principal (rule 3). `detail` holds
+    the entry's words only where the reader's own read of that record would show them; otherwise it
+    is null and `words_withheld` says so, and the entry's count is withheld with them."""
+
+    recorded_at: datetime
+    #: Who acted, by name, or fixed words where the identity provider gives none: never an
+    #: account's id (rule 7, ADR-106 Amendment 1).
+    who: str
+    action: str
+    kind: AuditKind
+    held_in: AuditRecord
+    investigation_id: str | None = None
+    case_name: str | None = None
+    detail: dict[str, Any] | None = None
+    words_withheld: bool = False
+    result_cardinality: int | None = None
+
+
+class AuditSectionPage(BaseModel):
+    """`GET /v1/admin/audit`: a page, newest first, with the total of what this reader may see under
+    these filters. An entry withheld from them is neither on the page nor in the total."""
+
+    entries: list[AuditSectionEntry] = Field(default_factory=list)
+    total: int = Field(ge=0)
+    offset: int = Field(ge=0)
+    limit: int = Field(ge=1)
+    #: What this record leaves out and why, said rather than left silent (rule 2).
+    note: str | None = None
+    #: The person picker's choices: the names of everyone who wrote an entry of this record the
+    #: reader may read, whatever the other filters; a filter by person sends one of these back.
+    people: list[str] = Field(default_factory=list)
+
+
+class PromotionAlertSetting(BaseModel):
+    """Admin › Operations' *Alert the reviewers and administrators after N days* (ADR-145
+    decision 9; default 3)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    alert_after_days: int = Field(default=3, ge=1, le=90)
+
+
+class AgeingRule(BaseModel):
+    """One thing that ages in Operations (O3), and what happens when it does, in words."""
+
+    what: str
+    after_days: int
+    then: str
+
+
+class WaitingPromotion(BaseModel):
+    """A promotion waiting for review (ADR-143 decision 10), as Operations lists it: named by its
+    load and dataset, never by what it adds (rule 7)."""
+
+    promotion_id: str
+    load_id: str
+    dataset_id: str
+    dataset_name: str
+    #: The proposer by name, or fixed words where there is none: never an account's id (rule 7).
+    proposed_by_name: str
+    proposed_at: datetime
+    age_days: int = Field(ge=0)
+    overdue: bool
+
+
+class OperationsAgeing(BaseModel):
+    """`GET /v1/admin/operations/ageing`: what ages and when, and the promotions waiting."""
+
+    alert_after_days: int
+    rules: list[AgeingRule]
+    waiting: list[WaitingPromotion] = Field(default_factory=list)
+    #: False until promotions are recorded (case's L3.4): none can wait, and the screen says so.
+    promotions_recorded: bool = False
+
+
+class PromotionOverdueAlert(BaseModel):
+    """*Promotions overdue* (ADR-145 Amendment 4 decision 11, R7), raised once per promotion at N
+    days to the dataset's Authors holding `review_promotions` and to administrators. Its words name
+    the load and the dataset, never the promotion's contents (rule 7)."""
+
+    promotion_id: str
+    load_id: str
+    dataset_id: str
+    raised_at: datetime
+    recipients: list[str]
+    words: str
+
+
+class PromotionOverdueNotice(BaseModel):
+    """One *Promotions overdue* alert as its recipient reads it (L2.7's *Needs you*): the alert
+    without its recipients, since who else was alerted is not that person's to read."""
+
+    promotion_id: str
+    load_id: str
+    dataset_id: str
+    raised_at: datetime
+    words: str
+
+
+class NeedsYouProposals(BaseModel):
+    """One dataset's proposed link types in the reader's *Needs you* (ADR-145 decision 11, A2;
+    ADR-090 Amendment 4): how many the reader may read and decide. A dataset whose proposals the
+    reader is not cleared to read is not listed at all, not even as having one open (ADR-143
+    Amendment 4's *Open*, the strict reading; the orchestrator's ruling at L2.7's review)."""
+
+    dataset_id: str
+    dataset_name: str
+    to_decide: int
+
+
+class NeedsYou(BaseModel):
+    """The reader's *Needs you* (L2.7): their overdue promotions, served only while they are still a
+    recipient (Amendment 4 decision 11), and the proposed link types of the datasets their cases
+    load into, for a holder of `accept_types`."""
+
+    promotions_overdue: list[PromotionOverdueNotice]
+    proposals: list[NeedsYouProposals]
+
+
 ALL_MODELS: list[type[BaseModel]] = [
     PersonAccount, DashboardIdentity, RegisteredDashboard, RolesInput, DashboardInput,
-    ComponentHealth, UpdateNotice, SystemStatus, EmbeddedDashboard, DashboardGuestToken,
+    ComponentHealth, UpdateNotice, ConvertedViews, SystemStatus, EmbeddedDashboard,
+    DashboardGuestToken,
     AccessInput, InviteInput, SignInDelivery, DemoPackStatus,
     ModelRoleStatus, EngineStatus, ScheduleRunView, AdminSchedule, PauseScheduleInput, DataFeed,
     ChangeScheduleInput, AdminDataset, DatasetEgressInput, OrganisationArrival,
-    OrganisationLinkInput,
+    OrganisationLinkInput, DatasetPromotionPolicyInput, DatasetAuthor, AdminDatasetAuthors,
+    AdminLinkedCase, AdminDatasetCases, LayerDryRun,
+    BuiltInRole, TeamInput, TeamMember, Team, CustomRoleInput, CustomRoleVersion, CustomRole,
+    RolesCatalogue, TeamLeadInput, TeamCoverInput, OwnedItem, DisablePlan, OwnedTransfer,
+    DisableInput, PersonCaseLevel, AdminPersonRow, CaseWithoutAuthor, AdminPeopleRows,
+    AuditSectionEntry, AuditSectionPage, PromotionAlertSetting, AgeingRule, WaitingPromotion,
+    OperationsAgeing, PromotionOverdueAlert, PromotionOverdueNotice, NeedsYouProposals, NeedsYou,
 ]  # fmt: skip

@@ -2,9 +2,8 @@
 
 Neither the graph itself (the Vault's job) nor ephemeral working-set state
 (Valkey's job, `working_set/store.py`) — an investigation record is small,
-relational, control-plane metadata: who created it, when, and (for a
-branch) what it was forked from. Postgres already exists in this phase for
-the audit stream, so investigation metadata lives in the same database
+relational, control-plane metadata: who created it and when. Postgres already
+exists in this phase for the audit stream, so investigation metadata lives in the same database
 rather than inventing a fourth store for a handful of columns.
 
 **`owning_unit` is the investigation-level authorization boundary** —
@@ -21,7 +20,7 @@ separately by the handling filter on every read
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import cast, get_args
@@ -30,7 +29,8 @@ import asyncpg
 from pydantic import BaseModel, Field, field_validator
 
 from conduit_common.identity import new_id
-from schemas.domain import DomainPack, Interval, Principal
+from schemas.domain import DomainPack, Principal
+from schemas.rights import teams_of
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +42,7 @@ CREATE TABLE IF NOT EXISTS investigations (
     id TEXT PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL,
     created_by TEXT NOT NULL,
-    owning_unit TEXT NOT NULL,
-    branched_from TEXT REFERENCES investigations (id)
+    owning_unit TEXT NOT NULL
 );
 """
 
@@ -89,27 +88,32 @@ CREATE TABLE IF NOT EXISTS investigation_tab_state (
 #: constraint change; an unknown value is refused on the way in and dropped on the way out.
 _DOMAIN_SQL = "ALTER TABLE investigations ADD COLUMN IF NOT EXISTS domains TEXT[]"
 
-#: ADR-128 decision 2 (B3). A branch made from what is lit records its window, and the events it
-#: inherits from its parents are held to it. NULL for every case that has none, which is every
-#: case from before the change. Run on every start, as the domains column is.
-_BRANCH_WINDOW_SQL = """
-ALTER TABLE investigations ADD COLUMN IF NOT EXISTS branch_valid_from TIMESTAMPTZ;
-ALTER TABLE investigations ADD COLUMN IF NOT EXISTS branch_valid_to TIMESTAMPTZ;
-"""
-
 _MIGRATE_EXISTING_SQL = """
 UPDATE investigations SET unit_level = 'viewer';
 INSERT INTO investigation_grants (investigation_id, account_id, level)
     SELECT id, created_by, 'author' FROM investigations ON CONFLICT DO NOTHING;
 """
 
+#: ADR-112 Amendment 5 decision 3 (L2.5): a team holds a case level as `team:<its role's id>`, and
+#: a person holds it through each team whose role (`role:<id>`) their token carries on this
+#: request: read from the principal every time, never kept, so it ends when they leave the team.
+#: A person's level is the highest they hold, in their own name or through a team.
+TEAM_GRANT_PREFIX = "team:"
+
+
+def grant_subjects(principal: Principal) -> list[str]:
+    """Whom a case's grants may name for this principal: the account, and each team it is in."""
+    teams = teams_of(principal.roles)
+    return [principal.id, *(f"{TEAM_GRANT_PREFIX}{t}" for t in teams)]
+
+
 _LEVEL_SQL = (
     "SELECT i.id, i.name, i.created_at, i.created_by, i.owning_unit, "
-    "i.branched_from, i.branch_valid_from, i.branch_valid_to, i.domains, "
-    "g.level AS grant_level, i.unit_level "
-    "FROM investigations i "
-    "LEFT JOIN investigation_grants g "
-    "ON g.investigation_id = i.id AND g.account_id = $3 "
+    "i.domains, "
+    "(SELECT g.level FROM investigation_grants g "
+    "WHERE g.investigation_id = i.id AND g.account_id = ANY($3::text[]) "
+    "ORDER BY CASE g.level WHEN 'author' THEN 3 WHEN 'editor' THEN 2 ELSE 1 END DESC "
+    "LIMIT 1) AS grant_level, i.unit_level FROM investigations i "
     "WHERE i.id = $1 AND i.owning_unit = $2 AND i.removed_at IS NULL"
 )
 
@@ -148,22 +152,19 @@ class Investigation(BaseModel):
     created_at: datetime
     created_by: str
     owning_unit: str
-    branched_from: str | None = None
     #: ADR-126: the domain packs the case carries, sorted and without repeats. Empty means the POLE
     #: core model alone. An unknown value is refused here, so no write can take one; a stored one is
     #: dropped on the way out by `_known_domains`, before it reaches this model.
     domains: list[DomainPack] = Field(default_factory=list)
     #: ADR-126 decision 2: someone has chosen (the column is not NULL), `{}` included. Not on the
-    #: wire (`exclude`): it is for a branch, which inherits the stored value exactly, so a branch of
-    #: a never-chosen case is never chosen too. See `domains_to_inherit`.
+    #: wire (`exclude`): it is for a case opened from this one's alert, which takes the stored value
+    #: exactly, so one opened from a never-chosen case is never chosen too. See
+    #: `domains_to_inherit`.
     domains_chosen: bool = Field(default=False, exclude=True)
-    #: ADR-128 decision 2: the window a branch made from what is lit was made with, both ends
-    #: included; its inherited events are held to it. `None` for every other case. Not on the wire.
-    branch_window: Interval | None = Field(default=None, exclude=True)
 
     def domains_to_inherit(self) -> list[DomainPack] | None:
-        """What a branch of this case is created with: the stored value, NULL (None) included, not
-        the read-side list, which cannot tell "never chosen" from "chosen POLE"."""
+        """What a case opened from this one's alert is created with: the stored value, NULL (None)
+        included, not the read-side list, which cannot tell "never chosen" from "chosen POLE"."""
         return self.domains if self.domains_chosen else None
 
     @field_validator("domains")
@@ -190,16 +191,10 @@ def _known_domains(stored: Sequence[str] | None, investigation_id: str) -> list[
 
 
 def _domain_fields(row: asyncpg.Record) -> dict[str, object]:
-    """The `domains`, `domains_chosen` and `branch_window` fields of a case row, as stored."""
-    window = (
-        Interval(valid_from=row["branch_valid_from"], valid_to=row["branch_valid_to"])
-        if row["branch_valid_from"] is not None
-        else None
-    )
+    """The `domains` and `domains_chosen` fields of a case row, as stored."""
     return {
         "domains": _known_domains(row["domains"], row["id"]),
         "domains_chosen": row["domains"] is not None,
-        "branch_window": window,
     }
 
 
@@ -246,7 +241,6 @@ class InvestigationStore:
                 await conn.execute(_ACCESS_SQL)
                 await conn.execute(_TAB_SQL)
                 await conn.execute(_DOMAIN_SQL)
-                await conn.execute(_BRANCH_WINDOW_SQL)
                 if first_time:
                     await conn.execute(_MIGRATE_EXISTING_SQL)
         return cls(pool)
@@ -259,15 +253,10 @@ class InvestigationStore:
         principal: Principal,
         *,
         name: str,
-        branched_from: str | None = None,
         domains: Sequence[str] | None = None,
-        branch_window: Interval | None = None,
     ) -> Investigation:
-        """`owning_unit` is always the *acting* principal's own `org_unit`
-        — for a branch, that is the branching principal, never inherited
-        from the source investigation (`app.py`'s `branch_investigation`
-        already authorised the branching principal against the source
-        before calling this). The creator is the case's first Author, and a new case is
+        """`owning_unit` is always the *acting* principal's own `org_unit`, never another case's.
+        The creator is the case's first Author, and a new case is
         visible to nobody else until an Author shares it (ADR-052 §2, §4).
 
         `domains` (ADR-126): None leaves the column NULL, "never chosen"; a list, empty included,
@@ -282,26 +271,20 @@ class InvestigationStore:
             created_at=datetime.now(UTC),
             created_by=principal.id,
             owning_unit=principal.org_unit,
-            branched_from=branched_from,
             domains=chosen or [],
             domains_chosen=chosen is not None,
-            branch_window=branch_window,
         )
         async with self._pool.acquire() as conn, conn.transaction():
             await conn.execute(
                 "INSERT INTO investigations "
-                "(id, name, created_at, created_by, owning_unit, branched_from, domains, "
-                "branch_valid_from, branch_valid_to) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                "(id, name, created_at, created_by, owning_unit, domains) "
+                "VALUES ($1, $2, $3, $4, $5, $6)",
                 investigation.id,
                 investigation.name,
                 investigation.created_at,
                 investigation.created_by,
                 investigation.owning_unit,
-                investigation.branched_from,
                 chosen,
-                branch_window.valid_from if branch_window else None,
-                branch_window.valid_to if branch_window else None,
             )
             await conn.execute(
                 "INSERT INTO investigation_grants (investigation_id, account_id, level) "
@@ -319,8 +302,7 @@ class InvestigationStore:
         `get_authorized` is what every route actually uses."""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT id, name, created_at, created_by, owning_unit, branched_from, "
-                "branch_valid_from, branch_valid_to, domains "
+                "SELECT id, name, created_at, created_by, owning_unit, domains "
                 "FROM investigations WHERE id = $1 AND removed_at IS NULL",
                 investigation_id,
             )
@@ -340,7 +322,7 @@ class InvestigationStore:
         level = max(held, key=lambda held_level: held_level.rank) if held else None
         fields = {
             k: row[k]
-            for k in ("id", "name", "created_at", "created_by", "owning_unit", "branched_from")
+            for k in ("id", "name", "created_at", "created_by", "owning_unit")
         }
         fields.update(_domain_fields(row))
         return Investigation(**fields), level
@@ -356,7 +338,7 @@ class InvestigationStore:
     ) -> tuple[Investigation, AccessLevel | None] | None:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                _LEVEL_SQL, investigation_id, principal.org_unit, principal.id
+                _LEVEL_SQL, investigation_id, principal.org_unit, grant_subjects(principal)
             )
         return self._parse_level_row(row)
 
@@ -375,15 +357,15 @@ class InvestigationStore:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT i.id, i.name, i.created_at, i.created_by, i.owning_unit, "
-                "i.branched_from, i.branch_valid_from, i.branch_valid_to, i.domains, "
-                "g.level AS grant_level, i.unit_level "
-                "FROM investigations i "
-                "LEFT JOIN investigation_grants g "
-                "ON g.investigation_id = i.id AND g.account_id = $3 "
+                "i.domains, "
+                "(SELECT g.level FROM investigation_grants g "
+                "WHERE g.investigation_id = i.id AND g.account_id = ANY($3::text[]) "
+                "ORDER BY CASE g.level WHEN 'author' THEN 3 WHEN 'editor' THEN 2 ELSE 1 END DESC "
+                "LIMIT 1) AS grant_level, i.unit_level FROM investigations i "
                 "WHERE i.id = $1 AND i.owning_unit = $2 AND i.removed_at IS NULL",
                 investigation_id,
                 principal.org_unit,
-                principal.id,
+                grant_subjects(principal),
             )
         found = self._parse_level_row(row)
         if found is None:
@@ -475,16 +457,17 @@ class InvestigationStore:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT i.id, i.name, i.created_at, i.created_by, i.owning_unit, "
-                "i.branched_from, i.branch_valid_from, i.branch_valid_to, i.domains, "
-                "g.level AS grant_level, i.unit_level "
-                "FROM investigations i "
-                "LEFT JOIN investigation_grants g "
-                "ON g.investigation_id = i.id AND g.account_id = $2 "
+                "i.domains, "
+                "(SELECT g.level FROM investigation_grants g "
+                "WHERE g.investigation_id = i.id AND g.account_id = ANY($2::text[]) "
+                "ORDER BY CASE g.level WHEN 'author' THEN 3 WHEN 'editor' THEN 2 ELSE 1 END DESC "
+                "LIMIT 1) AS grant_level, i.unit_level FROM investigations i "
                 "WHERE i.owning_unit = $1 AND i.removed_at IS NULL "
-                "AND (g.level IS NOT NULL OR i.unit_level IS NOT NULL) "
+                "AND (i.unit_level IS NOT NULL OR EXISTS (SELECT 1 FROM investigation_grants o "
+                "WHERE o.investigation_id = i.id AND o.account_id = ANY($2::text[]))) "
                 "ORDER BY i.created_at DESC, i.id DESC",
                 principal.org_unit,
-                principal.id,
+                grant_subjects(principal),
             )
         listed: list[tuple[Investigation, AccessLevel]] = []
         for row in rows:
@@ -641,6 +624,64 @@ class InvestigationStore:
                 raise InvestigationNotFoundError(investigation_id)
             await self._record(conn, investigation_id, by.id, "remove", investigation_id, None)
 
+    async def replace_authors(
+        self,
+        investigation_id: str,
+        owners: Sequence[str],
+        *,
+        by: Principal,
+        audit: Callable[[asyncpg.Connection, list[str]], Awaitable[None]],
+    ) -> list[str]:
+        """Admin › Datasets' *Change owner…* (ADR-145 Amendment 4 decision 6): `owners` become the
+        case's Authors and every other Author's grant ends, each recorded in the access history,
+        and `audit` writes its entry on the same connection, all in one transaction: a failure
+        part-way leaves nothing changed. Returns the Authors before."""
+        async with self._pool.acquire() as conn, conn.transaction():
+            rows = await conn.fetch(
+                "SELECT account_id FROM investigation_grants WHERE investigation_id = $1 "
+                "AND level = $2 ORDER BY account_id FOR UPDATE",
+                investigation_id,
+                AccessLevel.AUTHOR.value,
+            )
+            before = [r["account_id"] for r in rows]
+            for owner in owners:
+                await conn.execute(
+                    "INSERT INTO investigation_grants (investigation_id, account_id, level) "
+                    "VALUES ($1, $2, $3) ON CONFLICT (investigation_id, account_id) "
+                    "DO UPDATE SET level = EXCLUDED.level",
+                    investigation_id,
+                    owner,
+                    AccessLevel.AUTHOR.value,
+                )
+                await self._record(
+                    conn, investigation_id, by.id, "grant", owner, AccessLevel.AUTHOR
+                )
+            for gone in sorted(set(before) - set(owners)):
+                await conn.execute(
+                    "DELETE FROM investigation_grants WHERE investigation_id = $1 "
+                    "AND account_id = $2",
+                    investigation_id,
+                    gone,
+                )
+                await self._record(conn, investigation_id, by.id, "revoke", gone, None)
+            await audit(conn, before)
+        return before
+
+    async def admin_states(self, investigation_ids: Sequence[str]) -> dict[str, tuple[str, bool]]:
+        """Admin › Datasets' linked cases (ADR-143 Amendment 2 decision 2): each case's name and
+        whether it is removed, open and removed alike, and nothing else of it. No level check:
+        the route's right (`administer_system`) is the gate. A case that does not exist is left
+        out."""
+        if not investigation_ids:
+            return {}
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, name, removed_at IS NOT NULL AS removed FROM investigations "
+                "WHERE id = ANY($1::text[])",
+                list(set(investigation_ids)),
+            )
+        return {r["id"]: (r["name"] or "", bool(r["removed"])) for r in rows}
+
     async def list_grants(self, investigation_id: str) -> dict[str, AccessLevel]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
@@ -666,8 +707,7 @@ class InvestigationStore:
         administrator finds nothing."""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT id, name, created_at, created_by, owning_unit, branched_from, "
-                "branch_valid_from, branch_valid_to, domains "
+                "SELECT id, name, created_at, created_by, owning_unit, domains "
                 "FROM investigations WHERE id = $1 AND owning_unit = $2 AND removed_at IS NULL",
                 investigation_id,
                 principal.org_unit,

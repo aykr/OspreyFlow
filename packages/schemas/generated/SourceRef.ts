@@ -3,10 +3,12 @@
 export type DocumentId = string;
 export type Locator = string;
 export type ExcerptHash = string;
+export type SourceLoadId = string | null;
 
 export interface SourceRef {
   document_id: DocumentId;
   locator: Locator;
   excerpt_hash: ExcerptHash;
+  load_id?: SourceLoadId;
   [k: string]: unknown;
 }

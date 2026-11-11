@@ -23,6 +23,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+from services.api.list_connector import ParquetListRows, PostgresListStore
+from services.api.target_models import PostgresTargetModelStore, core_types_of
+from services.ingest.staging import ObjectStorageConfig
 from valkey.asyncio import Valkey
 
 from adapters.compute_rustworkx.adapter import ComputeRustworkxAdapter
@@ -37,10 +40,12 @@ from ports.graph import GraphPort
 from ports.media import MediaStore
 from schemas.domain import OntologySchema
 
+from . import rule_editor
 from .alerts import AlertStore
 from .analytics_store import Close, open_analytics
 from .audit import AuditWriter
 from .auth import PrincipalResolver
+from .board_store import PostgresBoardItemStore
 from .cache import CachedQuery
 from .config import ApiConfig
 from .dataset_scope import DatasetStampingGraph, stamping
@@ -48,6 +53,7 @@ from .datasets import PostgresDatasetStore
 from .explore import EXPLORE_TTL_SECONDS
 from .held_rows import HeldRowStore
 from .hotlists import HotlistStore
+from .investigations import InvestigationStore
 from .jobs import JobQueue
 from .kyc_expiries import KycExpiryStore
 from .media_store import open_media_store
@@ -62,10 +68,12 @@ from .pipeline_run import (
 from .recipe_run import RecipeRunDeps
 from .recipe_runs import RecipeRunStore
 from .review import ExtractionCandidateStore
+from .run_quotas import PostgresQuotaStore
 from .screening import ScreeningListStore
 from .strength_influencers import InfluencerStore
 from .studio_publish import _REPO_ROOT as RECIPES_REPO_ROOT
 from .typology_rules import TypologyRuleStore
+from .watch_reach import DatasetReach, owner_reaches_dataset_in
 
 __all__ = ["RECIPES_REPO_ROOT", "RunResources", "build_run_resources"]
 
@@ -91,8 +99,17 @@ class RunResources:
     screening_lists: ScreeningListStore
     kyc_expiries: KycExpiryStore
     recipe_runs: RecipeRunStore
+    #: ADR-141 decision 6: the run quotas every run's start judges, a seed's load among them.
+    run_quotas: PostgresQuotaStore
     extraction_candidates: ExtractionCandidateStore
     datasets_store: PostgresDatasetStore
+    #: The cases' levels, which a watch's owner's reach is asked of (ADR-146 Amendment 4 point 7).
+    investigations: InvestigationStore
+    #: ADR-140 Amendment 12: a staged pipeline's lists, and where staged rows are kept.
+    target_models: PostgresTargetModelStore
+    staging_storage: ObjectStorageConfig
+    #: ADR-140 Amendment 13: deployment-wide lists and subscriptions, which a staged run reads.
+    list_store: PostgresListStore
     explore_cache: CachedQuery
     analytics: AnalyticsPort
     close_analytics: Close
@@ -105,7 +122,37 @@ class RunResources:
     principal_resolver: PrincipalResolver
     #: ADR-139: installation-wide and case link-strength influencers.
     influencers: InfluencerStore
+    #: L3.6: the drawn watches a load is run against (ADR-143 Amendment 2 decision 8).
+    board_items: PostgresBoardItemStore
     recipe_repo_root: Path = RECIPES_REPO_ROOT
+
+    @property
+    def watch_reach(self) -> DatasetReach:
+        """Whether a watch's owner still reaches its dataset, over the stores held here: a
+        command-line load matches watches as the Conduit's own loads do (the L2.10 gate's finding,
+        `test_run_resources.py`, which first stood this path's fail-closed gap in the open)."""
+        return owner_reaches_dataset_in(self.datasets_store, self.investigations)
+
+    @property
+    def datasets(self) -> PostgresDatasetStore:
+        """The run's name for the datasets store (`RecipeRunDeps.datasets`)."""
+        return self.datasets_store
+
+    @property
+    def rule_lists(self) -> rule_editor.RuleListReader:
+        """ADR-146 decision 3 (L2.11): a command-line run reads a rule's named Studio list within
+        the rule's own dataset, over the stores held here, as the Conduit's runs do."""
+        return rule_editor.rule_list_reader(
+            datasets=self.datasets_store,
+            models=self.target_models,
+            lists=self.list_store,
+            rows_kept=ParquetListRows(self.staging_storage),
+        )
+
+    @property
+    def rule_reach(self) -> rule_editor.RuleReach:
+        """What a rule on a declared dataset reads (a composite's members), over the stores here."""
+        return rule_editor.rule_reach_of(self.datasets_store)
 
     def run_deps(self) -> RecipeRunDeps:
         """The dependencies of `run_recipe_as`, over the objects held here."""
@@ -134,7 +181,17 @@ class RunResources:
             compute=self.compute,
             kyc_expiries=self.kyc_expiries,
             recipe_runs=self.recipe_runs,
+            run_quotas=self.run_quotas,
             influencers=self.influencers,
+            target_models=self.target_models,
+            staging_storage=self.staging_storage,
+            list_store=self.list_store,
+            rule_lists=self.rule_lists,
+            rule_reach=self.rule_reach,
+            watch_reach=self.watch_reach,
+            board_items=self.board_items,
+            datasets=self.datasets_store,
+            investigations=self.investigations,
         )
 
     async def close(self) -> None:
@@ -152,8 +209,13 @@ class RunResources:
         await self.screening_lists.close()
         await self.kyc_expiries.close()
         await self.recipe_runs.close()
+        await self.run_quotas.close()
         await self.extraction_candidates.close()
         await self.datasets_store.close()
+        await self.investigations.close()
+        await self.target_models.close()
+        await self.list_store.close()
+        await self.board_items.close()
         await self.principal_resolver.aclose()
         await self.close_analytics()
 
@@ -187,9 +249,26 @@ async def build_run_resources(config: ApiConfig) -> RunResources:
     kyc_expiries = await KycExpiryStore.connect(config.postgres.dsn)
     # ADR-110 decision 6: the run ledger.
     recipe_runs = await RecipeRunStore.connect(config.postgres.dsn)
+    run_quotas = await PostgresQuotaStore.connect(config.postgres.dsn)
     extraction_candidates = await ExtractionCandidateStore.connect(config.postgres.dsn)
     # ADR-099: the datasets of each unit and of each case.
     datasets_store = await PostgresDatasetStore.connect(config.postgres.dsn)
+    investigations = await InvestigationStore.connect(config.postgres.dsn)
+    # ADR-140 Amendment 12: the datasets' domain models, whose lists a staged pipeline's Lookups
+    # read, and the store their rows and the staged Parquet are kept in.
+    from ontology.loader import load_default_ontology
+
+    core = load_default_ontology()
+    target_models = await PostgresTargetModelStore.connect(
+        config.postgres.dsn,
+        core_types=core_types_of(
+            [e.name for e in core.entity_types], [e.name for e in core.edge_types]
+        ),
+    )
+    staging_storage = ObjectStorageConfig.from_env()
+    list_store = await PostgresListStore.connect(config.postgres.dsn)
+    # L3.6: a command-line load runs the drawn watches on its dataset, as the Conduit's do.
+    board_items = await PostgresBoardItemStore.connect(config.postgres.dsn)
     # ADR-099 Amendment 6: no write names a dataset the registry does not hold.
     cast(DatasetStampingGraph, graph).check_against(datasets_store)
 
@@ -240,8 +319,13 @@ async def build_run_resources(config: ApiConfig) -> RunResources:
         screening_lists=screening_lists,
         kyc_expiries=kyc_expiries,
         recipe_runs=recipe_runs,
+        run_quotas=run_quotas,
         extraction_candidates=extraction_candidates,
         datasets_store=datasets_store,
+        investigations=investigations,
+        target_models=target_models,
+        staging_storage=staging_storage,
+        list_store=list_store,
         explore_cache=explore_cache,
         analytics=analytics,
         close_analytics=close_analytics,
@@ -252,4 +336,5 @@ async def build_run_resources(config: ApiConfig) -> RunResources:
         compute=compute,
         jobs=jobs,
         principal_resolver=principal_resolver,
+        board_items=board_items,
     )

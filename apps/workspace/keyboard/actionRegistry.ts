@@ -147,14 +147,14 @@ export const CANVAS_ACTIONS = defineActionRegistry("CANVAS_ACTIONS", [
   // was run against it, which is what these entries and their test cases close.
   "delete-removes-selected-nodes",
   "clear-view-by-keyboard",
-  // 4 October 2026 (ADR-084): the selected nodes can be sent to a new tab. A button in the same
-  // row as Remove selected and Clear view, so it is reached by Tab like them.
-  "branch-selected-opens-a-new-tab",
-  "branch-selected-from-a-selected-nodes-menu",
+  // ADR-144 decision 4 (L3.2b): the selected nodes saved as a private view of the case, from the
+  // selection bar (reached by Tab like Remove from view and Clear) and from a selected node's menu.
+  "save-selected-as-a-view-from-the-selection-bar",
+  "save-selected-as-a-view-from-a-selected-nodes-menu",
   // 26 October 2026 (ADR-128 decision 2, B3): a window set by Set exact dates lights part of the
-  // canvas; Select what is lit replaces the selection with it, Branch selected then opens a tab holding
+  // canvas; Select what is lit replaces the selection with it, Save as a view then keeps
   // only that slice, and one undo gives the earlier selection back.
-  "select-what-is-lit-then-branch-selected-by-keyboard",
+  "select-what-is-lit-then-save-as-a-view-by-keyboard",
   "undo-select-what-is-lit-by-keyboard",
   "layout-menu-chooses-layout",
   "layout-menu-chooses-force-directed-tree",
@@ -251,13 +251,13 @@ export const QUERY_BUILDER_ACTIONS = defineActionRegistry("QUERY_BUILDER_ACTIONS
 ] as const);
 
 /**
- * Hotlists/monitors/the alert inbox — Phase 7 Stage 6c Part 2, the fourth keyboard-driven surface
+ * Hotlists and monitors (the alert inbox went in L2.10) — Phase 7 Stage 6c Part 2, the fourth keyboard-driven surface
  * (`keyboard/watch-panels-harness.tsx`'s own docstring has the reasoning for a separate
  * harness/spec pair). Every native `Input`/`Select`'s own Tab-reachability needs no case here, the
  * same exemption `QUERY_BUILDER_ACTIONS`'s own docstring already establishes — only an action with
- * real state mutation or a real network call does: creating a hotlist or a monitor, jumping from
- * an alert into a branched investigation, and opening that investigation once the jump result is
- * shown (a real callback out of the component, not only a local state flip).
+ * real state mutation or a real network call does: creating a hotlist or a monitor, and opening an
+ * inbox alert at its own address (ADR-146 decision 6, L2.9: a real callback out of the component,
+ * not only a local state flip; it replaced the jump into a case of its own).
  */
 export const WATCH_PANEL_ACTIONS = defineActionRegistry("WATCH_PANEL_ACTIONS", [
   "submit-create-hotlist",
@@ -265,8 +265,12 @@ export const WATCH_PANEL_ACTIONS = defineActionRegistry("WATCH_PANEL_ACTIONS", [
   "choose-a-new-hotlists-audience-by-keyboard",
   "change-a-hotlists-audience-by-keyboard",
   "submit-create-monitor",
-  "alert-row-jump",
-  "jump-result-open-investigation",
+  // ADR-146 decisions 4 and 7 (L2.10): a watch's own schedule, and what the Glass makes; the inbox's
+  // own action went with it.
+  "set-a-watched-patterns-schedule-by-keyboard",
+  "watch-for-an-entity-by-keyboard",
+  "save-a-pattern-as-a-watch-by-keyboard",
+  "raise-an-alert-by-keyboard",
 ] as const);
 
 /**
@@ -437,9 +441,9 @@ export const SELECTION_ACTIONS = defineActionRegistry("SELECTION_ACTIONS", [
 export const CASE_DATASETS_ACTIONS = defineActionRegistry("CASE_DATASETS_ACTIONS", [
   "tick-datasets-and-create-a-case-by-keyboard",
   "change-what-a-case-reads-by-keyboard",
-  // ADR-126: the case's domain models, chosen when it is made and changed by its Author.
+  // ADR-126: the case's domain models, chosen when it is made; read-only after, from the dataset's
+  // domain model (ADR-126 Amendment 2).
   "choose-a-cases-domain-models-when-creating-it-by-keyboard",
-  "change-a-cases-domain-models-by-keyboard",
 ] as const);
 
 /** The case's brief (ADR-128 decision 3): the Cases drawer's Brief section, each edit its Author makes
@@ -463,13 +467,81 @@ export const CASE_ACCESS_ACTIONS = defineActionRegistry("CASE_ACCESS_ACTIONS", [
   "remove-an-accounts-access-by-keyboard",
 ] as const);
 
-/** One tree of cases and their branches (ADR-084 Amendment 4): a branch opened, renamed and deleted
- * from its row; deleting the branch on screen returns to its case. `keyboard/case-tree.spec.ts`. */
-export const CASE_TREE_ACTIONS = defineActionRegistry("CASE_TREE_ACTIONS", [
-  "open-a-branch-from-the-tree",
-  "rename-a-branch-from-the-tree",
-  "delete-a-branch-from-the-tree",
-  "delete-the-branch-you-are-in-returns-to-its-case",
+/** Case views (ADR-144; the owner's ruling of 8 November 2026, Amendment 2): a view opened, shared and
+ * deleted from *Views in this case*, opened from another case's row, saved from its form, and left for
+ * the case from the banner over an opened view. `keyboard/views.spec.ts`. */
+export const VIEW_ACTIONS = defineActionRegistry("VIEW_ACTIONS", [
+  "open-a-view-from-views-in-this-case-by-keyboard",
+  "share-a-view-with-the-case-by-keyboard",
+  "delete-a-view-after-asking-once-by-keyboard",
+  "open-a-view-of-another-case-from-the-cases-list-by-keyboard",
+  "save-a-view-from-its-form-by-keyboard",
+  "go-back-to-the-case-from-an-open-view-by-keyboard",
+  // ADR-143 Amendment 2 decision 7 (L3.9).
+  "open-a-merged-drawings-notes-by-keyboard",
+] as const);
+
+/** Drawing boards (ADR-143 decisions 4 to 7; Amendment 2 decision 5; L3.3): a board opened, made
+ * blank, from a view or from the selection, and shared; an item declared (with a source document and
+ * an icon of its own), inspected, moved by the arrow keys, edited and withdrawn after asking once,
+ * each also from its menu; the link form opened from the selected item and from an item's menu; a
+ * picture added or chosen on the board; *Same* and *Not the same* decided; a drawing started with no case;
+ * and back to the boards. `keyboard/boards.spec.ts`. */
+export const BOARD_ACTIONS = defineActionRegistry("BOARD_ACTIONS", [
+  "open-a-board-from-the-boards-list-by-keyboard",
+  "make-a-blank-board-by-keyboard",
+  "make-a-board-from-a-view-by-keyboard",
+  "make-a-board-from-the-selection-by-keyboard",
+  "share-a-board-with-the-case-by-keyboard",
+  "declare-an-item-by-keyboard",
+  "declare-an-item-with-a-source-document-by-keyboard",
+  "choose-an-items-icon-by-keyboard",
+  "inspect-an-item-by-keyboard",
+  "inspect-an-item-from-its-menu-by-keyboard",
+  "move-an-item-by-the-arrow-keys",
+  "draw-a-link-from-the-selected-item-by-keyboard",
+  "draw-a-link-from-an-items-menu-by-keyboard",
+  "edit-an-item-by-keyboard",
+  "edit-an-item-from-its-menu-by-keyboard",
+  "withdraw-an-item-after-asking-once-by-keyboard",
+  "withdraw-an-item-from-its-menu-by-keyboard",
+  "add-a-picture-to-a-drawn-item-by-keyboard",
+  "choose-a-picture-on-the-board-by-keyboard",
+  "decide-same-on-a-suggested-match-by-keyboard",
+  "decide-not-the-same-on-a-suggested-match-by-keyboard",
+  "start-a-drawing-with-no-case-by-keyboard",
+  "go-back-to-the-boards-by-keyboard",
+  // ADR-143 decision 8 (L3.4).
+  "promote-drawn-items-by-keyboard",
+  "close-the-promotion-sheet-by-escape",
+] as const);
+
+/** The Ingest Studio's *Analyst promotions* (ADR-143 decision 10; Amendment 2 decision 1; L3.4):
+ * review, reject, a removed case's layer merged or deleted. `keyboard/promotions.spec.ts`. */
+export const PROMOTION_ACTIONS = defineActionRegistry("PROMOTION_ACTIONS", [
+  "review-and-approve-a-promotion-by-keyboard",
+  "reject-a-promotion-with-a-reason-by-keyboard",
+  "close-a-promotions-details-by-escape",
+  "merge-a-removed-cases-layer-by-keyboard",
+  "cancel-a-layer-merge-by-keyboard",
+  "delete-a-removed-cases-layer-after-asking-once-by-keyboard",
+] as const);
+
+/** The Ingest Studio's *Merge into a dataset…* (ADR-143 Amendment 2 decision 6; Amendment 3; L3.9):
+ * a drawn dataset mapped and matched, its dry run, the merge, and the merge closed.
+ * `keyboard/drawn-merge.spec.ts`. */
+export const DRAWN_MERGE_ACTIONS = defineActionRegistry("DRAWN_MERGE_ACTIONS", [
+  "choose-a-dataset-and-map-and-match-a-drawing-by-keyboard",
+  "tick-a-match-and-run-the-merges-dry-run-by-keyboard",
+  "merge-a-drawn-dataset-after-its-dry-run-by-keyboard",
+  "close-a-drawn-merge-by-escape",
+  "map-a-drawn-type-onto-another-of-the-targets-types-by-keyboard",
+] as const);
+
+/** A drawn watch's alert in the one queue (ADR-143 Amendment 2 decision 8; L3.6): *Open the board*
+ * its drawn item is on. `keyboard/drawn-watch-alert.spec.ts`. */
+export const DRAWN_WATCH_ALERT_ACTIONS = defineActionRegistry("DRAWN_WATCH_ALERT_ACTIONS", [
+  "open-the-board-from-a-drawn-watch-alert-by-keyboard",
 ] as const);
 
 /** Where to start in a case's data (ADR-100): a node from the most connected, or from a type's
@@ -530,7 +602,6 @@ export const PIPELINE_STUDIO_ACTIONS = defineActionRegistry("PIPELINE_STUDIO_ACT
   "remove-a-deduplicate-key-column-by-keyboard",
   "save-the-deduplicate-key-by-keyboard",
   "clear-the-deduplicate-key-by-keyboard",
-  "read-rows-already-loaded-on-a-run-report-by-keyboard",
   "read-rows-already-loaded-in-verify-by-keyboard",
   // ADR-127 Amendment 13 (B2-7b): the links of the row template in Map, reached by keys alone.
   "select-a-map-link-by-keyboard",
@@ -566,10 +637,28 @@ export const ALERTS_ACTIONS = defineActionRegistry("ALERTS_ACTIONS", [
   "show-an-alert-on-the-canvas-by-keyboard",
   "close-an-alert-with-a-reason-by-keyboard",
   // The owner's answer of 1 November 2026: the closing reason, one of a closed list of five; and
-  // the watches with their alert inbox, reached from the Watches tab now the rail has no entry.
+  // the watches, kept with the rules in Rules and Monitoring (ADR-146; the inbox went in L2.10).
   "choose-a-closing-reason-by-keyboard",
-  "reach-the-watches-and-alert-inbox-by-keyboard",
+  "reach-the-watches-kept-with-the-rules-by-keyboard",
   "filter-the-queue-by-keyboard",
+  // ADR-146 decision 2's filters, Amendment 1's lead tools and decision 5's inventory (L2.10).
+  "filter-the-queue-by-whose-and-age-by-keyboard",
+  "give-a-team-alert-to-a-member-by-keyboard",
+  "suppress-a-team-alert-by-keyboard",
+  "filter-what-raises-alerts-by-keyboard",
+  "send-a-rules-alerts-to-a-named-team-by-keyboard",
+  // ADR-146 decision 3 (L2.11): the rule editor's dataset chosen first, its draft saved, tested
+  // and made live.
+  "choose-a-rules-dataset-by-keyboard",
+  "save-a-rule-draft-by-keyboard",
+  "test-a-rule-draft-by-keyboard",
+  "make-a-rule-live-by-keyboard",
+  // The lane-reviewer's L2.11 item 15: the list picker, the When of a list's refresh, and another
+  // Author deciding a rule going live.
+  "choose-a-rules-screening-list-by-keyboard",
+  "run-a-rule-when-its-list-refreshes-by-keyboard",
+  "approve-a-rule-going-live-by-keyboard",
+  "send-back-a-rule-going-live-by-keyboard",
   "deploy-a-rule-by-keyboard",
   "retire-a-rule-by-keyboard",
   "release-held-rows-by-keyboard",
@@ -592,8 +681,6 @@ export const ALERTS_ACTIONS = defineActionRegistry("ALERTS_ACTIONS", [
   // list refreshed and a list subscribed to.
   "deploy-an-aml-template-by-keyboard",
   "read-the-screening-lists-by-keyboard",
-  "refresh-a-screening-list-by-keyboard",
-  "subscribe-to-a-screening-list-by-keyboard",
 ] as const);
 
 /** ADR-139 decision 3 in the Monitoring place's Connection strength tab: a waiting installation-wide
@@ -626,7 +713,6 @@ export const MONITORING_STAGE_D_ACTIONS = defineActionRegistry("MONITORING_STAGE
   "propose-closing-a-high-severity-alert-by-keyboard",
   "approve-closing-a-high-severity-alert-by-keyboard",
   "send-back-a-proposed-close-by-keyboard",
-  "set-a-list-refresh-schedule-by-keyboard",
 ] as const);
 
 /** ADR-133 decision 6, stage (d): the Ingest Studio's "Checks on load" step reached from a pipeline,
@@ -637,6 +723,14 @@ export const CHECKS_ON_LOAD_ACTIONS = defineActionRegistry("CHECKS_ON_LOAD_ACTIO
   "attach-a-rule-and-hold-on-a-hit-by-keyboard",
   "save-the-checks-by-keyboard",
   "read-the-alerts-a-sample-would-raise-by-keyboard",
+] as const);
+
+/** *Show as BPMN* (ADR-146 decision 3, L2.11a): the rule's stored BPMN drawn read-only, opened and
+ * closed by keyboard, focus back on its button. `keyboard/rule-standards.spec.ts`. */
+export const RULE_STANDARDS_ACTIONS = defineActionRegistry("RULE_STANDARDS_ACTIONS", [
+  "open-show-as-bpmn-by-keyboard",
+  "close-show-as-bpmn-by-escape-focus-returns",
+  "close-show-as-bpmn-by-close-focus-returns",
 ] as const);
 
 /** The Ownership place (ADR-109 phase C): find an entity, trace its beneficial owners, change the
@@ -663,6 +757,9 @@ export const QUESTIONS_ACTIONS = defineActionRegistry("QUESTIONS_ACTIONS", [
   // ADR-135 decision 5: the model engine is reached and changed by keyboard, and the engine chosen
   // is the one the question names.
   "choose-the-model-engine-by-keyboard",
+  // ADR-144 decision 4 (L3.2b): asked in a private view (*Ask the model about these*), and left for
+  // the whole case by *Ask about the whole case instead*.
+  "ask-in-a-view-then-about-the-whole-case-by-keyboard",
 ] as const);
 
 /** Files added straight to a case (ADR-094 step 3): from the strip over the canvas, standing alone,
@@ -699,6 +796,17 @@ export const PROPOSED_TYPES_ACTIONS = defineActionRegistry("PROPOSED_TYPES_ACTIO
   "rename-at-promotion-by-keyboard",
   "reject-by-keyboard",
   "retire-by-keyboard",
+] as const);
+
+/** The Studio's *1 Model* tab's proposed link types (ADR-143 decision 9, ADR-090 Amendment 4; L3.5): each
+ * added to the draft model (Direct or Probabilistic) or declined, each with a reason. `keyboard/model-proposals.spec.ts`. */
+export const MODEL_PROPOSALS_ACTIONS = defineActionRegistry("MODEL_PROPOSALS_ACTIONS", [
+  "add-a-proposed-type-to-the-draft-model-by-keyboard",
+  "decline-a-proposed-type-by-keyboard",
+  "escape-closes-the-decision-form-and-returns-focus",
+  "a-refusal-is-shown-in-the-conduits-words-by-keyboard",
+  "cancel-closes-the-decision-form-by-keyboard",
+  "add-a-lost-type-to-the-draft-model-again-by-keyboard",
 ] as const);
 
 /** The Inspector's parts (ADR-096): each folds under its header, opening *Change this link* lands in
@@ -740,9 +848,84 @@ export const SHELL_ACTIONS = defineActionRegistry("SHELL_ACTIONS", [
   "help-from-the-rail-by-keyboard",
   // ADR-132: the skip link, under both brands.
   "skip-to-main-content-by-keyboard",
+  // ADR-145 decisions 1–3: the place switcher (both brands), the banner's cross-link and its
+  // sections, and Home's cards.
+  "switch-place-by-keyboard",
+  "banner-cross-link-by-keyboard",
+  "banner-sections-by-keyboard",
+  "home-place-cards-by-keyboard",
+  // ADR-145 Amendment 2 (variant B): the rail's More and each destination under it, More views, and a
+  // folded panel of the column opened with one keypress.
+  "rail-more-by-keyboard",
+  "more-views-by-keyboard",
+  "open-a-folded-panel-by-keyboard",
+  // ADR-145 Amendment 4 and ADR-146 decision 2 (L2.9): Rules and Monitoring, the fourth place, in the
+  // switcher and back to the Glass's last view; and ADR-146 decision 6: Home opens an alert, not its
+  // case, and Rules and Monitoring's card by its key, a case chosen for it.
+  "switch-to-rules-and-monitoring-by-keyboard",
+  "back-to-the-glass-from-rules-and-monitoring-by-keyboard",
+  "open-an-alert-from-home-by-keyboard",
+  "open-rules-and-monitoring-from-home-by-keyboard",
+] as const);
+
+/** Rules and Monitoring (ADR-146 decisions 2 and 6, L2.9): its tabs, an alert opened at its own
+ * address and left by Back, an address the reader may not see left for the queue, and *Open the
+ * evidence* with the way back to the alert, still open. `keyboard/rules-place.spec.ts`. */
+export const RULES_PLACE_ACTIONS = defineActionRegistry("RULES_PLACE_ACTIONS", [
+  "move-between-the-tabs-by-keyboard",
+  "open-an-alert-at-its-address-by-keyboard",
+  "back-to-the-queue-from-an-address-by-keyboard",
+  // ADR-146 decision 6 (R5): Open the evidence, and the way back to the alert, still open.
+  "open-the-evidence-by-keyboard",
+  "back-to-the-alert-from-its-evidence-by-keyboard",
+] as const);
+
+// ADR-135 Amendment 2: Admin › Models (platform lane P1), its own harness until the section is in
+// Admin's list.
+export const MODELS_ACTIONS = defineActionRegistry("MODELS_ACTIONS", [
+  "add-a-model-engine-by-keyboard",
+  "edit-a-model-engine-by-keyboard",
+  "enter-a-model-key-by-keyboard",
+  "rotate-a-model-key-by-keyboard",
+  "remove-a-model-key-by-keyboard",
+  "test-a-model-engine-by-keyboard",
+  "set-each-jobs-default-engine-by-keyboard",
+  "remove-a-model-engine-by-keyboard",
+  // ADR-135 Amendment 3: an engine's limits and the gateway's usage.
+  "set-a-model-engines-limits-by-keyboard",
+  "choose-the-model-usage-period-by-keyboard",
+] as const);
+
+// ADR-147: Admin › Maps (platform lane P3).
+export const MAPS_ACTIONS = defineActionRegistry("MAPS_ACTIONS", [
+  "add-a-map-provider-by-keyboard",
+  "edit-a-map-provider-by-keyboard",
+  "enter-a-map-key-by-keyboard",
+  "remove-a-map-key-by-keyboard",
+  "make-a-map-provider-the-default-by-keyboard",
+  "remove-a-map-provider-by-keyboard",
+  "build-the-basemap-by-keyboard",
+  "verify-the-map-providers-by-keyboard",
+  "add-a-prefetch-area-by-keyboard",
+  "remove-a-prefetch-area-by-keyboard",
+  "set-the-prefetch-schedule-by-keyboard",
+  "fetch-every-prefetch-area-now-by-keyboard",
+] as const);
+
+/** The analyst's map (P4, `02_GLASS_FRONTEND.md` §3.5): the basemap switch and the place search
+ * over the case's gazetteer (`map/MapControls.tsx`), each proven in `map-view.spec.ts`. */
+export const MAP_VIEW_ACTIONS = defineActionRegistry("MAP_VIEW_ACTIONS", [
+  "switch-the-basemap-by-keyboard",
+  "find-a-place-by-keyboard",
+  // P6 (ADR-147 Amendment 2, the owner's ruling 6): the case's gazetteers beside the place search.
+  "add-a-gazetteer-by-keyboard",
+  "remove-a-gazetteer-by-keyboard",
 ] as const);
 
 export const ADMIN_ACTIONS = defineActionRegistry("ADMIN_ACTIONS", [
+  // L2.12 (ADR-145 Amendment 4 decision 12): a right's tip, and the help page from Admin.
+  "read-a-rights-tip-by-keyboard",
+  "open-and-leave-roles-teams-and-authors-from-admin-by-keyboard",
   "save-a-persons-roles-by-keyboard",
   "register-a-dashboard-by-keyboard",
   "remove-a-dashboard-by-keyboard",
@@ -765,6 +948,62 @@ export const ADMIN_ACTIONS = defineActionRegistry("ADMIN_ACTIONS", [
   "change-a-schedule-by-keyboard",
   // ADR-136 decision 2: a dataset's egress, set by an administrator.
   "set-a-datasets-egress-by-keyboard",
+  // ADR-145 decision 8 and Amendment 4 decisions 6 and 7; ADR-143 Amendment 2 decision 1 (L2.4
+  // part 2): a dataset's owners and promotion policy, a removed case's dry runs, System's setting.
+  "change-a-datasets-owner-by-keyboard",
+  "set-a-datasets-promotion-policy-by-keyboard",
+  "dry-run-a-removed-cases-merge-by-keyboard",
+  "dry-run-a-removed-cases-delete-by-keyboard",
+  // L2.5c (ADR-143 Amendment 5 decision 7): Admin's own Delete of a removed case's layer.
+  "delete-a-removed-cases-layer-by-keyboard",
+  "set-who-may-own-a-dataset-by-keyboard",
+  // ADR-140 Amendment 4: a connection named by an administrator.
+  "name-a-connection-by-keyboard",
+  // ADR-145 decision 5: Admin's sections.
+  "move-between-admin-sections-by-keyboard",
+  "open-a-coming-admin-section-by-keyboard",
+  // ADR-145 decisions 6 and 7 and Amendment 5 (L2.5): People's row, Name an Author, Disable…, and
+  // Roles: a custom role made, copied and edited, a team, its lead and its cover.
+  "give-the-super-user-preset-by-keyboard",
+  "give-a-custom-role-by-keyboard",
+  "name-an-author-by-keyboard",
+  "transfer-and-disable-a-person-by-keyboard",
+  "copy-a-built-in-role-by-keyboard",
+  "make-a-custom-role-by-keyboard",
+  "edit-a-custom-role-by-keyboard",
+  "show-a-roles-versions-by-keyboard",
+  "make-a-role-a-team-by-keyboard",
+  "hand-over-a-teams-lead-by-keyboard",
+  "name-a-teams-cover-by-keyboard",
+  "end-a-teams-cover-by-keyboard",
+  // ADR-145 decisions 9 and 10 (L2.6): Audit's filters, a case's rule audit and paging; Operations'
+  // N days before a promotion waiting for review is overdue.
+  "read-the-audit-by-kind-and-person-by-keyboard",
+  "read-a-cases-rule-audit-by-keyboard",
+  "page-through-the-audit-by-keyboard",
+  "set-when-promotions-are-overdue-by-keyboard",
+  // L2.7 (ADR-140 Amendments 13 and 15; ADR-145 decision 12 and Amendment 4 decision 12): an API
+  // connection named with its fields and a connection tested; the grading scheme's command copied;
+  // the tips of a role, a team's lead and a dataset's Authors read with their controls.
+  "name-an-api-connection-by-keyboard",
+  "name-a-sql-connection-by-keyboard",
+  "name-a-json-connection-by-keyboard",
+  "test-a-connection-by-keyboard",
+  "copy-the-grading-change-command-by-keyboard",
+  "read-a-roles-tip-by-keyboard",
+  "read-a-teams-lead-tip-by-keyboard",
+  "read-a-datasets-authors-tip-by-keyboard",
+] as const);
+
+// ADR-145 decision 11 (A2), L2.7: the top bar's Needs you and the Studio's proposals reminder.
+export const NEEDS_YOU_ACTIONS = defineActionRegistry("NEEDS_YOU_ACTIONS", [
+  "read-a-needs-you-entrys-tip-by-keyboard",
+  "open-operations-from-needs-you-by-keyboard",
+  "open-a-datasets-model-tab-from-needs-you-by-keyboard",
+  "open-the-model-tab-from-the-studios-reminder-by-keyboard",
+  // ADR-145 Amendment 4 decision 12: Home's What you can do, and what you answer for.
+  "open-what-you-answer-for-by-keyboard",
+  "read-why-i-can-do-this-by-keyboard",
 ] as const);
 
 // ADR-110 decision 7 (D5): the Publish screen's structured schedule.
@@ -773,6 +1012,91 @@ export const PUBLISH_ACTIONS = defineActionRegistry("PUBLISH_ACTIONS", [
   "pause-and-resume-a-schedule-by-keyboard",
   // ADR-110 Amendment 4: the folder watch.
   "set-a-folder-watch-by-keyboard",
+] as const);
+
+// ADR-140 decision 1 (redesign phase 2): the Ingest Studio's four places, its dataset switcher, the
+// Runs tab and Deploy.
+export const INGEST_STUDIO_ACTIONS = defineActionRegistry("INGEST_STUDIO_ACTIONS", [
+  "move-between-the-four-places-by-keyboard",
+  "switch-dataset-by-keyboard",
+  "open-a-days-run-report-by-keyboard",
+  "open-held-rows-from-a-run-by-keyboard",
+  "run-a-pipeline-from-runs-by-keyboard",
+  "add-files-from-sources-by-keyboard",
+  "deploy-a-version-by-keyboard",
+  "deploy-and-run-now-by-keyboard",
+  // Moved from PIPELINE_STUDIO_ACTIONS with Run now (ADR-127 decision 5's count on a run report).
+  "read-rows-already-loaded-on-a-run-report-by-keyboard",
+  // ADR-140 Amendment 3: chapter 9's paused watch resumed, and the runs read again.
+  "resume-a-watch-and-read-the-runs-again-by-keyboard",
+  // ADR-140 Amendment 4: registered sources.
+  "register-a-source-by-keyboard",
+  "edit-a-sources-governance-by-keyboard",
+  "re-profile-a-source-and-open-it-in-a-pipeline-by-keyboard",
+  "use-a-registered-source-in-a-pipeline-by-keyboard",
+  // ADR-140 Amendment 6: phase 3's exit, a file registered and used in a new pipeline, no marking asked.
+  "register-a-source-and-use-it-in-a-new-pipeline-by-keyboard",
+  // ADR-110 Amendments 6 and 13 (redesign phase 4): a source's refresh mode set, and its refresh
+  // paused with why and resumed.
+  "set-a-sources-refresh-mode-by-keyboard",
+  "pause-and-resume-a-sources-refresh-by-keyboard",
+  // ADR-140 Amendment 8 (redesign phase 6): the drawer, Preview, Test, the two modes, the Map
+  // editor's strip and keyboard bind, and the reports pipeline built from scratch in guided mode.
+  "open-a-steps-drawer-beside-the-canvas-by-keyboard",
+  "preview-a-source-step-by-keyboard",
+  "preview-maps-graph-by-keyboard",
+  "test-the-pipeline-in-the-drawer-by-keyboard",
+  "switch-guided-and-expert-mode-by-keyboard",
+  "open-a-step-from-the-guided-list-by-keyboard",
+  "read-an-expert-step-in-guided-mode-by-keyboard",
+  "go-back-to-a-step-from-the-map-strip-by-keyboard",
+  "bind-a-column-by-choosing-both-and-enter",
+  "build-the-reports-pipeline-from-scratch-in-guided-mode-by-keyboard",
+  "edit-the-reports-pipeline-in-expert-mode-by-keyboard",
+  // The review of L1.2: guided mode's read-only expert step, an edit in expert mode, the load rules
+  // from the Load step, letting a chosen column go, and the drawer's Settings after Preview.
+  "an-expert-step-cannot-be-removed-in-guided-mode-by-keyboard",
+  "edit-a-step-in-expert-mode-by-keyboard",
+  "open-load-rules-from-the-load-step-by-keyboard",
+  "let-go-a-chosen-column-by-keyboard",
+  "go-back-to-a-steps-settings-from-preview-by-keyboard",
+  // The second review: guided mode may not remove the step that feeds an expert step.
+  "the-step-feeding-an-expert-step-cannot-be-removed-in-guided-mode-by-keyboard",
+  // ADR-140 Amendment 12 (redesign phase 7b): a drawer per staging step, its live sample, the save
+  // gate's refusals in its words, and phase 7's exit built by keys.
+  "add-a-staging-step-by-keyboard",
+  "set-a-lookup-in-its-drawer-by-keyboard",
+  "set-a-join-in-its-drawer-by-keyboard",
+  "set-a-filter-in-its-drawer-by-keyboard",
+  "set-a-derive-in-its-drawer-by-keyboard",
+  "set-a-union-in-its-drawer-by-keyboard",
+  "set-a-dedupe-in-its-drawer-by-keyboard",
+  "add-and-remove-a-row-in-a-steps-drawer-by-keyboard",
+  "read-a-steps-sample-again-by-keyboard",
+  "preview-a-staging-step-by-keyboard",
+  "a-drawer-refuses-what-the-save-gate-refuses-by-keyboard",
+  "remove-a-staging-step-by-keyboard",
+  "build-visits-and-contacts-by-keys-for-phase-7s-exit",
+  // ADR-140 decisions 3, 12, 13 and 16 (redesign phase 8): the expert steps, Show YAML, and Test's
+  // disclosure.
+  "add-a-sql-step-and-check-its-sql-by-keyboard",
+  "set-a-fuzzy-match-in-its-drawer-by-keyboard",
+  "read-an-expert-step-without-the-right-by-keyboard",
+  "show-and-save-the-pipeline-yaml-by-keyboard",
+  "read-the-expert-steps-a-test-disclosed-by-keyboard",
+  // ADR-140 Amendment 9 decision 4 (L1.7): Studio › Releases.
+  "export-a-release-by-keyboard",
+  "check-and-import-a-release-by-keyboard",
+  // ADR-141 decisions 6, 9 and 11 (L1.7): the Runs tab's external orchestration.
+  "hand-a-pipeline-to-an-orchestrator-by-keyboard",
+  "read-a-pipelines-airflow-dag-by-keyboard",
+  "take-a-pipeline-back-from-its-orchestrator-by-keyboard",
+] as const);
+
+// ADR-141 decision 6 (L1.7): Admin › Running › Operations' run quotas (`operations-figures.spec.ts`).
+export const OPERATIONS_FIGURES_ACTIONS = defineActionRegistry("OPERATIONS_FIGURES_ACTIONS", [
+  "save-a-run-quota-by-keyboard",
+  "read-a-refused-quota-save-by-keyboard",
 ] as const);
 
 // ADR-114 Amendment 5 point 9: Start, where a person goes after signing in, and the mark back to it.
@@ -796,7 +1120,7 @@ export const WELCOME_ACTIONS = defineActionRegistry("WELCOME_ACTIONS", [
 export const VIEW_OVER_CAP_ACTIONS = defineActionRegistry("VIEW_OVER_CAP_ACTIONS", [
   "see-the-over-cap-dialog-when-the-server-says-the-view-is-too-large",
   "try-again-from-the-over-cap-dialog-by-keyboard",
-  "choose-a-type-and-open-a-filtered-branch-by-keyboard",
+  "choose-a-type-and-save-a-view-by-keyboard",
   "put-the-over-cap-dialog-away-with-escape-by-keyboard",
 ] as const);
 
@@ -813,10 +1137,23 @@ export const SESSION_PROMPT_ACTIONS = defineActionRegistry("SESSION_PROMPT_ACTIO
 export const REPORTS_ACTIONS = defineActionRegistry("REPORTS_ACTIONS", [
   "change-the-reports-period-by-keyboard",
   "download-the-figures-by-keyboard",
-  // ADR-111 Amendment 3: the Dashboards tab, and choosing one of several boards.
-  "open-the-dashboards-tab-and-choose-a-board-by-keyboard",
-  // ADR-110 decision 9 (D5): the Data feeds tab.
+  // ADR-110 decision 9 (D5): the Data feeds tab. (The Dashboards tab went with the second door,
+  // ADR-145 Amendment 4 decision 8; choosing a board is ALERT_FIGURES_ACTIONS'.)
   "open-the-data-feeds-tab-by-keyboard",
+] as const);
+
+// L2.12 (ADR-145 Amendment 4 decisions 8–10 and 12; ADR-146 decision 9): the Figures' Alerts panel,
+// the Alert monitoring board first on the Dashboards, the Reports Viewer's journey from an alert and
+// its way back, and the Roles, teams and Authors page. `alert-figures.spec.ts`.
+export const ALERT_FIGURES_ACTIONS = defineActionRegistry("ALERT_FIGURES_ACTIONS", [
+  "open-the-newest-alert-from-the-alerts-panel-by-keyboard",
+  "go-back-to-your-alerts-from-the-figures-by-keyboard",
+  "choose-the-alert-monitoring-board-and-a-superset-board-by-keyboard",
+  "filter-the-alert-monitoring-board-by-keyboard",
+  "go-back-to-your-alerts-from-the-board-by-keyboard",
+  "open-an-alerts-case-figures-from-home-by-keyboard",
+  "open-an-alerts-dashboard-from-home-by-keyboard",
+  "go-back-from-the-roles-help-page-by-keyboard",
 ] as const);
 
 // ADR-113 stage 5: the Trends tab, built and driven with the keyboard alone.
@@ -901,4 +1238,30 @@ export const MATRIX_ACTIONS = defineActionRegistry("MATRIX_ACTIONS", [
   "show-a-row-on-the-graph-by-keyboard",
   // ADR-139 decision 6: the link table sorts by connection strength and by its ends' rarity.
   "sort-links-by-strength-and-rarity-by-keyboard",
+] as const);
+
+/** Studio › Sources' connectors and screening lists (ADR-140 Amendment 13; redesign phase 9): a list
+ * subscribed by its id, imported through a format's template and through the blank template, refreshed
+ * now and scheduled, a dataset's own list's rows imported, a source registered through a SQL connection
+ * by its read, and read again by Refresh now. `keyboard/sources-connectors.spec.ts`. */
+export const SOURCES_CONNECTORS_ACTIONS = defineActionRegistry("SOURCES_CONNECTORS_ACTIONS", [
+  "subscribe-a-dataset-to-a-screening-list-by-keyboard",
+  "import-a-screening-list-through-a-template-by-keyboard",
+  "import-a-client-list-through-the-blank-template-by-keyboard",
+  "refresh-a-screening-list-now-by-keyboard",
+  "schedule-a-screening-lists-refresh-by-keyboard",
+  "import-a-datasets-own-list-rows-by-keyboard",
+  "register-a-source-through-a-sql-connection-by-keyboard",
+  "refresh-a-connector-source-now-by-keyboard",
+  // The lane review of L1.6: the API and JSON read steps, unsubscribing, and a schedule stopped.
+  "register-a-source-through-an-api-connection-by-keyboard",
+  "register-a-source-through-a-json-connection-by-keyboard",
+  "unsubscribe-a-dataset-from-a-screening-list-by-keyboard",
+  "refresh-a-screening-list-by-hand-only-by-keyboard",
+] as const);
+
+// ADR-145 Amendment 4 decision 12 (L1.8): the Studio's who-can tips and its door to the help page.
+export const STUDIO_TIPS_ACTIONS = defineActionRegistry("STUDIO_TIPS_ACTIONS", [
+  "reach-a-refused-studio-actions-tip-by-keyboard",
+  "open-roles-teams-and-authors-from-the-studio-by-keyboard",
 ] as const);

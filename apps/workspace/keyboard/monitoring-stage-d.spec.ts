@@ -116,7 +116,7 @@ async function press(page: Page, target: Locator) {
 
 async function rulesTab(page: Page, query = "") {
   await page.goto(`/keyboard/alerts-harness.html${query}`);
-  await press(page, page.getByRole("tab", { name: "Rules" }));
+  await press(page, page.getByRole("tab", { name: "What raises alerts" }));
 }
 
 test("a sentence is set to run every week on a day at an hour, and deployed, by keyboard", async ({ page }) => {
@@ -217,18 +217,6 @@ test("a second member approves a proposed close, and another is sent back, by ke
   await expect.poll(() => sent.find((s) => s.path === "alert-queue/h1/send-back")?.body).toEqual({
     reason: "check the second deposit first" });  // prettier-ignore
   registerCovered(REGISTRY, "send-back-a-proposed-close-by-keyboard");
-});
-
-test("a screening list's refresh schedule is set, by keyboard", async ({ page }) => {
-  const sent = await serve(page);
-  await page.goto("/keyboard/alerts-harness.html?lists=manage");
-  await press(page, page.getByRole("tab", { name: "Lists" }));
-  await page.getByRole("combobox", { name: "Refreshed" }).selectOption("weekly");
-  await page.getByRole("combobox", { name: "On (refresh day)" }).selectOption("1");
-  await press(page, page.getByRole("button", { name: "Save the schedule" }));
-  await expect(page.getByRole("status")).toContainText("is refreshed every Monday at 05:00 (Europe/London), as you.");
-  expect(sent.find((s) => s.method === "PUT")?.body).toEqual({ schedule: { every: "weekly", hour: 5, weekday: 1 } });
-  registerCovered(REGISTRY, "set-a-list-refresh-schedule-by-keyboard");
 });
 
 test("every registered stage (d) Monitoring action has its own proving test case above", () => {

@@ -23,6 +23,25 @@ export type UncoveredWrites = boolean;
 export type ReleasedFrom = string | null;
 export type EventsStamped = boolean;
 export type RevertedAt = string | null;
+export type RowsWithdrawn = number;
+export type WithdrawnNodeIds = NodeId[];
+export type WithdrawnEdgeIds = EdgeId[];
+export type EdgeType = string;
+export type Revision = number;
+export type LoadId1 = string | null;
+export type Classification = string;
+export type HandlingCode = string;
+export type ActionCode = string | null;
+export type SanitisationCode = string | null;
+export type OrgUnitId = string;
+export type ReviewDate = string | null;
+export type LegalBasis = string | null;
+export type LeftDigest = string | null;
+export type OwnKeyMerges = LinkPriorState[];
+export type SourceId = string;
+export type Column = string;
+export type Kind = "number" | "time" | "text";
+export type Value = string;
 
 /**
  * One execution of a recipe against a source — the persisted form of
@@ -62,5 +81,61 @@ export interface LoadRecord {
   superseded_by?: PrincipalId | null;
   reverted_at?: RevertedAt;
   reverted_by?: PrincipalId | null;
+  rows_withdrawn?: RowsWithdrawn;
+  withdrawn_node_ids?: WithdrawnNodeIds;
+  withdrawn_edge_ids?: WithdrawnEdgeIds;
+  own_key_merges?: OwnKeyMerges;
+  watermark?: SourceWatermark | null;
+  [k: string]: unknown;
+}
+/**
+ * ADR-110 Amendment 16: a link exactly as it was stored just before a returning row's load
+ * merged into it. A row a full snapshot withdrew comes back, and its write merges into the link
+ * its own withdrawn key recorded; the load keeps that link's prior state so its revert can put the
+ * link back as it was, and refuses if the link was written since (its `revision` or `load_id`
+ * moved).
+ *
+ * **Graph data (rule 3).** `stored` holds the link's properties, provenance and marking as the
+ * adapter stores them. It is held in the run ledger for `services/ingest/load_revert.py` alone:
+ * no route, view, report, log or metering carries it, and `LoadReport` leaves it out of every
+ * dump. `handling` is the link's marking when it was read; a restore writes the link back at it,
+ * never at a weaker one.
+ */
+export interface LinkPriorState {
+  edge_id: EdgeId;
+  edge_type: EdgeType;
+  revision: Revision;
+  load_id?: LoadId1;
+  handling: Handling;
+  stored?: Stored;
+  left_digest?: LeftDigest;
+  [k: string]: unknown;
+}
+export interface Handling {
+  classification: Classification;
+  handling_code: HandlingCode;
+  action_code?: ActionCode;
+  sanitisation_code?: SanitisationCode;
+  originator: OrgUnitId;
+  owning_unit: OrgUnitId;
+  review_date?: ReviewDate;
+  legal_basis?: LegalBasis;
+  [k: string]: unknown;
+}
+export interface Stored {
+  [k: string]: unknown;
+}
+/**
+ * The highest value of an incremental source's watermark column a run read (ADR-110 Amendment
+ * 6 point 1), kept with the load's record: the next refresh of the source, by the same pipeline
+ * into the same case, reads only rows past it. `value` is the value as the file held it;
+ * `kind` says how it compares (as a number, as an instant, or as text). For the ledger alone: a
+ * value of the loader's own source, never in a route's answer.
+ */
+export interface SourceWatermark {
+  source_id: SourceId;
+  column: Column;
+  kind: Kind;
+  value: Value;
   [k: string]: unknown;
 }

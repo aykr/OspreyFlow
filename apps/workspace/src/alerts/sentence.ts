@@ -46,6 +46,8 @@ export interface SentenceDraft {
   steps: string;
   area: AreaBox;
   minScore: string;
+  /** ADR-146 decision 3 (the rule editor's list picker): the one Studio list it screens against. */
+  listId?: string;
   frequency: FrequencyKind;
   frequencyLink: string;
   atLeast: string;
@@ -63,8 +65,12 @@ export interface SentenceDraft {
    * only under client parity). */
   strengthScale: "drawn" | "client";
   severity: "low" | "medium" | "high";
-  team: "case" | "my_team";
-  runs: "pre_commit" | "post_commit" | "schedule";
+  /** ADR-146 decision 8: the case team, a named team (`teamId`), or `my_team`, the label written
+   * before teams, kept only for the rules saved with it (gap map Q5 (B)). */
+  team: "case" | "my_team" | "team";
+  teamId?: string;
+  /** ADR-146 decision 3: or when a screening list it reads refreshes (the rule editor's). */
+  runs: "pre_commit" | "post_commit" | "schedule" | "list_refresh";
   onHit: "load" | "hold";
   scope: Scope;
   /** ADR-133 stage (d): a scheduled rule's cadence, its hour (Europe/London) and, weekly, its day. */
@@ -283,7 +289,7 @@ export function toSentence(draft: SentenceDraft): RuleSentence {
       relationship = { kind: "on_hotlist" };
       break;
     case "on_screening_list":
-      relationship = { kind: "on_screening_list", min_score: Number(draft.minScore) };
+      relationship = { kind: "on_screening_list", min_score: Number(draft.minScore), ...(draft.listId ? { list_id: draft.listId } : {}) };
       break;
   }
   let frequency: Record<string, unknown> | null = null;
@@ -342,6 +348,7 @@ export function toSentence(draft: SentenceDraft): RuleSentence {
     ...(strength ? { strength } : {}),
     severity: draft.severity,
     team: draft.scope === "just_me" ? "case" : draft.team,
+    ...(draft.scope !== "just_me" && draft.team === "team" && draft.teamId ? { team_id: draft.teamId } : {}),
     runs,
     on_hit: holds && draft.scope !== "just_me" ? "hold" : "load",
     scope: draft.scope,
@@ -374,6 +381,7 @@ export function fromSentence(sentence: RuleSentence): SentenceDraft {
     if (r.other_type) draft.otherType = String(r.other_type);
     if (r.steps) draft.steps = String(r.steps);
     if (r.min_score) draft.minScore = String(r.min_score);
+    if (r.list_id) draft.listId = String(r.list_id);
     if (r.area) draft.area = boxOf(r.area as { name?: string; points: { lon: number; lat: number }[] });
   }
   const f = sentence.frequency as unknown as Loose | null | undefined;
@@ -396,6 +404,7 @@ export function fromSentence(sentence: RuleSentence): SentenceDraft {
   }
   draft.severity = (sentence.severity ?? "medium") as SentenceDraft["severity"];
   draft.team = (sentence.team ?? "case") as SentenceDraft["team"];
+  if (sentence.team_id) draft.teamId = sentence.team_id;
   draft.runs = (sentence.runs ?? "post_commit") as SentenceDraft["runs"];
   draft.onHit = (sentence.on_hit ?? "load") as SentenceDraft["onHit"];
   draft.scope = (sentence.scope ?? "this_case") as Scope;
@@ -470,7 +479,7 @@ export function sentenceSummary(sentence: RuleSentence): string {
     );
   if (st?.kind === "shared_attribute_rarity")
     parts.push(`the shared-attribute rarity with another ${sentence.subject} reaches ${String(st.reaches)}`);
-  const whom = { just_me: "its author alone", this_case: sentence.team === "my_team" ? "its author's team" : "the case team", deployment: "every case's team" }[
+  const whom = { just_me: "its author alone", this_case: sentence.team === "my_team" ? "its author's team" : sentence.team === "team" ? "its team alone" : "the case team", deployment: "every case's team" }[
     (sentence.scope ?? "this_case") as Scope
   ];
   const scheduled =

@@ -27,8 +27,10 @@ from typing import Any, Protocol
 
 import yaml
 
-from . import demo, starters
+from . import conduit_client, demo, starters
 from . import deployments as named
+from . import grading as grading_verb
+from . import maps as map_verbs
 from . import models as engine_keys
 from .answers import (
     MODES,
@@ -40,14 +42,16 @@ from .answers import (
 )
 from .cloud import build_enterprise, build_small
 from .doctor import (
+    TRUST_EMAIL_FIX,
+    TRUST_EMAIL_SAYS,
     Check,
     GpuPlan,
     Probes,
     ServerPlan,
     SystemProbes,
+    backups_checks,
+    deployment_name_of,
     format_check,
-    TRUST_EMAIL_FIX,
-    TRUST_EMAIL_SAYS,
     gpu_checks,
     gpu_plan,
     joins_by_email,
@@ -75,7 +79,7 @@ from .run import (
 VERBS = (
     "doctor", "install", "start", "stop", "status", "open", "logs", "demo", "backup", "restore",
     "update", "uninstall", "repair-sign-in", "switch", "models", "apply", "deployments",
-    "starters",
+    "starters", "map", "grading", "release", "run",
 )  # fmt: skip
 _NOT_INSTALLED = "Nothing is installed here yet — run ospreyflow install."
 
@@ -348,10 +352,65 @@ def _parser() -> argparse.ArgumentParser:
         parents=[common],
     )
     set_key.add_argument("name", help="the provider, as osprey.yaml names it (gemini, openai, …)")
-    remove = key_actions.add_parser(
-        "remove-key", help="remove a provider's key", parents=[common]
-    )
+    remove = key_actions.add_parser("remove-key", help="remove a provider's key", parents=[common])
     remove.add_argument("name")
+
+    # ADR-147 decision 6: the basemap providers and the local basemap, for headless use.
+    maps = verbs.add_parser(
+        "map", help="list the map providers, verify them, run the prefetch areas, build the basemap"
+    )
+    map_actions = maps.add_subparsers(dest="action", metavar="ACTION", required=True)
+    map_actions.add_parser("list", help="each provider, its tier, its key's state and its state")
+    map_actions.add_parser("verify", help="check attribution, and a tier-4 service's CRS and zooms")
+    map_actions.add_parser("prefetch", help="fetch every prefetch area's tiles now")
+    build = map_actions.add_parser("build", help="build the tier-1 basemap in the Conduit")
+    build.add_argument("region", help="a named region (rutland, great-britain, …)")
+    build.add_argument(
+        "--unit",
+        required=True,
+        help="the unit the gazetteer's places are held by: one that holds a case or a dataset",
+    )
+    build.add_argument(
+        "--planetiler-jar", type=Path, help="planetiler's release jar, copied into the tiles folder"
+    )
+
+    # ADR-143 decision 11 and Amendment 6: the grading scheme, the drawn items and the setting.
+    grading = verbs.add_parser("grading", help="change the grading scheme of every drawn item")
+    grading_actions = grading.add_subparsers(dest="action", metavar="ACTION", required=True)
+    regrade = grading_actions.add_parser(
+        "change", help="a dry run, then the change with its token: items and setting together"
+    )
+    regrade.add_argument("--to", required=True, help="5x5x5, 3x5x2, or a scheme file (.yaml)")
+    regrade.add_argument("--mapping", required=True, type=Path, help="the old-to-new mapping")
+    first = regrade.add_mutually_exclusive_group(required=True)
+    first.add_argument("--dry-run", action="store_true", help="what it would change; no writes")
+    first.add_argument("--confirm", help="the token the dry run of this mapping gave")
+    regrade.add_argument(
+        "--stop-api", action="store_true", help="stop the Conduit for the change, start it after"
+    )
+
+    # ADR-140 Amendment 9 decision 4: a dataset's release, as the Studio's Export and Import do.
+    release = verbs.add_parser("release", help="export or import a dataset's release (YAML)")
+    release_actions = release.add_subparsers(dest="action", metavar="ACTION", required=True)
+    export = release_actions.add_parser("export", help="the dataset's release, into a new folder")
+    export.add_argument("dataset", help="the dataset's id")
+    export.add_argument("--name", required=True, help="the release's name (lower case, '-', '.')")
+    export.add_argument("--release-version", required=True, help="the release's own version")
+    export.add_argument("--out", required=True, type=Path, help="a new, empty folder")
+    imported = release_actions.add_parser("import", help="a release's folder, as drafts")
+    imported.add_argument("folder", type=Path, help="the folder an export made")
+    imported.add_argument("--dataset", required=True, help="the receiving dataset's id")
+    imported.add_argument("--dry-run", action="store_true", help="what it would write; no writes")
+    # ADR-141 decision 9: a run triggered by the deployment's service identity, as its owner.
+    run_verb = verbs.add_parser("run", help="run a deployed pipeline, as its owner")
+    run_verb.add_argument("dataset", help="the dataset's id")
+    run_verb.add_argument("pipeline", help="the pipeline's id")
+    run_verb.add_argument("--version", default="latest", help="a deployed version, or latest")
+    run_verb.add_argument(
+        "--external-run-id", required=True, help="the orchestrator's run id: a retry loads once"
+    )
+    run_verb.add_argument("--wait", action="store_true", help="wait for the run to finish")
+    run_verb.add_argument("--fail-on", help="held, or rejections>N%%: exit 2 when met")
 
     uninstall = verbs.add_parser("uninstall", help="remove the deployment")
     uninstall.add_argument("--keep-data", action="store_true")
@@ -368,24 +427,58 @@ def _print_checks(checks: list[Check]) -> bool:
     return all(check.ok for check in checks)
 
 
-def _doctor(args: argparse.Namespace, probes: Probes, product: Path) -> int:
+def _doctor(
+    args: argparse.Namespace, probes: Probes, product: Path, env: Mapping[str, str]
+) -> int:
     server = None
     base = _product_config(product)
+    made: Mapping[str, Any] = base
     gpu = gpu_plan(base)
     if args.config is not None:
         raw = _file_or_default_answers(args)
-        answers = load_answers(raw, packs=[str(p) for p in raw.get("demo_packs") or ()])
+        home = Path(env["HOME"]) if env.get("HOME") else None
+        answers = load_answers(raw, packs=[str(p) for p in raw.get("demo_packs") or ()], home=home)
         server = server_plan(answers)
         gpu = _gpu_of(answers, base)
+        # ADR-114 Amendment 37: the backups folder these answers name, before the install.
+        made = osprey_config(answers, base)
     ok = _print_checks(
         run_doctor(
             args.mode, probes, product=product, cloud=args.cloud, server=server, gpu=gpu,
             # ADR-114 Amendment 33, "Step 33": the installed deployment's own setting, when the
             # answers are not given (their own setting is checked with the server's).
             joins_by_email=server is None and joins_by_email(base),
+            # ADR-135 Amendment 2 decision 9: an installed deployment's model keys, as it says.
+            model_states=getattr(probes, "model_key_states", lambda: None)(),
         )
+        + _backups_checks(probes, product, made, env)
     )  # fmt: skip
     return 0 if ok else 1
+
+
+def _backups_checks(
+    probes: Probes, product: Path, base: Mapping[str, object], env: Mapping[str, str]
+) -> list[Check]:
+    """ADR-114 Amendment 37 decisions 4 and 5, for the checkout's deployment and each one kept by
+    name (ADR-138): sets left behind, and a backups folder a sync client copies."""
+    deployments: list[tuple[str, Mapping[str, object]]] = []
+    if base:
+        deployments.append((deployment_name_of(base), base))
+    unread: list[Check] = []
+    for name in named.named(env):
+        try:
+            own = read_config(named.named_target(env, name).folder)
+        except (OSError, yaml.YAMLError) as failed:
+            unread.append(Check(
+                "backups-unread", True,
+                f"The deployment {name}'s osprey.yaml could not be read, so its backups were not "
+                f"checked ({type(failed).__name__})",
+                f"fix {named.named_target(env, name).folder / 'osprey.yaml'}", warn=True,
+            ))  # fmt: skip
+            continue
+        deployments.append((deployment_name_of(own), own))
+    home = Path(env["HOME"]) if env.get("HOME") else Path.home()
+    return unread + backups_checks(probes, product, deployments, home=home)
 
 
 def _product_config(product: Path) -> dict[str, object]:
@@ -431,7 +524,10 @@ def _govuk_flags(args: argparse.Namespace) -> dict[str, str]:
 
 
 def _prompted_answers(
-    ctx: _Context, mode: str, packs: Sequence[str], starter: starters.Starter | None = None,
+    ctx: _Context,
+    mode: str,
+    packs: Sequence[str],
+    starter: starters.Starter | None = None,
     flags: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     raw: dict[str, Any] = {"mode": mode}
@@ -456,6 +552,9 @@ def _prompted_answers(
         raw["folders"] = {
             "ingest": ctx.ask("Folder the Ingest Studio lists", "~/OspreyFlow/ingest"),
             "tiles": ctx.ask("Folder for the basemap", "~/OspreyFlow/basemap"),
+            # ADR-114 Amendment 37 decision 1: outside the checkout; each deployment's sets in
+            # a subfolder of their own.
+            "backups": ctx.ask("Folder for backups", "~/OspreyFlow/backups"),
         }
     else:
         raw["cloud"] = {
@@ -678,6 +777,16 @@ def _install(args: argparse.Namespace, ctx: _Context) -> int:
         server=server_plan(answers) if own_server else None,
         gpu=_gpu_of(answers, _product_config(ctx.product)),
     )  # fmt: skip
+    if not args.cloud and args.mode != "enterprise":
+        # ADR-114 Amendment 38 decision 8: the folder these answers name, before anything is
+        # written: one inside the checkout refused, one a sync client copies warned of.
+        made = osprey_config(answers, _product_config(ctx.product))
+        name = ctx.target.name if ctx.target.named else deployment_name_of(made)
+        # Judged by the home `load_answers` read `~` from.
+        checks = [
+            *checks,
+            *backups_checks(ctx.probes, ctx.product, [(name, made)], home=Path.home()),
+        ]
     if not _print_checks(checks):
         print("Nothing was installed. Fix the above and run ospreyflow install again.")
         return 1
@@ -753,7 +862,7 @@ def _say_resolution_off(answers: Answers) -> None:
     if packs:
         print(
             f"Post-ingest resolution is off (components.post_ingest_resolution: false), because "
-            f"{', '.join(packs)} needs it off: its live loads must not add automatic \"same as\" "
+            f'{", ".join(packs)} needs it off: its live loads must not add automatic "same as" '
             "links. An analyst's own Resolve now still works (section 11 of the administration "
             "guide)."
         )
@@ -1212,34 +1321,185 @@ def _uninstall(args: argparse.Namespace, ctx: _Context) -> int:
     return 0
 
 
+def _map(args: argparse.Namespace, ctx: _Context) -> int:
+    """ADR-147 decision 6: through the Conduit's own *Maps* code inside its container, so the
+    command line and *Admin › Maps* are one code with one audit (`cli/ospreyflow/maps.py`)."""
+    directory = ctx.deployed()
+    in_conduit = [*compose(directory), "exec", "-T", "api", *map_verbs.MAP_PATH]
+    who = f"cli:{getpass.getuser()}"
+    if args.action == "list":
+        code, out = ctx.capture([*in_conduit, "list"])
+        print(out, end="")
+        return code
+    if args.action == "build":
+        tiles = map_verbs.tiles_folder(ctx.config_path)
+        if args.planetiler_jar is not None:
+            placed = map_verbs.place_jar(args.planetiler_jar, tiles)
+            print(f"The map builder is in the tiles folder: {placed}")
+        print(
+            f"The {args.region} basemap is built by the Conduit, in its container: it downloads "
+            "the region's extract, runs planetiler and loads the place names."
+        )
+        ctx.step(
+            f"build the {args.region} basemap",
+            [*in_conduit, "build", args.region, "--by", who, "--unit", args.unit],
+        )
+        return 0
+    ctx.step(f"{args.action} the maps", [*in_conduit, args.action, "--by", who])
+    return 0
+
+
+def _conduit_running(ctx: _Context, directory: Path) -> bool:
+    code, output = ctx.capture(
+        [*compose(directory), "ps", "--format", "json", "api"], cwd=ctx.product
+    )
+    if code != 0:
+        raise CommandRefused("Could not ask Docker about the Conduit. Is Docker running?")
+    # Anything but stopped (restarting, paused, starting) may draw: only these are stopped.
+    stopped = {"exited", "created", "dead", ""}
+    return any(str(row.get("State", "")) not in stopped for row in _services(output))
+
+
+def _conduit_verb(args: argparse.Namespace, ctx: _Context) -> int:
+    """`release` and `run`: thin clients of the Conduit's routes (`conduit_client.py`), at the
+    deployment's own address unless `OSPREY_API_URL` names another."""
+    with conduit_client.client(
+        conduit_client.api_url(ctx.env, named.address_of(ctx.config_path))
+    ) as http:
+        if args.verb == "run":
+            return conduit_client.run(
+                http, token=conduit_client.service_token(ctx.env, http), dataset=args.dataset,
+                pipeline=args.pipeline, version=args.version,
+                external_run_id=args.external_run_id, wait=args.wait,
+                fail_on=conduit_client.parse_fail_on(args.fail_on),
+            )  # fmt: skip
+        token = conduit_client.person_token(ctx.env)
+        if args.action == "export":
+            return conduit_client.release_export(
+                http, token=token, dataset=args.dataset, name=args.name,
+                version=args.release_version, out=args.out,
+            )  # fmt: skip
+        return conduit_client.release_import(
+            http, token=token, dataset=args.dataset, folder=args.folder, dry_run=args.dry_run
+        )
+
+
+def _grading(args: argparse.Namespace, ctx: _Context) -> int:
+    """ADR-143 Amendment 6: `scripts.grading_change` in a one-shot from the Conduit's image, then,
+    after a change, the setting, the render and the start (`cli/ospreyflow/grading.py`)."""
+    directory = ctx.deployed()
+    mapping = args.mapping.resolve()
+    if not mapping.is_file():
+        raise CommandRefused(f"There is no mapping file at {mapping}. Nothing was changed.")
+    mounts = ["-v", f"{mapping}:{grading_verb.IN_CONTAINER}/mapping.yaml:ro"]
+    to = args.to
+    scheme_file = None
+    if grading_verb.is_scheme_file(to):
+        scheme_file = Path(to).resolve()
+        if not scheme_file.is_file():
+            raise CommandRefused(f"There is no scheme file at {scheme_file}. Nothing was changed.")
+        mounts += ["-v", f"{scheme_file}:{grading_verb.IN_CONTAINER}/scheme.yaml:ro"]
+        to = f"{grading_verb.IN_CONTAINER}/scheme.yaml"
+    running = _conduit_running(ctx, directory)
+    if not args.dry_run and running and not args.stop_api:
+        raise CommandRefused(
+            "The Conduit is running, and the change needs it stopped: a drawing made during the "
+            "change, or before the deployment starts again in the new scheme, would be in the old "
+            "one. Run again with --stop-api to stop it for the change and start it after; "
+            "stopping it is your choice, so it is not done for you. Nothing was changed."
+        )
+    argv = [
+        *compose(directory), "run", "--rm", "--no-deps", "--entrypoint", "python", *mounts,
+        "api", *grading_verb.GRADING_PATH, "--to", to,
+        "--mapping", f"{grading_verb.IN_CONTAINER}/mapping.yaml",
+        *(["--dry-run"] if args.dry_run else ["--confirm", args.confirm]),
+        "--changed-by", f"cli:{getpass.getuser()}",
+    ]  # fmt: skip
+    if args.dry_run:
+        return ctx.run(argv, cwd=ctx.product)
+    if running:
+        ctx.step("stop the Conduit", [*compose(directory), "stop", "api"])
+    code = ctx.run(argv, cwd=ctx.product)
+    if code in grading_verb.NOTHING_CHANGED:
+        if running:
+            ctx.step("start the Conduit again", [*compose(directory), "up", "-d", "--wait", "api"])
+        return code
+    if code != 0:
+        # A stop part way, an unforeseen failure, a killed one-shot: some items may be changed.
+        print(
+            f"The change did not finish (exit {code}), and the Conduit is left stopped: run the "
+            "dry run and the same change again to finish it. grading.scheme is not changed yet."
+        )
+        return code
+    value = (
+        grading_verb.scheme_file_beside(ctx.config_path, scheme_file) if scheme_file else args.to
+    )
+    config = ctx.config_path
+    text = config.read_text(encoding="utf-8") if config.exists() else ""
+    config.write_text(grading_verb.with_grading_scheme(text, value), encoding="utf-8")
+    if grading_verb.scheme_set(config.read_text(encoding="utf-8")) != value:
+        raise CommandRefused(
+            f"The items are changed, but grading.scheme in {config} could not be set to {value}: "
+            "set it by hand, then run ospreyflow apply and ospreyflow start. The Conduit is "
+            "left stopped."
+        )
+    print(f"grading.scheme is {value} in {config}.")
+    try:
+        ctx.step(
+            "render the deployment in the new scheme",
+            [*ctx.python, "-m", "harness.apply", "--reapply",
+             "--config", str(config), "--out-root", str(directory.parent)],
+        )  # fmt: skip
+        ctx.step("start the Conduit", [*compose(directory), "up", "-d", "--wait", "api"])
+    except StepFailed:
+        print(
+            "The items and grading.scheme are changed, but the deployment did not start again: "
+            "the Conduit is stopped. Run ospreyflow apply, then ospreyflow start."
+        )
+        raise
+    print("The Conduit is started in the new scheme; the boards offer its grades.")
+    return 0
+
+
 def _models(args: argparse.Namespace, ctx: _Context) -> int:
-    """ADR-135 decision 3. A key goes to `deployment.env` alone and is never printed; then only the
-    services whose environment it changes are started again (`cli/ospreyflow/models.py`)."""
+    """ADR-135 decision 3, Amendment 2 decision 8: through the Conduit's own key path inside its
+    container, so the gateway, the models file and the audit are *Admin › Models*' own. The key is
+    handed over by name in the Docker client's environment (`-e`), never an argument, never
+    printed; nothing is restarted (`cli/ospreyflow/models.py`)."""
     directory = ctx.deployed()
     env_file = directory / "deployment.env"
     models = engine_keys.read_models(ctx.product, directory)
     wanted = engine_keys.read_wanted(ctx.config_path.parent)
+    in_conduit = [*compose(directory), "exec", "-T"]
+    code, out = ctx.capture([*in_conduit, "api", *engine_keys.KEY_PATH, "status"])
+    states = engine_keys.parse_status(out) if code == 0 else None
     if args.action is None:
-        print("\n".join(engine_keys.list_engines(models, env_file)))
+        defaults = engine_keys.parse_defaults(out) if code == 0 else None
+        print("\n".join(engine_keys.list_engines(models, env_file, states, defaults)))
         return 0
+    known = set(states or {})
+    who = f"cli:{getpass.getuser()}"
     if args.action == "key":
-        label = engine_keys.set_key(
-            models, args.name, env_file, ctx.env, ctx.ask_secret, wanted=wanted
+        label, key = engine_keys.read_key(
+            models, args.name, ctx.env, ctx.ask_secret, wanted=wanted, known=known
         )
-        said = f"The key for {label} is set, in {env_file}."
-    else:
-        label, removed = engine_keys.remove_key(models, args.name, env_file, wanted=wanted)
-        if not removed:
-            print(f"{label} has no key here; nothing was changed.")
-            return 0
-        said = (
-            f"The key for {label} is removed; {label} is not offered to analysts until one is set."
-        )
+        ctx.step(
+            f"hand the key for {label} to the model gateway",
+            [*in_conduit, "-e", engine_keys.KEY_GIVEN, "api", *engine_keys.KEY_PATH,
+             "set", args.name, "--by", who],
+            env={engine_keys.KEY_GIVEN: key},
+        )  # fmt: skip
+        print(f"The key for {label} is set, in the model gateway.")
+        return 0
+    label = engine_keys.checked_name(models, args.name, wanted=wanted, known=known)
+    if states is not None and states.get(args.name) == "none":
+        print(f"{label} has no key here; nothing was changed.")
+        return 0
     ctx.step(
-        "start the model gateway and the Conduit again",
-        [*compose(directory), "up", "-d", "--no-deps", "--wait", *engine_keys.RESTARTED],
+        f"remove the key for {label} from the model gateway",
+        [*in_conduit, "api", *engine_keys.KEY_PATH, "remove", args.name, "--by", who],
     )
-    print(said)
+    print(f"The key for {label} is removed; {label} is not offered to analysts until one is set.")
     return 0
 
 
@@ -1288,6 +1548,12 @@ def _dispatch(args: argparse.Namespace, ctx: _Context) -> int:
         return _repair_sign_in(args, ctx)
     if verb == "models":
         return _models(args, ctx)
+    if verb == "map":
+        return _map(args, ctx)
+    if verb == "grading":
+        return _grading(args, ctx)
+    if verb in ("release", "run"):
+        return _conduit_verb(args, ctx)
     if verb == "apply":
         return _apply_settings(ctx)
     raise AssertionError(verb)  # pragma: no cover - argparse refuses any other verb
@@ -1357,7 +1623,7 @@ def main(
             compose(directory) if (directory / "compose.yaml").is_file() else None
         )
         if args.verb == "doctor":
-            return _doctor(args, real_probes, product)
+            return _doctor(args, real_probes, product, env)
         ctx = _Context(
             product,
             env,
@@ -1383,10 +1649,9 @@ def main(
         if args.verb in ("backup", "restore"):
             module = f"harness.{args.verb}"
             # ADR-138: a deployment kept by name is named to the harness by its own osprey.yaml and
-            # rendered folder; its backups are kept in its own folder, never mixed with another's.
+            # rendered folder. Its sets go to its own subfolder of its backups folder, which the
+            # harness reads there (ADR-114 Amendment 37 decision 3), never mixed with another's.
             pointed = ctx.named_args("--generated-root")
-            if target.named and args.verb == "backup" and "--out-root" not in passthrough:
-                pointed += ["--out-root", str(target.folder / "backups")]
             return ctx.run([*ctx.python, "-m", module, *pointed, *passthrough], cwd=product)
         return _dispatch(args, ctx)
     except (CommandRefused, AnswersRefused) as refusal:

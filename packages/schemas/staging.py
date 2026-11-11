@@ -1,0 +1,416 @@
+"""Staging steps: the recipe's `staging:` list (ADR-140 decision 11; `09_INGEST_STUDIO.md` §9;
+redesign brief §6; the redesign's phase 7).
+
+A pipeline's staging steps sit between its source tables and Map. Each step reads one or more
+**tables** by name and gives one table, named by the step's `id`. A table name is either one of the
+pipeline's source tables (the name its rows are given to the engine under) or an earlier step's
+`id`. **The last step is the table Map reads**; every earlier step must feed a later one, so no step
+is dangling (`services/ingest/staging_catalogue.staging_rule_violations`).
+
+The catalogue is closed (rule 8): Lookup, Join, Filter, Derive, Union, Dedupe. Each is a declared
+record, and every value-changing part of it is a Knowledge Adapter with a golden file: a Join's
+normalised key names an adapter from `knowledge_adapters.REGISTRY`, a Derive names an operation from
+`knowledge_adapters.derive.DERIVE_OPERATIONS`. No field anywhere holds an expression, and an
+unknown key is refused (`extra="forbid"`), so a step cannot smuggle one in under a new name.
+
+**The expert steps** (ADR-140 decisions 12 and 13; the redesign's phase 8) are in the union too, as
+declared records: `sql` (one SELECT over the step's upstream tables, run in the Vault's DuckDB
+sandbox, `services/ingest/sql_transform.py`) and `fuzzy_match` (two tables compared by the
+Splink-backed comparisons, `services/ingest/fuzzy_match.py`). Rule 8 as ADR-140 rewords it: guided
+mode offers neither and shows them read-only; writing one needs the right `write_sql_transforms`.
+
+Provenance: every staged row carries its `source_refs`, one per input row it came from (a Join two,
+a Union one, a Dedupe's survivor those of every row it stood for), and the element Map writes from
+it lists one `SourceRef` per ref in its `provenance.sources` (the orchestrator's settlement of 8
+November 2026, Q2 (a)).
+"""
+
+from __future__ import annotations
+
+from decimal import Decimal, InvalidOperation
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+#: A step's id, which later steps read it by: lower-case, as a YAML key reads plainly.
+StepId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
+#: A table a step reads: a source table's name or an earlier step's id.
+TableName = Annotated[str, Field(min_length=1, max_length=128)]
+#: A column of a table.
+ColumnName = Annotated[str, Field(min_length=1, max_length=256)]
+
+#: Derive's catalogue (`knowledge_adapters.derive.DERIVE_OPERATIONS`; brief §6), as the schema
+#: refuses anything else. `tests/knowledge_adapters/test_derive.py` holds the two lists equal.
+DeriveOperation = Literal[
+    "concat", "split", "substring", "date_parse", "arithmetic", "case_when", "normalise"
+]
+
+
+class _Step(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: StepId
+    #: Plain words for the canvas and the run report; optional.
+    label: str | None = None
+
+
+class AddedColumn(BaseModel):
+    """A column a Lookup or a Join brings across, optionally renamed."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    column: ColumnName
+    as_: ColumnName | None = Field(default=None, alias="as")
+
+
+class LookupStep(_Step):
+    """Add columns from a reference list on a key: every row of `input` is kept, and a row whose
+    key is not in the list keeps empty cells for the added columns (counted, never dropped). The
+    list is the dataset's own, or a screening list the dataset subscribes to (ADR-140 Amendment 9
+    decision 3); its key column is the list's own `key_column`."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    kind: Literal["lookup"]
+    input: TableName
+    #: The reference list, by name (`list:` in the YAML).
+    list_: str = Field(alias="list", min_length=1)
+    #: The column of `input` whose value is looked up in the list's key column.
+    on: ColumnName
+    #: A Knowledge Adapter both sides are read through before they are compared; `None` = exact.
+    normalise: str | None = None
+    add: list[AddedColumn] = Field(min_length=1)
+
+
+class JoinStep(_Step):
+    """Join two tables on a declared key, never a guessed one (brief §6): exact, or each side read
+    through the same Knowledge Adapter first (E.164, prison number, IBAN…). A row of `left` with
+    several matches gives one row per match, each carrying both sides' refs."""
+
+    kind: Literal["join"]
+    left: TableName
+    right: TableName
+    left_key: ColumnName
+    right_key: ColumnName
+    normalise: str | None = None
+    how: Literal["inner", "left"] = "inner"
+    #: The right table's columns brought across; the left table's are all kept.
+    add: list[AddedColumn] = Field(min_length=1)
+
+
+class FilterCondition(BaseModel):
+    """One declared condition on a column: exactly one of `is`, `equals` or `in`."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    field: ColumnName
+    is_: Literal["not_null", "null"] | None = Field(default=None, alias="is")
+    equals: str | None = None
+    in_: list[str] | None = Field(default=None, alias="in", min_length=1)
+
+    @model_validator(mode="after")
+    def _exactly_one(self) -> FilterCondition:
+        given = [
+            n
+            for n, v in (("is", self.is_), ("equals", self.equals), ("in", self.in_))
+            if v is not None
+        ]
+        if len(given) != 1:
+            raise ValueError(
+                f"a filter condition on {self.field!r} names exactly one of is, equals or in, "
+                f"not {', '.join(given) or 'none'}"
+            )
+        return self
+
+
+class FilterStep(_Step):
+    """Keep the rows for which every condition holds; the others are counted, not lost."""
+
+    kind: Literal["filter"]
+    input: TableName
+    keep: list[FilterCondition] = Field(min_length=1)
+
+
+class _Settings(BaseModel):
+    #: A key an operation does not read is refused, as on every step (rule 8).
+    model_config = ConfigDict(extra="forbid")
+
+
+class ConcatSettings(_Settings):
+    separator: str = " "
+
+
+class SplitSettings(_Settings):
+    delimiter: str = Field(default="|", min_length=1)
+    #: The part kept, the first being 0.
+    part: int = Field(default=0, ge=0)
+
+
+class SubstringSettings(_Settings):
+    #: The first character kept, the first being 0.
+    start: int = Field(default=0, ge=0)
+    length: int | None = Field(default=None, ge=1)
+
+
+class DateParseSettings(_Settings):
+    #: Required to read a date that is not ISO 8601, as the connector profile's is.
+    date_order: Literal["dmy", "mdy"] | None = None
+    #: An IANA zone for a time written without an offset.
+    tz: str | None = None
+
+
+class ArithmeticSettings(_Settings):
+    op: Literal["add", "subtract", "multiply", "divide"]
+    #: A number in place of a second column (written as text, read as a decimal).
+    constant: str | None = None
+
+
+class CaseWhenCase(_Settings):
+    equals: str
+    then: str
+
+
+class CaseWhenSettings(_Settings):
+    cases: list[CaseWhenCase] = Field(min_length=1)
+    otherwise: str | None = None
+
+    @model_validator(mode="after")
+    def _each_value_once(self) -> CaseWhenSettings:
+        seen: set[str] = set()
+        for case in self.cases:
+            if case.equals in seen:
+                raise ValueError(f"case_when names {case.equals} twice")
+            seen.add(case.equals)
+        return self
+
+
+class NormaliseSettings(_Settings):
+    #: A one-column Knowledge Adapter that gives one value (the save gate checks which).
+    adapter: str = Field(min_length=1)
+
+
+DeriveSettings = (
+    ConcatSettings
+    | SplitSettings
+    | SubstringSettings
+    | DateParseSettings
+    | ArithmeticSettings
+    | CaseWhenSettings
+    | NormaliseSettings
+)
+
+#: Each operation's own settings, and how many columns it reads: (fewest, most); `None` = no most.
+_DERIVE_SETTINGS: dict[str, tuple[type[_Settings], int, int | None]] = {
+    "concat": (ConcatSettings, 2, None),
+    "split": (SplitSettings, 1, 1),
+    "substring": (SubstringSettings, 1, 1),
+    "date_parse": (DateParseSettings, 1, 1),
+    "arithmetic": (ArithmeticSettings, 1, 2),
+    "case_when": (CaseWhenSettings, 1, 1),
+    "normalise": (NormaliseSettings, 1, 1),
+}
+
+
+class DeriveStep(_Step):
+    """A new column from a catalogued operation over named columns (brief §6). `settings` are the
+    operation's own declared settings, typed per operation (a separator, a part, a time zone…):
+    data and never code, and a key the operation does not read is refused, as is a wrong number
+    of columns."""
+
+    kind: Literal["derive"]
+    input: TableName
+    column: ColumnName
+    operation: DeriveOperation
+    columns: list[ColumnName] = Field(min_length=1)
+    settings: DeriveSettings
+
+    @model_validator(mode="before")
+    @classmethod
+    def _settings_of_its_operation(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or data.get("operation") not in _DERIVE_SETTINGS:
+            return data
+        model, _fewest, _most = _DERIVE_SETTINGS[data["operation"]]
+        settings = data.get("settings")
+        if not isinstance(settings, BaseModel):
+            data = {**data, "settings": model.model_validate(settings or {})}
+        elif not isinstance(settings, model):
+            raise ValueError(f"settings of another operation given to {data['operation']}")
+        return data
+
+    @model_validator(mode="after")
+    def _columns_it_reads(self) -> DeriveStep:
+        _model, fewest, most = _DERIVE_SETTINGS[self.operation]
+        n = len(self.columns)
+        if n < fewest or (most is not None and n > most):
+            reads = (
+                f"{fewest}"
+                if fewest == most
+                else (f"at least {fewest}" if most is None else f"{fewest} or {most}")
+            )
+            raise ValueError(f"{self.operation} reads {reads} column(s), not {n}")
+        if isinstance(self.settings, ArithmeticSettings):
+            if (n == 1) != (self.settings.constant is not None):
+                raise ValueError("arithmetic takes one column with a constant, or two columns")
+            if self.settings.constant is not None:
+                try:
+                    number = Decimal(self.settings.constant)
+                except InvalidOperation as exc:
+                    raise ValueError("arithmetic's constant is not a number") from exc
+                if not number.is_finite():
+                    raise ValueError("arithmetic's constant is not a number")
+        return self
+
+
+class UnionStep(_Step):
+    """Stack tables with the same columns; each row keeps its own refs."""
+
+    kind: Literal["union"]
+    inputs: list[TableName] = Field(min_length=2)
+
+
+class DedupeStep(_Step):
+    """Drop repeats on declared columns (today's deduplication key, as a step). The first row in
+    the input's order stands for its repeats and carries all their refs, so the element it becomes
+    names every source row it stands for; the repeats are counted."""
+
+    kind: Literal["dedupe"]
+    input: TableName
+    on: list[ColumnName] = Field(min_length=1)
+
+
+class SqlStep(_Step):
+    """Expert mode (ADR-140 decision 12; R4, R15): **one SELECT** over the tables named in
+    `inputs`, each read under its own name, run by the Vault's DuckDB in a sandbox: read-only, no
+    file or network function, no table but its inputs, a time and a memory limit, and only the
+    rows the person running it may read. Every input table carries a `_ref` column; the SELECT
+    must carry it through, as a column named `_ref` or starting `_ref_` (an aggregate as a list,
+    `list(_ref)`), so each output row names every input row it came from. `summary` is the plain
+    words guided mode and every run report show beside the SQL: mandatory."""
+
+    kind: Literal["sql"]
+    inputs: list[TableName] = Field(min_length=1)
+    select: str = Field(min_length=1, max_length=20_000)
+    summary: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def _summary_in_words(self) -> SqlStep:
+        if not self.summary.strip():
+            raise ValueError("a SQL step needs a summary in plain words of what it does")
+        if not self.select.strip():
+            raise ValueError("a SQL step needs its SELECT")
+        if len(set(self.inputs)) != len(self.inputs):
+            raise ValueError("a SQL step names each table it reads once")
+        return self
+
+
+#: The Splink-backed comparisons already in the product (`ontology.resolution_functions.
+#: COMPARISON_FUNCTIONS`; `tests/ingest/test_fuzzy_match.py` holds the two lists equal).
+FuzzyMethod = Literal["exact", "jaro_winkler", "levenshtein"]
+#: The blocking keys a fuzzy match may narrow its pairs by (`BLOCKING_FUNCTIONS`, likewise).
+FuzzyBlock = Literal["exact", "soundex", "year"]
+
+
+class FuzzyComparison(BaseModel):
+    """One comparison: a column of the left table against a column of the right, by a method."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    left: ColumnName
+    right: ColumnName
+    method: FuzzyMethod
+
+
+class FuzzyBlocking(BaseModel):
+    """Only pairs agreeing on this key are compared (as the ontology's `resolution.blocking`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    left: ColumnName
+    right: ColumnName
+    method: FuzzyBlock = "exact"
+
+
+class FuzzySameAs(BaseModel):
+    """The two elements of Map's row template the match says may be one: `left`, written from the
+    left table's columns, and `right`, from the matched columns. The engine writes a scored
+    `SAME_AS` between them marked `inferred`, never a merge (ADR-006 Amendment 1; rules 5 and 6)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    left: str = Field(min_length=1)
+    right: str = Field(min_length=1)
+
+
+class FuzzyMatchStep(_Step):
+    """Expert mode (ADR-140 decision 13; ADR-006 Amendment 1; R5, R13): each row of `left` kept,
+    with the columns `add` names from its best-scoring row of `right` and that row's score as
+    `match_score`, when the score is at least `threshold`; a row below it is kept with those cells
+    empty, and counted. The threshold is part of the pipeline's version. What Map writes from a
+    matched column is `inferred` with the score, and the match itself is the `SAME_AS` that
+    `same_as` names, inferred until a person confirms it. It is the last step: Map reads it."""
+
+    kind: Literal["fuzzy_match"]
+    left: TableName
+    right: TableName
+    compare: list[FuzzyComparison] = Field(min_length=1)
+    block_on: list[FuzzyBlocking] = Field(default_factory=list)
+    threshold: float = Field(gt=0, lt=1)
+    add: list[AddedColumn] = Field(min_length=1)
+    same_as: FuzzySameAs
+
+    @model_validator(mode="after")
+    def _two_tables(self) -> FuzzyMatchStep:
+        if self.left == self.right:
+            raise ValueError("a fuzzy match compares two tables, not one with itself")
+        if self.same_as.left == self.same_as.right:
+            raise ValueError("a fuzzy match's same_as names two different elements")
+        return self
+
+
+#: The column a fuzzy match gives each kept row: the score of its match, empty below threshold.
+MATCH_SCORE = "match_score"
+
+#: The expert steps' kinds (ADR-140 decision 3): guided mode shows them read-only, and saving one
+#: needs the right `write_sql_transforms`.
+EXPERT_KINDS: frozenset[str] = frozenset({"sql", "fuzzy_match"})
+
+
+StagingStep = Annotated[
+    LookupStep | JoinStep | FilterStep | DeriveStep | UnionStep | DedupeStep | SqlStep
+    | FuzzyMatchStep,
+    Field(discriminator="kind"),
+]
+
+
+def step_inputs(step: StagingStep) -> list[str]:
+    """The tables a step reads, in order."""
+    if isinstance(step, (JoinStep, FuzzyMatchStep)):
+        return [step.left, step.right]
+    if isinstance(step, (UnionStep, SqlStep)):
+        return list(step.inputs)
+    return [step.input]
+
+
+ALL_MODELS: tuple[type[BaseModel], ...] = (
+    AddedColumn,
+    ConcatSettings,
+    SplitSettings,
+    SubstringSettings,
+    DateParseSettings,
+    ArithmeticSettings,
+    CaseWhenCase,
+    CaseWhenSettings,
+    NormaliseSettings,
+    LookupStep,
+    JoinStep,
+    FilterCondition,
+    FilterStep,
+    DeriveStep,
+    UnionStep,
+    DedupeStep,
+    SqlStep,
+    FuzzyComparison,
+    FuzzyBlocking,
+    FuzzySameAs,
+    FuzzyMatchStep,
+)

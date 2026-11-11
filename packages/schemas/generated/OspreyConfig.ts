@@ -41,7 +41,7 @@ export type Ingest = string;
  */
 export type Tiles = string;
 /**
- * Default: none — the owned services (workspace, api, ingest) are PULLED, by the digest recorded in versions.lock, from the registry reference harness/render.py's own service_images names. This is the operator path: the harness image itself carries no services/ or apps/workspace source, and round 05's own finding was that the documented one-command bootstrap could not Launch without it — a clean laptop has no checkout. Set to a checkout root containing services/api/Dockerfile, services/ingest/Dockerfile and apps/workspace/Dockerfile (this repository's own root, for a developer/CI run) to BUILD owned images from source instead. Declared and the Dockerfiles absent is refused by name (harness.render.MissingDockerfileError) — never silently treated as the pull path.
+ * Default: none — the owned services (workspace, api, ingest) are PULLED, by the digest recorded in versions.lock, from the registry reference harness/render.py's own service_images names. This is the operator path: the harness image itself carries no services/ or apps/workspace source, and a review found that the documented one-command bootstrap could not Launch without it — a clean laptop has no checkout. Set to a checkout root containing services/api/Dockerfile, services/ingest/Dockerfile and apps/workspace/Dockerfile (this repository's own root, for a developer/CI run) to BUILD owned images from source instead. Declared and the Dockerfiles absent is refused by name (harness.render.MissingDockerfileError) — never silently treated as the pull path.
  */
 export type SourcePath = string | null;
 /**
@@ -273,6 +273,10 @@ export type Profile1 = string | null;
  */
 export type Credential = string | null;
 /**
+ * WMTS: the query parameter the provider's key goes in
+ */
+export type CredentialParam = string | null;
+/**
  * Whether tiles are fetched through the Conduit (which caches them and keeps the key on the server) rather than by the browser
  */
 export type Proxy = "required" | "recommended" | "none";
@@ -320,6 +324,14 @@ export type HotlistAudience = "only_me" | "team";
  * Default: true. Whether a hotlist's owner may choose its audience, when making it or later. When false, every new hotlist takes hotlist_audience and a change is refused.
  */
 export type HotlistAudienceEditable = boolean;
+/**
+ * Default: none. The private hosts a SQL or API connection may reach: each a host name in full (nomis-replica.client.internal) or a network inside 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 or fc00::/7 (10.20.0.0/16) that a connection's host name resolves into. Everything else inside a network stays refused. Never admitted, whatever is listed: this machine, a cloud's metadata services (169.254.0.0/16, fd00:ec2::/32, 100.100.0.0/16), Docker's and the cluster's own names, and any address in the Conduit's own networks or the deployment's own services'. A host must still be on the egress allow-list.
+ */
+export type PrivateHosts = string[];
+/**
+ * Default: none. The name of each SQL or API connection's secret (NOMIS_REPLICA for OSPREY_CONNECTION_SECRET_NOMIS_REPLICA in deployment.env). Only the Conduit is given a declared secret, every other service having it blanked, and a connection whose secret is not declared reads nothing.
+ */
+export type Secrets = string[];
 /**
  * The mail server's name
  */
@@ -369,6 +381,10 @@ export type Name2 = string | null;
  */
 export type GraphPort = number | null;
 /**
+ * Default: the handling scheme's highest. The highest marking this deployment may hold: a load or an import marked above it is refused before anything is written, in words that say this limit and never the item's content. A demo pack that declares no highest marking is judged as the scheme's highest, so under a lower setting it is refused. One of the handling scheme's classifications.
+ */
+export type HighestMarking = string | null;
+/**
  * Default: ospreyflow. The GOV.UK look, for a service on a gov.uk domain only.
  */
 export type Brand = "ospreyflow" | "govuk";
@@ -384,6 +400,10 @@ export type Organisation = string | null;
  * Default: none. The phase banner shows at alpha or beta.
  */
 export type Phase = "alpha" | "beta" | "live" | "none";
+/**
+ * Default: 5x5x5. The scheme drawn items are graded in: 5x5x5; 3x5x2, whose handling code (P or C) is part of the grade and never merged with the marking; or the path of a scheme file (.yaml, beside this file unless absolute) naming its own scheme and each part's grades.
+ */
+export type Scheme = string;
 /**
  * The managed server's address
  */
@@ -486,6 +506,7 @@ export interface OspreyConfig {
   map?: MapConfig | null;
   reporting?: ReportingConfig;
   monitoring?: MonitoringConfig;
+  connectors?: ConnectorsConfig;
   /**
    * Default: none — one-time codes
    */
@@ -493,6 +514,7 @@ export interface OspreyConfig {
   welcome?: WelcomeConfig;
   deployment?: DeploymentConfig;
   appearance?: AppearanceConfig;
+  grading?: GradingConfig;
   external?: ExternalConfig;
   resources?: ResourcesConfig;
 }
@@ -682,6 +704,7 @@ export interface MapProvider {
   profile?: Profile1;
   variables?: Variables;
   credential?: Credential;
+  credential_param?: CredentialParam;
   proxy?: Proxy;
   /**
    * Keep fetched tiles a while
@@ -738,6 +761,15 @@ export interface MonitoringConfig {
   hotlist_audience_editable?: HotlistAudienceEditable;
 }
 /**
+ * The Studio's SQL and API connectors (`06_DECISIONS.md` ADR-140 Amendments 13 and 15). A
+ * connector never reaches inside the deployment or its network unless the operator admits a
+ * client's private database or API here; the installer's setting, never Admin's.
+ */
+export interface ConnectorsConfig {
+  private_hosts?: PrivateHosts;
+  secrets?: Secrets;
+}
+/**
  * The mail server the identity provider sends invitations and sign-in resets through
  * (`06_DECISIONS.md` ADR-114 Amendment 5). Without one, people are signed in by a one-time code.
  * **No password here**: `osprey.yaml` never holds a secret (§2.5); the install reads it from
@@ -768,6 +800,7 @@ export interface WelcomeConfig {
 export interface DeploymentConfig {
   name?: Name2;
   graph_port?: GraphPort;
+  highest_marking?: HighestMarking;
 }
 /**
  * How every page of the deployment looks (ADR-132): the deployment's brand, which is not the
@@ -781,6 +814,16 @@ export interface AppearanceConfig {
   service_name?: ServiceName;
   organisation?: Organisation;
   phase?: Phase;
+}
+/**
+ * The deployment's grading scheme (`06_DECISIONS.md` ADR-143 decision 11 and Amendment 6): the
+ * scheme every drawn node and link is graded in, chosen at install (`install.yaml`'s
+ * `grading.scheme`) and shown read-only in Admin. Changed only by `ospreyflow grading change`
+ * (C13), which changes the items and this setting together: editing this alone would leave the
+ * items' grades in the old scheme.
+ */
+export interface GradingConfig {
+  scheme?: Scheme;
 }
 /**
  * What a cloud runs for the deployment instead of a container (ADR-114 decision 8).

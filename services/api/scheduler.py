@@ -23,6 +23,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter
+from services.ingest.watermark import RefreshRead
 from valkey.asyncio import Valkey
 
 from conduit_common.identity import new_id
@@ -33,8 +34,10 @@ from schemas.domain import Alert, AlertMode, Principal
 from schemas.ingest import StudioRecipeDraft, StudioRecipeStatus
 from schemas.rights import Right, rights_for
 
+from .dataset_scope import CompositeReadOnlyError
 from .investigations import InsufficientAccessError, InvestigationNotFoundError
 from .recipe_runs import NotRunOutcome, RecipeRunStore, RunTrigger
+from .run_quotas import QuotaRefused
 from .studio_map import resolve_source_handling
 
 if TYPE_CHECKING:
@@ -126,9 +129,7 @@ def describe(cron: str, timezone: str) -> str:
     minute, hour, day, month, weekday = cron.split()
     words: str | None = None
     if minute.isdigit() and hour == "*" and day == month == weekday == "*":
-        words = (
-            "every hour, on the hour" if minute == "0" else f"every hour at {int(minute)} past"
-        )
+        words = "every hour, on the hour" if minute == "0" else f"every hour at {int(minute)} past"
     elif minute.isdigit() and hour.isdigit() and day == month == "*":
         at = f"at {int(hour):02d}:{int(minute):02d}"
         if weekday == "*":
@@ -140,9 +141,7 @@ def describe(cron: str, timezone: str) -> str:
     return f"{words or f'on the cron schedule `{cron}`'} ({timezone})"
 
 
-def schedule_notice(
-    owner_id: str, recipe: StudioRecipeDraft, words: str, now: datetime
-) -> Alert:
+def schedule_notice(owner_id: str, recipe: StudioRecipeDraft, words: str, now: datetime) -> Alert:
     """Decision 10's notice (Amendment 3, point 1): an alert in the owner's own inbox, carrying its
     words and no referent, and no typology — so the case team's queue, which reads typology alerts
     only, never shows it. `rule_id` names the recipe as `schedule:<recipe id>`."""
@@ -176,10 +175,54 @@ class ScheduledRecipes(Protocol):
     async def set_paused(self, recipe_id: str, *, paused: bool, reason: str | None) -> None: ...
 
 
+@dataclass(frozen=True)
+class SourceWatch:
+    """A registered source's folder watch (ADR-110 Amendment 6 point 5), as each pipeline reading
+    the source takes it: the source's pattern, its owner and when it was set, in place of the
+    pipeline's own."""
+
+    source_id: str
+    dataset_id: str
+    pattern: str
+    owner: str | None
+    set_at: datetime | None
+    paused: bool = False
+    #: How each file is read (Amendment 6 point 1), from the source's policy.
+    mode: str = "snapshot"
+    dropped_rows: str = "keep"
+    watermark_column: str | None = None
+
+    @property
+    def read(self) -> RefreshRead:
+        return RefreshRead(
+            source_id=self.source_id,
+            mode=self.mode,
+            dropped_rows=self.dropped_rows,
+            watermark_column=self.watermark_column,
+        )
+
+
+class SourceWatches(Protocol):
+    async def watching(self) -> list[tuple[StudioRecipeDraft, SourceWatch]]:
+        """Each deployed pipeline (published or needing attention) reading a source with a folder
+        watch, with that watch."""
+        ...
+
+    async def set_paused(self, source_id: str, *, paused: bool, reason: str | None) -> None: ...
+
+
+#: Amendment 6 point 2, at the executor: a pipeline deployed before the rule, met by a refresh.
+KEYLESS_REFRESH = (
+    "this pipeline has no deduplication key, so a refresh would load its rows again; give it a "
+    "key and deploy it again, or set the source's refresh to by hand"
+)
+
+
 class RunAs(Protocol):
     """`run_recipe_as` with the deployment's dependencies, as the owner: trigger `schedule` for a
     slot, `manual` for the Admin area's *Run now* (`slot` `None`), `watch` for a file
-    (`source_file`, read from its location)."""
+    (`source_file`, read from its location). `refresh`: a source refresh's read of the file, in
+    the source's mode (Amendment 6 point 1)."""
 
     async def __call__(
         self,
@@ -188,11 +231,20 @@ class RunAs(Protocol):
         case: str,
         slot: datetime | None,
         source_file: WatchedFile | None = None,
+        trigger: RunTrigger | None = None,
+        refresh: RefreshRead | None = None,
     ) -> Any: ...
 
 
 class ScheduleRunRefused(ValueError):
     """The Admin area's *Run now* refused, in words (ADR-110 Amendment 3, point 2)."""
+
+
+#: ADR-099 Amendment 15: a run whose case reads a composite, refused before anything is written.
+_COMPOSITE_CASE = (
+    "its case reads a composite, which is read-only for now: run it in a case that reads that "
+    "dataset"
+)
 
 
 class _Refused(Exception):
@@ -232,28 +284,62 @@ class ScheduleExecutor:
     #: `PrincipalResolver.resolve_for_owner_detailed`: raises rather than collapsing to `None`,
     #: so the ledger can say which refusal it was.
     resolve_owner: Callable[[str], Awaitable[Principal]]
-    #: The case's own Editor check (`InvestigationStore.get_authorized`) and `scope_to_case`.
+    #: The case's own Editor check (`InvestigationStore.get_authorized`) and `scope_to_case`;
+    #: raises `CompositeReadOnlyError` for a case reading a composite (ADR-099 Amendment 15).
     check_case: Callable[[Principal, str], Awaitable[Principal]]
     run: RunAs
     #: Decision 10: a notice in the owner's own inbox when a scheduled run fails or is refused.
     notify: Callable[[str, StudioRecipeDraft, str], Awaitable[None]] | None = None
     #: Amendment 4: the files waiting in the recipe's folder (`folder_watch.waiting_files`).
     watch_files: Callable[[StudioRecipeDraft, datetime], Awaitable[list[WatchedFile]]] | None = None
+    #: ADR-110 Amendment 6 point 5: the sources' folder watches, each run by every pipeline that
+    #: reads the source.
+    source_watches: SourceWatches | None = None
+    #: Amendment 6 point 6: a case of the owner's that loads into a dataset (`scope_to_dataset`'s
+    #: reach), for a pipeline whose own case does not.
+    case_for_dataset: Callable[[Principal, str], Awaitable[str | None]] | None = None
 
     async def tick(self, now: datetime) -> None:
+        by_source: set[str] = set()
+        if self.source_watches is not None and self.watch_files is not None:
+            for recipe, watch in await self.source_watches.watching():
+                by_source.add(recipe.recipe_id)
+                try:
+                    await self._consider_source_watch(recipe, watch, now)
+                except Exception:  # noqa: BLE001 - one pipeline's trouble never stops the others
+                    log.exception(
+                        "source refresh of recipe %s could not be judged", recipe.recipe_id
+                    )
         for recipe in await self.recipes.scheduled():
             try:
-                await self._consider(recipe, now)
+                await self._consider(recipe, now, own_watch=recipe.recipe_id not in by_source)
             except Exception:  # noqa: BLE001 - one recipe's trouble never stops the others
                 log.exception("schedule of recipe %s could not be judged", recipe.recipe_id)
 
-    async def _consider(self, recipe: StudioRecipeDraft, now: datetime) -> None:
+    async def _consider(
+        self, recipe: StudioRecipeDraft, now: datetime, *, own_watch: bool = True
+    ) -> None:
         if recipe.schedule_paused:
             return
         if recipe.schedule_cron is not None:
             await self._consider_slot(recipe, now)
-        if recipe.schedule_watch is not None and self.watch_files is not None:
+        # A pipeline reading a watched source runs by the source's watch, never its own as well.
+        if own_watch and recipe.schedule_watch is not None and self.watch_files is not None:
             await self._consider_watch(recipe, now)
+
+    async def _consider_source_watch(
+        self, recipe: StudioRecipeDraft, watch: SourceWatch, now: datetime
+    ) -> None:
+        if watch.paused:
+            return
+        view = recipe.model_copy(
+            update={
+                "schedule_watch": watch.pattern,
+                "schedule_owner": watch.owner,
+                "schedule_set_at": watch.set_at,
+            }
+        )
+        await self._consider_watch(view, now, source=watch)
 
     async def _consider_slot(self, recipe: StudioRecipeDraft, now: datetime) -> None:
         assert recipe.schedule_cron is not None
@@ -297,14 +383,19 @@ class ScheduleExecutor:
             return
         try:
             await self.run(owner, recipe, case, latest)
+        except QuotaRefused as refused:  # ADR-141 decision 6: recorded refused, in words
+            await self._tell_owner(recipe, f"{self._due(recipe, latest)} was refused: {refused}")
         except Exception as error:  # noqa: BLE001 - the ledger has it as failed, in words
             log.exception("scheduled run of recipe %s failed", recipe.recipe_id)
             await self._tell_owner(recipe, f"{self._due(recipe, latest)} failed: {error}")
         finally:
             await self._release(lock, token)
 
-    async def _consider_watch(self, recipe: StudioRecipeDraft, now: datetime) -> None:
-        if recipe.status is StudioRecipeStatus.FLAGGED:
+    async def _consider_watch(
+        self, recipe: StudioRecipeDraft, now: datetime, *, source: SourceWatch | None = None
+    ) -> None:
+        trigger: RunTrigger = "source_refresh" if source is not None else "watch"
+        if recipe.status is StudioRecipeStatus.FLAGGED and source is None:
             return  # its files wait until it is published again (Amendment 4, point 6)
         assert self.watch_files is not None
         taken = await self.runs.watched_files(recipe.recipe_id)
@@ -322,8 +413,26 @@ class ScheduleExecutor:
             if not await reply(self.valkey.set(claim, "1", nx=True, ex=_CLAIM_SECONDS)):
                 return
             words = f"The run of {recipe.label} on the file {file.name}"
+            if source is not None and recipe.status is StudioRecipeStatus.FLAGGED:
+                # Amendment 5 item 3: a refresh records a pipeline needing attention as blocked.
+                await self._not_run(
+                    recipe, None, "blocked",
+                    "the ontology changed since this pipeline was deployed; deploy it again to run "
+                    "it",
+                    trigger=trigger, source_file=file.identity,
+                )  # fmt: skip
+                return
+            if source is not None and recipe.deduplicate is None:
+                await self._not_run(
+                    recipe, None, "refused", KEYLESS_REFRESH, counts=False,
+                    trigger=trigger, source_file=file.identity,
+                )  # fmt: skip
+                await self._tell_owner(recipe, f"{words} was refused: {KEYLESS_REFRESH}")
+                return
             try:
-                owner, case = await self._owner(recipe)
+                owner, case = await self._owner(
+                    recipe, dataset=source.dataset_id if source is not None else None
+                )
                 if recipe.dataset_id not in (owner.datasets or []):
                     # Rule 4: the folder is the dataset's, read only through a case that has it.
                     raise _Refused(
@@ -333,13 +442,18 @@ class ScheduleExecutor:
             except _Refused as refused:
                 await self._not_run(
                     recipe, None, "refused", str(refused), counts=refused.about_the_owner,
-                    trigger="watch", source_file=file.identity,
+                    trigger=trigger, source_file=file.identity,
                 )  # fmt: skip
                 await self._tell_owner(recipe, f"{words} was refused: {refused}")
-                await self._pause_if_refused_again(recipe, refused)
+                await self._pause_if_refused_again(recipe, refused, source=source)
                 return
             try:
-                await self.run(owner, recipe, case, None, file)
+                await self.run(
+                    owner, recipe, case, None, file, trigger=trigger,
+                    refresh=source.read if source is not None else None,
+                )  # fmt: skip
+            except QuotaRefused as refused:  # ADR-141 decision 6: recorded refused, in words
+                await self._tell_owner(recipe, f"{words} was refused: {refused}")
             except Exception as error:  # noqa: BLE001 - the ledger has it as failed, in words
                 log.exception("watched run of recipe %s failed", recipe.recipe_id)
                 await self._tell_owner(recipe, f"{words} failed: {error}")
@@ -351,9 +465,19 @@ class ScheduleExecutor:
         if held in (token, token.encode()):
             await reply(self.valkey.delete(lock))
 
-    async def _pause_if_refused_again(self, recipe: StudioRecipeDraft, refused: _Refused) -> None:
+    async def _pause_if_refused_again(
+        self, recipe: StudioRecipeDraft, refused: _Refused, *, source: SourceWatch | None = None
+    ) -> None:
         in_a_row = await self.runs.refusals_in_a_row(recipe.recipe_id)
         if refused.about_the_owner and in_a_row >= REFUSALS_BEFORE_PAUSE:
+            if source is not None and self.source_watches is not None:
+                # Amendment 6 point 6: the source's policy pauses, not the pipeline's schedule.
+                await self.source_watches.set_paused(
+                    source.source_id,
+                    paused=True,
+                    reason=f"paused after three refused runs in a row; the last: {refused}",
+                )
+                return
             await self.recipes.set_paused(
                 recipe.recipe_id,
                 paused=True,
@@ -377,6 +501,22 @@ class ScheduleExecutor:
         finally:
             await self._release(lock, token)
 
+    async def owner_for_external(self, recipe: StudioRecipeDraft) -> tuple[Principal, str]:
+        """ADR-141 decision 10: an external trigger's run acts as the pipeline's owner (the person
+        who marked it owned externally), resolved afresh through token exchange with every check a
+        scheduled slot gets, and the loader's studio role (`run_pipelines`) besides; refused in
+        words (`ScheduleRunRefused`) otherwise. Never as the service identity."""
+        try:
+            owner, case = await self._owner(recipe)
+        except _Refused as refused:
+            raise ScheduleRunRefused(str(refused)) from refused
+        if Right.RUN_PIPELINES not in rights_for(owner.roles):
+            raise ScheduleRunRefused(
+                f"the pipeline's owner, {recipe.schedule_owner}, no longer holds the loader's "
+                "studio role (run_pipelines)"
+            )
+        return owner, case
+
     @staticmethod
     def _due(recipe: StudioRecipeDraft, slot: datetime) -> str:
         zone = _zone(recipe.schedule_timezone or DEFAULT_TIMEZONE)
@@ -391,12 +531,60 @@ class ScheduleExecutor:
         except Exception:  # noqa: BLE001 - a notice that cannot be written is logged, not raised
             log.exception("could not tell the owner of recipe %s", recipe.recipe_id)
 
-    async def _owner(self, recipe: StudioRecipeDraft) -> tuple[Principal, str]:
+    async def _owner(
+        self, recipe: StudioRecipeDraft, *, dataset: str | None = None
+    ) -> tuple[Principal, str]:
+        """`dataset`: a source refresh's (Amendment 6 point 6), whose run goes through the
+        pipeline's own case when that case loads into the dataset, else through a case of the
+        owner's that does, else is refused."""
         owner_id, case = recipe.schedule_owner, recipe.schedule_case
+        if dataset is not None:
+            if owner_id is None:
+                raise _Refused("the source's refresh has no owner; set it again on the source")
+            case = await self._case_into(owner_id, case, dataset)
         if owner_id is None or case is None:
             raise _Refused("the schedule has no owner; set it again from the case it runs in")
+        owner = await self._resolve(owner_id)
+        if Right.SCHEDULE_PIPELINES not in rights_for(owner.roles):
+            raise _Refused(f"the schedule's owner, {owner_id}, no longer holds schedule_pipelines")
         try:
-            owner = await self.resolve_owner(owner_id)
+            owner = await self.check_case(owner, case)
+        except (InsufficientAccessError, InvestigationNotFoundError) as error:
+            raise _Refused(
+                f"the schedule's owner, {owner_id}, is no longer an Editor of its case"
+            ) from error
+        except CompositeReadOnlyError as error:
+            # Every run, so a case switched to a composite after its schedule was set starts none;
+            # a lasting refusal, so after three in a row the schedule is paused, saying why,
+            # rather than the owner told at every slot (Amendment 3).
+            raise _Refused(_COMPOSITE_CASE) from error
+        if not principal_may_view(resolve_source_handling(recipe), owner, self.scheme):
+            raise _Refused(
+                f"the source is marked above the clearance of the schedule's owner, {owner_id}"
+            )
+        return owner, case
+
+    async def _case_into(self, owner_id: str, case: str | None, dataset: str) -> str:
+        owner = await self._resolve(owner_id)
+        if case is not None:
+            try:
+                scoped = await self.check_case(owner, case)
+                if scoped.datasets and scoped.datasets[0] == dataset:
+                    return case
+            except (InsufficientAccessError, InvestigationNotFoundError, CompositeReadOnlyError):
+                # A pipeline's own case reading a composite loads nothing; another case of the
+                # owner's that loads into the source's dataset may (ADR-110 Amendment 6 point 6).
+                pass
+        found = await self.case_for_dataset(owner, dataset) if self.case_for_dataset else None
+        if found is None:
+            raise _Refused(
+                f"the refresh's owner, {owner_id}, has no case that loads into the source's dataset"
+            )
+        return found
+
+    async def _resolve(self, owner_id: str) -> Principal:
+        try:
+            return await self.resolve_owner(owner_id)
         except PrincipalRevoked as error:
             raise _Refused(f"the schedule's owner, {owner_id}, can no longer sign in") from error
         except PrincipalExchangeUnavailable as error:
@@ -408,21 +596,6 @@ class ScheduleExecutor:
             raise _Refused(
                 f"OspreyFlow could not act as the schedule's owner, {owner_id}"
             ) from error
-        if Right.SCHEDULE_PIPELINES not in rights_for(owner.roles):
-            raise _Refused(
-                f"the schedule's owner, {owner_id}, no longer holds schedule_pipelines"
-            )
-        try:
-            owner = await self.check_case(owner, case)
-        except (InsufficientAccessError, InvestigationNotFoundError) as error:
-            raise _Refused(
-                f"the schedule's owner, {owner_id}, is no longer an Editor of its case"
-            ) from error
-        if not principal_may_view(resolve_source_handling(recipe), owner, self.scheme):
-            raise _Refused(
-                f"the source is marked above the clearance of the schedule's owner, {owner_id}"
-            )
-        return owner, case
 
     async def _not_run(
         self,

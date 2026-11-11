@@ -1,11 +1,11 @@
-// The Admin area's Schedules and runs (`06_DECISIONS.md` ADR-110 decision 8, Amendment 2): every
+// The Admin area's Operations (formerly Schedules and runs; ADR-141 decision 1) (`06_DECISIONS.md` ADR-110 decision 8, Amendment 2): every
 // scheduled recipe across the deployment — its schedule in words, case, owner, next run and last
 // outcome — with Pause, Resume and its run history. A run's counts appear only where the Conduit sent
 // them; where it withheld them (the source is above the administrator's clearance, rule 3) that is
 // said, and nothing is shown in their place.
 import { useEffect, useState } from "react";
 
-import type { AdminSchedule, ScheduleRunView } from "../../../../packages/schemas/generated";
+import type { AdminSchedule, RunMetering, ScheduleRunView } from "../../../../packages/schemas/generated";
 import { Button } from "../design/primitives";
 import { DEFAULT_TIMEZONE, ScheduleEditor } from "../ingest/publish/ScheduleEditor";
 import { choiceOf, cronOf, type ScheduleChoice } from "../ingest/publish/scheduleChoice";
@@ -38,7 +38,22 @@ const when = (iso: string | null | undefined) =>
 export const COUNTS_WITHHELD_REASON =
   "some of what it loaded is above your clearance or restricted to another unit";
 
-/** One run in words: its outcome, then its counts, or why there are none. */
+/** What a run cost, in words (ADR-110 Amendment 6 point 9): a figure not yet measured says so, and
+ * is never shown as 0. */
+export function meteringInWords(m: RunMetering): string {
+  const seconds = (m.wall_ms / 1000).toLocaleString("en-GB", { maximumFractionDigits: 1 });
+  const measured = (n: number | null | undefined, what: string) => (n === null || n === undefined ? `${what} not measured` : `${n} ${what}`);
+  return [
+    `took ${seconds} s`,
+    `${m.rows_read} rows read`,
+    measured(m.rows_staged, "rows staged"),
+    measured(m.parquet_bytes, "bytes to Parquet"),
+    measured(m.object_store_bytes, "bytes to the object store"),
+    `${m.graph_writes} graph writes`,
+  ].join(", ");
+}
+
+/** One run in words: its outcome, then its counts and what it cost, or why there are none. */
 export function runInWords(run: ScheduleRunView): string {
   const outcome = OUTCOME[run.outcome];
   if (run.withheld) return `${outcome}: counts withheld — ${COUNTS_WITHHELD_REASON}`;
@@ -46,16 +61,19 @@ export function runInWords(run: ScheduleRunView): string {
     return (
       `${outcome}: ${run.rows_read} rows read, ${run.nodes_created ?? 0} created, ` +
       `${run.nodes_referenced ?? 0} referenced, ${run.rows_rejected ?? 0} rejected` +
-      (run.rows_held ? `, ${run.rows_held} held` : "")
+      (run.rows_held ? `, ${run.rows_held} held` : "") +
+      (run.metering ? ` (${meteringInWords(run.metering)})` : "")
     );
   }
   return run.failure ? `${outcome}: ${run.failure}` : outcome;
 }
 
 /** What started a run, for a list of runs: a watched run names its file (ADR-110 Amendment 4),
- * which the Conduit leaves out where the reader may not view the source. */
+ * which the Conduit leaves out where the reader may not view the source; a source's refresh says so
+ * (Amendment 6 point 5). */
 export function triggerInWords(run: ScheduleRunView): string {
   if (run.trigger === "watch") return run.file ? `watch, ${run.file}` : "watch";
+  if (run.trigger === "source_refresh") return run.file ? `source refresh, ${run.file}` : "source refresh";
   return run.trigger;
 }
 
@@ -123,12 +141,12 @@ export function Schedules({ api }: { api: AdminApi }) {
       </p>
       {problem && <p role="alert">{problem}</p>}
       {said && <p role="status">{said}</p>}
-      {schedules?.length === 0 && <p className="label" style={{ margin: 0 }}>No recipe is scheduled.</p>}
+      {schedules?.length === 0 && <p className="label" style={{ margin: 0 }}>No pipeline is scheduled.</p>}
       {schedules && schedules.length > 0 && (
-        <table className="table" aria-label="Scheduled recipes">
+        <table className="table" aria-label="Scheduled pipelines">
           <thead>
             <tr>
-              <th>Recipe</th>
+              <th>Pipeline</th>
               <th>Case</th>
               <th>Schedule</th>
               <th>Owner</th>
@@ -142,7 +160,7 @@ export function Schedules({ api }: { api: AdminApi }) {
               <tr key={s.recipe_id}>
                 <td>
                   <span className="value">{s.label}</span>
-                  {s.flagged && <div className="label">Blocked: the ontology changed since it was published</div>}
+                  {s.flagged && <div className="label">Needs attention: the ontology changed since it was deployed</div>}
                   {s.paused && <div className="label">{s.paused_reason ?? "paused"}</div>}
                   {open === s.recipe_id && <History api={api} schedule={s} />}
                   {editing?.recipeId === s.recipe_id && (
@@ -182,7 +200,7 @@ export function Schedules({ api }: { api: AdminApi }) {
                     </Button>
                   )}{" "}
                   <Button
-                    aria-label={`Run ${s.label} now`}
+                    aria-label={`Run now: ${s.label}`}
                     onClick={() =>
                       act(runScheduleNow(api, s.recipe_id), (ran) => `${ran.label} was run now; it runs as ${ran.owner ?? "its owner"}.`)
                     }

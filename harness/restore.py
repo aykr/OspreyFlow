@@ -75,10 +75,13 @@ from harness import identity, keycloak_admin
 from harness.backup import (
     REALM,
     BackupFailed,
+    FoundSet,
     _compose,
     _env_value,
     _run,
     arcadedb_request,
+    backups_folder,
+    find_sets,
     schema_versions,
 )
 from harness.render import (
@@ -131,6 +134,14 @@ class DryRun:
     #: Items the deployment did not have when the set was taken (a fresh deployment's recipes
     #: repository, say): nothing is restored for them, and the dry run says so.
     empty: tuple[str, ...] = ()
+    #: ADR-135 Amendment 2 with `05_DEPLOYMENT.md` §6.1: the engines whose key must be entered
+    #: again, since no backup carries a key.
+    keys_to_enter: tuple[str, ...] = ()
+    #: ADR-147: the map providers whose key was set in Admin; the backup holds none.
+    map_keys_to_enter: tuple[str, ...] = ()
+    #: ADR-140 Amendment 13: the connections' secrets and the egress list, which live only in
+    #: `deployment.env`, which no backup carries.
+    connection_settings_to_enter: tuple[str, ...] = ()
 
     def render(self) -> str:
         lines = [
@@ -156,6 +167,28 @@ class DryRun:
                 "",
                 "  WARNING     this set was taken with the Conduit running. Its graph store and",
                 "              its analytics database were captured at different instants.",
+            ]
+        if self.keys_to_enter:
+            lines += [
+                "",
+                "  model keys  no backup carries a key (05_DEPLOYMENT.md §6.1). After the restore,",
+                f"              enter the key of {', '.join(self.keys_to_enter)} again,",
+                "              in Admin › Models or with ospreyflow models key <name>. The",
+                "              engines, their models and each job's default are restored.",
+            ]
+        if self.connection_settings_to_enter:
+            lines += [
+                "",
+                "  connections no backup carries deployment.env (05_DEPLOYMENT.md §6.1). After the",
+                f"              restore, set {', '.join(self.connection_settings_to_enter)}",
+                "              in deployment.env again; the connections themselves are restored.",
+            ]
+        if self.map_keys_to_enter:
+            lines += [
+                "",
+                "  map keys    no backup carries a key (05_DEPLOYMENT.md §6.1). After the restore,",
+                f"              enter the key of {', '.join(self.map_keys_to_enter)} again,",
+                "              in Admin › Maps. The providers and prefetch areas are restored.",
             ]
         lines += [
             "",
@@ -220,6 +253,9 @@ def dry_run_for(directory: Path, manifest: dict[str, Any]) -> DryRun:
         audit_statement=manifest["audit_disposition"]["statement"],
         quiesced=bool(manifest["quiesced"]),
         empty=tuple(manifest.get("empty", ())),
+        keys_to_enter=tuple(engines_with_keys(directory)),
+        map_keys_to_enter=tuple(map_providers_with_keys(directory)),
+        connection_settings_to_enter=tuple(connection_secrets_to_enter(directory)),
     )
 
 
@@ -613,6 +649,95 @@ def check_schema_compatibility(manifest: dict[str, Any]) -> None:
         )
 
 
+def engines_with_keys(directory: Path) -> list[str]:
+    """The engines whose key the set's models file records (ADR-135 Amendment 2): each must be
+    entered again after the restore, since the backup holds none (`05_DEPLOYMENT.md` §6.1)."""
+    path = directory / "config" / "models.yaml"
+    if not path.is_file():
+        return []
+    import yaml
+
+    recorded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return sorted(dict(recorded.get("keys") or {}))
+
+
+def connection_secrets_to_enter(directory: Path) -> list[str]:
+    """The `deployment.env` settings the set's connections need (ADR-140 Amendment 13): each SQL or
+    API connection's `OSPREY_CONNECTION_SECRET_<NAME>`, and `OSPREY_CONNECTOR_EGRESS` when any such
+    connection exists. Read from the dump's `ingest_connections` rows, which name a secret and
+    never hold one."""
+    import json
+
+    dump = directory / "postgres" / "dump.sql"
+    if not dump.is_file():
+        return []
+    names: set[str] = set()
+    reaching = False
+    columns: list[str] | None = None
+    with dump.open(encoding="utf-8") as handle:
+        for line in handle:
+            if columns is None:
+                if line.startswith("COPY public.ingest_connections ("):
+                    inside = line[line.index("(") + 1 : line.index(")")]
+                    columns = [c.strip() for c in inside.split(",")]
+                continue
+            if line.startswith("\\."):
+                break
+            row = dict(zip(columns, line.rstrip("\n").split("\t"), strict=False))
+            if row.get("kind") in ("sql", "api"):
+                reaching = True
+            settings = row.get("settings")
+            if settings and settings != "\\N":
+                secret = json.loads(settings).get("secret")
+                if secret:
+                    names.add(f"OSPREY_CONNECTION_SECRET_{secret}")
+    return sorted(names) + (["OSPREY_CONNECTOR_EGRESS"] if reaching else [])
+
+
+def map_providers_with_keys(directory: Path) -> list[str]:
+    """The map providers whose key the set's maps file says was set in Admin (ADR-147)."""
+    path = directory / "config" / "maps.yaml"
+    if not path.is_file():
+        return []
+    import yaml
+
+    recorded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return sorted(str(k) for k in recorded.get("keys_held") or [])
+
+
+def restore_maps_file(compose_file: Path, maps_file: Path) -> None:
+    """The maps file back into the Conduit's own volume (ADR-147 decision 1), written beside it and
+    renamed over it, so a Conduit reading it never meets half a file. A key file left on the
+    volume is not given to the restored providers unless each address is the one its key was
+    entered for (`map_admin.address_of`)."""
+    _run(
+        _compose(compose_file)
+        + ["exec", "-T", "api", "sh", "-c",
+           "umask 077 && cat > /run/osprey/map-settings/.maps-restored.yaml"
+           " && mv -f /run/osprey/map-settings/.maps-restored.yaml"
+           " /run/osprey/map-settings/maps.yaml"],  # fmt: skip
+        item="maps",
+        input=maps_file.read_text(encoding="utf-8"),
+    )
+
+
+def restore_models_file(compose_file: Path, models_file: Path) -> None:
+    """The models file back into the Conduit's own volume (ADR-135 Amendment 2 decision 9)."""
+    _run(
+        _compose(compose_file)
+        + [
+            "exec",
+            "-T",
+            "api",
+            "sh",
+            "-c",
+            "umask 077 && cat > /run/osprey/model-settings/models.yaml",
+        ],
+        item="models",
+        input=models_file.read_text(encoding="utf-8"),
+    )
+
+
 def run_restore(
     *,
     directory: Path,
@@ -661,6 +786,10 @@ def run_restore(
         )
     for held in by_item.get("identity", []):
         restore_identity(compose_file, held)
+    for models_file in by_item.get("models", []):
+        restore_models_file(compose_file, models_file)
+    for maps_file in by_item.get("maps", []):
+        restore_maps_file(compose_file, maps_file)
     return plan
 
 
@@ -672,7 +801,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "and refuses to proceed until it is acknowledged with --yes."
         ),
     )
-    parser.add_argument("directory", type=Path)
+    parser.add_argument(
+        "directory",
+        nargs="?",
+        default=None,
+        help="the set: its folder, or its name, looked for in the deployment's backups folder "
+        "first and then where sets were written before; left out, the sets are listed",
+    )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--profile", default=None)
     parser.add_argument("--generated-root", type=Path, default=DEFAULT_OUT_ROOT)
@@ -685,6 +820,31 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _chosen_set(given: str, found: list[FoundSet]) -> FoundSet | None:
+    """The set the operator named (ADR-114 Amendment 37 decision 3): a folder, as it is (said to be
+    in an old place when it is one; one that is not a set is refused by `run_restore`, as before);
+    else a set's bare name, the deployment's own folder first (`found` lists it before an old copy
+    of the same name)."""
+    path = Path(given).expanduser()
+    if path.is_dir() or "/" in given or given.startswith(("~", ".")):
+        own = path.resolve()
+        return next((s for s in found if s.path.resolve() == own), FoundSet(path))
+    return next((s for s in found if s.path.name == given), None)
+
+
+def _list_sets(found: list[FoundSet], home: Path) -> int:
+    if not found:
+        print(f"restore: no sets for this deployment in {home} or where sets were written before.")
+        return 0
+    print(f"restore: this deployment's sets, newest first (its folder: {home})")
+    for item in found:
+        print(f"  {item.path}")
+        if item.belongs_in is not None:
+            print(f"    in an old place; move it with: {item.move_command()}")
+    print("Restore one with: ospreyflow restore <its name or folder>")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     # ADR-114 Amendment 4 decision 7: the deployment's names reach its proxy on this machine.
@@ -694,6 +854,24 @@ def main(argv: list[str] | None = None) -> int:
     answer_the_deployment_here(config)
     # ADR-132 Amendment 1: the deployment's own folder, `deployment.name` or the profile.
     profile = args.profile or generated_folder(config)
+    found = find_sets(config, profile)
+    if args.directory is None:
+        return _list_sets(found, backups_folder(config)[0] / profile)
+    chosen = _chosen_set(args.directory, found)
+    if chosen is None:
+        print(
+            f"restore: REFUSED\n  no set {args.directory} for {profile}, in "
+            f"{backups_folder(config)[0] / profile} or where sets were written before\n  "
+            "list this deployment's sets with: ospreyflow restore",
+            file=sys.stderr,
+        )
+        return 2
+    if chosen.belongs_in is not None:
+        print(
+            f"restore: {chosen.path} is in an old place (ADR-114 Amendment 37). Move it to "
+            f"{chosen.belongs_in} with:\n  {chosen.move_command()}"
+        )
+    args.directory = chosen.path
     compose_file = args.generated_root / profile / "compose.yaml"
     if not compose_file.exists():
         print(f"restore: no rendered deployment at {compose_file}.", file=sys.stderr)

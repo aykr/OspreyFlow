@@ -6,6 +6,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AdminPlace } from "./AdminPlace";
+import { runInWords, triggerInWords } from "./Schedules";
 
 afterEach(() => {
   cleanup();
@@ -45,6 +46,13 @@ function serve(handler: (path: string, init?: RequestInit) => Response | null = 
       if (init?.body) bodies.set(`${init.method} ${path}`, JSON.parse(String(init.body)));
       const answered = handler(path, init);
       if (answered) return answered;
+      // ADR-145 decision 9: Operations opens with what ages (`sections/Operations.tsx`).
+      if (path === "operations/ageing")
+        return json(200, { alert_after_days: 3, rules: [], waiting: [], promotions_recorded: false });
+      // ADR-141 (L1.7): then the runs, the scheduler, external triggers and quotas (`OperationsFigures`).
+      if (path === "operations/runs")
+        return json(200, { days: 7, units: ["unit-1"], rows: [], external: [], quotas: [],
+          scheduler: { skipped: 0, missed: 0, running_now: 0, refused: [], paused: [] } });  // prettier-ignore
       if (path === "schedules") return json(200, [SCHEDULE, SECRET]);
       if (path === "schedules/feed/pause")
         return json(200, { ...SCHEDULE, paused: true, paused_reason: "paused by admin-1", next_run: null });
@@ -69,11 +77,11 @@ describe("Schedules and runs", () => {
   it("is a tab only for an account holding operate_schedules", async () => {
     serve();
     place(["administer_system"]);
-    expect(screen.queryByRole("tab", { name: "Schedules and runs" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Operations" })).toBeNull();
     cleanup();
     serve();
     place(["operate_schedules"]);
-    expect(await screen.findByRole("table", { name: "Scheduled recipes" })).toBeTruthy();
+    expect(await screen.findByRole("table", { name: "Scheduled pipelines" })).toBeTruthy();
   });
 
   it("shows each schedule in words with its case, owner and last outcome", async () => {
@@ -117,7 +125,7 @@ describe("Schedules and runs", () => {
   it("runs a schedule now, as its owner, and says a refusal in the Conduit's words", async () => {
     const sent = serve();
     place(["operate_schedules"]);
-    fireEvent.click(await screen.findByRole("button", { name: "Run Daily custody export now" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Run now: Daily custody export" }));
     await waitFor(() => expect(sent).toContain("POST schedules/feed/run"));
     expect(await screen.findByText(/runs as approver-1/)).toBeTruthy();
     cleanup();
@@ -127,7 +135,7 @@ describe("Schedules and runs", () => {
         : null,
     );
     place(["operate_schedules"]);
-    fireEvent.click(await screen.findByRole("button", { name: "Run Daily custody export now" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Run now: Daily custody export" }));
     expect((await screen.findByRole("alert")).textContent).toBe(
       "Not run: the schedule's owner, approver-1, can no longer sign in",
     );
@@ -148,10 +156,35 @@ describe("Schedules and runs", () => {
   it("says when nothing is scheduled, and says a refusal", async () => {
     serve((path) => (path === "schedules" ? json(200, []) : null));
     place(["operate_schedules"]);
-    expect(await screen.findByText("No recipe is scheduled.")).toBeTruthy();
+    expect(await screen.findByText("No pipeline is scheduled.")).toBeTruthy();
     cleanup();
     serve((path) => (path === "schedules" ? json(403, {}) : null));
     place(["operate_schedules"]);
     expect(await screen.findByRole("alert")).toHaveProperty("textContent", "Your account does not hold the right for this.");
+  });
+});
+
+
+// ADR-110 Amendments 6 and 12 (redesign phase 4): a source refresh named as one, with its file; and
+// what a run cost, a figure not yet measured said so, never 0, and nothing where it is withheld.
+describe("a run's words", () => {
+  const RUN = { run_id: "x", trigger: "source_refresh", started_at: "2026-11-06T09:00:00Z", outcome: "succeeded",
+    run_as: "eng-1", rows_read: 4, nodes_created: 2, nodes_referenced: 0, rows_rejected: 0, file: "calls-0601.csv",
+    metering: { wall_ms: 400, rows_read: 4, rows_staged: null, parquet_bytes: null, object_store_bytes: 0, graph_writes: 3 } } as const;  // prettier-ignore
+
+  it("names a source refresh and its file", () => {
+    expect(triggerInWords(RUN as never)).toBe("source refresh, calls-0601.csv");
+    expect(triggerInWords({ ...RUN, file: null } as never)).toBe("source refresh");
+  });
+
+  it("says what the run cost after its counts", () => {
+    expect(runInWords(RUN as never)).toBe(
+      "Succeeded: 4 rows read, 2 created, 0 referenced, 0 rejected (took 0.4 s, 4 rows read, rows staged not measured, " +
+        "bytes to Parquet not measured, 0 bytes to the object store, 3 graph writes)",
+    );
+  });
+
+  it("says nothing of the cost where the counts are withheld", () => {
+    expect(runInWords({ ...RUN, withheld: true, metering: null } as never)).not.toContain("took");
   });
 });

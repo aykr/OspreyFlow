@@ -48,4 +48,9 @@ def load_record_from_report(
         rule_node_ids=list(report.rule_node_ids),
         released_from=released_from,
         events_stamped=True,
+        rows_withdrawn=report.rows_withdrawn,
+        withdrawn_node_ids=list(report.withdrawn_node_ids),
+        withdrawn_edge_ids=list(report.withdrawn_edge_ids),
+        own_key_merges=list(report.own_key_merges),
+        watermark=report.watermark,
     )

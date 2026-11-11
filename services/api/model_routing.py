@@ -22,6 +22,11 @@ default engine; an analyst may name another per request. **The route decides, in
 
 Every result says which engine and model produced it (`ExtractionResult.engine`, `.model`).
 
+Each call is made inside `usage.calling(engine, job)` (ADR-135 Amendment 3): the gateway records
+it under that engine and job, and a hosted engine's call goes with that engine's own key, whose
+limits the gateway applies. A limit's refusal reaches the caller as `ModelLimitReached`, worded
+with the engine's label.
+
 This wraps the model adapter, so every call the Conduit makes goes through it. The Conduit is told
 the engines by `harness/render.py` (`OSPREY_MODEL_ENGINES`, `OSPREY_MODEL_DEFAULTS`,
 `OSPREY_SENDABLE_HANDLING_CODES`) and whether each key is present by Compose
@@ -31,10 +36,12 @@ the engines by `harness/render.py` (`OSPREY_MODEL_ENGINES`, `OSPREY_MODEL_DEFAUL
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, cast
 
+from adapters.model_litellm.errors import ModelLimitReached
+from adapters.model_litellm.usage import calling
 from ports.model import ModelPort
 from schemas.admin import EngineStatus, ModelRoleStatus
 from schemas.domain import Handling, Vector
@@ -81,6 +88,9 @@ class Engine:
     #: ADR-136 decision 1: the organisation holds a data-processing agreement covering this key.
     privacy_contract: bool = False
     contract_reference: str | None = None
+    #: The period of its token budget, if one is set (ADR-135 Amendment 3), for the words a person
+    #: sees when it is used up.
+    budget_period: str | None = None
 
 
 class DatasetEgressReader(Protocol):
@@ -108,7 +118,11 @@ def dataset_refusal(
         name = f"“{dataset.name}”" if dataset is not None else "a dataset not known here"
         if egress == "any" or (egress == "contracted" and engine.privacy_contract):
             continue
-        (contracted if egress == "contracted" else none).append(name)
+        refused = contracted if egress == "contracted" else none
+        # Each name once: a case's analyst layer is named as the dataset it takes its egress from
+        # (`datasets.as_its_case`, ADR-143), which is named beside it.
+        if name not in refused:
+            refused.append(name)
     if none:
         return (
             f"{_names(none)} {'is' if len(none) == 1 else 'are'} set to egress none, never sent "
@@ -222,7 +236,20 @@ class RoutedModel:
 
     @property
     def routes(self) -> ModelRoutes:
+        source = getattr(self, "_source", None)
+        if source is not None:
+            self._routes = source()
         return self._routes
+
+    def set_routes(self, routes: ModelRoutes) -> None:
+        """ADR-135 Amendment 2: *Admin › Models* changes the engines while the Conduit runs; the
+        next request is routed by them, with no restart."""
+        self._routes = routes
+
+    def follow(self, source: Callable[[], ModelRoutes]) -> None:
+        """Read the routes from `source` at each request, so a change another Conduit replica made
+        (through the shared models file) is followed too."""
+        self._source = source
 
     async def held(self, datasets: Sequence[str] | None) -> Mapping[str, Dataset]:
         """Each of `datasets` this router can read the egress of; the rest are `none`."""
@@ -242,7 +269,7 @@ class RoutedModel:
         """The engine and model a request for `role` reaches. `asked` is used only where the
         deployment's local model for the role is not known. `datasets` are those the material comes
         from, and `held` their egress as `held()` read it (ADR-136)."""
-        routes = self._routes
+        routes = self.routes
         if engine is not None and engine != LOCAL:
             named = routes.engines.get(engine)
             if named is None:
@@ -298,23 +325,44 @@ class RoutedModel:
         """`choose`, with the datasets' egress read first."""
         return self.choose(role, asked, handling, engine, datasets, await self.held(datasets))
 
+    def _limit_words(self, hit: ModelLimitReached, engine: str) -> ModelLimitReached:
+        named = self.routes.engines.get(engine)
+        if named is None:
+            return hit.for_engine(LOCAL_LABEL)
+        return hit.for_engine(named.label, named.budget_period)
+
     async def extract(self, req: ExtractionRequest) -> ExtractionResult:
         choice = await self.decide("extraction", req.model, req.handling, req.engine, req.datasets)
-        result = await self._inner.extract(req.model_copy(update={"model": choice.model}))
+        try:
+            with calling(choice.engine, "extraction"):
+                result = await self._inner.extract(req.model_copy(update={"model": choice.model}))
+        except ModelLimitReached as hit:
+            raise self._limit_words(hit, choice.engine) from None
         return result.model_copy(update={"engine": choice.engine})
 
     async def transcribe(self, req: TranscribeRequest) -> Transcript:
         choice = await self.decide("transcription", req.model, req.handling, None, req.datasets)
-        return await self._inner.transcribe(req.model_copy(update={"model": choice.model}))
+        try:
+            with calling(choice.engine, "transcription"):
+                return await self._inner.transcribe(req.model_copy(update={"model": choice.model}))
+        except ModelLimitReached as hit:
+            raise self._limit_words(hit, choice.engine) from None
 
     async def describe_image(self, req: VisionRequest) -> ImageAnalysis:
         choice = await self.decide("vision", req.model, req.handling, None, req.datasets)
-        return await self._inner.describe_image(req.model_copy(update={"model": choice.model}))
+        try:
+            with calling(choice.engine, "vision"):
+                return await self._inner.describe_image(
+                    req.model_copy(update={"model": choice.model})
+                )
+        except ModelLimitReached as hit:
+            raise self._limit_words(hit, choice.engine) from None
 
     async def embed(self, texts: Sequence[str]) -> list[Vector]:
         """Embeddings carry no handling here, so they never leave: always the local model (the
         adapter's own), whatever the provider names."""
-        return await self._inner.embed(texts)
+        with calling(LOCAL, "embedding"):
+            return await self._inner.embed(texts)
 
 
 def _json(environ: Mapping[str, str], name: str, empty: object) -> object:

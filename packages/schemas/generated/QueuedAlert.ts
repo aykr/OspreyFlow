@@ -16,7 +16,7 @@ export type EdgeIds = EdgeId[];
 export type EventIds = string[];
 export type ValidFrom = string;
 export type ValidTo = string | null;
-export type Trigger = ("pre_commit" | "post_commit" | "schedule") | null;
+export type Trigger = ("pre_commit" | "post_commit" | "schedule" | "list_refresh") | null;
 export type Status = "open" | "claimed" | "closing" | "closed";
 export type Assignee = string | null;
 export type Disposition = ("true_positive" | "false_positive" | "duplicate" | "no_further_action" | "referred") | null;
@@ -27,12 +27,19 @@ export type CloseProposedBy = string | null;
 export type CloseProposedAt = string | null;
 export type Severity = ("low" | "medium" | "high") | null;
 export type Team = string | null;
+export type RoutedTeam = string | null;
+export type SuppressedUntil = string | null;
+export type SuppressReason = string | null;
+export type SuppressedBy = string | null;
 export type Summary = string;
-export type Kind = "typology" | "hotlist" | "monitor";
+export type Kind = "typology" | "hotlist" | "monitor" | "analyst" | "drawn_watch";
 export type Severity1 = "low" | "medium" | "high";
 export type Audience = "case" | "team" | "owner";
 export type Team1 = string | null;
 export type AssigneeName = string | null;
+export type TeamName = string | null;
+export type Suppressed = boolean;
+export type Lead = boolean;
 
 /**
  * One row of the case's alert queue: the alert, and its finding in words with the entities
@@ -46,6 +53,9 @@ export interface QueuedAlert {
   audience?: Audience;
   team?: Team1;
   assignee_name?: AssigneeName;
+  team_name?: TeamName;
+  suppressed?: Suppressed;
+  lead?: Lead;
   [k: string]: unknown;
 }
 /**
@@ -61,11 +71,9 @@ export interface QueuedAlert {
  * investigation_scope`. Threaded from `ChangeStreamEntry.investigation_id`, itself threaded from
  * whichever producer route was investigation-scoped at the point the triggering write happened
  * (ingest); `None` for a producer that genuinely has no single investigation in scope (the
- * corpus-wide resolution trigger). B14's "jump" branches a new investigation from this field via
- * `InvestigationStore.create(principal, branched_from=...)` — the identical mechanism
- * `branch_investigation` already uses, not new investigation-linking infrastructure. `None` here
- * means the jump starts an unbranched investigation instead of one carrying that link, disclosed
- * to the analyst rather than silently omitted.
+ * corpus-wide resolution trigger). B14's "jump" opens a case of the jumper's own from the
+ * alert; since L3.2 that case records no case it came from (ADR-144 Amendment 1), and the jump's
+ * audit row names this one.
  */
 export interface Alert {
   id: Id;
@@ -93,6 +101,10 @@ export interface Alert {
   close_proposed_at?: CloseProposedAt;
   severity?: Severity;
   team?: Team;
+  routed_team?: RoutedTeam;
+  suppressed_until?: SuppressedUntil;
+  suppress_reason?: SuppressReason;
+  suppressed_by?: SuppressedBy;
   [k: string]: unknown;
 }
 export interface Interval {

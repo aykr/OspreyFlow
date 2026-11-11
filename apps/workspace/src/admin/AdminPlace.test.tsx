@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
-// ADR-110 Amendment 1, ADR-112: the Admin area. Tabs follow the account's rights; a person's roles are
+// ADR-110 Amendment 1, ADR-112: the Admin area. Its sections follow the account's rights (ADR-145 decision 5); a person's roles are
 // saved whole with their other grants kept; a dashboard's secret is shown once; a refusal is said.
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AdminPlace, feedFreshness } from "./AdminPlace";
+import { convertedWords } from "./sections/System";
 
 afterEach(() => {
   cleanup();
@@ -39,15 +40,17 @@ function serve(handler: (path: string, init?: RequestInit) => Response | null = 
   return sent;
 }
 
-function place(rights: string[]) {
+/** The Admin place for these rights, and (ADR-145 decision 5) the section opened from its side list. */
+function place(rights: string[], section?: string) {
   render(<AdminPlace apiBaseUrl="http://x" bearerToken="t" rights={new Set(rights)} />);
+  if (section) fireEvent.click(within(screen.getByRole("navigation", { name: "Admin sections" })).getByRole("button", { name: section }));
 }
 
 describe("the Admin area", () => {
-  it("shows only the tabs the account holds a right for", async () => {
+  it("shows only the sections the account holds a right for", async () => {
     serve();
-    place(["administer_system"]);
-    expect(screen.queryByRole("tab", { name: "People and roles" })).toBeNull();
+    place(["administer_system"], "System");
+    expect(screen.queryByRole("button", { name: "People and roles" })).toBeNull();
     expect(await screen.findByText("not answering: unreachable")).toBeTruthy();
   });
 
@@ -65,7 +68,7 @@ describe("the Admin area", () => {
           })
         : null,
     );
-    place(["administer_system"]);
+    place(["administer_system"], "System");
     const line = await screen.findByText("The Conduit cannot act for people: run `ospreyflow repair-sign-in`");
     expect(line).toBeTruthy();
     expect(screen.queryByText(/not answering/)).toBeNull();
@@ -106,6 +109,20 @@ describe("the Admin area", () => {
     await waitFor(() => expect((screen.getByLabelText("Dashboard reads at clearance") as HTMLSelectElement).value).toBe("OFFICIAL"));
     fireEvent.click(screen.getByRole("button", { name: "Register" }));
     expect(await screen.findByText("A dashboard cannot read above your own clearance (SECRET asked).")).toBeTruthy();
+  });
+});
+
+// ADR-090 Amendment 4 (as Amendment 5 timed it, L2.7): proposed types are decided on the Studio's Model
+// tab of their dataset, so Admin has no Proposed types section, for a holder of manage_ontology or any
+// other right, and nothing in Admin asks for the proposals.
+describe("Proposed types are not in the Admin area", () => {
+  it("is no section, even for a holder of manage_ontology with every other right", () => {
+    const sent = serve();
+    place(["manage_ontology", "manage_people", "manage_dashboards", "administer_system", "operate_schedules", "read_audit"]);
+    const nav = screen.getByRole("navigation", { name: "Admin sections" });
+    expect(within(nav).queryByRole("button", { name: "Proposed types" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Review proposed types" })).toBeNull();
+    expect(sent.some(({ path }) => path.includes("link-types"))).toBe(false);
   });
 });
 
@@ -182,6 +199,7 @@ describe("people: invite, access, disable, enable, reset sign-in", () => {
 
   it("disables a person only once it is confirmed, and enables them again", async () => {
     const sent = serve((path) => {
+      if (path === "people/u1/disable-plan") return json(200, { person: "u1", items: [], not_yet_listed: ["boards"] });
       if (path === "people/u1/disable") return json(200, { ...PERSON, enabled: false });
       if (path === "people/u1/enable") return json(200, { ...PERSON, enabled: true });
       return null;
@@ -189,7 +207,7 @@ describe("people: invite, access, disable, enable, reset sign-in", () => {
     place(["manage_people"]);
     fireEvent.click(await screen.findByRole("button", { name: "Disable osprey-demo-analyst" }));
     expect(sent.some((s) => s.path === "POST people/u1/disable")).toBe(false);
-    fireEvent.click(screen.getByRole("button", { name: "Confirm disabling osprey-demo-analyst" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Confirm disabling osprey-demo-analyst" }));
     expect(await screen.findByText("Disabled")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Enable osprey-demo-analyst" }));
     await waitFor(() => expect(sent.some((s) => s.path === "POST people/u1/enable")).toBe(true));
@@ -248,7 +266,7 @@ describe("the Demo packs tab", () => {
   it("shows each pack, its licence and credit, whether it is loaded, and the command that adds it", async () => {
     serve((path) => (path === "demo-packs" ? json(200, PACKS) : null));
     place(["administer_system"]);
-    fireEvent.click(await screen.findByRole("tab", { name: "Demo packs" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Demo packs" }));
     expect(await screen.findByText("PaySim — mobile-money fraud (simulated)")).toBeTruthy();
     expect(screen.getByText(/CC-BY-SA-4.0/)).toBeTruthy();
     expect(screen.getByText(/Lopez-Rojas, Elmir and Axelsson/)).toBeTruthy();
@@ -264,7 +282,7 @@ describe("the Demo packs tab", () => {
   it("says which pack is real people's data, and only that one (ADR-114 Amendment 23 point 4)", async () => {
     serve((path) => (path === "demo-packs" ? json(200, PACKS) : null));
     place(["administer_system"]);
-    fireEvent.click(await screen.findByRole("tab", { name: "Demo packs" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Demo packs" }));
     const enron = await screen.findByRole("article", { name: "Enron — a real company's email" });
     expect(within(enron).getByRole("note").textContent).toMatch(/^Real personal data\./);
     expect(screen.getAllByRole("note")).toHaveLength(1);
@@ -275,10 +293,42 @@ describe("the Demo packs tab", () => {
     const writeText = vi.fn(async () => undefined);
     vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
     place(["administer_system"]);
-    fireEvent.click(await screen.findByRole("tab", { name: "Demo packs" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Demo packs" }));
     fireEvent.click(await screen.findByRole("button", { name: "Copy the command for operation-ledger" }));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith("ospreyflow demo add operation-ledger"));
     expect(await screen.findByText("Copied. Run it in a terminal on the machine OspreyFlow runs on.")).toBeTruthy();
+  });
+});
+
+// ADR-144 decision 6 (L2.5b): the System tab says how many cases made from another became views,
+// in how many cases, as the Conduit counted them in the administrator's unit.
+describe("the System tab's cases converted to views", () => {
+  it("says the counts, and that the dry-run report names any case not placed", async () => {
+    serve((path) => (path === "system" ? json(200, { components: [], converted_views: { views: 3, cases: 2 } }) : null));
+    place(["administer_system"], "System");
+    const section = await screen.findByRole("region", { name: "Cases converted to views" });
+    expect(section.textContent).toContain("3 cases made from another became views, in 2 cases of your unit.");
+    expect(section.textContent).toContain("its dry-run report, which the operator runs, names each and why.");
+  });
+
+  it("says when nothing became a view, and says so in words when the count is not known", async () => {
+    expect(convertedWords({ views: 0, cases: 0 })[0]).toBe("No case made from another has become a view in your unit.");
+    expect(convertedWords({ views: 1, cases: 1 })[0]).toBe(
+      "1 case made from another became a view, in 1 case of your unit.",
+    );
+    // The orchestrator's review of L2.5b: a count that could not be read is said, in words.
+    expect(convertedWords({ problem: "Not known: the count could not be read (OSError)" })[0]).toBe(
+      "Not known: the count could not be read (OSError)",
+    );
+    serve((path) =>
+      path === "system"
+        ? json(200, { components: [], converted_views: { views: 0, cases: 0, problem: "Not known: the count could not be read (OSError)" } })
+        : null,
+    );
+    place(["administer_system"], "System");
+    const section = await screen.findByRole("region", { name: "Cases converted to views" });
+    expect(section.textContent).toContain("Not known: the count could not be read");
+    expect(section.textContent).not.toContain("No case made from another");
   });
 });
 
@@ -297,7 +347,7 @@ describe("the System tab's models", () => {
           })
         : null,
     );  // prettier-ignore
-    place(["administer_system"]);
+    place(["administer_system"], "System");
     const table = await screen.findByRole("table", { name: "Models" });
     expect(table.textContent).toContain("openai/gpt-4o-mini");
     expect(table.textContent).toContain("this deployment");
@@ -310,7 +360,7 @@ describe("the System tab's models", () => {
         ? json(200, { components: [], models: [{ role: "extraction", model: "qwen", runs_at: "this deployment", local_model: "qwen" }], model_notice: null })
         : null,
     );  // prettier-ignore
-    place(["administer_system"]);
+    place(["administer_system"], "System");
     await screen.findByRole("table", { name: "Models" });
     expect(screen.queryByRole("note")).toBeNull();
   });
@@ -333,7 +383,7 @@ describe("the System tab's engines", () => {
           })
         : null,
     );  // prettier-ignore
-    place(["administer_system"]);
+    place(["administer_system"], "System");
     const table = await screen.findByRole("table", { name: "Engines" });
     const rows = within(table).getAllByRole("row").slice(1).map((row) =>
       within(row).getAllByRole("cell").map((cell) => cell.textContent),
@@ -358,9 +408,20 @@ describe("the System tab's engines", () => {
           })
         : null,
     );  // prettier-ignore
-    place(["administer_system"]);
+    place(["administer_system"], "System");
     await screen.findByRole("table", { name: "Engines" });
     expect(document.body.textContent).not.toContain("AIza-not-a-real-key");
+  });
+});
+
+// ADR-148 decision 10: the deployment's marking ceiling.
+describe("the System tab's highest marking", () => {
+  it("says the deployment's highest marking and what it refuses", async () => {
+    serve((path) => (path === "system" ? json(200, { version: "v0.4.1", components: [], models: [], model_notice: null, update: null, highest_marking: "OFFICIAL-SENSITIVE" }) : null));
+    place(["administer_system"], "System");
+    const ceiling = await screen.findByRole("region", { name: "Highest marking" });
+    expect(ceiling.textContent).toContain("OFFICIAL-SENSITIVE");
+    expect(ceiling.textContent).toContain("refused before anything is written");
   });
 });
 
@@ -376,7 +437,7 @@ describe("the System tab's version", () => {
           })
         : null,
     );  // prettier-ignore
-    place(["administer_system"]);
+    place(["administer_system"], "System");
     const version = await screen.findByRole("region", { name: "Version" });
     expect(version.textContent).toContain("OspreyFlow v0.4.1");
     expect(version.textContent).toContain("v0.5.0 is available.");
@@ -389,7 +450,7 @@ describe("the System tab's version", () => {
 
   it("says when there has been no check", async () => {
     serve((path) => (path === "system" ? json(200, { version: "v0.4.1", components: [], models: [], model_notice: null, update: null }) : null));
-    place(["administer_system"]);
+    place(["administer_system"], "System");
     const version = await screen.findByRole("region", { name: "Version" });
     expect(version.textContent).toContain("Not checked for updates yet.");
     expect(version.textContent).toContain("ospreyflow update --check");
@@ -407,11 +468,11 @@ describe("the Datasets tab", () => {
   it("is the system administrator's, and says what each setting means and that none is the default", async () => {
     serve((path) => (path === "datasets" ? json(200, DATASETS) : null));
     place(["manage_people"]);
-    expect(screen.queryByRole("tab", { name: "Datasets" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Datasets" })).toBeNull();
     cleanup();
     serve((path) => (path === "datasets" ? json(200, DATASETS) : null));
     place(["administer_system"]);
-    fireEvent.click(screen.getByRole("tab", { name: "Datasets" }));
+    fireEvent.click(screen.getByRole("button", { name: "Datasets" }));
     const table = await screen.findByRole("table", { name: "Datasets" });
     const egress = within(table).getByLabelText("Egress for Enron corpus") as HTMLSelectElement;
     expect(egress.value).toBe("none");
@@ -428,7 +489,7 @@ describe("the Datasets tab", () => {
           : null,
     );
     place(["administer_system"]);
-    fireEvent.click(screen.getByRole("tab", { name: "Datasets" }));
+    fireEvent.click(screen.getByRole("button", { name: "Datasets" }));
     fireEvent.change(await screen.findByLabelText("Egress for Enron corpus"), { target: { value: "any" } });
     fireEvent.click(screen.getByRole("button", { name: "Save egress for Enron corpus" }));
     await waitFor(() => expect(sent.some((s) => s.path === "PUT datasets/enron/egress")).toBe(true));
@@ -445,7 +506,7 @@ describe("the Datasets tab", () => {
           : null,
     );
     place(["administer_system"]);
-    fireEvent.click(screen.getByRole("tab", { name: "Datasets" }));
+    fireEvent.click(screen.getByRole("button", { name: "Datasets" }));
     fireEvent.change(await screen.findByLabelText("Egress for Enron corpus"), { target: { value: "any" } });
     fireEvent.click(screen.getByRole("button", { name: "Save egress for Enron corpus" }));
     expect(await screen.findByText("Your account does not hold the right for this.")).toBeTruthy();
@@ -576,5 +637,18 @@ describe("people: join a refused organisation arrival", () => {
     await screen.findByText("Demo Analyst");
     expect(screen.queryByRole("region", { name: "Refused organisation sign-ins" })).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
+
+describe("Roles, teams and Authors from Admin (ADR-145 Amendment 4 decision 12)", () => {
+  it("opens the one help page and comes back to Admin", () => {
+    serve();
+    render(<AdminPlace apiBaseUrl="http://x" bearerToken="t" rights={new Set(["manage_people"])} />);
+    fireEvent.click(screen.getByRole("button", { name: "Roles, teams and Authors" }));
+    expect(screen.getByRole("heading", { level: 2, name: "Roles, teams and Authors" })).toBeTruthy();
+    const back = screen.getByRole("button", { name: "← Back to Admin" });
+    expect(document.activeElement).toBe(back);
+    fireEvent.click(back);
+    expect(screen.getByRole("navigation", { name: "Admin sections" })).toBeTruthy();
   });
 });

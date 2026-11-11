@@ -12,7 +12,8 @@ case; the rule still evaluated as its deployer (ADR-036), only readership widens
 cannot see, they are not shown (rule 3, ADR-039's all-or-nothing):** an alert any of whose entities,
 links or transactions the reader cannot read is left out of the queue and its count, and opening
 it answers as if it did not exist — its words name what it concerns, so a partial alert would
-disclose the hidden part. Visibility is always the adapters' own answer, read as the reader.
+disclose the hidden part. Visibility is always the adapters' own answer, read as the reader
+(`alerts.read_evidence`; until ADR-146 decision 10, gap map G2, the list checked nodes alone).
 
 **Triage.** An open alert is claimed by one member (or released again), and closed with a
 disposition and its reason. A *true positive* is the human confirmation rule 5 waits for: the
@@ -22,7 +23,9 @@ the alert and leaves the node `inferred` — a suggestion nobody confirmed, whic
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from datetime import UTC, date, datetime, timedelta
+from typing import TYPE_CHECKING
 
 from services.extract.writer import confirm_edge, confirm_node
 
@@ -31,6 +34,7 @@ from ports.analytics import AnalyticsPort
 from ports.graph import GraphPort
 from schemas.analytics import EventFilter, EventListRequest, EventRecord
 from schemas.domain import (
+    SUPPRESS_DAYS_MAX,
     Alert,
     AlertExplanation,
     AlertMode,
@@ -42,7 +46,23 @@ from schemas.domain import (
     QueuedAlert,
 )
 
-from .alerts import AlertNotFoundError, AlertStore, AlertTriageConflict, QueueRow
+from .alerts import (
+    EVENT_CHUNK,
+    AlertNotFoundError,
+    AlertStore,
+    AlertTriageConflict,
+    QueueRow,
+    QueueShow,
+    evidence_node_ids,
+    purge_copies,
+    raiser_reads_admitting,
+    read_evidence,
+    settle_repoints,
+)
+from .dataset_scope import refuse_unless_in_the_layer
+
+if TYPE_CHECKING:
+    from .working_set.service import WorkingSetService
 
 #: The properties that name an entity, most telling first.
 _NAME_PROPERTIES = (
@@ -68,6 +88,9 @@ def node_name(node: Node) -> str:
 def summary_of(alert: Alert, nodes: dict[str, Node]) -> str:
     """The finding in words, each entity named as the reader sees it, not by its id. A hotlist or
     monitor alert has no words of its own; it is said from what it found."""
+    if alert.rule_id.startswith("analyst:"):
+        named = ", ".join(node_name(nodes[i]) for i in alert.referent_node_ids if i in nodes)
+        return f"{alert.words or 'Raised by an analyst'}: {named}" if named else (alert.words or "")
     if alert.words is None and alert.typology is None:
         named = ", ".join(node_name(nodes[i]) for i in alert.referent_node_ids if i in nodes)
         if alert.rule_id.startswith("hotlist:"):
@@ -82,69 +105,72 @@ def summary_of(alert: Alert, nodes: dict[str, Node]) -> str:
     return words
 
 
-def _wanted(alert: Alert) -> list[str]:
-    return [*alert.referent_node_ids, *([alert.alert_node_id] if alert.alert_node_id else [])]
+def suppressed_today(alert: Alert, today: date | None = None) -> bool:
+    """ADR-146 Amendment 1: suppressed through its last day, and never after, with no action."""
+    until = alert.suppressed_until
+    return until is not None and until >= (today or datetime.now(UTC).date())
 
 
-def _queued(row: QueueRow, summary: str) -> QueuedAlert:
+def _queued(row: QueueRow, summary: str, *, lead_of: Collection[str] = ()) -> QueuedAlert:
+    routed = row.alert.routed_team
     return QueuedAlert(
         alert=row.alert,
         summary=summary,
         kind=row.kind,
         severity=row.severity,
         audience=row.audience,
-        team=row.alert.team if row.audience == "team" else None,
+        team=routed if routed is not None else (row.alert.team if row.audience == "team" else None),
+        suppressed=suppressed_today(row.alert),
+        lead=routed is not None and routed in lead_of,
     )
 
 
 async def monitoring_queue(
     store: AlertStore,
     graph: GraphPort,
+    analytics: AnalyticsPort,
     investigation_id: str,
     reader: Principal,
     *,
     kinds: Sequence[str] | None = None,
     severities: Sequence[str] | None = None,
     statuses: Sequence[str] | None = None,
+    show: QueueShow | None = None,
+    older_than_days: int | None = None,
+    lead_of: Collection[str] = (),
 ) -> list[QueuedAlert]:
     """ADR-133 decision 5: the one queue, as `reader` may see it. Which rows is the query's answer
-    (`AlertStore.list_queue`, rule 3); what each names is then read **once, in one batch**, as the
-    reader, through the adapter's own access step (`GraphPort.get_nodes`). An alert any of whose
-    entities is missing from that answer is left out whole (ADR-039's all-or-nothing): it is neither
-    listed nor counted, the order of the rest is unchanged, and the work done is the same one read
-    whether it exists or not — so no count, order or timing says a hidden alert is there."""
+    (`AlertStore.list_queue`, rule 3); everything they cite (nodes, links and transactions, ADR-146
+    decision 10) is then read **once per kind, in one batch**, as the reader, through each
+    adapter's own access step (`alerts.read_evidence`). An alert any of whose evidence is missing
+    from those answers is left out whole (ADR-039's all-or-nothing): it is neither listed nor
+    counted, the order of the rest is unchanged, and the reads are the same calls with the same ids
+    whether it is hidden or not — so no count, order or timing says a hidden alert is there. Its
+    explanation refuses it the same way (`explain_with_evidence`), so the list and the explanation
+    agree."""
+    await settle_repoints(store, graph)
     rows = await store.list_queue(
-        investigation_id, reader, kinds=kinds, severities=severities, statuses=statuses
+        investigation_id, reader, kinds=kinds, severities=severities, statuses=statuses,
+        show=show, older_than_days=older_than_days,
+    )  # fmt: skip
+    readable = await read_evidence(
+        [row.alert for row in rows], reader, graph, analytics, scope=lambda _: investigation_id
     )
-    wanted = sorted({node_id for row in rows for node_id in _wanted(row.alert)})
-    readable = {n.id: n for n in await graph.get_nodes(wanted, reader)} if wanted else {}
+    admitted = await raiser_reads_admitting(store, [row.alert for row in rows], reader)
     shown: list[QueuedAlert] = []
     for row in rows:
-        ids = _wanted(row.alert)
-        if any(node_id not in readable for node_id in ids):
+        if not readable.whole(row.alert) or row.alert.id not in admitted:
             continue
-        shown.append(_queued(row, summary_of(row.alert, {i: readable[i] for i in ids})))
+        ids = evidence_node_ids(row.alert)
+        named = {i: readable.nodes[i] for i in ids}
+        shown.append(_queued(row, summary_of(row.alert, named), lead_of=lead_of))
     return shown
-
-
-async def _visible_nodes(
-    alert: Alert, graph: GraphPort, reader: Principal
-) -> dict[str, Node] | None:
-    """Every entity the alert concerns, and its own node, as the reader reads them — or `None`
-    when any of them is hidden from the reader."""
-    wanted = [*alert.referent_node_ids, *([alert.alert_node_id] if alert.alert_node_id else [])]
-    found: dict[str, Node] = {}
-    for node_id in wanted:
-        node = await graph.get_node(node_id, reader)
-        if node is None:
-            return None
-        found[node_id] = node
-    return found
 
 
 async def queue(
     store: AlertStore,
     graph: GraphPort,
+    analytics: AnalyticsPort,
     investigation_id: str,
     reader: Principal,
     *,
@@ -156,27 +182,46 @@ async def queue(
     alert's nodes in turn, stopping at a hidden one, so its work grew with the alerts the reader
     may not see; `test_case_queue_reads.py`)."""
     shown = await monitoring_queue(
-        store, graph, investigation_id, reader, kinds=["typology"], statuses=statuses
+        store, graph, analytics, investigation_id, reader, kinds=["typology"], statuses=statuses
     )
     return sorted(shown, key=lambda q: (q.alert.created_at, q.alert.id), reverse=True)
 
 
 async def _visible_row(
-    store: AlertStore, graph: GraphPort, alert_id: str, investigation_id: str, reader: Principal
+    store: AlertStore,
+    graph: GraphPort,
+    analytics: AnalyticsPort,
+    alert_id: str,
+    investigation_id: str,
+    reader: Principal,
 ) -> tuple[QueueRow, dict[str, Node]]:
-    """One alert of the reader's queue, and everything it names as they read it — or not found,
-    the same answer as for an alert that does not exist."""
+    """One alert of the reader's queue, and every node it names as they read it — or not found, the
+    same answer as for an alert that does not exist, when any node, link or transaction it cites is
+    hidden from them (ADR-146 decision 10: the queue's own check, `alerts.read_evidence`, so every
+    path that acts on or draws an alert refuses exactly what the queue withholds; until it, this
+    read nodes alone, and a triage path acted on, and returned the words of, an alert the reader
+    could not wholly see)."""
+    await settle_repoints(store, graph)
     row = await store.get_queue_alert(alert_id, investigation_id, reader)
-    nodes = await _visible_nodes(row.alert, graph, reader)
-    if nodes is None:
+    readable = await read_evidence(
+        [row.alert], reader, graph, analytics, scope=lambda _: investigation_id
+    )
+    if not readable.whole(row.alert) or not await raiser_reads_admitting(
+        store, [row.alert], reader
+    ):
         raise AlertNotFoundError(alert_id)
-    return row, nodes
+    return row, {i: readable.nodes[i] for i in evidence_node_ids(row.alert)}
 
 
 async def _visible_alert(
-    store: AlertStore, graph: GraphPort, alert_id: str, investigation_id: str, reader: Principal
+    store: AlertStore,
+    graph: GraphPort,
+    analytics: AnalyticsPort,
+    alert_id: str,
+    investigation_id: str,
+    reader: Principal,
 ) -> tuple[Alert, dict[str, Node]]:
-    row, nodes = await _visible_row(store, graph, alert_id, investigation_id, reader)
+    row, nodes = await _visible_row(store, graph, analytics, alert_id, investigation_id, reader)
     return row.alert, nodes
 
 
@@ -204,25 +249,32 @@ async def explain_with_evidence(
 ) -> tuple[AlertExplanation, list[EventRecord]]:
     """`explain`, and the cited transactions as the analytics store holds them — with their
     handlings, which a report pack's alert item rests on (ADR-134 decision 1)."""
-    row, nodes = await _visible_row(store, graph, alert_id, investigation_id, reader)
+    row, nodes = await _visible_row(store, graph, analytics, alert_id, investigation_id, reader)
     alert = row.alert
+    # Read as the queue reads them (`read_evidence`): the cited links by their ids, whatever their
+    # ends, and every cited transaction, in chunks cut from the ids, in the alert's own case.
+    # Anything gone since the check (a revert in between) refuses the whole alert, as it would.
     edges = await _cited_edges(alert, graph, reader, list(nodes))
-    if len({e.id for e in edges if e.type != "ALERTED_ON"}) < len(set(alert.edge_ids)):
+    if len({e.id for e in edges} & set(alert.edge_ids)) < len(set(alert.edge_ids)):
         raise AlertNotFoundError(alert_id)
     transactions: list[ExplainedTransaction] = []
     cited_events: list[EventRecord] = []
     if alert.event_ids:
-        page = await analytics.list_events(
-            EventListRequest(
-                filter=EventFilter(investigation_scope=investigation_id, event_ids=alert.event_ids),
-                limit=200,
-            ),
-            reader,
-        )
-        if page.total < len(set(alert.event_ids)):
+        where = investigation_id  # the reader's own case, as the queue's check reads them (R1)
+        ids = sorted(set(alert.event_ids))
+        for start in range(0, len(ids), EVENT_CHUNK):
+            chunk = ids[start : start + EVENT_CHUNK]
+            page = await analytics.list_events(
+                EventListRequest(
+                    filter=EventFilter(investigation_scope=where, event_ids=chunk),
+                    limit=EVENT_CHUNK,
+                ),
+                reader,
+            )
+            cited_events.extend(e for e in page.events if e.event_id in chunk)
+        if len({e.event_id for e in cited_events}) < len(ids):
             # A cited transaction the reader cannot read: the alert is not theirs to see.
             raise AlertNotFoundError(alert_id)
-        cited_events = list(page.events)
         transactions = sorted(
             (
                 ExplainedTransaction(
@@ -233,7 +285,7 @@ async def explain_with_evidence(
                     occurred_at=e.occurred_at,
                     amount=_number(e.properties.get("amount")),
                 )
-                for e in page.events
+                for e in cited_events
             ),
             key=lambda t: t.occurred_at,
         )
@@ -246,7 +298,9 @@ async def explain_with_evidence(
         kind=row.kind,
         severity=row.severity,
         audience=row.audience,
-        team=alert.team if row.audience == "team" else None,
+        # A routed alert's team is the one it was routed to (ADR-146 decision 8), not the unit
+        # its owner shares a watch with (the L2.10 review's item 9).
+        team=(alert.routed_team or alert.team) if row.audience == "team" else None,
     )
     return explanation, cited_events
 
@@ -265,29 +319,42 @@ def _number(value: object) -> float | None:
 async def _cited_edges(
     alert: Alert, graph: GraphPort, reader: Principal, node_ids: list[str]
 ) -> list[Edge]:
-    """The links the alert cites, and its own `ALERTED_ON` links, among its nodes, as the reader
-    reads them."""
-    cited = set(alert.edge_ids)
-    return [
+    """The links the alert cites, read by their ids whatever their ends, as the queue's check reads
+    them (`read_evidence`; L2.8b item 8), and its own `ALERTED_ON` links among its nodes, as the
+    reader reads them."""
+    cited = sorted(set(alert.edge_ids))
+    links = await graph.get_edges(cited, reader) if cited else []
+    alerted = [
         e
         for e in await graph.edges_among(node_ids, reader)
-        if e.id in cited or (e.type == "ALERTED_ON" and e.source == alert.alert_node_id)
+        if e.type == "ALERTED_ON" and e.source == alert.alert_node_id and e.id not in cited
     ]
+    return [*links, *alerted]
 
 
 async def canvas_elements(
-    store: AlertStore, graph: GraphPort, investigation_id: str, alert_id: str, reader: Principal
+    store: AlertStore,
+    graph: GraphPort,
+    analytics: AnalyticsPort,
+    investigation_id: str,
+    alert_id: str,
+    reader: Principal,
 ) -> tuple[Alert, list[Node], list[Edge]]:
     """What "open on the canvas" puts there: the alert's node, its entities and the links among
     them it cites — all of it visible to the reader, or the alert is not found."""
-    alert, nodes = await _visible_alert(store, graph, alert_id, investigation_id, reader)
+    alert, nodes = await _visible_alert(store, graph, analytics, alert_id, investigation_id, reader)
     return alert, list(nodes.values()), await _cited_edges(alert, graph, reader, list(nodes))
 
 
 async def claim(
-    store: AlertStore, graph: GraphPort, investigation_id: str, alert_id: str, member: Principal
+    store: AlertStore,
+    graph: GraphPort,
+    analytics: AnalyticsPort,
+    investigation_id: str,
+    alert_id: str,
+    member: Principal,
 ) -> Alert:
-    await _visible_alert(store, graph, alert_id, investigation_id, member)
+    await _visible_alert(store, graph, analytics, alert_id, investigation_id, member)
     return await store.set_queue_triage(
         alert_id, investigation_id, member, expect_status=["open"], status="claimed",
         assignee=member.id,
@@ -295,9 +362,14 @@ async def claim(
 
 
 async def release(
-    store: AlertStore, graph: GraphPort, investigation_id: str, alert_id: str, member: Principal
+    store: AlertStore,
+    graph: GraphPort,
+    analytics: AnalyticsPort,
+    investigation_id: str,
+    alert_id: str,
+    member: Principal,
 ) -> Alert:
-    alert, _ = await _visible_alert(store, graph, alert_id, investigation_id, member)
+    alert, _ = await _visible_alert(store, graph, analytics, alert_id, investigation_id, member)
     if alert.assignee not in (None, member.id):
         raise AlertTriageConflict(alert_id)
     return await store.set_queue_triage(
@@ -308,7 +380,23 @@ async def release(
 
 class CloseRefused(Exception):
     """ADR-133 decision 7: the person who proposed closing a high-severity alert cannot approve
-    it."""
+    it. ADR-146 decision 7: a dataset alert is closed by its home case's Authors alone."""
+
+
+#: Whether the closer is an Author of the alert's own case (a dataset alert's home case).
+CloserCheck = Callable[[Alert], Awaitable[bool]]
+
+
+class NotTheHomeCasesAuthor(CloseRefused):
+    """ADR-146 decision 7: a dataset alert is closed by its home case's Authors alone; refused as
+    `not_the_home_cases_author` wherever a close is decided (dispose and approve alike)."""
+
+
+async def _refuse_a_dataset_alert_closer(alert: Alert, closer: CloserCheck | None) -> None:
+    if alert.rule_id.startswith("analyst:dataset:") and (closer is None or not await closer(alert)):
+        raise NotTheHomeCasesAuthor(
+            "Only the Authors of the dataset's home case close a dataset alert."
+        )
 
 
 def needs_second_person(row: QueueRow) -> bool:
@@ -322,18 +410,22 @@ def needs_second_person(row: QueueRow) -> bool:
 async def dispose(
     store: AlertStore,
     graph: GraphPort,
+    analytics: AnalyticsPort,
     investigation_id: str,
     alert_id: str,
     member: Principal,
     *,
     disposition: str,
     reason: str,
+    working_set: WorkingSetService | None = None,
+    closer: CloserCheck | None = None,
 ) -> Alert:
     """Closes the alert with its disposition and reason — or, for a high-severity alert a second
     person may read, proposes the close: the alert waits as `closing`, its disposition and reason
     kept, until another member approves it (`approve_close`)."""
-    row, nodes = await _visible_row(store, graph, alert_id, investigation_id, member)
+    row, nodes = await _visible_row(store, graph, analytics, alert_id, investigation_id, member)
     alert = row.alert
+    await _refuse_a_dataset_alert_closer(alert, closer)
     if alert.status in ("closed", "closing"):
         raise AlertTriageConflict(alert_id)
     if needs_second_person(row):
@@ -344,16 +436,25 @@ async def dispose(
         )  # fmt: skip
     return await _close(
         store, graph, investigation_id, alert, nodes, member, disposition=disposition,
-        reason=reason, expect=["open", "claimed"],
+        reason=reason, expect=["open", "claimed"], working_set=working_set,
     )  # fmt: skip
 
 
 async def approve_close(
-    store: AlertStore, graph: GraphPort, investigation_id: str, alert_id: str, member: Principal
+    store: AlertStore,
+    graph: GraphPort,
+    analytics: AnalyticsPort,
+    investigation_id: str,
+    alert_id: str,
+    member: Principal,
+    *,
+    working_set: WorkingSetService | None = None,
+    closer: CloserCheck | None = None,
 ) -> Alert:
     """The second person approves a proposed close: the alert closes with the proposer's
     disposition and reason, decided by `member`, the proposer kept beside it."""
-    alert, nodes = await _visible_alert(store, graph, alert_id, investigation_id, member)
+    alert, nodes = await _visible_alert(store, graph, analytics, alert_id, investigation_id, member)
+    await _refuse_a_dataset_alert_closer(alert, closer)
     if alert.status != "closing" or alert.disposition is None or alert.close_proposed_by is None:
         raise AlertTriageConflict(alert_id)
     if alert.close_proposed_by == member.id:
@@ -363,16 +464,21 @@ async def approve_close(
     return await _close(
         store, graph, investigation_id, alert, nodes, member, disposition=alert.disposition,
         reason=alert.disposition_reason or "", expect=["closing"],
-        proposed_by=alert.close_proposed_by,
+        proposed_by=alert.close_proposed_by, working_set=working_set,
     )  # fmt: skip
 
 
 async def send_back(
-    store: AlertStore, graph: GraphPort, investigation_id: str, alert_id: str, member: Principal
+    store: AlertStore,
+    graph: GraphPort,
+    analytics: AnalyticsPort,
+    investigation_id: str,
+    alert_id: str,
+    member: Principal,
 ) -> Alert:
     """A proposed close turned down (or withdrawn by its proposer): the alert goes back to the
     person who proposed it, claimed, its proposed disposition cleared."""
-    alert, _ = await _visible_alert(store, graph, alert_id, investigation_id, member)
+    alert, _ = await _visible_alert(store, graph, analytics, alert_id, investigation_id, member)
     if alert.status != "closing":
         raise AlertTriageConflict(alert_id)
     return await store.set_queue_triage(
@@ -393,10 +499,10 @@ async def _close(
     reason: str,
     expect: list[str],
     proposed_by: str | None = None,
+    working_set: WorkingSetService | None = None,
 ) -> Alert:
     alert_id = alert.id
     confirmed_node: str | None = None
-    cited: list[str] | None = None
     if disposition == "true_positive":
         node = nodes.get(alert.alert_node_id) if alert.alert_node_id is not None else None
         # ADR-109 Amendment 7 (owner ruling, 11 October 2026): a true positive on a screening alert
@@ -412,17 +518,47 @@ async def _close(
             and e.provenance.state is not ProvenanceState.ASSERTED
         ]  # fmt: skip
         if (node is not None and node.provenance.state is not ProvenanceState.ASSERTED) or matches:
-            tx = await graph.begin_transaction()
-            try:
-                if node is not None and node.provenance.state is not ProvenanceState.ASSERTED:
-                    confirmed_node = await confirm_node(graph, node.id, member, tx=tx)
-                renamed = {e.id: await confirm_edge(graph, e, member, tx=tx) for e in matches}
-            except Exception:
-                await graph.rollback_transaction(tx)
-                raise
-            await graph.commit_transaction(tx)
-            if renamed:
-                cited = [renamed.get(edge_id, edge_id) for edge_id in alert.edge_ids]
+            # ADR-099 Amendment 15: a close that confirms writes, and a composite is read-only:
+            # in a composite case it goes ahead only for what is wholly the case's layer's (an
+            # alert raised there, item 2), else is refused here, before any write, so the close is
+            # never left half done.
+            confirming: list[Node | Edge] = (
+                [node]
+                if node is not None and node.provenance.state is not ProvenanceState.ASSERTED
+                else []
+            )
+            await refuse_unless_in_the_layer([*confirming, *matches])
+            # ADR-109 Amendments 9 and 10: each confirmed link's repoint is recorded before the
+            # graph's commit and applied after it, whatever the triage write below then does, so a
+            # refused triage (another member's at the same moment) or any failure between the two
+            # stores leaves no alert citing the superseded link.
+            async with store.repointing(graph) as repoint:
+                tx = await graph.begin_transaction()
+                try:
+                    if node is not None and node.provenance.state is not ProvenanceState.ASSERTED:
+                        # Each link the confirm clones is recorded too (ADR-109 Amendment 11).
+                        confirmed_node = await confirm_node(
+                            graph, node.id, member, tx=tx, on_link_cloned=repoint.cloned
+                        )
+                        # The alert's own node is renamed in the same record, so a triage refused
+                        # after the commit cannot leave it naming a superseded node (B6).
+                        await repoint.record_node(node.id, confirmed_node)
+                    for e in matches:
+                        await repoint.record(
+                            e.id, await confirm_edge(graph, e, member, tx=tx), old_type=e.type
+                        )
+                except Exception:
+                    # Its commit never sent, nothing recorded can land: the record goes with it,
+                    # so a close the graph refused before its commit leaves no record.
+                    repoint.never_committed()
+                    await graph.rollback_transaction(tx)
+                    raise
+                await graph.commit_transaction(tx)
+            # The moved alerts' re-marked nodes leave every working set that stored a copy at the
+            # old marking (ADR-109 Amendment 10).
+            if working_set is not None and repoint.remarked_nodes:
+                await purge_copies(working_set, repoint.remarked_nodes)
+                await repoint.purged()
     return await store.set_queue_triage(
         alert_id,
         investigation_id,
@@ -433,8 +569,8 @@ async def _close(
         disposition=disposition,
         disposition_reason=reason,
         decided_by=member.id,
-        alert_node_id=confirmed_node,
-        edge_ids=cited,
+        # No node here: the close's record owns the node's rename (to the newest revision the graph
+        # holds, after any re-mark), and writing the confirmed node back would undo it.
         close_proposed_by=proposed_by,
     )
 
@@ -446,21 +582,45 @@ class AssignmentRefused(Exception):
 async def assign(
     store: AlertStore,
     graph: GraphPort,
+    analytics: AnalyticsPort,
     investigation_id: str,
     alert_id: str,
     member: Principal,
     *,
     assignee: str,
     allowed: set[str],
+    lead_of: Collection[str] = (),
+    team_members: Mapping[str, set[str]] | None = None,
 ) -> Alert:
     """ADR-133 stage (a): give an open or claimed alert to one member of the case. `allowed` is the
     route's answer to who may be given work in this case (its Editors and Authors). Only a case
     alert (a typology alert, which every member of the case may read) is given to someone else: an
     alert shared with a team, or its owner's alone, may be read by people the case's member list
     does not show, so it is claimed by a person who can see it, never handed to one who may not."""
-    row, _ = await _visible_row(store, graph, alert_id, investigation_id, member)
+    row, _ = await _visible_row(store, graph, analytics, alert_id, investigation_id, member)
     if row.alert.status == "closed":
         raise AlertTriageConflict(alert_id)
+    routed = row.alert.routed_team
+    if routed is not None and assignee != member.id:
+        # ADR-146 decision 8 and Amendment 1: the team's lead (or cover) gives one of the team's
+        # alerts to a named member of the team who holds the case, and no one else gives it.
+        if routed not in lead_of:
+            raise AssignmentRefused(
+                "Only the team's lead, or its cover, gives one of the team's alerts to a member."
+            )
+        if assignee not in (team_members or {}).get(routed, set()):
+            raise AssignmentRefused(
+                "That person is not a member of the team who can work on this case's alerts."
+            )
+        return await store.set_queue_triage(
+            alert_id, investigation_id, member, expect_status=["open", "claimed"],
+            status="claimed", assignee=assignee,
+        )  # fmt: skip
+    if routed is not None:
+        return await store.set_queue_triage(
+            alert_id, investigation_id, member, expect_status=["open", "claimed"],
+            status="claimed", assignee=member.id,
+        )  # fmt: skip
     if assignee not in allowed:
         raise AssignmentRefused("That person is not a member of this case who can work on alerts.")
     if row.audience != "case" and assignee != member.id:
@@ -474,7 +634,46 @@ async def assign(
     )  # fmt: skip
 
 
+class SuppressRefused(Exception):
+    """*Suppress until…* refused, in words (ADR-146 Amendment 1)."""
+
+
+async def suppress(
+    store: AlertStore,
+    graph: GraphPort,
+    analytics: AnalyticsPort,
+    investigation_id: str,
+    alert_id: str,
+    member: Principal,
+    *,
+    until: date,
+    reason: str,
+    lead_of: Collection[str],
+    today: date | None = None,
+) -> Alert:
+    """ADR-146 Amendment 1: the team's lead, or its cover while the cover lasts, suppresses one of
+    the team's alerts until a day at most 90 days ahead, with a reason. Refused for anyone else,
+    a member of the team included, and for an alert routed to no team (it has no lead)."""
+    row, _ = await _visible_row(store, graph, analytics, alert_id, investigation_id, member)
+    routed = row.alert.routed_team
+    if routed is None or routed not in lead_of:
+        raise SuppressRefused("Only the team's lead, or its cover, suppresses one of its alerts.")
+    now = today or datetime.now(UTC).date()
+    if until < now:
+        raise SuppressRefused("A suppression ends today or later.")
+    if until > now + timedelta(days=SUPPRESS_DAYS_MAX):
+        raise SuppressRefused(f"A suppression ends at most {SUPPRESS_DAYS_MAX} days ahead.")
+    if row.alert.status == "closed":
+        raise AlertTriageConflict(alert_id)
+    return await store.set_suppression(
+        alert_id, investigation_id, member, until=until, reason=reason
+    )
+
+
 __all__ = [
+    "SuppressRefused",
+    "suppress",
+    "suppressed_today",
     "AssignmentRefused",
     "CloseRefused",
     "approve_close",

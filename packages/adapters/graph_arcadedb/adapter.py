@@ -38,9 +38,14 @@ from ports.graph import (
     RARITY_PAIR_CAP,
     AmbiguousElementId,
     BulkEdgeResult,
+    DatasetFootprint,
     FindLimitExceeded,
+    LinkCloned,
     NodeSuggestions,
+    NotPromotable,
+    PromotionReverted,
     RarityTooLarge,
+    RestoredElements,
     StoredLink,
     StoredNode,
     SubgraphTooLarge,
@@ -53,6 +58,7 @@ from schemas.domain import (
     EdgeId,
     EdgeWrite,
     ExpandRequest,
+    Grading,
     Handling,
     Interval,
     ListNodesPage,
@@ -85,6 +91,7 @@ from schemas.explore import (
     SharedContacts,
     TypeCounts,
 )
+from schemas.ingest import LinkPriorState, stored_digest
 from schemas.merge import merge_datasets, merge_interval, merge_properties, merge_provenance
 from schemas.strength import (
     SHARED_VALUE,
@@ -129,7 +136,7 @@ from .builders import (
     suggestion_scope,
 )
 from .bulk import BulkEdgeLoader, BulkTransport, GremlinBulkTransport
-from .client import ArcadeDBClient
+from .client import ArcadeDBClient, ArcadeDBError
 from .gremlin_literals import (
     groovy_identifier,
     groovy_string_list_literal,
@@ -376,6 +383,11 @@ class GraphArcadeDBAdapter:
             )
             type_name = groovy_identifier(physical_type_name(write.type))
             set_clause = ", ".join(f"{key} = :{key}" for key in props)
+            if replaces_reverted:
+                # A fresh create is no longer withdrawn (ADR-110 Amendment 6 point 3): the row came
+                # back, and the snapshot's revert has nothing of its own left here.
+                props["withdrawn_by_load"] = None
+                set_clause = ", ".join(f"{key} = :{key}" for key in props)
             if existing is not None:  # live (merged above) or reverted (replaced whole)
                 await self._client.sql(
                     f"UPDATE {type_name} SET {set_clause} WHERE id = :id",
@@ -669,7 +681,11 @@ class GraphArcadeDBAdapter:
             )
             if existing is not None:
                 edge_lit = groovy_string_literal(edge_id)
-                command = f'g.E().has("id",{edge_lit}){property_steps}'
+                # ADR-110 Amendment 18: its own type alone, never another type holding the id.
+                command = (
+                    f"g.E().hasLabel({groovy_string_literal(type_name)})"
+                    f'.has("id",{edge_lit}){property_steps}'
+                )
                 await self._client.gremlin(command, params=bound_params, session_id=tx)
                 if merged_interval is not None and merged_interval.valid_to is None:
                     # ADR-127 decision 11: a merge that leaves the span open writes no flattened
@@ -782,7 +798,9 @@ class GraphArcadeDBAdapter:
             )
         ]
 
-    async def _record_ids(self, type_names: Sequence[str], ids: list[str]) -> list[str]:
+    async def _record_ids(
+        self, type_names: Sequence[str], ids: list[str], *, tx: TxId | None = None
+    ) -> list[str]:
         """The record ids of the elements holding `ids`, over each stored type in `type_names`
         (ADR-124 decision 6). One SQL query per type, run together: a type's own unique `id` index
         answers it, which Gremlin's `has("id", within(...))` does not (it scans the store). The
@@ -791,7 +809,7 @@ class GraphArcadeDBAdapter:
         so there is no missing type to read as no rows: any error is raised."""
         found = await asyncio.gather(
             *(
-                self._client.sql(render_record_id_lookup_sql(t), params={"ids": ids})
+                self._client.sql(render_record_id_lookup_sql(t), params={"ids": ids}, session_id=tx)
                 for t in type_names
             )
         )
@@ -1113,6 +1131,41 @@ class GraphArcadeDBAdapter:
             degree=sum(degree_by_type.values()),
             degree_by_type=degree_by_type,
         )
+
+    async def dataset_footprints(
+        self, dataset_ids: Sequence[str], principal: Principal
+    ) -> dict[str, DatasetFootprint]:
+        """`GraphPort.dataset_footprints`: per dataset, one query for its nodes and one for its
+        links, each the access step (`gremlin_has_step`) with the dataset asked as the reader's
+        datasets, a link's ends held to the handling axes alone, so a link from a loaded node
+        counts. The counts and sums are the store's (`asString().length()`,
+        `select("size_bytes")`)."""
+        asked = sorted(set(dataset_ids))
+        ends = self._access.gremlin_has_step(principal.model_copy(update={"datasets": None}))
+        size = 'coalesce(unfold().values("properties").asString().length().sum(),constant(0))'
+        pictures = (
+            'coalesce(unfold().filter(values("properties").select("media_kind").is("image"))'
+            '.values("properties").select("size_bytes").sum(),constant(0))'
+        )
+
+        async def one(dataset: str) -> DatasetFootprint:
+            reader = principal.model_copy(update={"datasets": [dataset]})
+            has = self._access.gremlin_has_step(reader)
+            (nodes,) = await self._client.gremlin(
+                f'g.V().{has}.fold().project("n","b","p")'
+                f".by(count(local)).by({size}).by({pictures})"
+            )
+            (edges,) = await self._client.gremlin(
+                f"g.E().{has}.where(outV().{ends}).where(inV().{ends})"
+                f'.fold().project("n","b").by(count(local)).by({size})'
+            )
+            return DatasetFootprint(
+                nodes=int(nodes["n"]), edges=int(edges["n"]),
+                properties_bytes=int(nodes["b"]) + int(edges["b"]), picture_bytes=int(nodes["p"]),
+            )  # fmt: skip
+
+        found = await asyncio.gather(*(one(d) for d in asked))
+        return dict(zip(asked, found, strict=True))
 
     async def type_counts(self, principal: Principal) -> TypeCounts:
         nodes_query, edges_query = render_type_counts_gremlin(self._access, principal)
@@ -1697,12 +1750,182 @@ class GraphArcadeDBAdapter:
             *[("node", t, ids) for t, ids in await self._holders("vertex", node_ids, tx)],
             *[("link", t, ids) for t, ids in await self._holders("edge", edge_ids, tx)],
         ]
+        # A revert clears `withdrawn_by_load` too (ADR-110 Amendment 6 point 3): reverting the load
+        # that made an element takes it back for good, so the withdrawing refresh's later revert
+        # cannot restore it.
         for _, type_name, ids in plan:
             await self._client.sql(
-                f"UPDATE `{groovy_identifier(type_name)}` SET reverted = true WHERE id IN :ids",
+                f"UPDATE `{groovy_identifier(type_name)}` SET reverted = true, "
+                "withdrawn_by_load = null WHERE id IN :ids",
                 params={"ids": ids},
                 session_id=tx,
             )
+
+    async def withdraw_elements(
+        self, node_ids: Sequence[NodeId], edge_ids: Sequence[EdgeId], load_id: str, tx: TxId
+    ) -> None:
+        # Resolved as a revert resolves (an ambiguous id refused before anything is written), and
+        # only a live element is withdrawn: one already reverted is not this refresh's to restore.
+        plan = [
+            *[t_ids for t_ids in await self._holders("vertex", node_ids, tx)],
+            *[t_ids for t_ids in await self._holders("edge", edge_ids, tx)],
+        ]
+        for type_name, ids in plan:
+            await self._client.sql(
+                f"UPDATE `{groovy_identifier(type_name)}` SET reverted = true, "
+                "withdrawn_by_load = :load WHERE id IN :ids AND reverted = false",
+                params={"ids": ids, "load": load_id},
+                session_id=tx,
+            )
+
+    async def promote_elements(
+        self,
+        node_ids: Sequence[NodeId],
+        edge_ids: Sequence[EdgeId],
+        dataset_id: str,
+        load_id: str,
+        tx: TxId,
+    ) -> None:
+        # Resolved and checked first, written after (all or nothing, ADR-143 decision 8): every id
+        # must be held by exactly one type of its kind and be live, or nothing is written.
+        wanted = len(set(node_ids)) + len(set(edge_ids))
+        plan = [
+            *(await self._holders("vertex", sorted(set(node_ids)), tx)),
+            *(await self._holders("edge", sorted(set(edge_ids)), tx)),
+        ]
+        rows: list[tuple[str, dict[str, Any]]] = []
+        for type_name, ids in plan:
+            found = await self._client.sql(
+                f"SELECT id, datasets, reverted, superseded_by, promoted_by_load FROM "
+                f"`{groovy_identifier(type_name)}` WHERE id IN :ids",
+                params={"ids": ids},
+                session_id=tx,
+            )
+            rows += [(type_name, r) for r in found]
+        # Live, and not promoted by another load already (one element, one promotion: a second
+        # stamp would leave the first load's revert taking back nothing).
+        live = [
+            (t, r)
+            for t, r in rows
+            if r.get("reverted") is not True
+            and not r.get("superseded_by")
+            and not r.get("promoted_by_load")
+        ]
+        self._refuse_unless_all_live(wanted, len(live))
+        for type_name, row in live:
+            await self._client.sql(
+                f"UPDATE `{groovy_identifier(type_name)}` SET datasets = :datasets, "
+                "promoted_by_load = :load WHERE id = :id",
+                params={
+                    "id": row["id"],
+                    "load": load_id,
+                    "datasets": merge_datasets(row.get("datasets"), [dataset_id]),
+                },
+                session_id=tx,
+            )
+
+    @staticmethod
+    def _refuse_unless_all_live(wanted: int, live: int) -> None:
+        """All or nothing (ADR-143 decision 8): refused before anything is written."""
+        if live != wanted:
+            raise NotPromotable(wanted - live)
+
+    async def revert_promotion(self, load_id: str, dataset_id: str, tx: TxId) -> PromotionReverted:
+        counts = {"vertex": 0, "edge": 0}
+        for kind in counts:
+            for type_name in await self._types_with_unique_id(kind):
+                name = groovy_identifier(type_name)
+                found = await self._client.sql(
+                    f"SELECT id, datasets FROM `{name}` WHERE promoted_by_load = :load",
+                    params={"load": load_id},
+                    session_id=tx,
+                )
+                for row in found:
+                    kept = sorted(set(row.get("datasets") or []) - {dataset_id})
+                    await self._client.sql(
+                        f"UPDATE `{name}` SET datasets = :datasets, promoted_by_load = null "
+                        "WHERE id = :id",
+                        params={"id": row["id"], "datasets": kept},
+                        session_id=tx,
+                    )
+                counts[kind] += len(found)
+        return PromotionReverted(nodes=counts["vertex"], edges=counts["edge"])
+
+    async def withdraw_layer(
+        self, dataset_id: str, withdrawal: str, tx: TxId
+    ) -> PromotionReverted:
+        # By the `datasets BY ITEM` index, then only an element wholly the layer's: one promoted
+        # from it holds the source too and is left (Amendment 2 decision 1).
+        counts = {"vertex": 0, "edge": 0}
+        for kind in counts:
+            for type_name in await self._types_with_unique_id(kind):
+                name = groovy_identifier(type_name)
+                found = await self._client.sql(
+                    f"SELECT id, datasets FROM `{name}` WHERE datasets CONTAINS :ds "
+                    "AND reverted = false",
+                    params={"ds": dataset_id},
+                    session_id=tx,
+                )
+                ids = [str(r["id"]) for r in found if list(r.get("datasets") or []) == [dataset_id]]
+                for chunk in _id_chunks(ids):
+                    await self._client.sql(
+                        f"UPDATE `{name}` SET reverted = true, withdrawn_by_load = :w "
+                        "WHERE id IN :ids AND reverted = false",
+                        params={"ids": chunk, "w": withdrawal},
+                        session_id=tx,
+                    )
+                counts[kind] += len(ids)
+        return PromotionReverted(nodes=counts["vertex"], edges=counts["edge"])
+
+    async def restore_withdrawn(self, load_id: str, tx: TxId) -> RestoredElements:
+        nodes: list[NodeId] = []
+        for type_name in await self._types_with_unique_id("vertex"):
+            name = groovy_identifier(type_name)
+            rows = await self._client.sql(
+                f"SELECT id FROM `{name}` WHERE withdrawn_by_load = :load",
+                params={"load": load_id},
+                session_id=tx,
+            )
+            ids = [str(r["id"]) for r in rows]
+            for chunk in _id_chunks(ids):
+                await self._client.sql(
+                    f"UPDATE `{name}` SET reverted = false, withdrawn_by_load = null "
+                    "WHERE id IN :ids",
+                    params={"ids": chunk},
+                    session_id=tx,
+                )
+            nodes.extend(ids)
+        edges: list[EdgeId] = []
+        for type_name in await self._types_with_unique_id("edge"):
+            name = groovy_identifier(type_name)
+            rows = await self._client.sql(
+                f"SELECT id, source, target FROM `{name}` WHERE withdrawn_by_load = :load",
+                params={"load": load_id},
+                session_id=tx,
+            )
+            back: list[str] = []
+            for row in rows:
+                # Each link written once: a live link of this type between the same ends, written
+                # since, keeps the pair, and the withdrawn one stays withdrawn (either direction,
+                # since an undirected type may store the pair either way round).
+                live = await self._client.sql(
+                    f"SELECT count(*) AS n FROM `{name}` WHERE reverted = false "
+                    "AND superseded_by IS NULL AND id <> :id AND ((source = :s AND target = :t) "
+                    "OR (source = :t AND target = :s))",
+                    params={"id": row["id"], "s": row["source"], "t": row["target"]},
+                    session_id=tx,
+                )
+                if not live or int(live[0].get("n", 0)) == 0:
+                    back.append(str(row["id"]))
+            for chunk in _id_chunks(back):
+                await self._client.sql(
+                    f"UPDATE `{name}` SET reverted = false, withdrawn_by_load = null "
+                    "WHERE id IN :ids",
+                    params={"ids": chunk},
+                    session_id=tx,
+                )
+            edges.extend(back)
+        return RestoredElements(node_ids=tuple(nodes), edge_ids=tuple(edges))
 
     async def _holders(
         self, kind: str, ids: Sequence[str], tx: TxId | None = None
@@ -1741,19 +1964,22 @@ class GraphArcadeDBAdapter:
             for chunk in _id_chunks(found_ids)
         ]
 
-    async def live_edges_touching(self, node_ids: Sequence[NodeId]) -> set[EdgeId]:
+    async def live_edges_touching(
+        self, node_ids: Sequence[NodeId], tx: TxId | None = None
+    ) -> set[EdgeId]:
         found: set[EdgeId] = set()
         types = None
         for chunk in _id_chunks(node_ids):
             types = types if types is not None else await self._types_with_unique_id("vertex")
-            rids = await self._record_ids(types, chunk)
+            rids = await self._record_ids(types, chunk, tx=tx)
             if not rids:
                 continue
             # By record id, not by `has("id", ...)`: the node is read from its index, and only its
             # own links are walked. Live links only: neither reverted nor superseded, as every read.
             ids_literal = groovy_string_list_literal(rids)
             rows = await self._client.gremlin(
-                f'g.V({ids_literal}).bothE().has("reverted",false).hasNot("superseded_by").values("id")'
+                f'g.V({ids_literal}).bothE().has("reverted",false).hasNot("superseded_by").values("id")',
+                session_id=tx,
             )
             found.update(str(row["result"]) for row in rows)
         return found
@@ -1805,13 +2031,23 @@ class GraphArcadeDBAdapter:
                         load_id=None if load_id is None else str(load_id),
                         reverted=row.get("reverted") is True,
                         superseded=row.get("superseded_by") is not None,
+                        superseded_by=(
+                            None if row.get("superseded_by") is None else str(row["superseded_by"])
+                        ),
                     )
         return found
 
-    async def stored_link_states(self, edge_ids: Sequence[EdgeId]) -> dict[EdgeId, StoredLink]:
-        gathered: dict[EdgeId, list[tuple[bool, bool]]] = {}
+    async def stored_link_states(
+        self, edge_ids: Sequence[EdgeId], *, edge_type: str | None = None
+    ) -> dict[EdgeId, StoredLink]:
+        gathered: dict[EdgeId, list[tuple[bool, str | None]]] = {}
         chunks = _id_chunks(edge_ids)
-        types = await self._types_with_unique_id("edge") if chunks else []
+        if not chunks:
+            types: list[str] = []
+        elif edge_type is not None:
+            types = [physical_type_name(edge_type)]  # that type's index alone
+        else:
+            types = await self._types_with_unique_id("edge")
         for chunk in chunks:
             results = await asyncio.gather(
                 *(
@@ -1825,17 +2061,115 @@ class GraphArcadeDBAdapter:
             )
             for rows in results:
                 for row in rows:
+                    by = row.get("superseded_by")
                     gathered.setdefault(str(row["id"]), []).append(
-                        (row.get("reverted") is True, row.get("superseded_by") is not None)
+                        (row.get("reverted") is True, None if by is None else str(by))
                     )
         # An id two types hold is read as the worst of them: superseded if either copy is,
         # reverted only if both are, so the revert refuses when in doubt.
         return {
             edge_id: StoredLink(
-                reverted=all(r for r, _ in states), superseded=any(sup for _, sup in states)
+                reverted=all(r for r, _ in states),
+                superseded=any(by is not None for _, by in states),
+                superseded_by=next((by for _, by in states if by is not None), None),
+                held_by=len(states),
             )
             for edge_id, states in gathered.items()
         }
+
+    # --- a link's prior state (ADR-110 Amendment 16) ---------------------------------
+
+    #: What a stored link holds beside its properties that its prior state leaves out: ArcadeDB's
+    #: own record fields, and the flattened span, which a restore derives from `interval` exactly
+    #: as `upsert_edges` writes it (epoch milliseconds wrapped in `Date`).
+    _NOT_PRIOR_STATE = frozenset({"valid_from", "valid_to"})
+
+    async def read_link_state(
+        self, edge_id: EdgeId, edge_type: str, tx: TxId | None = None
+    ) -> LinkPriorState | None:
+        type_name = groovy_identifier(physical_type_name(edge_type))
+        rows = await self._client.sql(
+            f"SELECT FROM `{type_name}` WHERE id = :id",
+            params={"id": edge_id},
+            session_id=tx,
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        audit = AuditStub.model_validate(row["audit"])
+        return LinkPriorState(
+            edge_id=edge_id,
+            edge_type=edge_type,
+            revision=audit.revision,
+            load_id=audit.load_id,
+            handling=Handling.model_validate(row["handling"]),
+            stored=self._as_stored(row),
+        )
+
+    def _as_stored(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            k: v for k, v in row.items() if not k.startswith("@") and k not in self._NOT_PRIOR_STATE
+        }
+
+    async def restore_link_state(self, state: LinkPriorState, tx: TxId) -> bool:
+        type_name = groovy_identifier(physical_type_name(state.edge_type))
+        rows = await self._client.sql(
+            f"SELECT FROM `{type_name}` WHERE id = :id",
+            params={"id": state.edge_id},
+            session_id=tx,
+        )
+        if not rows or state.left_digest is None:
+            return False
+        current = rows[0]
+        held = stored_digest(self._as_stored(current))
+        if held == stored_digest(state.stored):
+            return True  # put back already, by an earlier attempt
+        if held != state.left_digest:
+            return False  # written since, by anyone
+        props = {k: v for k, v in state.stored.items() if k != "id"}
+        # Rule 3: the marking the state was read at, written back whole, never a weaker one.
+        marking = state.handling
+        props.update(
+            {
+                "handling_classification": marking.classification,
+                "handling_code": marking.handling_code,
+                "owning_unit": marking.owning_unit,
+                "originator": marking.originator,
+                "handling": marking.model_dump(mode="json"),
+            }
+        )
+        interval = Interval.model_validate(props["interval"]) if props.get("interval") else None
+        if interval is not None:
+            props["valid_from"] = int(interval.valid_from.timestamp() * 1000)
+            if interval.valid_to is not None:
+                props["valid_to"] = int(interval.valid_to.timestamp() * 1000)
+        bound = {f"prop_{key}": value for key, value in props.items()}
+        steps = "".join(
+            f".property({key!r}, new Date(prop_{key}))"
+            if key in self._NOT_PRIOR_STATE
+            else f".property({key!r}, prop_{key})"
+            for key in props
+        )
+        await self._client.gremlin(
+            # Its own type alone: another type holding the same id is never written (MF11).
+            f"g.E().hasLabel({groovy_string_literal(type_name)})"
+            f'.has("id",{groovy_string_literal(state.edge_id)}){steps}',
+            params=bound,
+            session_id=tx,
+        )
+        # What the later write added and the prior state never held (a closed span's end, a
+        # property of its own) goes, so the link reads exactly as it did.
+        added = sorted(
+            k for k in current
+            if not k.startswith("@") and k != "id" and k not in props
+        )  # fmt: skip
+        for key in added:
+            await self._client.sql(
+                f"UPDATE `{type_name}` REMOVE `{groovy_identifier(key)}` WHERE id = :id",
+                params={"id": state.edge_id},
+                session_id=tx,
+            )
+        return True
 
     # --- one-off provenance rewrite -------------------------------------------
 
@@ -1874,9 +2208,63 @@ class GraphArcadeDBAdapter:
                     break
         return changed
 
+    async def regrade_drawn(self, element_id: str, grading: Grading, original: Grading) -> bool:
+        """ADR-143 Amendment 6: `GraphPort.regrade_drawn`. The element's stored type is found from
+        its unique `id` index, vertex or edge (`_holders`); its stored `provenance` is read whole,
+        with no access step (an operator's write, not a reader's read), and written back with the
+        drawn grade and original alone changed. Nothing else in the record is written: not the
+        audit, not a link's occurrences or weight, not a node's resolution."""
+        held = [
+            type_name
+            for kind in ("vertex", "edge")
+            for type_name, ids in await self._holders(kind, [element_id])
+            if element_id in ids
+        ]
+        if not held:
+            return False
+        if len(held) > 1:
+            raise AmbiguousElementId("element", len(held))
+        quoted = groovy_identifier(held[0])
+        rows = await self._client.sql(
+            f"SELECT provenance, reverted, superseded_by FROM `{quoted}` WHERE id = :id",
+            params={"id": element_id},
+        )
+        if len(rows) != 1:
+            return False
+        row = rows[0]
+        provenance = row.get("provenance")
+        if not isinstance(provenance, dict):
+            return False
+        drawn = provenance.get("drawn")
+        if row.get("reverted") is True or row.get("superseded_by") or not isinstance(drawn, dict):
+            return False
+        changed = {
+            **provenance,
+            "drawn": {
+                **drawn,
+                "grading": grading.model_dump(mode="json"),
+                "original_grading": original.model_dump(mode="json"),
+            },
+        }
+        # Guarded in the write itself, not only by the read before it: a record reverted or
+        # superseded between the two is not changed, and the count says so.
+        written = await self._client.sql(
+            f"UPDATE `{quoted}` SET provenance = :provenance WHERE id = :id "
+            "AND (reverted IS NULL OR reverted = false) AND superseded_by IS NULL",
+            params={"provenance": changed, "id": element_id},
+        )
+        return _updated_count(written) == 1
+
     # --- supersession --------------------------------------------------------
 
-    async def supersede_node(self, node_id: NodeId, replacement: NodeWrite, tx: TxId) -> NodeId:
+    async def supersede_node(
+        self,
+        node_id: NodeId,
+        replacement: NodeWrite,
+        tx: TxId,
+        *,
+        on_link_cloned: LinkCloned | None = None,
+    ) -> NodeId:
         schema = self._require_schema()
         entity_type = schema.entity_type(replacement.type)
         if entity_type is None:
@@ -1930,12 +2318,22 @@ class GraphArcadeDBAdapter:
         )
 
         await self._repoint_incident_edges(
-            node_id, new_node_id, created_by=replacement.created_by, tx=tx
+            node_id,
+            new_node_id,
+            created_by=replacement.created_by,
+            tx=tx,
+            on_link_cloned=on_link_cloned,
         )
         return new_node_id
 
     async def _repoint_incident_edges(
-        self, old_node_id: NodeId, new_node_id: NodeId, *, created_by: str, tx: TxId
+        self,
+        old_node_id: NodeId,
+        new_node_id: NodeId,
+        *,
+        created_by: str,
+        tx: TxId,
+        on_link_cloned: LinkCloned | None = None,
     ) -> None:
         """`superseded_by` only marks the old node invisible by default —
         it does nothing to the edges still recorded against it, and a
@@ -1951,26 +2349,35 @@ class GraphArcadeDBAdapter:
         old_lit = groovy_string_literal(old_node_id)
         now = now_utc()
 
+        # Both lists are read before anything is cloned: a clone of an out-link is itself a link
+        # of this node only if it is a self-loop, and an in-link read after the out-links were
+        # cloned would find such a clone, and the self-loop once more (L2.8c review round 2). A
+        # self-loop is an out-link and an in-link both: it is cloned once, from the new node to
+        # itself, and left out of the in-links.
         out_edges = await self._client.gremlin(
             f'g.V().has("id",{old_lit}).outE().has("reverted",false).elementMap()',
             session_id=tx,
         )
-        for edge_record in out_edges:
-            await self._clone_edge_onto(
-                edge_record,
-                source=new_node_id,
-                target=edge_record["target"],
-                created_by=created_by,
-                now=now,
-                tx=tx,
-            )
-
         in_edges = await self._client.gremlin(
             f'g.V().has("id",{old_lit}).inE().has("reverted",false).elementMap()',
             session_id=tx,
         )
+        for edge_record in out_edges:
+            target = edge_record["target"]
+            clone = await self._clone_edge_onto(
+                edge_record,
+                source=new_node_id,
+                target=new_node_id if target == old_node_id else target,
+                created_by=created_by,
+                now=now,
+                tx=tx,
+            )
+            await self._name_clone(old_lit, edge_record, clone, tx, on_link_cloned)
+
         for edge_record in in_edges:
-            await self._clone_edge_onto(
+            if edge_record["source"] == old_node_id:
+                continue  # a self-loop, cloned with the out-links
+            clone = await self._clone_edge_onto(
                 edge_record,
                 source=edge_record["source"],
                 target=new_node_id,
@@ -1978,6 +2385,7 @@ class GraphArcadeDBAdapter:
                 now=now,
                 tx=tx,
             )
+            await self._name_clone(old_lit, edge_record, clone, tx, on_link_cloned)
 
         if out_edges or in_edges:
             await self._client.gremlin(
@@ -1985,6 +2393,30 @@ class GraphArcadeDBAdapter:
                 '.property("reverted", true)',
                 session_id=tx,
             )
+
+    async def _name_clone(
+        self,
+        old_node_lit: str,
+        edge_record: dict[str, Any],
+        clone: EdgeId,
+        tx: TxId,
+        on_link_cloned: LinkCloned | None,
+    ) -> None:
+        """The original names its clone as `superseded_by`, as `supersede_edge` marks the link it
+        replaces, so the graph's own stored state says where it went; and the caller is told,
+        before the commit (ADR-109 Amendment 11). The original is found from the corrected node
+        by its own type and id, so another type holding the same id (ADR-110 Amendment 18) is
+        never marked."""
+        old_type = logical_type_name(edge_record["label"])
+        label_lit = groovy_string_literal(edge_record["label"])
+        await self._client.gremlin(
+            f'g.V().has("id",{old_node_lit}).bothE({label_lit}).has("reverted",false)'
+            f'.has("id",{groovy_string_literal(edge_record["id"])})'
+            f'.property("superseded_by", {groovy_string_literal(clone)})',
+            session_id=tx,
+        )
+        if on_link_cloned is not None:
+            await on_link_cloned(str(edge_record["id"]), clone, old_type)
 
     async def _clone_edge_onto(
         self,
@@ -2058,7 +2490,9 @@ class GraphArcadeDBAdapter:
         )
         return cloned_edge_id
 
-    async def supersede_edge(self, edge_id: EdgeId, replacement: EdgeWrite, tx: TxId) -> EdgeId:
+    async def supersede_edge(
+        self, edge_id: EdgeId, replacement: EdgeWrite, tx: TxId, *, old_type: str
+    ) -> EdgeId:
         """Unlike `supersede_node`, nothing needs repointing: nothing in
         this domain model references an edge by id except an assessment's
         evidence list (`01_DOMAIN_MODEL.md` §5), which is expected to
@@ -2077,8 +2511,11 @@ class GraphArcadeDBAdapter:
         validate_properties(edge_type, replacement.properties)
 
         edge_lit = groovy_string_literal(edge_id)
+        # ADR-110 Amendment 18: the old link's own type, named by the caller, alone; another type
+        # holding the same id is never read or marked.
+        old_label = groovy_string_literal(groovy_identifier(physical_type_name(old_type)))
         existing_results = await self._client.gremlin(
-            f'g.E().has("id",{edge_lit}).elementMap()', session_id=tx
+            f'g.E().hasLabel({old_label}).has("id",{edge_lit}).elementMap()', session_id=tx
         )
         if not existing_results:
             raise OntologyError(f"cannot supersede {edge_id!r}: no such edge")
@@ -2106,7 +2543,8 @@ class GraphArcadeDBAdapter:
         # out: its occurrences live on in the replacement (ADR-120 Amendment 5).
         new_id_lit = groovy_string_literal(replacement_edge_id)
         await self._client.gremlin(
-            f'g.E().has("id",{edge_lit}).property("superseded_by", {new_id_lit})',
+            f'g.E().hasLabel({old_label}).has("id",{edge_lit})'
+            f'.property("superseded_by", {new_id_lit})',
             session_id=tx,
         )
         type_name = groovy_identifier(physical_type_name(replacement.type))
@@ -2156,3 +2594,12 @@ def _logical_counts(results: list[Any]) -> dict[str, int]:
         name = logical_type_name(label)
         counts[name] = counts.get(name, 0) + int(count)
     return counts
+
+
+def _updated_count(rows: Any) -> int:
+    """How many records an ArcadeDB `UPDATE` changed, from its answer (`[{"count": n}]`)."""
+    if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict):
+        count = rows[0].get("count")
+        if isinstance(count, int):
+            return count
+    raise ArcadeDBError(f"an UPDATE answered {rows!r}, not its count")

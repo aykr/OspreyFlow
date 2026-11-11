@@ -14,11 +14,11 @@ unreachable identity provider or a deployment with no admin-users URL yields no 
 failed read**: the caller shows the id, as before ADR-106.
 
 **Who is a person (build order step 15).** The same read says whether an id is a person: an account
-the identity provider holds that is not a client's service account (Keycloak marks one with
-`serviceAccountClientId`). An id that is no account (a seed's own principal, such as
-`ledger-seed-worker`, which holds a grant on the case it made) is no person either. `people` answers
-for the ids a caller already serves, under decision 3's rule, and fails closed: an id it could not
-ask about is not counted a person.
+the identity provider holds, enabled, that is not a client's service account (Keycloak marks one
+with `serviceAccountClientId`). A disabled account still has its name read, but is no person. An
+id that is no account (a seed's own principal, such as `ledger-seed-worker`, which holds a grant on
+the case it made) is no person either. `people` answers for the ids a caller already serves, under
+decision 3's rule, and fails closed: an id it could not ask about is not counted a person.
 """
 
 from __future__ import annotations
@@ -34,11 +34,15 @@ from principal_auth import OidcSettings
 NAME_TTL_SECONDS = 300.0
 
 
-def _display_name(account: dict[str, object]) -> str | None:
-    """"firstName lastName", or the username when the account carries neither name part."""
+def _full_name(account: dict[str, object]) -> str | None:
+    """ "firstName lastName", or None when the account carries neither name part."""
     parts = [str(account.get(key) or "").strip() for key in ("firstName", "lastName")]
-    full = " ".join(part for part in parts if part)
-    return full or str(account.get("username") or "").strip() or None
+    return " ".join(part for part in parts if part) or None
+
+
+def _display_name(account: dict[str, object]) -> str | None:
+    """ "firstName lastName", or the username when the account carries neither name part."""
+    return _full_name(account) or str(account.get("username") or "").strip() or None
 
 
 class PrincipalNameDirectory:
@@ -53,6 +57,8 @@ class PrincipalNameDirectory:
         self._names: dict[str, tuple[str | None, float]] = {}
         #: id -> whether it is a person (an account that is no service account), kept with its name.
         self._persons: dict[str, bool] = {}
+        #: id -> its name parts alone, never the username (`full_names`), kept with its name.
+        self._full: dict[str, str | None] = {}
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -83,6 +89,15 @@ class PrincipalNameDirectory:
             return {}
         known = await self._read(ids)
         return {i: name for i, (name, _) in known.items() if name}
+
+    async def full_names(self, ids: Iterable[str]) -> dict[str, str]:
+        """As `display_names`, but a name only from the account's name parts: an account with
+        neither is absent, never served by its username, which is the identity provider's
+        identifier (Admin › Audit and Operations, ADR-145 Amendment 6 point 2)."""
+        if not self._configured():
+            return {}
+        known = await self._read(ids)
+        return {i: full for i in known if (full := self._full.get(i))}
 
     async def people(self, ids: Iterable[str]) -> set[str] | None:
         """Of the ids given, those the identity provider holds as people; `None` on a deployment
@@ -124,12 +139,18 @@ class PrincipalNameDirectory:
             if response.status_code == 200:
                 account = response.json()
                 name = _display_name(account)
-                person = not account.get("serviceAccountClientId")
+                # A disabled account is no person: whoever held it answers for nothing now.
+                # Keycloak always carries `enabled`; one without it is not counted (fail closed).
+                person = account.get("enabled") is True and not account.get(
+                    "serviceAccountClientId"
+                )
                 self._names[principal_id] = (name, now + self._ttl)
                 self._persons[principal_id] = person
+                self._full[principal_id] = _full_name(account)
                 resolved[principal_id] = (name, person)
             elif response.status_code == 404:
                 self._names[principal_id] = (None, now + self._ttl)
                 self._persons[principal_id] = False
+                self._full[principal_id] = None
                 resolved[principal_id] = (None, False)
         return resolved

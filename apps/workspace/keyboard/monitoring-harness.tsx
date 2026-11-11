@@ -1,8 +1,11 @@
-// The Monitoring place with a synthetic case's alerts of every kind (ADR-133 decision 5, stage (a)),
+// Rules and Monitoring (ADR-146 decision 2; the Monitoring place before it) with a synthetic case's
+// alerts of every kind (ADR-133 decision 5, stage (a)),
 // served by the page itself: for the every-harness axe scan (`a11y/every-harness.spec.ts`, which
 // finds this page by its directory) and for the Product Overview deck's screens, in both brands
-// (`?brand=govuk`). Nothing here reaches a server. `?open=<id>` opens that alert; `?tab=rules` and
-// `?tab=watches` open those tabs; `?tab=rules&sentence=preview` writes a rule as a sentence there and
+// (`?brand=govuk`). Nothing here reaches a server. `?open=<id>` opens that alert; `?tab=rules`,
+// `?tab=watches` and `?tab=lists` open *What raises alerts*, `?tab=held` *Held rows* and
+// `?tab=changes` *Changes* (the owner's M1 tabs); `?address=missing` is an alert's address the
+// reader may not see, or that does not exist (ADR-146 decision 6); `?tab=rules&sentence=preview` writes a rule as a sentence there and
 // previews it (ADR-133 stage (b)). ADR-133 stage (c): `?tab=lists` opens the screening lists (with
 // `&lists=manage`, as whoever may load them, after a refresh), and `?tab=rules&template=<typology>`
 // fills the rule form from that template (the high-risk jurisdiction one with two codes). The data
@@ -17,7 +20,7 @@ import { createRoot } from "react-dom/client";
 import "../src/design/tokens.css";
 import "../src/design/primitives.css";
 import { applyHarnessBrand } from "./brandHarness";
-import { AlertsPlace } from "../src/alerts/AlertsPlace";
+import { RulesPlace } from "../src/alerts/RulesPlace";
 
 await applyHarnessBrand();
 
@@ -70,6 +73,19 @@ const QUEUE = [
   {
     alert: { ...base, id: "a-own", rule_id: "hotlist:hl-2", referent_node_ids: ["n4"], created_at: hoursAgo(80), status: "open", assignee: null },
     summary: "A hotlisted identifier appeared: OKAFOR, Callum", kind: "hotlist", severity: "high", audience: "owner", team: null,
+  },
+  // ADR-146 decision 8 and Amendment 1 (L2.10): a rule's alert routed to a team, suppressed by its
+  // lead, opened by the lead (`?open=a-team`); and one taken back by a revert (G12).
+  {
+    alert: { ...base, id: "a-team", rule_id: "typology:r-daily", typology: "sentence", referent_node_ids: ["n4"], created_at: hoursAgo(50), status: "open", assignee: null,
+      routed_team: "team-7", suppressed_until: "2026-12-01", suppress_reason: "A known pattern, reviewed weekly", suppressed_by: "analyst-1",
+      words: "OKAFOR, Callum is a listed person", trigger: "post_commit", alert_node_id: null },
+    summary: "OKAFOR, Callum is a listed person", kind: "typology", severity: "medium", audience: "team", team: "team-7", team_name: "Prison intel", suppressed: true,
+  },
+  {
+    alert: { ...base, id: "a-back", rule_id: "typology:r1", typology: "structuring", referent_node_ids: ["n1"], created_at: hoursAgo(90), status: "closed", assignee: null, disposition: null,
+      words: "3 movements under the threshold", trigger: "pre_commit", alert_node_id: null },
+    summary: "3 movements under the threshold", kind: "typology", severity: "medium", audience: "case", team: null,
   },
 ];  // prettier-ignore
 
@@ -215,7 +231,12 @@ function answer(path: string, search: URLSearchParams): unknown {
   const row = QUEUE.find((r) => local === `alert-queue/${r.alert.id}`);
   if (row) {
     const nodes = row.alert.referent_node_ids.map((id) => ENTITIES[id as keyof typeof ENTITIES]);
-    return { ...row, nodes, edges: [], transactions: [] };
+    // ADR-146: what fired a watch alert, and the lead's tools on the team's own alert.
+    const fired = row.kind === "hotlist" || row.kind === "monitor"
+      ? { fired_on: nodes.map((n) => ({ type: n.type, label: "A matched item", files: [{ name: "pid_seized_comms_batch2.csv", row: 3 }], more_files: 0 })) }
+      : {};  // prettier-ignore
+    const lead = row.alert.id === "a-team" ? { lead: true, team_name: "Prison intel", suppressed: true } : {};
+    return { ...row, nodes, edges: [], transactions: [], ...fired, ...lead };
   }
   if (local === "alert-assignees") return [{ id: "analyst-1", name: "Ana Lyst" }, { id: "analyst-2", name: "Priya Shah" }];
   if (local === "rules") return STAGE_D ? [WIDE_RULE, SCHEDULED_RULE, SENTENCE_RULE] : [SENTENCE_RULE];
@@ -227,27 +248,38 @@ function answer(path: string, search: URLSearchParams): unknown {
   if (local === "patterns") return { patterns: [{ id: "sp1", pattern_id: "pat-1", version: 1, name: "Phone shared by two people", owner_id: "analyst-1", created_at: hoursAgo(500), definition: { nodes: [], edges: [] } }] };
   if (local === "hotlists") return HOTLISTS;
   if (local === "monitors") return { monitors: [{ id: "mo-1", pattern_id: "pat-1", owner_id: "analyst-1", status: "active", created_at: hoursAgo(500) }] };
-  // The owner's answer of 1 November 2026: the alert inbox lives in the Watches tab now.
-  if (local === "alerts")
-    return {
-      alerts: [{
-        id: "w-1", rule_id: "hotlist:hl-1", owner_id: "analyst-1", mode: "full", referent_node_ids: ["n1"],
-        evidence_available: true, investigation_id: "inv-1", created_at: hoursAgo(30),
-        hotlist: { identifier: "07700 900918", kept_as_written: false, review_date: "2027-01-31" },
-        fired_on: [{ type: "Endpoint", label: "+447700900918", files: [{ name: "pid_seized_comms_batch2.csv", row: 3 }], more_files: 0 }],
-      }],
-    };  // prettier-ignore
+  // ADR-146 decisions 5 and 8 (L2.10): the inventory and the teams a rule may go to.
+  if (local === "alert-sources")
+    return { sources: [
+      { id: "r-daily", rule_id: "typology:r-daily", name: "Listed people", source: "rule", kind: "rule", maker: "analyst-1", maker_name: "Ana Lyst", owner: "Prison intel", state: "live", alerts_30_days: 4, not_of_interest: 0.25, last_fired_at: hoursAgo(30), suppressed: [{ alert_id: "a1", until: "2026-12-01", reason: "A known pattern", by: "analyst-1" }] },
+      { id: "hl-1", rule_id: "hotlist:hl-1", name: "Hotlist 07700 900918", source: "watch", kind: "hotlist", maker: "analyst-1", owner: "analyst-1", state: "live", expires_on: "2027-01-31", alerts_30_days: 1, suppressed: [] },
+    ] };  // prettier-ignore
+  if (local === "alert-teams") return [{ role_id: "team-7", display_name: "Prison intel", lead: true, members: ["analyst-2"], member_count: 6 }];
+  // ADR-146 decision 3 (L2.11): the rule editor's dataset, its draft saved and tested.
+  if (local === "rules/datasets")
+    return [{ id: "ds-prison", name: "Prison records", kind: "source", second_person: true, ontology: ONTOLOGY,
+      lists: [{ id: "l-uk", name: "UK sanctions", kind: "screening", version: 3, deployment_wide: true }] }]; // prettier-ignore
+  if (local === "rules/drafts")
+    return { id: "r-new", investigation_id: "inv-1", owner_id: "analyst-1", name: "Listed visitors", status: "draft",
+      created_at: hoursAgo(1), trigger: "post_commit", budget_ms: 5000, dataset_id: "ds-prison", version: 1,
+      params: { typology: "sentence", pattern_id: "p", sentence: { subject: "Person", conditions: [] } } }; // prettier-ignore
+  if (local === "rules/r-new/test") return { rule_id: "r-new", version: 1, days: 30, would_raise: 2, words: "" };
   return null;
 }
 
+/** The `.bpmn` the codec writes, for *Show as BPMN* (rules-b's fixture). */
+const BPMN = (await import("../src/alerts/ruleStandards/fixtures/visits-to-listed-people.bpmn?raw")).default;
+
 window.fetch = async (input: RequestInfo | URL) => {
   const url = new URL(String(input));
+  if (url.pathname.endsWith("/export.bpmn")) return new Response(BPMN, { status: 200 });
   const body = answer(url.pathname, url.searchParams);
   return new Response(JSON.stringify(body ?? {}), { status: body === null ? 404 : 200 });
 };
 
 createRoot(document.getElementById("root")!).render(
-  <AlertsPlace
+  <RulesPlace
+    canMakeLive
     apiBaseUrl="http://monitoring-harness.invalid"
     bearerToken="unused"
     investigationId="inv-1"
@@ -255,6 +287,11 @@ createRoot(document.getElementById("root")!).render(
     isAdministrator={STAGE_D}
     canManageLists={new URLSearchParams(window.location.search).get("lists") === "manage"}
     onCanvas={() => undefined}
+    address={
+      new URLSearchParams(window.location.search).get("address") === "missing"
+        ? { alertId: "gone", state: { status: "missing" } }
+        : null
+    }
   />,
 );
 
@@ -278,7 +315,9 @@ const open = params.get("open");
 for (let i = 0; i < 40 && (tab || open); i++) {
   await settle();
   if (tab) {
-    const label = { rules: "Rules", watches: "Watches", lists: "Lists" }[tab] ?? "Queue";
+    const label =
+      { rules: "What raises alerts", watches: "What raises alerts", lists: "What raises alerts", held: "Held rows", changes: "Changes" }[tab] ??
+      "Alerts";
     const button = [...document.querySelectorAll<HTMLButtonElement>('[role="tab"]')].find((b) => b.textContent === label);
     if (button) { button.click(); break; }
   } else if (open) {
@@ -336,12 +375,6 @@ if (template) {
   choose("High-risk jurisdictions", "XA, XB");
 }
 
-// `?lists=manage&tab=lists&refreshed=1`: a refresh just made, its words shown.
-if (params.get("refreshed")) {
-  for (let i = 0; i < 40 && !document.querySelector('[aria-label="Refresh now: Synthetic sanctions list"]'); i++) await settle();
-  document.querySelector<HTMLButtonElement>('[aria-label="Refresh now: Synthetic sanctions list"]')?.click();
-}
-
 // `?opened=1` (with `stage=d&tab=rules`): the scheduled rule's runs and its versions shown.
 if (params.get("opened")) {
   for (let i = 0; i < 40 && !document.querySelector('[aria-label="Schedule and runs of Listed people, every morning"]'); i++) await settle();
@@ -359,4 +392,29 @@ if (params.get("sentence") === "schedule") {
   await settle();
   choose("On (day of the week)", "1");
   choose("At (hour, Europe/London)", "7");
+}
+
+// `?editor=tested` (with `tab=rules`): the rule editor on its dataset, a rule on a screening list
+// written, saved as a draft and tested; `?editor=bpmn` then shows it as BPMN (axe, ADR-146).
+if (params.get("editor")) {
+  for (let i = 0; i < 40 && !choose("The dataset this rule watches", "ds-prison"); i++) await settle();
+  await settle();
+  pressButton("Choose the dataset");
+  for (let i = 0; i < 40 && !document.querySelector('[aria-label="Name of the rule"]'); i++) await settle();
+  choose("Subject", "Person");
+  await settle();
+  choose("Relationship", "on_screening_list");
+  await settle();
+  choose("Screening list", "l-uk");
+  choose("Alert goes to (team)", "team:team-7");
+  choose("Name of the rule", "Listed visitors");
+  await settle();
+  pressButton("Save the draft");
+  for (let i = 0; i < 40 && ![...document.querySelectorAll("button")].some((b) => b.textContent === "Test on the last 30 days"); i++) await settle();
+  pressButton("Test on the last 30 days");
+  await settle();
+  if (params.get("editor") === "bpmn") {
+    for (let i = 0; i < 40 && ![...document.querySelectorAll("button")].some((b) => b.textContent === "Show as BPMN"); i++) await settle();
+    pressButton("Show as BPMN");
+  }
 }

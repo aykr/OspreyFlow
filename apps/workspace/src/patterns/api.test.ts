@@ -5,7 +5,7 @@ import { askToSearch, fetchPatternPreview, listPatterns, loadPattern, runPattern
 
 // `savePattern`/`listPatterns`/`loadPattern` are otherwise-thin `fetch` wrappers (`site/api.ts`'s
 // own `api.test.ts` leaves those untested elsewhere in this codebase) — but their `!response.ok`
-// check is exactly the branch `GlassCanvas.tsx`'s `findPaths` was found to get wrong (`if
+// check is exactly the path `GlassCanvas.tsx`'s `findPaths` was found to get wrong (`if
 // (!response.ok) return;`, silently dropping a failed save/load with nothing surfaced to the
 // analyst). These pin down that each of the three new calls throws instead, so a failed save or
 // load produces an error `QueryBuilderPanel.tsx` can show rather than a call that looks like it
@@ -170,6 +170,17 @@ describe("askToSearch", () => {
     await expect(askToSearch("http://x", "tok", "inv-1", "q", [])).rejects.toThrow(
       "Could not express the question as a pattern. The pattern names a type that is not in this case's vocabulary.",
     );
+  });
+
+  it("says a model's limit is reached in the Conduit's own words (ADR-135 Amendment 3, P2)", async () => {
+    // The shape `app._model_limit_reached_handler` sends: a 429 whose words name the engine and the
+    // limit, built from the refusal alone, never the gateway's.
+    const refusal = {
+      error: "model_limit_reached",
+      detail: "The engine Local has reached its limit of 60 requests a minute: try again in 40 seconds, or ask someone who manages models.",
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 429, json: async () => refusal }));
+    await expect(askToSearch("http://x", "tok", "inv-1", "q", [])).rejects.toThrow(refusal.detail);
   });
 
   it("falls back to the status for any other failure", async () => {

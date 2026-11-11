@@ -52,6 +52,28 @@ class TrendLimitExceeded(Exception):
         self.cap_kind, self.cap, self.would_be = cap_kind, cap, would_be
 
 
+#: Past this, a total of declared amounts is refused (ADR-133 Amendment 10): a decimal of 38 digits,
+#: 9 after the point, holds less than 10^29, and a total is checked short of it.
+AMOUNT_TOTAL_LIMIT = 10**28
+
+
+class AmountTotalOutOfRange(Exception):
+    """A frequency's or an activity's total of a declared amount at or past `AMOUNT_TOTAL_LIMIT`
+    (ADR-133 Amendment 10, rule 2): refused whole on every adapter, never wrapped or cut."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "a total of the declared amount reaches 10^28, past what is counted exactly; nothing "
+            "is answered"
+        )
+
+
+def refuse_an_amount_total_out_of_range(*totals: float | None) -> None:
+    """Raises `AmountTotalOutOfRange` if any total reaches the limit (in either direction)."""
+    if any(t is not None and abs(t) >= AMOUNT_TOTAL_LIMIT for t in totals):
+        raise AmountTotalOutOfRange
+
+
 class AnalyticsPort(Protocol):
     async def histogram(self, req: HistogramRequest, principal: Principal) -> Histogram: ...
     async def geo_bins(self, req: GeoBinRequest, principal: Principal) -> list[GeoBin]: ...
@@ -160,6 +182,23 @@ class AnalyticsPort(Protocol):
         nothing. Like `load_events` it is a backend write, not principal-scoped, and counts every
         event of the load whatever its marking; afterwards no read, for any principal, returns or
         counts a retracted event."""
+        ...
+
+    async def withdraw_events_by_id(self, event_ids: Sequence[str], load_id: str) -> int:
+        """Sets aside exactly these events, by `event_id`, marked with `load_id`, and returns how
+        many (ADR-110 Amendments 8 point 1 and 15: a full snapshot's refresh withdrawing a dropped
+        row's own events, which the row's record names). Never by link: another event on the same
+        link, of any load or case, stays. Afterwards no read, for any principal, returns or counts
+        one of them. An id no event holds is not counted; an event already set aside stays with the
+        load that set it aside. Idempotent; no ids set aside nothing. A backend write, not
+        principal-scoped, like `retract_load`. `retract_load` of the load that wrote an event
+        removes it wherever it is, set aside included."""
+        ...
+
+    async def restore_withdrawn_events(self, load_id: str) -> int:
+        """Puts back exactly the events `load_id` set aside, as they were, and returns how many
+        (the revert of the refresh). Idempotent: a second call, or one for a load that set none
+        aside, puts back nothing and returns 0."""
         ...
 
     async def events_of_load_among(self, load_id: str, event_ids: Sequence[str]) -> set[str]:

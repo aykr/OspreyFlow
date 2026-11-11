@@ -12,18 +12,24 @@ without re-deriving what belongs to it.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+from collections.abc import Mapping
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from schemas.domain import Edge, EdgeId, Handling, Node, NodeId, PrincipalId, Provenance
 from schemas.monitoring import CheckNotJudged, WouldRaise
 
 from .connectors import load_connector_profiles
+from .profile import SourceProfile
+from .staging import StagingStep
 
 # --- Studio roles (09_INGEST_STUDIO.md §8) -------------------------------
 
@@ -272,6 +278,20 @@ class PipelineNodeKind(StrEnum):
     EXTRACT = "extract"
     ENRICH = "enrich"
     LOAD = "load"
+    #: The staging catalogue (ADR-140 decision 11, Amendments 11 and 12): each node's `config` is
+    #: its step record (`schemas.staging`), less its `id` and `kind`, which are the node's own. The
+    #: recipe's `staging:` list is built from these nodes in run order at save and publish
+    #: (`services/ingest/pipeline.staging_from_pipeline`), never kept beside them.
+    LOOKUP = "lookup"
+    JOIN = "join"
+    FILTER = "filter"
+    DERIVE = "derive"
+    UNION = "union"
+    DEDUPE = "dedupe"
+    #: The expert steps (ADR-140 decisions 12 and 13; the redesign's phase 8): read-only in guided
+    #: mode, and saved only by a person holding `write_sql_transforms`.
+    SQL = "sql"
+    FUZZY_MATCH = "fuzzy_match"
 
 
 class PipelineNode(BaseModel):
@@ -361,6 +381,9 @@ class StudioRecipeDraft(BaseModel):
     full `Recipe`, which does not exist until Map supplies a
     `row_template` and Publish supplies a `git_path`."""
 
+    #: `model_version` is a field, not pydantic's own `model_` namespace.
+    model_config = {"protected_namespaces": ()}
+
     recipe_id: str
     version: int
     status: StudioRecipeStatus
@@ -414,6 +437,9 @@ class StudioRecipeDraft(BaseModel):
     #: ADR-120 D10, Amendment 1: the pack versions it was published against. `None` = not pinned;
     #: `{}` = pinned, names and writes no pack.
     pack_versions: dict[str, int] | None = None
+    #: ADR-140 decisions 5 and 14: the dataset's live domain-model version it was published against.
+    #: `None` = not pinned (published before L3.1b, or the dataset had no live model).
+    model_version: int | None = None
     git_path: str | None = None
     published_by: PrincipalId | None = None
     #: Resolved at read time, never stored (ADR-106).
@@ -433,6 +459,13 @@ class StudioRecipeDraft(BaseModel):
     #: ADR-110 decisions 3 and 8: paused by a person, or by three refused runs in a row, and why.
     schedule_paused: bool = False
     schedule_paused_reason: str | None = None
+    #: ADR-141 decision 11: the one service identity (an OIDC client's name) an orchestrator
+    #: triggers this pipeline as, once its schedule is handed to it; `None` when it is not owned
+    #: externally. Set with `schedule_owner`, the person every external run acts as (decision 10).
+    owned_externally_by: str | None = None
+    #: ADR-140 Amendment 4: why a `flagged` recipe needs attention, in words; `None` when it does
+    #: not, or for one flagged before the reason was kept.
+    flagged_reason: str | None = None
     #: ADR-099 Amendment 3: the dataset of the case it was made in; found, listed and run only in a
     #: case reading it. `None` for one made before, until `stamp_datasets` places it.
     dataset_id: str | None = None
@@ -839,7 +872,23 @@ class RunRecipeInput(BaseModel):
     source_location: str | None = None
 
 
+class VerifyRecipeInput(BaseModel):
+    """Optional body of `POST …/ingest/recipes/{id}/verify` (ADR-140 decision 5): the domain-model
+    version the Test runs against. Omitted, it is the dataset's live version. It may name the open
+    draft only for a reader with `edit_target_model` on the dataset; for anyone else the draft's
+    version is answered exactly as a version that does not exist (422, the same words), so a tester
+    learns nothing of an unpublished draft (rule 3)."""
+
+    #: `model_version` is a field, not pydantic's own `model_` namespace.
+    model_config = {"protected_namespaces": ()}
+
+    model_version: int | None = Field(default=None, ge=1)
+
+
 class Recipe(BaseModel):
+    #: `model_version` is a field, not pydantic's own `model_` namespace.
+    model_config = {"protected_namespaces": ()}
+
     id: str
     version: int
     label: str
@@ -847,6 +896,10 @@ class Recipe(BaseModel):
     ontology_version: int
     #: ADR-120 D10, Amendment 1: `None` = not pinned; `{}` = pinned, names and writes no pack.
     pack_versions: dict[str, int] | None = None
+    #: ADR-140 decision 14: the pinned domain-model version, committed with the YAML. `None` = not
+    #: pinned, and left out of the YAML (`exclude_none`), so a recipe published before stays
+    #: byte-for-byte what it was.
+    model_version: int | None = None
     defaults: RecipeDefaults = Field(default_factory=RecipeDefaults)
     deduplicate: DeduplicateConfig | None = None
     row_template: RowTemplate
@@ -856,9 +909,80 @@ class Recipe(BaseModel):
     #: published before phase C (and on a v1 draft) — those run as the one canonical chain, and
     #: their committed YAML stays byte-for-byte what it was (`exclude_none` at serialisation).
     pipeline: PipelineGraph | None = None
+    #: ADR-140 decision 11 (redesign phase 7): the staging steps between the source tables and Map,
+    #: the last one the table Map reads (`schemas/staging.py`). `None` on every recipe without
+    #: them, and left out of the YAML (`exclude_none`), so a recipe published before stays
+    #: byte-for-byte what it was (`tests/schemas/test_recipe_staging.py`).
+    #: At least one step: an empty list is not "no staging" and would be written as `staging: []`.
+    staging: list[StagingStep] | None = Field(default=None, min_length=1)
 
 
 # --- Rejections and the load report (09_INGEST_STUDIO.md §5) -------------
+
+
+class RejectionRef(BaseModel):
+    """ADR-140 Amendment 12: a row a rejection came from, in a staged run. The table it is a row of
+    (a source's name, `reference_list:<name>@v<n>`, or a staged step's table), its row number, the
+    load that read it (a source row's; `None` for a list row or a staged table's row) and, for a
+    Join, the side. **No row key, raw or hashed** (rule 7;
+    `tests/schemas/test_staging_report_schemas.py`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    table: str
+    row_index: int = Field(ge=0)
+    load_id: str | None = None
+    side: Literal["left", "right"] | None = None
+
+
+class StagingStepCount(BaseModel):
+    """ADR-140 Amendment 12: what one staging step did in a run, as counts: the rows it read and
+    gave, and every row it did not pass on, by why (rule 2: nothing dropped silently). Counts of
+    the loader's own rows: a route withholds them as it withholds every count (rule 3)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    step: str
+    kind: str
+    rows_in: int = Field(ge=0)
+    rows_out: int = Field(ge=0)
+    unmatched: int = Field(default=0, ge=0)
+    filtered_out: int = Field(default=0, ge=0)
+    repeats_folded: int = Field(default=0, ge=0)
+    rejected: int = Field(default=0, ge=0)
+    #: A Join's right table: its rows in, and those that met no left row.
+    right_rows_in: int = Field(default=0, ge=0)
+    right_unmatched: int = Field(default=0, ge=0)
+    #: A fuzzy match's threshold (part of the version) and its rows at or above it; its rows below
+    #: are `unmatched`, kept and counted ("212 of 1,204 matched at 0.85 or more").
+    threshold: float | None = None
+    matched: int = Field(default=0, ge=0)
+    #: A SQL step's input rows the person running it may not read: absent from its tables, never
+    #: masked (ADR-140 decision 12). Withheld with every other count.
+    rows_withheld: int = Field(default=0, ge=0)
+
+
+class ExpertStepDisclosure(BaseModel):
+    """ADR-140 decision 16 and the redesign brief §5.3–5.4: every run report, and Test, says which
+    expert steps ran and what they were, in words, whether or not its counts are withheld. It is
+    the pipeline's own configuration, never a value of a row: the SQL step's summary and its
+    SELECT; the fuzzy match's tables, comparisons and threshold, and that it writes an inferred
+    `SAME_AS`, never a merge. Its counts are in `staging_steps`, withheld with the others."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    step: str
+    kind: Literal["sql", "fuzzy_match"]
+    label: str | None = None
+    #: The SQL step's own plain words, and its SELECT.
+    summary: str | None = None
+    select: str | None = None
+    #: The fuzzy match's tables, how they are compared, its threshold, and the elements whose
+    #: `SAME_AS` it writes.
+    reads: list[str] = Field(default_factory=list)
+    compares: list[str] = Field(default_factory=list)
+    threshold: float | None = None
+    same_as: list[str] = Field(default_factory=list)
 
 
 class RejectionRecord(BaseModel):
@@ -868,6 +992,9 @@ class RejectionRecord(BaseModel):
     row_index: int
     reason: str
     sample: str
+    #: ADR-140 Amendment 12: in a staged run, the rows the rejection came from (a Join's both
+    #: sides), so the reason's words need not be read to find them. Empty outside a staged run.
+    refs: list[RejectionRef] = Field(default_factory=list)
     #: Rule 3, ADR-127 Amendment 26: the marking of the rejected row, which `sample` (the whole
     #: row) is held at. A route answers a reader who cannot view it with the sample withheld
     #: (`load_records.report_view`), and never returns the marking itself. `None` where nothing of
@@ -876,6 +1003,101 @@ class RejectionRecord(BaseModel):
     #: Set where the row's marking could not be resolved: `sample` is then withheld from every
     #: reader, whatever their clearance, codes or unit (no unit is one nobody may hold).
     sample_unreadable: bool = False
+
+
+class LinkPriorState(BaseModel):
+    """ADR-110 Amendment 16: a link exactly as it was stored just before a returning row's load
+    merged into it. A row a full snapshot withdrew comes back, and its write merges into the link
+    its own withdrawn key recorded; the load keeps that link's prior state so its revert can put the
+    link back as it was, and refuses if the link was written since (its `revision` or `load_id`
+    moved).
+
+    **Graph data (rule 3).** `stored` holds the link's properties, provenance and marking as the
+    adapter stores them. It is held in the run ledger for `services/ingest/load_revert.py` alone:
+    no route, view, report, log or metering carries it, and `LoadReport` leaves it out of every
+    dump. `handling` is the link's marking when it was read; a restore writes the link back at it,
+    never at a weaker one."""
+
+    edge_id: EdgeId
+    edge_type: str
+    revision: int = Field(ge=1)
+    load_id: str | None = None
+    handling: Handling
+    stored: dict[str, Any] = Field(default_factory=dict)
+    #: `stored_digest` of the link as the load left it, read again inside its transaction after
+    #: its write. Its revert goes ahead only while the link still reads back to it (or to `stored`,
+    #: once an earlier attempt put it back): anything else written since, by any writer (a later
+    #: load, an analyst's correction, a re-stamp of its datasets, a provenance strip), refuses it.
+    left_digest: str | None = None
+
+
+def stored_digest(stored: Mapping[str, Any]) -> str:
+    """ADR-110 Amendment 16: a digest of a link's stored record, stable across reads. Keys sorted
+    at every depth; a float that is a whole number read as that integer (a store may return
+    `1.0` for `1`); lists kept in order; anything else as its JSON text. The same function at
+    the load and at the revert, so a link nobody wrote since reads back to the same digest."""
+
+    def canonical(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                str(k): canonical(v) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))
+            }
+        if isinstance(value, (list, tuple)):
+            return [canonical(v) for v in value]
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        return value
+
+    text = json.dumps(canonical(stored), sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+class RowElements(BaseModel):
+    """What one kept row wrote (ADR-110 Amendment 8 point 2): the nodes it wrote or matched and the
+    links it wrote, created or merged into, each by its stored id, and the events it wrote, by
+    `event_id` (Amendment 15: a full snapshot withdraws a dropped row's own events by these, never
+    by link). For the ledger alone."""
+
+    node_ids: list[NodeId] = Field(default_factory=list)
+    edge_ids: list[EdgeId] = Field(default_factory=list)
+    event_ids: list[str] = Field(default_factory=list)
+    #: ADR-110 Amendment 18: each of `edge_ids`' own edge type (the ontology's name), so a later
+    #: load reads a returning row's own link by its type, never by id alone. A row kept before
+    #: L1.2d has none, and its link is never captured: its merge stays a merge.
+    edge_types: dict[EdgeId, str] = Field(default_factory=dict)
+
+
+#: ADR-110 Amendment 6 point 1: how an incremental refresh compares its watermark column's values.
+WatermarkKind = Literal["number", "time", "text"]
+
+
+class SourceWatermark(BaseModel):
+    """The highest value of an incremental source's watermark column a run read (ADR-110 Amendment
+    6 point 1), kept with the load's record: the next refresh of the source, by the same pipeline
+    into the same case, reads only rows past it. `value` is the value as the file held it;
+    `kind` says how it compares (as a number, as an instant, or as text). For the ledger alone: a
+    value of the loader's own source, never in a route's answer."""
+
+    source_id: str
+    column: str
+    kind: WatermarkKind
+    value: str
+
+
+class RunMetering(BaseModel):
+    """What a run cost (ADR-110 Amendment 6 point 9, ADR-141 decision 2;
+    `services/ingest/metering.py` has how each is counted). `None` is *not measured*, never 0:
+    rows staged and bytes written to Parquet are a staged run's (ADR-140 Amendment 12), `None` for
+    any other. Counts of the run's own rows and writes: a route withholds them as it withholds
+    every count (rule 3)."""
+
+    wall_ms: int
+    rows_read: int
+    rows_staged: int | None = None
+    parquet_bytes: int | None = None
+    #: What the run put to the object store; a file already kept is kept once (content-addressed).
+    object_store_bytes: int | None = None
+    graph_writes: int
 
 
 class LoadReport(BaseModel):
@@ -902,6 +1124,30 @@ class LoadReport(BaseModel):
     #: kept with them: a run under another definition is refused while keys under this one are
     #: kept for the case. `None` for a recipe without `deduplicate`.
     row_key_fingerprint: str | None = None
+    #: ADR-110 Amendment 8 point 2: for each of `kept_row_keys`, what its row wrote, so a full
+    #: snapshot's refresh can withdraw exactly a dropped row's elements. Kept with the key in the
+    #: ledger; never in `LoadReportView`.
+    kept_row_elements: dict[str, RowElements] = Field(default_factory=dict)
+    #: ADR-110 Amendment 8 points 3 and 4, a full snapshot with *withdraw*: the dropped keys this
+    #: load withdrew (moved aside in the ledger with it) and the nodes and links it withdrew, for
+    #: the ledger alone; and the counts and words a route answers.
+    withdrawn_row_keys: list[str] = Field(default_factory=list)
+    withdrawn_node_ids: list[NodeId] = Field(default_factory=list)
+    withdrawn_edge_ids: list[EdgeId] = Field(default_factory=list)
+    #: ADR-110 Amendment 16: each link a returning row merged into that its own withdrawn key
+    #: recorded, as it was stored before the merge. Graph data, for the ledger alone (rule 3): left
+    #: out of every dump, so no view, report or route can carry it.
+    own_key_merges: SkipJsonSchema[list[LinkPriorState]] = Field(default_factory=list, exclude=True)
+    rows_withdrawn: int = 0
+    links_kept_an_occurrence: int = 0
+    rows_left_in_place: int = 0
+    refresh_notes: list[str] = Field(default_factory=list)
+    #: ADR-110 Amendment 6 point 1, an incremental refresh: the watermark this load reached (kept
+    #: with its record, for the ledger alone), and the rows it did not read because they lay at or
+    #: below the kept one, and those it read with no value in the column (counts a route answers).
+    watermark: SourceWatermark | None = None
+    rows_below_watermark: int = 0
+    rows_without_watermark: int = 0
     #: Only the nodes THIS load created — never a node it merely
     #: referenced, and never an edge it only extended (§9.1, when this
     #: becomes a `LoadRecord`, records only what revert may safely
@@ -934,12 +1180,94 @@ class LoadReport(BaseModel):
     #: and what the case's pre-commit rules did, in words — never a silent part-load (rule 2).
     rows_held: int = 0
     rule_notes: list[str] = Field(default_factory=list)
+    #: L3.6's carry (ADR-146 decision 4): how many drawn-watch alerts this load raised for the
+    #: run's own principal, the only ones they may read (a drawn watch's alert is its owner's alone,
+    #: so another owner's match is neither counted nor said: rules 3 and 7).
+    drawn_watch_alerts: int = 0
     #: Rule 3, ADR-127 Amendment 23: every distinct marking this load's rows were written at (each
     #: element the engine resolved for a row, once), in the order first met. A count of what the
     #: load wrote includes rows at each of them, so a reader who may not view one of them is shown
     #: none of the counts (`services/api/load_records.report_view`, `_schedule_run_view`). Kept in
     #: the run ledger beside the run; never in a route's answer.
     markings: list[Handling] = Field(default_factory=list)
+    #: Metering, part 1: set by `run_recipe_as` when the run ends; `None` for a load run any
+    #: other way (a release of held rows, a seed's own loader).
+    metering: RunMetering | None = None
+    #: ADR-140 Amendment 12: a staged run's steps, in run order, as counts. Empty for a run with
+    #: no staging steps.
+    staging_steps: list[StagingStepCount] = Field(default_factory=list)
+    #: ADR-140 decision 16 (phase 8): the expert steps this run ran, disclosed in words.
+    expert_steps: list[ExpertStepDisclosure] = Field(default_factory=list)
+
+
+# --- A staging step's live sample (ADR-140 Amendment 12; Q4 (a)) ---------------------------
+
+
+class StagingPreviewInput(BaseModel):
+    """A drawer's Preview: the pipeline as the drawer holds it (saved or not) and the step whose
+    output to show. Nothing is written."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pipeline: PipelineGraph
+    step: str = Field(min_length=1)
+
+
+class StagingPreview(BaseModel):
+    """The steps up to `step`, run over the first ten rows of each source of the saved pipeline,
+    writing nothing. `problems` are the save gate's refusals for the pipeline the drawer holds, in
+    its own words, with any word of the preview's own (a source not saved, a sample withheld); the
+    sample is still run when the steps up to `step` can be, and is empty when they cannot. Rule 3:
+    a reader who may not view every sampled row, or a Lookup's list rows, is given nothing of the
+    run (`values_masked`, the rest empty). No row key, raw or hashed, is here (rule 7): rows are
+    cells, refs are tables and row numbers. `profile` is the staged table's profile."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    step: str
+    problems: list[str] = Field(default_factory=list)
+    columns: list[str] = Field(default_factory=list)
+    rows: list[dict[str, str]] = Field(default_factory=list)
+    values_masked: bool = False
+    #: Of each source, how many rows the sample read (ten at most).
+    rows_sampled: int = 0
+    counts: list[StagingStepCount] = Field(default_factory=list)
+    rejections: list[RejectionRecord] = Field(default_factory=list)
+    profile: SourceProfile | None = None
+
+
+# --- Expert mode (ADR-140 decision 3; the redesign's phase 8) -------------------------------
+
+
+class PipelineYaml(BaseModel):
+    """The pipeline as YAML (*Show YAML*, ADR-140 decision 3): its nodes, each with its own
+    settings, and its lines, written by the Conduit. Editable in expert mode, and saved through
+    the same gates as the canvas's save (`PUT …/pipeline`): the text is read as a pipeline, never
+    run (`yaml.safe_load`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(max_length=200_000)
+
+
+class SqlCheckInput(BaseModel):
+    """`POST …/sql-check`: a SQL step's SELECT and the tables it reads, judged by the sandbox's
+    gate before it is saved. Nothing runs over any row."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pipeline: PipelineGraph
+    step: str = Field(min_length=1)
+
+
+class SqlCheck(BaseModel):
+    """The gate's words for one SQL step, empty when it may be saved. Nothing runs over a row: the
+    step's drawer shows its output on the live sample (`POST …/staging-preview`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    step: str
+    problems: list[str] = Field(default_factory=list)
 
 
 # --- The pipeline run report (06_DECISIONS.md ADR-108 phase C) -------------
@@ -963,6 +1291,26 @@ class LoadReportView(BaseModel):
     rejections: list[RejectionRecord] = Field(default_factory=list)
     rows_held: int = 0
     rule_notes: list[str] = Field(default_factory=list)
+    #: L3.6's carry (ADR-146 decision 4): how many drawn-watch alerts this load raised for the
+    #: run's own principal, the only ones they may read (a drawn watch's alert is its owner's alone,
+    #: so another owner's match is neither counted nor said: rules 3 and 7).
+    drawn_watch_alerts: int = 0
+    #: ADR-110 Amendment 8: what a full snapshot's refresh withdrew, as counts and words.
+    rows_withdrawn: int = 0
+    links_kept_an_occurrence: int = 0
+    rows_left_in_place: int = 0
+    #: ADR-140 Amendment 12: each staging step's counts, withheld with the other counts.
+    staging_steps: list[StagingStepCount] = Field(default_factory=list)
+    #: ADR-140 decision 16: the expert steps the run ran, in words. The pipeline's own settings,
+    #: never a row's value: given whether or not the counts are withheld.
+    expert_steps: list[ExpertStepDisclosure] = Field(default_factory=list)
+    refresh_notes: list[str] = Field(default_factory=list)
+    #: ADR-110 Amendment 6 point 1: an incremental refresh's rows left unread, and read without a
+    #: watermark value. The watermark itself is a value of the source, and never answered.
+    rows_below_watermark: int = 0
+    rows_without_watermark: int = 0
+    #: Metering, part 1: withheld with the counts.
+    metering: RunMetering | None = None
     #: Rule 3, ADR-127 Amendment 23: set where the reader may not view every marking the load's
     #: rows were written at. Every count above is then zero and the lists empty: a count of what a
     #: load wrote is a read.
@@ -1038,8 +1386,14 @@ class PipelineRunReport(BaseModel):
     #: The branches' held rows and rule notes, summed (ADR-109 ruling 1).
     rows_held: int = 0
     rule_notes: list[str] = Field(default_factory=list)
+    #: L3.6's carry (ADR-146 decision 4): how many drawn-watch alerts this load raised for the
+    #: run's own principal, the only ones they may read (a drawn watch's alert is its owner's alone,
+    #: so another owner's match is neither counted nor said: rules 3 and 7).
+    drawn_watch_alerts: int = 0
     #: The union of the branches' `markings`, each once (rule 3, ADR-127 Amendment 23).
     markings: list[Handling] = Field(default_factory=list)
+    #: Metering, part 1, for the whole run (`run_recipe_as`).
+    metering: RunMetering | None = None
 
 
 class BranchRunReportView(BaseModel):
@@ -1070,6 +1424,14 @@ class PipelineRunReportView(BaseModel):
     rejections: list[RejectionRecord] = Field(default_factory=list)
     rows_held: int = 0
     rule_notes: list[str] = Field(default_factory=list)
+    #: L3.6's carry (ADR-146 decision 4): how many drawn-watch alerts this load raised for the
+    #: run's own principal, the only ones they may read (a drawn watch's alert is its owner's alone,
+    #: so another owner's match is neither counted nor said: rules 3 and 7).
+    drawn_watch_alerts: int = 0
+    metering: RunMetering | None = None
+    #: ADR-140 decision 16: the expert steps the run's branches ran, in words, whether or not the
+    #: counts are withheld: the pipeline's own settings, never a row's value.
+    expert_steps: list[ExpertStepDisclosure] = Field(default_factory=list)
     #: As `LoadReportView.withheld`: the reader may not view every marking the run's rows were
     #: written at, so the counts are zero and the branches and stages are left out.
     withheld: bool = False
@@ -1115,6 +1477,9 @@ class VerifyReport(BaseModel):
     `schemas.domain.Node`/`Edge` shapes `GlassCanvas` already renders, not
     a second preview-only shape invented for this screen."""
 
+    #: `model_version` is a field, not pydantic's own `model_` namespace.
+    model_config = {"protected_namespaces": ()}
+
     rows_read: int
     rows_deduplicated: int
     #: ADR-127 decision 5: of the sample, the rows a run would skip because the case already kept
@@ -1144,6 +1509,11 @@ class VerifyReport(BaseModel):
     checks_not_judged: list[CheckNotJudged] = Field(default_factory=list)
     #: How many of the pipeline's checks the sample was judged against.
     checks_judged: int = 0
+    #: ADR-140 decision 5: the domain-model version the Test ran against; `None` when the dataset
+    #: has no live model.
+    model_version: int | None = None
+    #: ADR-140 decision 16 and brief §5: what each expert step disclosed, as a run report says it.
+    expert_steps: list[ExpertStepDisclosure] = Field(default_factory=list)
 
 
 # --- The load ledger (01_DOMAIN_MODEL.md §2.4, ADR-018) -------------------
@@ -1204,6 +1574,22 @@ class LoadRecord(BaseModel):
     #: record from before has neither, and reads as not reverted.
     reverted_at: datetime | None = None
     reverted_by: PrincipalId | None = None
+    #: ADR-110 Amendment 8 points 4 and 5: how many dropped rows a full snapshot's load withdrew,
+    #: and what it withdrew. Its revert restores them (`GraphPort.restore_withdrawn`, the events
+    #: and the keys), refused while a key it withdrew is kept again. Not elements the load holds:
+    #: no question of which elements a record holds reads these.
+    rows_withdrawn: int = 0
+    withdrawn_node_ids: list[NodeId] = Field(default_factory=list)
+    withdrawn_edge_ids: list[EdgeId] = Field(default_factory=list)
+    #: ADR-110 Amendment 16: the links a returning row merged into that its own withdrawn key
+    #: recorded, each as stored before the merge. Its revert restores them, refused if one was
+    #: written since, and a merge into any other link is still refused (ADR-127 decision 6). Graph
+    #: data (rule 3): read by `load_revert` alone, never by a view. A record from before has none.
+    own_key_merges: list[LinkPriorState] = Field(default_factory=list)
+    #: ADR-110 Amendment 6 point 1: the watermark an incremental refresh's load reached. The next
+    #: refresh reads from the latest such record of a succeeded run that is not reverted; the
+    #: revert is refused while a later refresh read past it.
+    watermark: SourceWatermark | None = None
 
 
 ALL_MODELS: tuple[type[BaseModel], ...] = (
@@ -1215,6 +1601,9 @@ ALL_MODELS: tuple[type[BaseModel], ...] = (
     PipelineGraph,
     StudioRecipeDraft,
     RecipeConnector,
+    RowElements,
+    SourceWatermark,
+    RunMetering,
     RecipeDefaults,
     DeduplicateConfig,
     FieldBinding,
@@ -1236,7 +1625,16 @@ ALL_MODELS: tuple[type[BaseModel], ...] = (
     SchedulePreviewInput,
     SchedulePreview,
     RunRecipeInput,
+    VerifyRecipeInput,
     Recipe,
+    RejectionRef,
+    StagingStepCount,
+    ExpertStepDisclosure,
+    StagingPreviewInput,
+    StagingPreview,
+    PipelineYaml,
+    SqlCheckInput,
+    SqlCheck,
     RejectionRecord,
     LoadReport,
     BranchRunReport,

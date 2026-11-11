@@ -13,6 +13,11 @@ export type Count = number;
 export type RowIndex = number;
 export type Reason1 = string;
 export type Sample = string;
+export type Table = string;
+export type RowIndex1 = number;
+export type LoadId = string | null;
+export type Side = ("left" | "right") | null;
+export type Refs = RejectionRef[];
 export type Classification = string;
 export type HandlingCode = string;
 export type ActionCode = string | null;
@@ -29,6 +34,7 @@ export type ProvenanceState = "asserted" | "inferred" | "unresolved";
 export type DocumentId = string;
 export type Locator = string;
 export type ExcerptHash = string;
+export type SourceLoadId = string | null;
 export type Sources = SourceRef[];
 export type SourcesWithheld = boolean;
 export type ExtractedBy = string | null;
@@ -36,6 +42,19 @@ export type ExtractionConfidence = number | null;
 export type FirstSeen = string;
 export type LastConfirmed = string | null;
 export type PrincipalId = string;
+export type ProvenanceClass = "analyst_drawn";
+export type DrawnItemId = string;
+export type DrawnBoardId = string;
+export type DrawnCaseId = string;
+export type DrawnLabel = string;
+export type GradingSchemeName = string;
+export type GradeSource = string;
+export type GradeIntelligence = string;
+export type GradeHandling = string;
+export type DrawnOriginalGrading = Grading | null;
+export type DrawnSourceNote = string | null;
+export type DrawnIcon = string | null;
+export type Gazetteer = string | null;
 export type ClusterId = string;
 export type ClusterScore = number | null;
 export type ResolutionRun = string | null;
@@ -44,10 +63,11 @@ export type ManuallySplit = NodeId[];
 export type CreatedAt = string;
 export type Revision = number;
 export type SupersededBy = string | null;
-export type LoadId = string | null;
+export type LoadId1 = string | null;
 export type RecipeId = string | null;
 export type RecipeVersion = number | null;
 export type Reverted = boolean;
+export type WithdrawnByLoad = string | null;
 export type Datasets = string[];
 export type Nodes = Node[];
 export type EdgeId = string;
@@ -79,6 +99,17 @@ export type RuleName1 = string;
 export type Why = string;
 export type ChecksNotJudged = CheckNotJudged[];
 export type ChecksJudged = number;
+export type ModelVersion = number | null;
+export type Step = string;
+export type Kind = "sql" | "fuzzy_match";
+export type Label = string | null;
+export type Summary = string | null;
+export type Select = string | null;
+export type Reads = string[];
+export type Compares = string[];
+export type Threshold = number | null;
+export type SameAs = string[];
+export type ExpertSteps = ExpertStepDisclosure[];
 
 /**
  * The dry run's three outputs (§5) in one response: counts,
@@ -100,6 +131,8 @@ export interface VerifyReport {
   would_raise?: WouldRaise;
   checks_not_judged?: ChecksNotJudged;
   checks_judged?: ChecksJudged;
+  model_version?: ModelVersion;
+  expert_steps?: ExpertSteps;
   [k: string]: unknown;
 }
 export interface EntitiesByType {
@@ -150,9 +183,23 @@ export interface RejectionRecord {
   row_index: RowIndex;
   reason: Reason1;
   sample: Sample;
+  refs?: Refs;
   marking?: Handling | null;
   sample_unreadable?: SampleUnreadable;
   [k: string]: unknown;
+}
+/**
+ * ADR-140 Amendment 12: a row a rejection came from, in a staged run. The table it is a row of
+ * (a source's name, `reference_list:<name>@v<n>`, or a staged step's table), its row number, the
+ * load that read it (a source row's; `None` for a list row or a staged table's row) and, for a
+ * Join, the side. **No row key, raw or hashed** (rule 7;
+ * `tests/schemas/test_staging_report_schemas.py`).
+ */
+export interface RejectionRef {
+  table: Table;
+  row_index: RowIndex1;
+  load_id?: LoadId;
+  side?: Side;
 }
 export interface Handling {
   classification: Classification;
@@ -188,13 +235,49 @@ export interface Provenance {
   first_seen: FirstSeen;
   last_confirmed?: LastConfirmed;
   confirmed_by?: PrincipalId | null;
+  drawn?: DrawnAssertion | null;
+  gazetteer?: Gazetteer;
   [k: string]: unknown;
 }
 export interface SourceRef {
   document_id: DocumentId;
   locator: Locator;
   excerpt_hash: ExcerptHash;
+  load_id?: SourceLoadId;
   [k: string]: unknown;
+}
+/**
+ * ADR-143 decision 4: on the provenance of every drawn node and link. A drawn item is asserted
+ * by its author, not model-derived: rule 5's `inferred` is for the matches it raises, not for
+ * it.
+ */
+export interface DrawnAssertion {
+  provenance_class?: ProvenanceClass;
+  item_id: DrawnItemId;
+  asserted_by: PrincipalId;
+  board_id: DrawnBoardId;
+  case_id: DrawnCaseId;
+  label: DrawnLabel;
+  grading: Grading;
+  original_grading?: DrawnOriginalGrading;
+  source_note?: DrawnSourceNote;
+  source_document?: DocumentId | null;
+  icon?: DrawnIcon;
+}
+/**
+ * A grade in one scheme, kept with its scheme so a later change of scheme (L3.7) keeps the
+ * original beside the new one (C13).
+ *
+ * A grade of a built-in scheme is checked against its parts here. A grade of a scheme file's
+ * scheme (Amendment 6) is checked where a grade enters, against the deployment's scheme: the
+ * board routes and the grading change. A stored one is read as stored, since an original may be of
+ * a scheme the deployment no longer has.
+ */
+export interface Grading {
+  scheme?: GradingSchemeName;
+  source: GradeSource;
+  intelligence: GradeIntelligence;
+  handling: GradeHandling;
 }
 export interface ResolutionState {
   cluster_id?: ClusterId | null;
@@ -209,10 +292,11 @@ export interface AuditStub {
   created_by: PrincipalId;
   revision?: Revision;
   superseded_by?: SupersededBy;
-  load_id?: LoadId;
+  load_id?: LoadId1;
   recipe_id?: RecipeId;
   recipe_version?: RecipeVersion;
   reverted?: Reverted;
+  withdrawn_by_load?: WithdrawnByLoad;
   [k: string]: unknown;
 }
 export interface Edge {
@@ -280,4 +364,22 @@ export interface CheckNotJudged {
   rule_name: RuleName1;
   why: Why;
   [k: string]: unknown;
+}
+/**
+ * ADR-140 decision 16 and the redesign brief §5.3–5.4: every run report, and Test, says which
+ * expert steps ran and what they were, in words, whether or not its counts are withheld. It is
+ * the pipeline's own configuration, never a value of a row: the SQL step's summary and its
+ * SELECT; the fuzzy match's tables, comparisons and threshold, and that it writes an inferred
+ * `SAME_AS`, never a merge. Its counts are in `staging_steps`, withheld with the others.
+ */
+export interface ExpertStepDisclosure {
+  step: Step;
+  kind: Kind;
+  label?: Label;
+  summary?: Summary;
+  select?: Select;
+  reads?: Reads;
+  compares?: Compares;
+  threshold?: Threshold;
+  same_as?: SameAs;
 }

@@ -68,6 +68,7 @@ from harness.realm import CONDUIT_CLIENT_ID
 from harness.reporting import reporting_env, reporting_services
 from harness.site import (
     PROXY_IMAGE,
+    highest_marking,
     proxy_service,
     render_caddyfile,
     render_glass_settings,
@@ -201,6 +202,26 @@ _OLLAMA_HEALTHCHECK = [
 #: _key` is what fails if the three drift apart again.
 LITELLM_KEY = "sk-ospreyflow-dev"
 
+#: ADR-135 Amendment 2 decision 3: the gateway keeps engines and keys in its own database, so its
+#: master key is no longer a fixed development value but minted per deployment, like the database's
+#: password and the encryption key ("salt") the stored keys are sealed with. Each name ends in
+#: SECRET or PASSWORD so `harness.apply.keep_existing_secrets` keeps it across every `apply`: a
+#: different salt silently drops every stored engine (measured), so it is minted once and never
+#: again. `LITELLM_KEY` above stays for the developer stack (`deploy/compose/dev.yaml`).
+GATEWAY_MASTER = "OSPREY_LITELLM_MASTER_SECRET"
+GATEWAY_SALT = "OSPREY_LITELLM_SALT_SECRET"
+GATEWAY_DB_PASSWORD = "OSPREY_LITELLM_DB_PASSWORD"
+#: Where the Conduit keeps the models file (decision 2): a named volume, which takes the image's own
+#: folder (made by `services/api/Dockerfile`, owned by its user) on first mount, so it is writable
+#: by the Conduit's user on any host.
+MODEL_SETTINGS_PATH = "/run/osprey/model-settings"
+#: ADR-147 decision 1: where the Conduit keeps the maps file and the map key file, a named volume of
+#: its own made the same way (`services/api/Dockerfile` makes the folder, owned by its user).
+MAP_SETTINGS_PATH = "/run/osprey/map-settings"
+#: ADR-147 decision 3: the one writable folder inside the read-only tiles folder, where a basemap
+#: built in the Conduit is written (`services/api/map_admin.BUILT_FOLDER`).
+TILES_BUILT_SUBDIR = "built"
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 DEFAULT_CONFIG_PATH = REPO_ROOT / "osprey.yaml"
@@ -264,15 +285,19 @@ def render_litellm_config(config: OspreyConfig) -> str:
     """
     extraction = config.extraction_model
     table = yaml.safe_load(_local_model_table(config, extraction))
-    table["model_list"] += provider_model_entries(config)
+    # ADR-135 Amendment 2 decision 3: hosted engines live only in the gateway's database, made
+    # there by the Conduit, so no `model_name` is both rendered and stored.
     return yaml.safe_dump(table, sort_keys=False)
 
 
 def provider_model_entries(config: OspreyConfig) -> list[dict[str, object]]:
-    """ADR-114 Amendment 6 point 4, ADR-135 decision 2: each enabled provider's models, routed
-    through the gateway as `provider/model`, each reading its own provider's key from the gateway's
-    own environment (`os.environ/OSPREY_MODEL_KEY_<NAME>`, or `OSPREY_MODEL_PROVIDER_KEY` for the
-    single `models.provider`) — never written into this file."""
+    """**No longer rendered** (ADR-135 Amendment 2 decision 3: the gateway's database holds each
+    engine's entries, made by the Conduit). Kept as the description the routing tests' stand-in
+    gateway builds its table from. ADR-114 Amendment 6 point 4, ADR-135 decision 2: each enabled
+    provider's models, routed through the gateway as `provider/model`, each reading its own
+    provider's key from the gateway's own environment (`os.environ/OSPREY_MODEL_KEY_<NAME>`, or
+    `OSPREY_MODEL_PROVIDER_KEY` for the single `models.provider`) — never written into this
+    file."""
     entries: list[dict[str, object]] = []
     for provider in config.models.enabled_providers:
         key = config.models.key_variable(provider.name)
@@ -308,6 +333,8 @@ def model_engines_env(config: OspreyConfig) -> list[str]:
             # ADR-136 decision 1: the contract mark and its reference (words, never a secret).
             "privacy_contract": p.privacy_contract,
             "contract_reference": p.contract_reference,
+            # ADR-135 Amendment 2: the Conduit makes the gateway's entries, so it needs the base.
+            "api_base": p.api_base,
         }
         for p in models.enabled_providers
     ]
@@ -342,6 +369,27 @@ def _keys_for_the_gateway_alone(config: OspreyConfig, services: dict[str, Any]) 
         if name == "api":
             for provider, key in keys.items():
                 environment[f"OSPREY_MODEL_KEY_PRESENT_{provider.upper()}"] = f"${{{key}:+yes}}"
+        service["environment"] = environment
+
+
+def connection_secret_variables(config: OspreyConfig) -> list[str]:
+    """Each declared connection secret's `deployment.env` variable (ADR-140 Amendment 15)."""
+    return [f"OSPREY_CONNECTION_SECRET_{name}" for name in config.connectors.secrets]
+
+
+def _connection_secrets_for_the_conduit_alone(
+    config: OspreyConfig, services: dict[str, Any]
+) -> None:
+    """A SQL or API connection's secret is read by the Conduit alone (the orchestrator's review of
+    ADR-140 Amendment 15, item 9, as ADR-135 decision 2 keeps a model key to the gateway): every
+    other owned service reads `deployment.env` whole, so its own environment, which Compose puts
+    above the file, blanks each declared secret."""
+    variables = connection_secret_variables(config)
+    for name, service in services.items():
+        if name == "api" or "env_file" not in service:
+            continue
+        environment = dict(service.get("environment") or {})
+        environment.update({variable: "" for variable in variables})
         service["environment"] = environment
 
 
@@ -393,7 +441,10 @@ def _local_model_table(config: OspreyConfig, extraction: str) -> str:
                     },
                 },
             ],
-            "general_settings": {"master_key": LITELLM_KEY},
+            "general_settings": {
+                "master_key": "os.environ/LITELLM_MASTER_KEY",
+                "store_model_in_db": True,
+            },
         },
         sort_keys=False,
     )
@@ -477,9 +528,7 @@ class UnpinnedImagesError(RuntimeError):
 OWNED_IMAGE_REGISTRY = "ghcr.io/ospreyflow"
 
 
-def service_images(
-    config: OspreyConfig, *, build_context: str = "../../.."
-) -> list[ServiceImage]:
+def service_images(config: OspreyConfig, *, build_context: str = "../../..") -> list[ServiceImage]:
     """Every container the rendered stack runs, in a deterministic order.
 
     `05_DEPLOYMENT.md` §3's own `local-lite` list is the reference: "the workspace, one Conduit,
@@ -608,6 +657,7 @@ def build_context_for(out_dir: Path, source_path: str | None) -> str:
         return BUILD_CONTEXT_FROM_OUTPUT_DIR
     return str(source)
 
+
 #: Published host ports, as `service -> (env var, default)`. Every one is overridable, because
 #: Preflight found 8000 already held by an unrelated container on a real machine and a deployment
 #: that cannot move its own ports is one an operator has to fight. The defaults are the
@@ -625,6 +675,7 @@ PORT_OVERRIDES: dict[str, tuple[str, int]] = {
     # run on the host and need the database (owner's ruling of 29 September 2026).
     "arcadedb": ("OSPREY_ARCADEDB_PORT", 2480),
 }
+
 
 def _published_port(config: OspreyConfig, service: str, default: int) -> int:
     """The host port a service is published at: ArcadeDB's is `deployment.graph_port` when set
@@ -667,8 +718,13 @@ _SERVICE_EXTRAS: dict[str, dict[str, object]] = {
     # the services read are kept (`harness/apply.py`'s `object_store_lines`).
     "objectstore": {
         "command": [
-            "server", "-s3", "-dir=/data", "-s3.port=8333", "-volume.max=1000",
-            "-master.volumeSizeLimitMB=1024", "-master.volumePreallocate=false",
+            "server",
+            "-s3",
+            "-dir=/data",
+            "-s3.port=8333",
+            "-volume.max=1000",
+            "-master.volumeSizeLimitMB=1024",
+            "-master.volumePreallocate=false",
         ],
         "environment": {
             "AWS_ACCESS_KEY_ID": "${OSPREY_MINIO_USER:-ospreyflow}",
@@ -797,7 +853,13 @@ _SERVICE_EXTRAS: dict[str, dict[str, object]] = {
     "litellm": {
         "command": ["--config", "/app/config.yaml", "--port", "4000"],
         "volumes": ["./litellm.yaml:/app/config.yaml:ro"],
-        "environment": {"LITELLM_MASTER_KEY": LITELLM_KEY},
+        "environment": {
+            "LITELLM_MASTER_KEY": "${" + GATEWAY_MASTER + ":?set in the deployment env file}",
+            "LITELLM_SALT_KEY": "${" + GATEWAY_SALT + ":?set in the deployment env file}",
+            # ADR-114 Amendment 7: the price list is read from the image, not GitHub (measured: it
+            # tried at every start).
+            "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+        },
         # **`service_started`, not `service_healthy`** — `ollama` has no healthcheck by design
         # (see its own comment: waiting for the model pull cost Floor A ten times its runtime).
         # The proxy only needs the server process reachable; a request for a model still being
@@ -947,6 +1009,8 @@ def compose_services(config: OspreyConfig, images: Sequence[ServiceImage]) -> di
             api_environment["OSPREY_RECIPE_REPO_ROOT"] = (
                 f"{config.components.storage.data}/{RECIPE_REPO_DIRNAME}"
             )
+            # ADR-147 decision 1: the maps file and the map key file, on their own volume.
+            api_environment["OSPREY_MAP_SETTINGS_DIR"] = MAP_SETTINGS_PATH
             # **Round 13cda — the Conduit could not reach a model at all.**
             # `adapters/model_litellm/client.py`'s `LiteLLMConfig.from_env` defaults to
             # `localhost:4000`, which inside the Conduit's own container is the Conduit. Every
@@ -955,7 +1019,9 @@ def compose_services(config: OspreyConfig, images: Sequence[ServiceImage]) -> di
             # rendered either, `09_INGEST_STUDIO.md` §4's whole review queue was unreachable.
             api_environment["LITELLM_HOST"] = "litellm"
             api_environment["LITELLM_PORT"] = "4000"
-            api_environment["LITELLM_API_KEY"] = LITELLM_KEY
+            api_environment["LITELLM_API_KEY"] = "${" + GATEWAY_MASTER + ":?set in the env file}"
+            # ADR-135 Amendment 2 decision 2: the models file, on its own volume.
+            api_environment["OSPREY_MODEL_SETTINGS_DIR"] = MODEL_SETTINGS_PATH
             # ADR-095 Amendment 2: where to ask whether the models have arrived (`/v1/readiness`).
             api_environment["OSPREY_OLLAMA_URL"] = "http://ollama:11434"
             # ADR-098 decision 2: the fast recogniser. Not in `depends_on` below: without it the
@@ -1010,6 +1076,12 @@ def compose_services(config: OspreyConfig, images: Sequence[ServiceImage]) -> di
                 # The built basemap, read-only, at the path a map provider's `source` names. See
                 # `StorageRoots.tiles`.
                 f"{host_folder_source(config.components.storage.tiles)}:{TILES_CONTAINER_PATH}:ro",
+                # ADR-147 decision 3: a basemap built in the Conduit is written here alone, a
+                # writable door laid over the read-only root as ADR-067's upload door is.
+                f"{host_folder_source(config.components.storage.tiles)}/{TILES_BUILT_SUBDIR}:"
+                f"{TILES_CONTAINER_PATH}/{TILES_BUILT_SUBDIR}",
+                # ADR-147 decision 1: the maps file and the map key file, the Conduit's alone.
+                f"map-settings:{MAP_SETTINGS_PATH}",
             ]
             service["depends_on"] = {
                 dependency: {"condition": "service_healthy"}
@@ -1134,6 +1206,8 @@ def compose_services(config: OspreyConfig, images: Sequence[ServiceImage]) -> di
         )
     )
     _keys_for_the_gateway_alone(config, services)
+    _connection_secrets_for_the_conduit_alone(config, services)
+    _gateway_database(config, services)
     if "keycloak" in services and ("postgres" in services or config.external.postgres is not None):
         services["keycloak-db"] = _keycloak_database_step(config)
     if config.external.postgres is not None:
@@ -1155,7 +1229,11 @@ def _render_compose(config: OspreyConfig, images: Sequence[ServiceImage]) -> str
             "osprey-staging": {"driver": "local"},
             # Round 13cda: without this the ~2.2GB model pull repeats on every `up`.
             "ollama-models": {"driver": "local"},
+            # ADR-147 decision 1: the maps file and the map key file, the Conduit's alone.
+            **({"map-settings": {"driver": "local"}} if "api" in services else {}),
             **({"whisper-models": {"driver": "local"}} if "whisper" in services else {}),
+            # ADR-135 Amendment 2 decision 2: the models file, the Conduit's alone.
+            **({"model-settings": {"driver": "local"}} if "litellm-db" in services else {}),
             **({"objectstore-data": {"driver": "local"}} if "objectstore" in services else {}),
             # ADR-114 Amendment 33 decision 3: with the organisation's certificate nothing is
             # obtained, so there is nothing for Caddy to keep.
@@ -1311,6 +1389,79 @@ def _keycloak_database_step(config: OspreyConfig) -> dict[str, object]:
     return step
 
 
+#: The gateway's role and database (ADR-135 Amendment 2 decision 3), made as Keycloak's are: its
+#: own, so its start-up schema diff (measured) can touch nothing of the Conduit's, and the
+#: Conduit's login cannot read the sealed keys.
+_GATEWAY_DATABASE_SQL = (
+    "SELECT 'CREATE ROLE litellm LOGIN' "
+    "WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'litellm')\\gexec\n"
+    "ALTER ROLE litellm WITH LOGIN PASSWORD :'pw';\n"
+    "SELECT 'CREATE DATABASE litellm OWNER litellm' "
+    "WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'litellm')\\gexec\n"
+)
+
+
+def _gateway_database(config: OspreyConfig, services: dict[str, Any]) -> None:
+    """The gateway's database, its encryption key and master key (ADR-135 Amendment 2 decision 3),
+    each secret blanked in every other service that reads the env file whole; the master key
+    reaches the Conduit alone besides, which calls the admin API with it."""
+    if "litellm" not in services or (
+        "postgres" not in services and config.external.postgres is None
+    ):
+        return
+    managed = config.external.postgres
+    host, port = (managed.host, managed.port) if managed is not None else ("postgres", 5432)
+    query = f"?sslmode={managed.sslmode}" if managed is not None else ""
+    gateway = services["litellm"]
+    gateway["environment"] = {
+        **dict(gateway.get("environment") or {}),
+        "DATABASE_URL": (
+            "postgresql://litellm:${" + GATEWAY_DB_PASSWORD + ":?set in the deployment env file}"
+            f"@{host}:{port}/litellm{query}"
+        ),
+        "STORE_MODEL_IN_DB": "True",
+    }
+    gateway["depends_on"] = {
+        **dict(gateway.get("depends_on") or {}),
+        "litellm-db": {"condition": "service_completed_successfully"},
+    }
+    script = (
+        f'psql -h {host} -p {port} -U "$$OSPREY_POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 '
+        + '-v pw="$$'
+        + GATEWAY_DB_PASSWORD
+        + '" <<'
+        + "'SQL'\n"
+        + _GATEWAY_DATABASE_SQL
+        + "SQL\n"
+    )
+    services["litellm-db"] = {
+        "restart": "no",
+        "image": POSTGRES_IMAGE,
+        "entrypoint": ["sh", "-c"],
+        "command": [script],
+        "environment": {
+            "OSPREY_POSTGRES_USER": "${OSPREY_POSTGRES_USER:-osprey}",
+            "PGPASSWORD": "${OSPREY_POSTGRES_PASSWORD:?set in the deployment env file}",
+            GATEWAY_DB_PASSWORD: "${" + GATEWAY_DB_PASSWORD + ":?set in the env file}",
+            **({"PGSSLMODE": managed.sslmode} if managed is not None else {}),
+        },
+        "depends_on": {"postgres": {"condition": "service_healthy"}},
+    }
+    if "api" in services:
+        api = services["api"]
+        api["volumes"] = [*api.get("volumes", []), f"model-settings:{MODEL_SETTINGS_PATH}"]
+    if config.profile.value == "cluster":
+        return  # the chart blanks them for every workload, its own workers too (`harness.cluster`)
+    for name, service in services.items():
+        if name in ("litellm", "litellm-db") or "env_file" not in service:
+            continue
+        environment = dict(service.get("environment") or {})
+        environment.update({GATEWAY_SALT: "", GATEWAY_DB_PASSWORD: ""})
+        if name != "api":
+            environment[GATEWAY_MASTER] = ""
+        service["environment"] = environment
+
+
 def _keycloak_jdbc_url(config: OspreyConfig) -> str:
     managed = config.external.postgres
     assert managed is not None
@@ -1346,6 +1497,14 @@ def release_version(config: OspreyConfig) -> str:
 
     source = config.components.source_path
     return checkout_version(Path(source) if source is not None else REPO_ROOT)
+
+
+def _grading_env(config: OspreyConfig) -> list[str]:
+    scheme = config.grading.resolved()
+    lines = [f"OSPREY_GRADING_SCHEME={scheme.scheme}"]
+    if config.grading.names_a_file:
+        lines.append(f"OSPREY_GRADING_GRADES={scheme.model_dump_json()}")
+    return lines
 
 
 def _render_env(config: OspreyConfig) -> str:
@@ -1387,6 +1546,8 @@ def _render_env(config: OspreyConfig) -> str:
         ),
         f"OSPREY_IDENTITY_PROVIDER={config.governance.identity_provider}",
         f"OSPREY_HANDLING_SCHEME={config.governance.handling_scheme}",
+        # ADR-148 decision 10: the deployment's marking ceiling, the scheme's highest when unset.
+        f"OSPREY_HIGHEST_MARKING={highest_marking(config)}",
         f"OSPREY_ONTOLOGY={config.governance.ontology}",
         f"OSPREY_REAL_DATA_EXCEPTIONS={config.governance.real_data_exceptions}",
         f"OSPREY_MODELS_LOCAL_ONLY={'true' if config.models.local_only else 'false'}",
@@ -1429,6 +1590,23 @@ def _render_env(config: OspreyConfig) -> str:
         f"OSPREY_HOTLIST_AUDIENCE={config.monitoring.hotlist_audience}",
         "OSPREY_HOTLIST_AUDIENCE_EDITABLE="
         + ("true" if config.monitoring.hotlist_audience_editable else "false"),
+        # ADR-140 Amendment 15: the private hosts and networks the operator admits the Studio's
+        # connectors to (names and networks, never a secret).
+        *(
+            ["OSPREY_CONNECTOR_PRIVATE=" + ",".join(config.connectors.private_hosts)]
+            if config.connectors.private_hosts
+            else []
+        ),
+        # The connection secrets the operator declares, by name only (never a value): only the
+        # Conduit is given them, and it reads no other.
+        *(
+            ["OSPREY_CONNECTOR_SECRETS=" + ",".join(config.connectors.secrets)]
+            if config.connectors.secrets
+            else []
+        ),
+        # ADR-143 decision 11 and Amendment 6: the scheme drawn items are graded in, by name, and a
+        # scheme file's grades beside it (the Conduit never reads the file itself).
+        *_grading_env(config),
         "",
         "# Ports published besides the front proxy's: the Conduit only when network.expose_conduit",
         "# asks, ArcadeDB on loopback only (ADR-114 Amendment 4 decision 3). Each is overridable.",
@@ -1532,6 +1710,18 @@ def _render_runbook(config: OspreyConfig, images: Sequence[ServiceImage]) -> str
     path and which Stage 2 §4 writes by hand — that one is a measurement, not a render.
     """
     rows = "\n".join(f"| `{i.service}` | `{i.image}` |" for i in images)
+    # ADR-114 Amendment 38 decision 9: where `harness.backup` writes this deployment's sets, not
+    # the setting verbatim (the schema's placeholder is no folder named off a server). Imported
+    # here, as `harness.backup` imports this module.
+    from harness.backup import FALLBACK_SPELLING, named_backups_folder
+
+    named = named_backups_folder(config)
+    sets = generated_folder(config)
+    backups = (
+        f"`{named.rstrip('/')}/{sets}/`"
+        if named is not None
+        else f"`{FALLBACK_SPELLING}/{sets}/` (`osprey.yaml` names no folder)"
+    )
     hosts = (
         "\n".join(f"- `{h.name}` — `{h.address}`" for h in config.cluster.hosts)
         if config.cluster.hosts
@@ -1565,7 +1755,7 @@ Search backend: `{config.components.search.value}`{
 | --- | --- |
 | Data | `{config.components.storage.data}` |
 | Staging | `{config.components.storage.staging}` |
-| Backups | `{config.components.storage.backups}` |
+| Backups | {backups} |
 | Ingest (read-only into the Conduit) | `{config.components.storage.ingest}` |
 
 ## Addresses
@@ -1700,7 +1890,10 @@ def load_config(path: Path) -> OspreyConfig:
     if not path.exists():
         return OspreyConfig()
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    return OspreyConfig.model_validate(raw)
+    config = OspreyConfig.model_validate(raw)
+    # ADR-143 Amendment 6: a scheme file named by `grading.scheme` is read beside this file.
+    config.grading.read_file(path.parent)
+    return config
 
 
 def find_drift(result: RenderResult, out_dir: Path) -> list[str]:
@@ -1751,9 +1944,9 @@ def write_private(path: Path, text: str) -> None:
 
 #: What a rendered file that holds no secret is written as, and a folder of them, whatever the
 #: installer's umask: readable by every account, because a container that does not run as the
-#: installer reads it through a bind mount (Keycloak as uid 1000, the workspace as `nginx`, the
-#: Conduit as `osprey`). Found on the first server, 4 November 2026 (ADR-114 Amendment 33): an
-#: install under `umask 077` wrote `realm.json` 600 and Keycloak could not import it.
+#: installer reads it through a bind mount (Keycloak as uid 1000, the workspace and the Conduit
+#: as 10001, ADR-148 decision 3). Found on the first server, 4 November 2026 (ADR-114 Amendment
+#: 33): an install under `umask 077` wrote `realm.json` 600 and Keycloak could not import it.
 SHARED_FILE_MODE = 0o644
 SHARED_FOLDER_MODE = 0o755
 
@@ -1814,6 +2007,20 @@ def write_config_copy(config_path: Path, out_dir: Path) -> Path:
         )
     # The Conduit mounts it, and it holds no secret (05_DEPLOYMENT.md §7: never in osprey.yaml).
     write_shared(target, content)
+    # ADR-143 Amendment 6: a scheme file it names beside it goes with it, so the copy reads as the
+    # original does (every later `load_config` of the copy, `harness.apply`'s among them).
+    scheme = (yaml.safe_load(content) or {}).get("grading", {}) if content else {}
+    named = scheme.get("scheme") if isinstance(scheme, dict) else None
+    if (
+        isinstance(named, str)
+        and named.endswith((".yaml", ".yml"))
+        and not Path(named).is_absolute()
+    ):
+        source = config_path.parent / named
+        if source.is_file():
+            kept = out_dir / named
+            kept.parent.mkdir(parents=True, exist_ok=True)
+            write_shared(kept, source.read_text(encoding="utf-8"))
     return target
 
 

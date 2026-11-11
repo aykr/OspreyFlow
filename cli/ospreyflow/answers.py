@@ -9,6 +9,8 @@ a person at the prompts and CI install the same way.
     folders:                       # host folders; absolute, or under the home folder with ~
       ingest: ~/OspreyFlow/ingest  # what the Ingest Studio lists (read-only to the Conduit)
       tiles: ~/OspreyFlow/basemap  # where a built basemap lives
+      backups: ~/OspreyFlow/backups  # where `ospreyflow backup` writes, outside the checkout:
+                                   #   each deployment's sets in <this>/<deployment name>/
     models:
       local_only: true             # no case content leaves the deployment
     demo_packs: [operation-ledger, hmp]
@@ -40,7 +42,8 @@ a person at the prompts and CI install the same way.
       ingest: /srv/ospreyflow/ingest   # folders.ingest: where the CSV exports are put
       redirect_http: false         #   true also publishes 80, only to send people to 443
       listen_address: 192.0.2.10   #   optional: one interface of the server; default every one
-      backups: /srv/ospreyflow/backups  # where `ospreyflow backup` writes; ~/OspreyFlow/backups
+      backups: /srv/ospreyflow/backups  # folders.backups, by its older name; give one, or
+                                   #   both naming the same folder
       memory_gib: auto             #   or a number (GiB): what the stores are sized to
       gpu: nvidia                  #   optional: the local engine on the server's NVIDIA GPU; none
     sign_in:                       # small on a server, optional; without it, local accounts only
@@ -60,6 +63,8 @@ a person at the prompts and CI install the same way.
       organisation: Example Department
       phase: beta                  #   alpha | beta | live | none
     demo_accounts: true            # false for no demo accounts (the blank starter's answer)
+    grading:                       # ADR-143 decision 11 (grading.* in osprey.yaml)
+      scheme: 5x5x5                #   5x5x5 | 3x5x2 | a scheme file (ospreyflow grading change)
 
 Unknown keys are refused by name, as `osprey.yaml`'s are, so a typo never silently means the
 default. This module depends on nothing but PyYAML: the command is small, and the deployment's own
@@ -89,7 +94,7 @@ PROFILES = {"lite": "local-lite", "small": "small", "enterprise": "cluster"}
 _TOP = {
     "mode", "components", "folders", "models", "demo_packs", "paysim_file", "cloud", "config",
     "mail", "external", "cluster", "starter", "appearance", "demo_accounts", "server",
-    "admin_email", "sign_in",
+    "admin_email", "sign_in", "grading",
 }  # fmt: skip
 #: ADR-114 Amendment 33: `server:` (drop 1), with `backups` and `memory_gib` (drop 2, units 5–6),
 #: and ADR-135 Amendment 1's `gpu`.
@@ -113,12 +118,13 @@ DEFAULT_ORGANISATION_LABEL = "Organisation account"
 ORGANISATION_SECRET_VARIABLE = "OSPREY_ORG_SIGN_IN_SECRET"
 _SECTIONS = {
     "components": {"dashboards"},
-    "folders": {"ingest", "tiles"},
+    "folders": {"ingest", "tiles", "backups"},
     "models": {"local_only"},
     "cloud": {"provider", "region", "domain", "size", "dns_zone", "admin_email", "api_cidrs"},
     "mail": {"host", "port", "from", "starttls", "username"},
     "cluster": {"namespace", "storage_class", "shared_storage_class"},
     "appearance": {"brand", "service_name", "organisation", "phase"},
+    "grading": {"scheme"},
 }
 #: The sections a named `config:` replaces; giving both is refused rather than one silently winning.
 _CONFIG_SECTIONS = ("components", "folders", "models")
@@ -161,7 +167,8 @@ class Answers:
     server: dict[str, Any] = field(default_factory=dict)
     #: The first administrator's email, on a server of your own (a cloud's is `cloud.admin_email`).
     admin_email: str | None = None
-    #: Amendment 33 decision 5: where `ospreyflow backup` writes on a server of your own.
+    #: Where `ospreyflow backup` writes (ADR-114 Amendment 37 decision 1, every profile;
+    #: Amendment 33 decision 5 first gave it to a server of your own). None leaves the base's.
     backups: Path | None = None
     #: Amendment 33 decision 6: `"auto"` (measured by the install), a number of GiB, or None.
     memory_gib: int | str | None = None
@@ -170,6 +177,21 @@ class Answers:
     #: Amendment 33 decision 4: the organisation's identity provider — alias, label, issuer and
     #: client id, as `governance` takes them. Empty without `sign_in.organisation`.
     organisation: dict[str, str] = field(default_factory=dict)
+    #: ADR-143 decision 11: `grading.scheme`, when the answers choose one; None leaves the
+    #: product's default.
+    grading_scheme: str | None = None
+
+
+def _grading_scheme(section: Mapping[str, Any]) -> str | None:
+    """`grading.scheme` as given: a built-in scheme's name or a scheme file's path. Which ones are
+    schemes is the deployment schema's to say (`schemas.domain.GRADING_PARTS`, the one list), when
+    the result is rendered, as for every other setting this module passes on."""
+    scheme = section.get("scheme")
+    if scheme in (None, ""):
+        return None
+    if not isinstance(scheme, str):
+        raise AnswersRefused(f"grading.scheme is a scheme's name or a scheme file, not {scheme!r}")
+    return scheme
 
 
 def _appearance(section: Mapping[str, Any], starter: starters.Starter | None) -> dict[str, str]:
@@ -542,11 +564,46 @@ def load_answers(
         case_domains=starter.domain.case_domains if starter is not None else None,
         server=server.get("network", {}),
         admin_email=str(admin_email) if admin_email is not None else None,
-        backups=server.get("backups", home / "OspreyFlow" / "backups") if server else None,
+        backups=_backups(folders, server, cloud=bool(cloud) or bool(external), home=home),
         memory_gib=server.get("memory_gib"),
         gpu=server.get("gpu", "none"),
         organisation=organisation,
+        grading_scheme=_grading_scheme(sections["grading"]),
     )
+
+
+#: The schema's `components.storage.backups` default (`harness.backup.LEGACY_PLACEHOLDER`).
+BACKUPS_PLACEHOLDER = "/var/lib/osprey/backups"
+
+
+def _backups(
+    folders: Mapping[str, Any], server: Mapping[str, Any], *, cloud: bool, home: Path
+) -> Path | None:
+    """ADR-114 Amendment 37 decision 1: the backups folder, `folders.backups` or Amendment 33's
+    `server.backups` as the same setting, refused when both are given and differ. With neither,
+    `~/OspreyFlow/backups` on this machine or a server of your own; a cloud's server is built
+    elsewhere, so nothing is written for it and its own `osprey.yaml` decides."""
+    named = None
+    if folders.get("backups"):
+        named = _host_path("folders.backups", folders["backups"], home)
+    old = server.get("backups")
+    if named is not None and old is not None and Path(named) != Path(old):
+        raise AnswersRefused(
+            f"folders.backups ({named}) and server.backups ({old}) name different folders; they "
+            "are the same setting, so give one, or both naming the same folder"
+        )
+    chosen = named or old
+    if chosen is not None and str(chosen).rstrip("/") == BACKUPS_PLACEHOLDER and not server:
+        # ADR-114 Amendment 38: `ospreyflow backup` reads the placeholder as no folder named off a
+        # server of your own, so a choice of it would be set aside without a word.
+        raise AnswersRefused(
+            f"folders.backups {BACKUPS_PLACEHOLDER} is the settings' placeholder, which a backup "
+            "off a server of your own reads as no folder named; give another folder, for example "
+            "~/OspreyFlow/backups"
+        )
+    if chosen is None and not cloud:
+        chosen = home / "OspreyFlow" / "backups"
+    return Path(chosen) if chosen is not None else None
 
 
 def osprey_config(answers: Answers, base: Mapping[str, Any]) -> dict[str, Any]:
@@ -559,6 +616,8 @@ def osprey_config(answers: Answers, base: Mapping[str, Any]) -> dict[str, Any]:
         if answers.appearance:
             # ADR-138: the guided page installs from its draft; the look is a Mode-screen answer.
             loaded["appearance"] = {**(loaded.get("appearance") or {}), **answers.appearance}
+        if answers.grading_scheme is not None:
+            loaded["grading"] = {**(loaded.get("grading") or {}), "scheme": answers.grading_scheme}
         return _resolution_off_for_the_packs(loaded, answers.demo_packs, own_file=answers.config)
     config = copy.deepcopy(dict(base))
     config["profile"] = PROFILES[answers.mode]
@@ -580,6 +639,9 @@ def osprey_config(answers: Answers, base: Mapping[str, Any]) -> dict[str, Any]:
     if answers.appearance:
         # ADR-138: only what the answers say; the rest of the section stays as the base has it.
         config["appearance"] = {**(config.get("appearance") or {}), **answers.appearance}
+    if answers.grading_scheme is not None:
+        # ADR-143 decision 11: chosen at install; changed later only by the grading command.
+        config["grading"] = {**(config.get("grading") or {}), "scheme": answers.grading_scheme}
     if answers.mode == "enterprise":
         # 05 §3b: a cluster's Conduits share ClickHouse; DuckDB would give each its own events.
         config.setdefault("components", {})["analytics_engine"] = "clickhouse"
@@ -595,7 +657,7 @@ def osprey_config(answers: Answers, base: Mapping[str, Any]) -> dict[str, Any]:
         # ADR-114 Amendment 33: the server's address, and its own certificate's paths.
         network.update(copy.deepcopy(answers.server))
     if answers.backups is not None:
-        # Amendment 33 decision 5: where `ospreyflow backup` writes on this server.
+        # Amendment 37 decision 1: where `ospreyflow backup` writes, for every profile.
         storage["backups"] = str(answers.backups)
     if isinstance(answers.memory_gib, int):
         # Decision 6: a number given is written as it is; `auto` is measured by the install.

@@ -105,7 +105,7 @@ export function periodsOf(figures: TrendFigures): string[] {
 // --- an alert in a pack (ADR-134 decision 1) -------------------------------------------------------
 
 const SEVERITY_WORD: Record<AlertSnapshot["severity"], string> = { high: "High", medium: "Medium", low: "Low" };
-const KIND_WORD: Record<AlertSnapshot["kind"], string> = { typology: "Typology alert", hotlist: "Hotlist match", monitor: "Monitor match" };
+const KIND_WORD: Record<AlertSnapshot["kind"], string> = { typology: "Typology alert", hotlist: "Hotlist match", monitor: "Monitor match", analyst: "Raised by an analyst", drawn_watch: "A load met a drawn item" };
 
 /** "Typology alert (Rapid movement) · High severity · raised 29 September 2026": the typology by its
  * label, as the queue names it, never its stored key (build order step 18c, D10). */
@@ -120,6 +120,8 @@ export function alertLine(alert: AlertSnapshot): string {
 export function alertStatusSentence(alert: AlertSnapshot): string {
   if (alert.status === "open") return "Open: not yet decided when this was added.";
   if (alert.status === "claimed") return "Open, being worked on, when this was added.";
+  // ADR-146 decision 6 (G9): a proposed close is still open; the outcome proposed is not yet one.
+  if (alert.status === "closing") return "Proposed for closing, waiting for a second person, when this was added.";
   // The reason as it was typed, ended once: a reason that already ends a sentence ("…through
   // Crescent.") is not given a second full stop (build order step 15).
   const typed = (alert.reason ?? "").trim();

@@ -30,12 +30,25 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum
+from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
+import yaml
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
+from schemas.domain import BUILT_IN_GRADING_SCHEMES, GradingSchemeAnswer
 from schemas.mapconfig import MapConfig
+from schemas.sources import SECRET_NAME, private_host_entry
 
 #: The Lite address (`06_DECISIONS.md` ADR-114 Amendment 4): the front proxy on port 80 of this
 #: machine, the Glass at this name, the identity provider at `id.` and the dashboards at `bi.`.
@@ -71,7 +84,7 @@ class AnalyticsEngine(StrEnum):
 
 class SearchBackend(StrEnum):
     """`05_DEPLOYMENT.md` §3's reduced variant, as a declarable component rather than a hidden
-    branch: "If Preflight finds less than 16 GB it offers a reduced variant that drops OpenSearch
+    code path: "If Preflight finds less than 16 GB it offers a reduced variant that drops OpenSearch
     and falls back to PostgreSQL full-text, stating the trade-off on screen: search quality
     degrades and semantic search is unavailable."
 
@@ -197,7 +210,7 @@ class ComponentsConfig(BaseModel):
             "Default: none — the owned services (workspace, api, ingest) are PULLED, by the "
             "digest recorded in versions.lock, from the registry reference harness/render.py's "
             "own service_images names. This is the operator path: the harness image itself "
-            "carries no services/ or apps/workspace source, and round 05's own finding was that "
+            "carries no services/ or apps/workspace source, and a review found that "
             "the documented one-command bootstrap could not Launch without it — a clean laptop "
             "has no checkout. Set to a checkout root containing services/api/Dockerfile, "
             "services/ingest/Dockerfile and apps/workspace/Dockerfile (this repository's own "
@@ -305,6 +318,10 @@ class ModelProviderConfig(BaseModel):
             raise ValueError(
                 f"the provider name {value!r} is not one LiteLLM knows the shape of (lower-case, "
                 "such as openai or anthropic)"
+            )
+        if value == LOCAL_ENGINE:
+            raise ValueError(
+                "local is this deployment's own engine; a provider outside it takes another name"
             )
         return value
 
@@ -815,6 +832,56 @@ class MonitoringConfig(BaseModel):
     )
 
 
+class ConnectorsConfig(BaseModel):
+    """The Studio's SQL and API connectors (`06_DECISIONS.md` ADR-140 Amendments 13 and 15). A
+    connector never reaches inside the deployment or its network unless the operator admits a
+    client's private database or API here; the installer's setting, never Admin's."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    private_hosts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Default: none. The private hosts a SQL or API connection may reach: each a host name "
+            "in full (nomis-replica.client.internal) or a network inside 10.0.0.0/8, "
+            "172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 or fc00::/7 (10.20.0.0/16) that a "
+            "connection's host name resolves into. Everything else inside a network stays "
+            "refused. Never admitted, whatever is listed: this machine, a cloud's metadata "
+            "services (169.254.0.0/16, fd00:ec2::/32, 100.100.0.0/16), Docker's and the "
+            "cluster's own names, and any address in the Conduit's own networks or the "
+            "deployment's own services'. A host must still be on the egress allow-list."
+        ),
+    )
+
+    secrets: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Default: none. The name of each SQL or API connection's secret "
+            "(NOMIS_REPLICA for OSPREY_CONNECTION_SECRET_NOMIS_REPLICA in deployment.env). Only "
+            "the Conduit is given a declared secret, every other service having it blanked, and a "
+            "connection whose secret is not declared reads nothing."
+        ),
+    )
+
+    @field_validator("secrets")
+    @classmethod
+    def _each_a_secret_name(cls, value: list[str]) -> list[str]:
+        for name in value:
+            if not re.fullmatch(SECRET_NAME, name):
+                raise ValueError(
+                    f"{name!r} is not a secret's name: capitals, digits and _ only, starting "
+                    "with a capital (NOMIS_REPLICA)"
+                )
+        return value
+
+    @field_validator("private_hosts")
+    @classmethod
+    def _each_private(cls, value: list[str]) -> list[str]:
+        for entry in value:
+            private_host_entry(entry)
+        return [e.strip() for e in value]
+
+
 class WelcomeConfig(BaseModel):
     """The welcome page before sign-in (ADR-115 decision 8): its About section, and the footer's
     links — the deploying organisation's own documents, each shown only when its address is
@@ -877,6 +944,19 @@ class DeploymentConfig(BaseModel):
         ),
     )
 
+    #: ADR-148 decision 10: the highest marking this deployment may hold. Checked against the
+    #: handling scheme the Conduit loads at render (`harness.site.highest_marking`).
+    highest_marking: str | None = Field(
+        default=None,
+        description=(
+            "Default: the handling scheme's highest. The highest marking this deployment may hold: "
+            "a load or an import marked above it is refused before anything is written, in words "
+            "that say this limit and never the item's content. A demo pack that declares no "
+            "highest marking is judged as the scheme's highest, so under a lower setting it is "
+            "refused. One of the handling scheme's classifications."
+        ),
+    )
+
     @field_validator("name")
     @classmethod
     def _a_compose_name(cls, value: str | None) -> str | None:
@@ -915,6 +995,70 @@ class AppearanceConfig(BaseModel):
         default="none",
         description="Default: none. The phase banner shows at alpha or beta.",
     )
+
+
+class GradingConfig(BaseModel):
+    """The deployment's grading scheme (`06_DECISIONS.md` ADR-143 decision 11 and Amendment 6): the
+    scheme every drawn node and link is graded in, chosen at install (`install.yaml`'s
+    `grading.scheme`) and shown read-only in Admin. Changed only by `ospreyflow grading change`
+    (C13), which changes the items and this setting together: editing this alone would leave the
+    items' grades in the old scheme."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scheme: str = Field(
+        default="5x5x5",
+        min_length=1,
+        description=(
+            "Default: 5x5x5. The scheme drawn items are graded in: 5x5x5; 3x5x2, whose handling "
+            "code (P or C) is part of the grade and never merged with the marking; or the path of "
+            "a scheme file (.yaml, beside this file unless absolute) naming its own scheme and "
+            "each part's grades."
+        ),
+    )
+
+    #: A scheme file's scheme, read by `harness.render.load_config` (beside `osprey.yaml`).
+    _file_scheme: GradingSchemeAnswer | None = PrivateAttr(default=None)
+
+    @property
+    def names_a_file(self) -> bool:
+        return self.scheme not in BUILT_IN_GRADING_SCHEMES
+
+    def read_file(self, beside: Path) -> None:
+        """Reads the scheme file `scheme` names, relative to `beside` unless absolute, and checks
+        it (`GradingSchemeAnswer`). Refused, naming the file, if it cannot be read or is not one."""
+        if not self.names_a_file:
+            return
+        path = Path(self.scheme)
+        path = path if path.is_absolute() else beside / path
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError) as unread:
+            raise ValueError(
+                f"grading.scheme: the scheme file {path} cannot be read: {unread}"
+            ) from None
+        try:
+            self._file_scheme = GradingSchemeAnswer.model_validate(raw)
+        except ValidationError as bad:
+            raise ValueError(f"grading.scheme: {path} is not a grading scheme: {bad}") from None
+
+    def resolved(self) -> GradingSchemeAnswer:
+        """The scheme and its grades: a built-in one's, or the scheme file's once read."""
+        if not self.names_a_file:
+            return GradingSchemeAnswer.of(self.scheme)
+        if self._file_scheme is None:
+            raise ValueError(f"grading.scheme: the scheme file {self.scheme} has not been read")
+        return self._file_scheme
+
+    @field_validator("scheme")
+    @classmethod
+    def _a_scheme_or_its_file(cls, value: str) -> str:
+        if value in BUILT_IN_GRADING_SCHEMES or value.endswith((".yaml", ".yml")):
+            return value
+        raise ValueError(
+            f"{value!r} is neither a grading scheme ({', '.join(BUILT_IN_GRADING_SCHEMES)}) nor a "
+            "scheme file (.yaml)"
+        )
 
 
 class MailConfig(BaseModel):
@@ -1123,10 +1267,12 @@ class OspreyConfig(BaseModel):
     map: MapConfig | None = Field(default=None, description="Default: none declared")
     reporting: ReportingConfig = Field(default_factory=ReportingConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
+    connectors: ConnectorsConfig = Field(default_factory=ConnectorsConfig)
     mail: MailConfig | None = Field(default=None, description="Default: none — one-time codes")
     welcome: WelcomeConfig = Field(default_factory=WelcomeConfig)
     deployment: DeploymentConfig = Field(default_factory=DeploymentConfig)
     appearance: AppearanceConfig = Field(default_factory=AppearanceConfig)
+    grading: GradingConfig = Field(default_factory=GradingConfig)
     external: ExternalConfig = Field(default_factory=ExternalConfig)
     resources: ResourcesConfig = Field(default_factory=ResourcesConfig)
 
@@ -1361,6 +1507,7 @@ ALL_MODELS: tuple[type[BaseModel], ...] = (
     ModelsConfig,
     OrganisationProvider,
     GovernanceConfig,
+    GradingConfig,
     ClusterHost,
     ClusterConfig,
     TlsFiles,

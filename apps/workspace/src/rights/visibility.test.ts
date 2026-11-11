@@ -12,7 +12,6 @@ import {
   landingView,
   railEntries,
   showsInspector,
-  homePanels,
   startFor,
   startPlaces,
   viewsFor,
@@ -25,30 +24,32 @@ const READER = ["read_alert_queue", "read_reports", "read_report_feed", "read_da
 
 describe("what the Glass offers each role", () => {
   it("offers an analyst the investigation and no administration", () => {
-    // The owner's answer of 1 November 2026: no Watches entry; watches are in Monitoring's Watches tab.
-    expect(railEntries(new Set(ANALYST))).toEqual(["cases", "alerts", "ownership", "history", "explore", "questions", "dashboards"]);
+    // ADR-146 decision 2: Monitoring is a place of its own (`shell/places.ts`), not the rail's;
+    // Connection strength, which is not alerts, stays in the Glass.
+    expect(railEntries(new Set(ANALYST))).toEqual(["cases", "ownership", "history", "explore", "questions", "dashboards", "strength"]);
     expect(viewsFor(new Set(ANALYST))).toEqual(["graph", "map", "matrix", "reports"]);
     expect(landingView(new Set(ANALYST))).toBe("graph");
   });
 
-  it("keeps watches reachable for someone who keeps watches but does not read the queue", () => {
-    // With the rail's Watches entry gone, Monitoring is where watches are: a person granted
-    // `keep_watches` alone must still be offered it, or their watches would be unreachable.
-    expect(railEntries(new Set(["investigate", "keep_watches"]))).toContain("alerts");
-    expect(railEntries(new Set(["investigate"]))).not.toContain("alerts");
+  it("offers no alerts in the Glass's rail: they are in Rules and Monitoring", () => {
+    for (const rights of [ANALYST, ENGINEER, READER, ["investigate", "keep_watches"]]) {
+      expect(railEntries(new Set(rights)) as string[]).not.toContain("alerts");
+    }
   });
 
   it("offers a data engineer the Studio and no watches or ownership", () => {
-    expect(railEntries(new Set(ENGINEER))).toEqual(["cases", "alerts", "history", "explore", "ingest", "dashboards"]);
+    // ADR-145 decision 1: the Studio is a place of its own, reached from the switcher, not the rail.
+    expect(railEntries(new Set(ENGINEER))).toEqual(["cases", "history", "explore", "dashboards", "strength"]);
   });
 
   it("offers an administrator the Admin area and nothing of a case's content", () => {
-    expect(railEntries(new Set(ADMIN))).toEqual(["cases", "types", "admin"]);
+    // ADR-145 decision 1: Admin and Proposed types left the rail (Proposed types is an Admin tab).
+    expect(railEntries(new Set(ADMIN))).toEqual(["cases"]);
     expect(viewsFor(new Set(ADMIN))).toEqual([]);
   });
 
-  it("lands a reports viewer on Reports, with the alerts and the feed", () => {
-    expect(railEntries(new Set(READER))).toEqual(["cases", "alerts", "dashboards"]);
+  it("lands a reports viewer on Reports, with the feed", () => {
+    expect(railEntries(new Set(READER))).toEqual(["cases", "dashboards"]);
     expect(viewsFor(new Set(READER))).toEqual(["reports"]);
     expect(landingView(new Set(READER))).toBe("reports");
     expect(canDownloadFeed(new Set(READER))).toBe(true);
@@ -58,8 +59,7 @@ describe("what the Glass offers each role", () => {
   });
 
   it("shows what it always showed while the rights are not yet known", () => {
-    expect(railEntries(null)).toContain("ingest");
-    expect(railEntries(null)).not.toContain("admin");
+    expect(railEntries(null)).toContain("history");
     expect(railEntries(null)).not.toContain("dashboards"); // ADR-111 Am. 3: only once the right is known
     expect(viewsFor(null)).toEqual(["graph", "map", "matrix", "reports"]);
   });
@@ -93,26 +93,24 @@ describe("what the Reports place offers each role (ADR-113)", () => {
 // ADR-114 Amendment 5 point 9: Start — the places a person may go after signing in, with no case open.
 describe("Start", () => {
   it("offers each place the person's rights open, Admin only once an administration right is known", () => {
-    expect(startPlaces(new Set(ANALYST))).toEqual(["glass"]);
+    // ADR-145 N6, from `shell/places.json` (the table `test_place_routes.py` checks the routes against).
+    expect(startPlaces(new Set(ANALYST.filter((r) => r !== "add_ingest_files")))).toEqual(["glass"]);
     expect(startPlaces(new Set(ENGINEER))).toEqual(["glass", "ingest"]);
+    expect(startPlaces(new Set([...ENGINEER, "operate_schedules"]))).toEqual(["glass", "ingest", "admin"]);
     expect(startPlaces(new Set(ADMIN))).toEqual(["admin"]);
-    expect(startPlaces(new Set([...ENGINEER, ...ADMIN]))).toEqual(["glass", "ingest", "admin"]);
+    expect(startPlaces(new Set([...ADMIN, "share_case"]))).toEqual(["glass", "admin"]);
     expect(startPlaces(new Set(READER))).toEqual(["glass"]);
-    expect(startPlaces(null)).toEqual(["glass", "ingest"]);
+    // ADR-145 Amendment 1: `manage_ontology` alone opens nothing; its routes ask for the administrator role too.
+    expect(startPlaces(new Set(["manage_ontology"]))).toEqual([]);
+    expect(startPlaces(new Set())).toEqual([]);
+    // ADR-145 N6: nothing is offered until the rights are known.
+    expect(startPlaces(null)).toEqual([]);
   });
 
   it("lands everyone on Home, a person with one place too, and goes to the place they chose", () => {
     expect(startFor(null)).toBe("start");
     expect(startFor("admin")).toBe("admin");
     expect(startFor("start")).toBe("start");
-  });
-
-  it("gives Home all three panels, each usable or naming the role that opens it", () => {
-    expect(homePanels(new Set(READER))).toEqual([
-      { place: "glass", allowed: true, role: "Analyst" },
-      { place: "ingest", allowed: false, role: "Data Engineer" },
-      { place: "admin", allowed: false, role: "Admin" },
-    ]);
   });
 
   it("offers a case's settings only to an Author who holds share_case (ADR-126, ADR-099)", () => {

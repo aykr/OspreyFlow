@@ -157,21 +157,16 @@ class GeometryRecord(BaseModel):
 
 
 class InheritedEvents(BaseModel):
-    """The events a branch reads from the cases it came from (ADR-084 Amendment 2).
-
-    A branch is a case of its own holding copies of some of its parent's links; the events behind
-    those links stay under the parent's scope. An event under one of `scopes` counts only if its
-    link is one of `edge_ids`, the links the branch holds, so a branch never reads its parent's
-    events for links it did not take. Every other `EventFilter` predicate and the access filter
-    apply to these events exactly as to the case's own. Set by the Conduit from the case's own
-    record and working set, never taken from a caller."""
+    """Events read from other cases beside the case's own (ADR-084 Amendment 2). Since L3.2 no
+    case reads another's (ADR-144 Amendment 1): the Conduit sets `EventFilter.inherited` to `None`
+    on every read and discards a caller's value. The shape is kept for the analytics port, which
+    still honours it: an event under one of `scopes` counts only if its link is one of
+    `edge_ids`, inside `window` when one is given, under the access filter as the case's own."""
 
     scopes: list[str] = Field(default_factory=list)
     edge_ids: list[EdgeId] = Field(default_factory=list)
-    #: ADR-128 decision 2: a branch made from what is lit records its window, and reads the
-    #: parent's events only inside it, both ends included, so its timeline starts and ends inside
-    #: the window. `None`: every inherited event, as before. Applies to the inherited events only;
-    #: the branch's own are never held to it.
+    #: ADR-128 decision 2: the window the other cases' events are read inside, both ends included.
+    #: `None`: every one. Applies to those events only.
     window: Interval | None = None
 
 
@@ -231,8 +226,8 @@ class EventFilter(BaseModel):
     #: A list is de-duplicated, keeping the order of first appearance, and holds at most the 168
     #: real cells (7 days x 24 hours): a longer one is refused, not thinned (ADR-130 Amendment 1).
     weekday_hours: list[WeekdayHour] | None = None
-    #: A branch's parents' events on the links it holds (ADR-084 Amendment 2). `None` reads the
-    #: case's own events only.
+    #: Other cases' events (ADR-084 Amendment 2); always `None` from the Conduit since L3.2, which
+    #: reads the case's own events only.
     inherited: InheritedEvents | None = None
 
     @field_validator("weekday_hours")
@@ -553,11 +548,13 @@ ALL_MODELS = (*ALL_MODELS, TrendRequest, TrendPoint, CountedHandling, TrendResul
 
 # --- Alert trends (`06_DECISIONS.md` ADR-134 decision 3) ------------------------------------------
 
-AlertFactKind = Literal["typology", "hotlist", "monitor"]
+AlertFactKind = Literal["typology", "hotlist", "monitor", "analyst", "drawn_watch"]
 #: Who may count an alert, as the one queue decides it (`services/api/alerts.py` `queue_scope`): a
 #: typology alert is its case's; a hotlist or monitor alert is its owner's, and its owner's team's
 #: when it is shared with them.
-AlertFactAudience = Literal["case", "team", "owner"]
+#: `routed` (ADR-146 decision 8): a rule's alert routed to a named team, counted in its case for
+#: the team's members alone (`team` holds the team's role id).
+AlertFactAudience = Literal["case", "team", "owner", "routed"]
 #: What an alert trend may split by or filter on: a closed list, never a property name.
 AlertTrendField = Literal["rule", "typology", "severity", "outcome"]
 ALERT_TREND_FIELDS: tuple[AlertTrendField, ...] = ("rule", "typology", "severity", "outcome")

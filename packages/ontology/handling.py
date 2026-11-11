@@ -18,6 +18,11 @@ import yaml
 from pydantic import BaseModel, ValidationError
 
 from schemas.domain import Edge, Handling, Node, Principal
+from schemas.mapconfig import (
+    GAZETTEER_DATASET_PREFIX,
+    GAZETTEER_ONLY_IDENTIFIERS,
+    GAZETTEER_SOURCE_IDENTIFIERS,
+)
 
 from .errors import HandlingSchemeError
 
@@ -331,7 +336,63 @@ def withhold_sources[Element: (Node, Edge)](element: Element, principal: Princip
     """`element` as `principal` may be sent it: where its sources are not within the case, a copy
     with them emptied and `provenance.sources_withheld` set. Otherwise `element` itself. Nothing
     stored is changed; the working set holds the full body and projects this for each reader."""
-    if _SOURCES_IN_FULL.get() or sources_within_case(element.datasets, principal):
+    if _SOURCES_IN_FULL.get():
+        return element
+    element = _board_as_known(element, principal)
+    element = _gazetteer_identifiers_withheld(element, principal)
+    if sources_within_case(element.datasets, principal):
         return element
     provenance = element.provenance.model_copy(update={"sources": [], "sources_withheld": True})
+    return element.model_copy(update={"provenance": provenance})
+
+
+def is_gazetteer_held(node: Node) -> bool:
+    """A gazetteer's place: a case's own copy of one (`provenance.gazetteer`, ADR-147 Amendment 2,
+    the owner's ruling 6), keyed on the copy's provenance, or the place itself in a gazetteer
+    dataset (`gazetteer-*`, Amendment 1)."""
+    return node.provenance.gazetteer is not None or any(
+        d.startswith(GAZETTEER_DATASET_PREFIX) for d in node.datasets
+    )
+
+
+def _gazetteer_identifiers_withheld[Element: (Node, Edge)](
+    element: Element, principal: Principal
+) -> Element:
+    """ADR-147 Amendment 1 (rule 7, the orchestrator's ruling of 9 November 2026): a gazetteer's
+    place (a node in a `gazetteer-*` dataset, or a case's copy of one: `is_gazetteer_held`) comes to
+    a request reader without its gazetteer's own
+    identifiers (`osm_id`, `uprn`, …), which are source-system identifiers. Amendment 3: every
+    other node comes without the six only a gazetteer carries (`GAZETTEER_ONLY_IDENTIFIERS`), and
+    keeps a `uprn`, which is a case's own. A case that adds the
+    gazetteer reads its places through search, expansion and every other node read, all of which
+    pass here. The Conduit's own work (`datasets is None`: resolution) keeps them, and so does a
+    read inside `sources_in_full`: a read written back, and a gazetteer load, which reads its places
+    whole (`load_gazetteer`). A rebuild matches a place by its `osm_id` inside the store anyway."""
+    if principal.datasets is None or not isinstance(element, Node):
+        return element
+    # ADR-147 Amendment 3 (CARRIES row 23, the strict reading): the six only a gazetteer carries
+    # leave every node, whatever dataset it is in, as a gazetteer loaded through the Studio sits in
+    # a case's own dataset unmarked; a gazetteer's place loses `uprn` too, a case's own keeps it.
+    withheld = (
+        GAZETTEER_SOURCE_IDENTIFIERS if is_gazetteer_held(element) else GAZETTEER_ONLY_IDENTIFIERS
+    )
+    if not any(name in element.properties for name in withheld):
+        return element
+    kept = {k: v for k, v in element.properties.items() if k not in withheld}
+    return element.model_copy(update={"properties": kept})
+
+
+def _board_as_known[Element: (Node, Edge)](element: Element, principal: Principal) -> Element:
+    """ADR-143 decision 4's board, as `principal` may know it (rule 3; the orchestrator's review of
+    L3.3): a drawn element's `board_id` is kept for its author alone. Only a board's creator draws
+    on it, so its author made the board; to anyone else it is given empty, so the id of a private
+    board tells no other member of the case it exists. A shared board's id is not needed to read
+    what was drawn: the board routes list the boards a reader may open. Every read path is sent
+    elements through here: the adapter's serialisation and the working set's projection."""
+    drawn = element.provenance.drawn
+    if drawn is None or drawn.asserted_by == principal.id or not drawn.board_id:
+        return element
+    provenance = element.provenance.model_copy(
+        update={"drawn": drawn.model_copy(update={"board_id": ""})}
+    )
     return element.model_copy(update={"provenance": provenance})

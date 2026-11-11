@@ -6,15 +6,18 @@ reads only elements of its own datasets, enforced in the graph adapter with the 
 (`AccessFilter.gremlin_structural_step`). This module holds the two records that limit rests on:
 the datasets of each unit, and the datasets of each case.
 
-**Who may name what.** A case names at least one dataset, every one of its own unit. A dataset of
-another unit and one that does not exist are refused with the same answer, so a refusal says
-nothing about another unit's data. Changing a case's datasets is its Author's (the route's level);
-a branch takes its parent's.
+**Who may name what.** A case names exactly one dataset, a source or a composite, of its own unit
+(ADR-099 Amendment 12). A dataset of another unit, an analyst layer and one that does not exist are
+refused with the same answer, so a refusal says nothing about another unit's data or a layer.
+Changing a case's dataset is its Author's (the route's level). No case is made from another (ADR-144
+Amendment 1); one made so since L3.1 reads its original's layer, read-only, until the upgrade turns
+it into a view. A case opened from an alert takes the dataset and has an empty analyst layer of its
+own, its maker holding no level on the original perhaps (ADR-143 Amendment 1 item 3).
 
 **Names are unique within a unit (ADR-099 Amendment 6),** ignoring case and spacing, so two of a
 unit's datasets never read alike; the id stays what every element and case refers to. A dataset
 asked for by name is refused when the name is taken; the one a case makes for itself, and a seed's,
-take a suffix instead ("Branch of Enron (2)").
+take a suffix instead ("Opened from alert A14 (2)").
 
 **Egress (ADR-136 decision 2).** Each dataset says where its material may go when a model is asked:
 `none`, never to a hosted engine; `contracted`, only to a provider under a privacy contract; `any`,
@@ -31,23 +34,58 @@ of the `WHERE` clause, so no row is fetched for them. The answer is the same emp
 the unit or case holds, so it says nothing of what exists. `list_all` and `egress_of` take no
 reader: the first is the Admin area's (`administer_system`, refused before any query), the second
 the model routing's, behind its own rights.
+
+**Three kinds (ADR-140 R8, ADR-099 Amendments 12 and 13, ADR-143 decision 1).** A `source`
+dataset is loaded through the Studio or a seed. A `composite` names two or more of its unit's
+source datasets (`members`) and holds none of their data: a case reading it reads each member, and
+the composite's own id, at read time. An `analyst_layer` belongs to exactly one case (`layer_of`),
+is made with it, named for it, of its unit, and is never offered: no list (`list_for`, `list_all`,
+`of_case`) returns one, none can be chosen for a case or as a member, and its name takes no place
+in the unit's names (the unique-name index leaves layers out, so a name refused would not say a
+layer exists).
+
+**One dataset per case.** A case chooses exactly one dataset, a source or a composite
+(`set_for_case`). What a request under the case reads, its *read set* (`ids_of_case`), is that
+dataset (a composite as its own id, then its members) **plus** the case's own layer, and nothing
+else. The order matters to writers that take the first (`dataset_scope.made_in`, the stamping
+graph): the first is the case's source, or a composite's own id (ADR-099 Amendment 14), which a
+record made in the case names; a composite is read-only for now, so the stamping graph writes
+nothing into it (Amendment 15). The analyst's own writes name the layer instead (ADR-143
+Amendment 1, `dataset_scope.analyst_layer`). A
+deployment made before this keeps reading every dataset a case named until
+`scripts.migrate_cases_to_one_dataset` places it; the one-row index on `investigation_datasets` is
+built once no case names two.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 import asyncpg
 from pydantic import BaseModel, Field
 
 from conduit_common.identity import new_id
-from schemas.admin import DatasetEgress
+from schemas.admin import DatasetEgress, PromotionPolicy
+from schemas.dataset_model import DatasetOwnersMayBe, HomeCase
 from schemas.domain import Principal
 from schemas.rights import rights_for
 
 MAX_DATASET_NAME = 200
+#: A composite names at least two datasets (one would be the dataset itself) and a bounded number.
+MAX_COMPOSITE_MEMBERS = 50
+
+DatasetKind = Literal["source", "composite", "analyst_layer", "drawn"]
+SOURCE: DatasetKind = "source"
+COMPOSITE: DatasetKind = "composite"
+ANALYST_LAYER: DatasetKind = "analyst_layer"
+#: ADR-143 Amendment 2 decision 5: made with its case and board from a drawing with no case; read
+#: by its home case alone, loaded by no pipeline, judged by no rule until merged.
+DRAWN: DatasetKind = "drawn"
+
+_EGRESS_ORDER: dict[DatasetEgress, int] = {"none": 0, "contracted": 1, "any": 2}
 
 
 class Dataset(BaseModel):
@@ -58,6 +96,66 @@ class Dataset(BaseModel):
     created_by: str
     #: ADR-136 decision 2: `none` until an administrator changes it.
     egress: DatasetEgress = "none"
+    #: ADR-099 Amendments 12 and 13: what kind of dataset this is.
+    kind: DatasetKind = SOURCE
+    #: A composite's members, in order; empty for any other kind.
+    members: list[str] = Field(default_factory=list)
+    #: An analyst layer's case; `None` for any other kind.
+    layer_of: str | None = None
+    #: The highest marking it may hold (ADR-145 decision 8; ADR-143 Amendment 2 decision 3): set
+    #: for a drawn dataset at its making; `None` for every other, read as the deployment's highest.
+    highest_marking: str | None = None
+    #: ADR-145 decision 8: how a drawn item is promoted into it, set in Admin › Datasets; enforced
+    #: by the promotion (L3.4). Every dataset starts at *Author promotes*.
+    promotion_policy: PromotionPolicy = "author_promotes"
+
+
+def layer_name(case_name: str | None, investigation_id: str) -> str:
+    """What a case's layer is called: for the case (ADR-143 decision 1). Never shown in a list."""
+    named = " ".join((case_name or "").split()) or investigation_id
+    return f"Analyst layer: {named}"[:MAX_DATASET_NAME]
+
+
+def strictest_egress(egresses: Sequence[DatasetEgress]) -> DatasetEgress:
+    """The most limiting of `egresses`; `none` when there are none to go by (ADR-136: not known is
+    `none`)."""
+    return min(egresses, key=_EGRESS_ORDER.__getitem__, default="none")
+
+
+def layer_egress(case_egresses: Sequence[DatasetEgress]) -> DatasetEgress:
+    """A layer's egress (ADR-136), held here and nowhere else: the strictest of what its case
+    otherwise reads, so a layer neither stops a case asking a hosted model nor lets its material
+    go further than the case's source would (ADR-136 Amendment 1)."""
+    return strictest_egress(case_egresses)
+
+
+def as_its_case(layer: Dataset, others: Sequence[Dataset]) -> Dataset:
+    """A layer as an egress question sees it (ADR-136): the strictest egress of what its case
+    otherwise reads (`layer_egress`), under the name of the dataset it takes that egress from. It
+    then never changes a verdict on its own, and a refusal that names datasets names that one, as
+    it would without the layer: the layer's own name is never in a response (ADR-143 decision 1).
+    With nothing else to go by it is `none`, named as the case's own drawn data."""
+    egress = layer_egress([d.egress for d in others])
+    source = next((d for d in others if d.egress == egress), None)
+    name = source.name if source is not None else "this case's own drawn data"
+    return layer.model_copy(update={"egress": egress, "name": name})
+
+
+def read_set(chosen: Sequence[Dataset], layer: str | None) -> list[str]:
+    """ADR-143 decision 1: what a request under a case reads, from what the case chose and its
+    layer. A composite reads as its own id then its members (ADR-099 Amendment 12 item 3), its
+    own id first because the first is where the case's writes go (Amendment 14). A case that has
+    chosen nothing reads nothing, its layer included."""
+    if not chosen:
+        return []
+    ids: list[str] = []
+    for dataset in chosen:
+        ids.append(dataset.id)
+        if dataset.kind == COMPOSITE:
+            ids.extend(dataset.members)
+    if layer is not None:
+        ids.append(layer)
+    return list(dict.fromkeys(ids))
 
 
 class CreateDatasetRequest(BaseModel):
@@ -65,7 +163,14 @@ class CreateDatasetRequest(BaseModel):
 
 
 class CaseDatasetsRequest(BaseModel):
+    #: ADR-099 Amendment 12: exactly one, a source or a composite. A list, for the wire shape the
+    #: Glass already sends; the store refuses any other length with the one refusal.
     dataset_ids: list[str] = Field(min_length=1, max_length=100)
+
+
+class CreateCompositeRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=MAX_DATASET_NAME)
+    member_ids: list[str] = Field(min_length=2, max_length=MAX_COMPOSITE_MEMBERS)
 
 
 def reads_dataset_names(reader: Principal) -> bool:
@@ -84,22 +189,161 @@ class DatasetStore(Protocol):
         self, principal: Principal, name: str, *, suffix_if_taken: bool = False
     ) -> Dataset: ...
     async def known(self, dataset_ids: Sequence[str]) -> set[str]: ...
+    #: Which of these are composites: read-only for now (ADR-099 Amendment 15).
+    async def composites_among(self, dataset_ids: Sequence[str]) -> set[str]: ...
+    #: Every case's analyst layer: what the corpus-wide resolution run leaves to each case.
+    async def layer_ids(self) -> set[str]: ...
     async def register(self, dataset: Dataset) -> Dataset: ...
     #: ADR-099 Amendment 11: both name datasets, so both take the reader and name none to a reader
     #: holding no right (`reads_dataset_names`).
     async def list_for(self, reader: Principal) -> list[Dataset]: ...
     async def of_case(self, investigation_id: str, reader: Principal) -> list[Dataset]: ...
+    #: The read set (module docstring): what a request under the case reads, its layer included.
     async def ids_of_case(self, investigation_id: str) -> list[str]: ...
+    #: Exactly one dataset, a source or a composite; makes the case's layer if it has none.
     async def set_for_case(
-        self, investigation_id: str, dataset_ids: Sequence[str], principal: Principal
+        self,
+        investigation_id: str,
+        dataset_ids: Sequence[str],
+        principal: Principal,
+        *,
+        case_name: str | None = None,
     ) -> list[Dataset]: ...
-    async def copy_case(self, from_investigation_id: str, to_investigation_id: str) -> None: ...
+    #: A case opened from an alert reads what the alert's case reads, and keeps an empty layer of
+    #: its own, `created_by` its maker: its maker may hold no level on the alert's case, so it
+    #: never reads that case's layer (ADR-143 Amendment 1 item 3).
+    async def read_the_same_dataset(
+        self,
+        from_investigation_id: str,
+        to_investigation_id: str,
+        *,
+        case_name: str | None = None,
+        created_by: str | None = None,
+    ) -> None: ...
+    #: The original case's layer a case made from another before L3.2 reads, read-only, until
+    #: the upgrade's migration turns it into a view (ADR-144 decision 6); `None` for any other.
+    async def read_only_layer_of(self, investigation_id: str) -> str | None: ...
+    #: The case a layer is the layer of; `None` for an id that is not a layer.
+    async def case_of_layer(self, layer_id: str) -> str | None: ...
+    #: Every case reading the dataset, directly or through a composite of it, by id: for a
+    #: dataset's own screens, filtered there to the cases the reader may open (rule 7).
+    async def cases_reading(self, dataset_id: str) -> list[str]: ...
+    #: The composites that have the dataset as a member.
+    async def composites_of(self, dataset_id: str) -> list[Dataset]: ...
+    #: ADR-145 Amendment 4 decision 2: the dataset's home case, `None` before its first *Make
+    #: live* (or `scripts.make_home_cases`).
+    async def home_case_of(self, dataset_id: str) -> HomeCase | None: ...
+    #: The dataset whose home case this case is, `None` for any other case.
+    async def dataset_of_home_case(self, investigation_id: str) -> str | None: ...
+    #: Records the dataset's home case, once: a second is refused (`HomeCaseHeld`).
+    async def set_home_case(self, home: HomeCase) -> None: ...
+    #: ADR-143 Amendment 2 decision 5: a drawn dataset, read by `home_case` alone (with the case's
+    #: layer); no other case may choose it.
+    async def create_drawn(
+        self, principal: Principal, name: str, *, highest_marking: str, home_case: str
+    ) -> Dataset: ...
+    #: Admin › System's *Dataset owners may be* (ADR-145 Amendment 4 decision 7).
+    async def owner_setting(self) -> DatasetOwnersMayBe: ...
+    async def set_owner_setting(self, value: DatasetOwnersMayBe) -> None: ...
+    #: ADR-143 decision 1: the case's layer, made if it has none (idempotent), and its id.
+    async def ensure_layer(
+        self, investigation_id: str, *, unit: str, created_by: str, case_name: str | None = None
+    ) -> str: ...
+    #: The case's own layer; a case made from another since L3.1 holds none (ADR-144 Amendment 1).
+    async def layer_of_case(self, investigation_id: str) -> str | None: ...
+    #: What the case chose, a source or a composite, with no reader: for the seeds and the
+    #: migration, never for a route (a route names datasets only through `of_case`).
+    async def chosen_of_case(self, investigation_id: str) -> list[Dataset]: ...
+    #: ADR-099 Amendment 12 item 2: a composite of the principal's unit's source datasets.
+    async def create_composite(
+        self,
+        principal: Principal,
+        name: str,
+        member_ids: Sequence[str],
+        *,
+        suffix_if_taken: bool = False,
+    ) -> Dataset: ...
     # ADR-136 decision 2: every dataset, for the Admin area; the egress of some; setting it.
     async def list_all(self) -> list[Dataset]: ...
     async def egress_of(self, dataset_ids: Sequence[str]) -> dict[str, Dataset]: ...
     async def set_egress(
         self, dataset_id: str, egress: DatasetEgress
     ) -> tuple[DatasetEgress, Dataset]: ...
+    # ADR-145 decision 8: Admin › Datasets' promotion policy.
+    async def set_promotion_policy(
+        self, dataset_id: str, policy: PromotionPolicy
+    ) -> tuple[PromotionPolicy, Dataset]: ...
+    #: ADR-143 Amendment 2 decision 7 (L3.9): a drawn dataset's merge, once, moving its home case
+    #: onto the target in the same transaction; and its undoing, by the merge's revert.
+    async def drawn_merged_of(self, dataset_id: str) -> DrawnMerged | None: ...
+    async def merge_drawn(self, merged: DrawnMerged) -> None: ...
+    async def unmerge_drawn(self, dataset_id: str) -> DrawnMerged | None: ...
+
+
+class DrawnNotCopied(Exception):
+    """ADR-143 Amendment 2 decision 5: a drawn dataset is read through its home case alone, so no
+    other case is made reading it, not even a case opened from an alert."""
+
+
+def refuse_copying_drawn(kinds: Iterable[str]) -> None:
+    """Both stores' `read_the_same_dataset` ask this of the kinds the case reads, before anything
+    is written."""
+    if DRAWN in kinds:
+        raise DrawnNotCopied
+
+
+@dataclass(frozen=True)
+class DrawnMerged:
+    """A drawn dataset merged into another (ADR-143 Amendment 2 decision 7; L3.9): its home case
+    reads `into` from then on, and the drawn dataset itself read-only, kept for its audit (so what
+    did not become data stays readable to the same members, and no one else). A revert of the
+    merge's load undoes it."""
+
+    dataset_id: str
+    into: str
+    load_id: str
+    case_id: str
+    merged_at: datetime
+
+
+class DrawnAlreadyMerged(Exception):
+    """One merge per drawn dataset."""
+
+
+class HomeCaseHeld(Exception):
+    """A dataset has one home case (ADR-145 Amendment 4 decision 2), and a case is the home of at
+    most one dataset: a second is refused."""
+
+    def __init__(self, dataset_id: str) -> None:
+        super().__init__(f"the dataset {dataset_id} already has its home case")
+
+
+class ReadOnlyLayerError(Exception):
+    """ADR-144 Amendment 1 decision 2: a case made from another since L3.1, until the upgrade turns
+    it into a view, reads its original case's layer and writes into none; it holds no layer of its
+    own. Asked for one, the store refuses rather than make it. On the wire, 409
+    `original_layer_read_only`."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "This case is waiting to become a view of the case it was made from, whose own work "
+            "it reads but cannot change: mark or link in that case."
+        )
+
+
+class TouchesTheOriginalsWorkError(ReadOnlyLayerError):
+    """L3.2 item 3: a case made from another before L3.2, which the upgrade has not yet turned into
+    a view, writes nothing into the graph. Any write there lands in the source its original reads
+    too, and a merge into a node the writer cannot read would carry the original's work into it.
+    One refusal for every write and every reader (`dataset_scope.refuse_writing_in_an_unconverted_
+    case`), before anything is written."""
+
+    def __init__(self) -> None:
+        Exception.__init__(
+            self,
+            "This case is waiting to become a view of the case it was made from, and nothing can "
+            "be written in it until then: make the change in that case.",
+        )
 
 
 class UnknownDatasetEgressError(Exception):
@@ -134,19 +378,101 @@ def _ordered(dataset_ids: Sequence[str]) -> list[str]:
     return ordered
 
 
+def _one(dataset_ids: Sequence[str]) -> str:
+    """ADR-099 Amendment 12 item 1: a case reads exactly one dataset (or one composite)."""
+    ordered = _ordered(dataset_ids)
+    if len(ordered) != 1:
+        raise DatasetRefusedError("a case reads exactly one dataset, or one composite")
+    return ordered[0]
+
+
+def _members(member_ids: Sequence[str]) -> list[str]:
+    ordered = list(dict.fromkeys(member_ids))
+    if not 2 <= len(ordered) <= MAX_COMPOSITE_MEMBERS:
+        raise DatasetRefusedError("a composite names at least two datasets")
+    return ordered
+
+
+def _members_of(dataset: Dataset) -> list[str]:
+    return list(dataset.members) if dataset.kind == COMPOSITE else [dataset.id]
+
+
+async def named_by_case(store: DatasetStore, investigation_id: str) -> list[str]:
+    """The source datasets a case names, a composite as its members: its read set without the
+    composite's own id or the case's layer. For a script asking what a case *names* (to copy it, or
+    widen it), never `ids_of_case`, which is what it *reads* and holds the case's own layer."""
+    return [m for d in await store.chosen_of_case(investigation_id) for m in _members_of(d)]
+
+
+async def read_also(
+    store: DatasetStore,
+    investigation_id: str,
+    dataset_id: str,
+    principal: Principal,
+    *,
+    case_name: str | None = None,
+) -> str:
+    """The case reads `dataset_id` as well as whatever it read: where it read nothing, that
+    dataset; where it read another, a composite of what it read and this one (ADR-099 Amendment 12:
+    a case never names two). What a seed loaded into an existing case does; idempotent. Returns
+    the id the case now chooses."""
+    chosen = await store.chosen_of_case(investigation_id)
+    reads = await named_by_case(store, investigation_id)
+    if dataset_id in reads and len(chosen) == 1:
+        return chosen[0].id
+    members = list(dict.fromkeys([*reads, dataset_id]))
+    if len(members) == 1:
+        await store.set_for_case(investigation_id, members, principal, case_name=case_name)
+        return members[0]
+    return await compose_for_case(store, investigation_id, members, principal, case_name=case_name)
+
+
+async def compose_for_case(
+    store: DatasetStore,
+    investigation_id: str,
+    members: Sequence[str],
+    principal: Principal,
+    *,
+    case_name: str | None = None,
+) -> str:
+    """A composite of `members`, named for them, chosen by the case. Its egress is the strictest
+    of its members' (ADR-136), so a case reading it may send exactly what it sent before it read a
+    composite; an administrator may change it afterwards like any dataset's."""
+    held = await store.egress_of(members)
+    label = " + ".join(held[m].name if m in held else m for m in members)
+    composite = await store.create_composite(
+        principal, label[:MAX_DATASET_NAME], members, suffix_if_taken=True
+    )
+    egress = strictest_egress([held[m].egress if m in held else "none" for m in members])
+    _, composite = await store.set_egress(composite.id, egress)
+    await store.set_for_case(investigation_id, [composite.id], principal, case_name=case_name)
+    return composite.id
+
+
 class InMemoryDatasetStore:
     """The same calls with no Postgres, for tests and a process without one."""
 
     def __init__(self) -> None:
         self.datasets: dict[str, Dataset] = {}
         self.cases: dict[str, list[str]] = {}
+        #: The original case's layer an unconverted case reads, read-only (ADR-144 Amendment 1).
+        self.layer_reads: dict[str, str] = {}
+        #: Each dataset's home case (ADR-145 Amendment 4 decision 2).
+        self.homes: dict[str, HomeCase] = {}
+        self.owners_may_be: DatasetOwnersMayBe = "people_and_teams"
+        #: Each drawn dataset merged into another (L3.9).
+        self.merged: dict[str, DrawnMerged] = {}
 
     def add(self, dataset: Dataset) -> Dataset:
         self.datasets[dataset.id] = dataset
         return dataset
 
+    def _offered(self) -> list[Dataset]:
+        return [d for d in self.datasets.values() if d.kind != ANALYST_LAYER]
+
     def _free_name(self, unit: str, name: str, *, suffix_if_taken: bool) -> str:
-        taken = {name_key(d.name) for d in self.datasets.values() if d.owning_unit == unit}
+        # A layer's name takes no place in the unit's names (it is never shown).
+        taken = {name_key(d.name) for d in self._offered() if d.owning_unit == unit}
         if name_key(name) not in taken:
             return name
         if not suffix_if_taken:
@@ -177,13 +503,71 @@ class InMemoryDatasetStore:
             )
         )
 
+    def _choosable(self, dataset_id: str, unit: str, *, kinds: Sequence[DatasetKind]) -> Dataset:
+        held = self.datasets.get(dataset_id)
+        if held is None or held.owning_unit != unit or held.kind not in kinds:
+            raise DatasetRefusedError(dataset_id)
+        return held
+
+    async def create_composite(
+        self,
+        principal: Principal,
+        name: str,
+        member_ids: Sequence[str],
+        *,
+        suffix_if_taken: bool = False,
+    ) -> Dataset:
+        members = _members(member_ids)
+        for member in members:
+            self._choosable(member, principal.org_unit, kinds=(SOURCE,))
+        cleaned = self._free_name(principal.org_unit, _clean(name), suffix_if_taken=suffix_if_taken)
+        return self.add(
+            Dataset(
+                id=new_id(),
+                name=cleaned,
+                owning_unit=principal.org_unit,
+                created_at=datetime.now(UTC),
+                created_by=principal.id,
+                kind=COMPOSITE,
+                members=members,
+            )
+        )
+
+    async def create_drawn(
+        self, principal: Principal, name: str, *, highest_marking: str, home_case: str
+    ) -> Dataset:
+        cleaned = self._free_name(principal.org_unit, _clean(name), suffix_if_taken=True)
+        drawn = self.add(
+            Dataset(
+                id=new_id(), name=cleaned, owning_unit=principal.org_unit,
+                created_at=datetime.now(UTC), created_by=principal.id, kind=DRAWN,
+                highest_marking=highest_marking,
+            )
+        )  # fmt: skip
+        self.cases[home_case] = [drawn.id]
+        await self.ensure_layer(
+            home_case, unit=principal.org_unit, created_by=principal.id, case_name=cleaned
+        )
+        return drawn
+
     async def known(self, dataset_ids: Sequence[str]) -> set[str]:
         return {d for d in dataset_ids if d in self.datasets}
 
+    async def composites_among(self, dataset_ids: Sequence[str]) -> set[str]:
+        return {d for d in dataset_ids if d in self.datasets and self.datasets[d].kind == COMPOSITE}
+
+    async def layer_ids(self) -> set[str]:
+        return {d.id for d in self.datasets.values() if d.kind == ANALYST_LAYER}
+
     async def list_for(self, reader: Principal) -> list[Dataset]:
         named = reads_dataset_names(reader)
+        # A drawn dataset is its home case's alone: never offered for another case to choose.
         return sorted(
-            (d for d in self.datasets.values() if named and d.owning_unit == reader.org_unit),
+            (
+                d
+                for d in self._offered()
+                if named and d.owning_unit == reader.org_unit and d.kind != DRAWN
+            ),
             key=lambda d: d.name,
         )
 
@@ -191,38 +575,182 @@ class InMemoryDatasetStore:
         named = reads_dataset_names(reader)
         return [self.datasets[i] for i in self.cases.get(investigation_id, []) if named]
 
+    async def chosen_of_case(self, investigation_id: str) -> list[Dataset]:
+        return [
+            self.datasets[i] for i in self.cases.get(investigation_id, []) if i in self.datasets
+        ]
+
+    async def layer_of_case(self, investigation_id: str) -> str | None:
+        for dataset in self.datasets.values():
+            if dataset.kind == ANALYST_LAYER and dataset.layer_of == investigation_id:
+                return dataset.id
+        return None
+
     async def ids_of_case(self, investigation_id: str) -> list[str]:
-        return list(self.cases.get(investigation_id, []))
+        # A test may give a case an id it never registered (Postgres's foreign key would refuse
+        # it); such an id reads as a source dataset of that id, as it did before kinds existed.
+        chosen = [
+            self.datasets.get(i)
+            or Dataset(id=i, name=i, owning_unit="", created_at=datetime.now(UTC), created_by="")
+            for i in self.cases.get(investigation_id, [])
+        ]
+        layer = await self.layer_of_case(investigation_id)
+        held = read_set(chosen, layer or self.layer_reads.get(investigation_id))
+        # A merged drawing's case reads its drawn dataset too, read-only (decision 7).
+        drawn = [m.dataset_id for m in self.merged.values() if m.case_id == investigation_id]
+        return list(dict.fromkeys([*held, *drawn])) if held else held
+
+    async def drawn_merged_of(self, dataset_id: str) -> DrawnMerged | None:
+        return self.merged.get(dataset_id)
+
+    async def merge_drawn(self, merged: DrawnMerged) -> None:
+        if merged.dataset_id in self.merged:
+            raise DrawnAlreadyMerged(merged.dataset_id)
+        held = self.cases.get(merged.case_id, [])
+        if held != [merged.dataset_id]:
+            raise DrawnAlreadyMerged(merged.dataset_id)
+        self.merged[merged.dataset_id] = merged
+        self.cases[merged.case_id] = [merged.into]
+
+    async def unmerge_drawn(self, dataset_id: str) -> DrawnMerged | None:
+        merged = self.merged.pop(dataset_id, None)
+        if merged is not None and self.cases.get(merged.case_id) == [merged.into]:
+            self.cases[merged.case_id] = [dataset_id]
+        return merged
+
+    async def read_only_layer_of(self, investigation_id: str) -> str | None:
+        return self.layer_reads.get(investigation_id)
+
+    async def case_of_layer(self, layer_id: str) -> str | None:
+        held = self.datasets.get(layer_id)
+        return held.layer_of if held is not None and held.kind == ANALYST_LAYER else None
+
+    async def composites_of(self, dataset_id: str) -> list[Dataset]:
+        return sorted(
+            (d for d in self.datasets.values() if d.kind == COMPOSITE and dataset_id in d.members),
+            key=lambda d: d.name,
+        )
+
+    async def cases_reading(self, dataset_id: str) -> list[str]:
+        through = {dataset_id, *(d.id for d in await self.composites_of(dataset_id))}
+        return sorted(case for case, chosen in self.cases.items() if through & set(chosen))
+
+    async def home_case_of(self, dataset_id: str) -> HomeCase | None:
+        return self.homes.get(dataset_id)
+
+    async def dataset_of_home_case(self, investigation_id: str) -> str | None:
+        return next(
+            (d for d, h in self.homes.items() if h.investigation_id == investigation_id), None
+        )
+
+    async def set_home_case(self, home: HomeCase) -> None:
+        if home.dataset_id in self.homes:
+            raise HomeCaseHeld(home.dataset_id)
+        if await self.dataset_of_home_case(home.investigation_id) is not None:
+            raise HomeCaseHeld(home.dataset_id)
+        self.homes[home.dataset_id] = home
+
+    async def owner_setting(self) -> DatasetOwnersMayBe:
+        return self.owners_may_be
+
+    async def set_owner_setting(self, value: DatasetOwnersMayBe) -> None:
+        self.owners_may_be = value
+
+    async def ensure_layer(
+        self, investigation_id: str, *, unit: str, created_by: str, case_name: str | None = None
+    ) -> str:
+        held = await self.layer_of_case(investigation_id)
+        if held is not None:
+            return held
+        if investigation_id in self.layer_reads:
+            raise ReadOnlyLayerError
+        layer = self.add(
+            Dataset(
+                id=new_id(),
+                name=layer_name(case_name, investigation_id),
+                owning_unit=unit,
+                created_at=datetime.now(UTC),
+                created_by=created_by,
+                kind=ANALYST_LAYER,
+                layer_of=investigation_id,
+            )
+        )
+        return layer.id
 
     async def set_for_case(
-        self, investigation_id: str, dataset_ids: Sequence[str], principal: Principal
+        self,
+        investigation_id: str,
+        dataset_ids: Sequence[str],
+        principal: Principal,
+        *,
+        case_name: str | None = None,
     ) -> list[Dataset]:
-        ordered = _ordered(dataset_ids)
-        for dataset_id in ordered:
-            held = self.datasets.get(dataset_id)
-            if held is None or held.owning_unit != principal.org_unit:
-                raise DatasetRefusedError(dataset_id)
-        self.cases[investigation_id] = ordered
+        chosen = _one(dataset_ids)
+        self._choosable(chosen, principal.org_unit, kinds=(SOURCE, COMPOSITE))
+        self.cases[investigation_id] = [chosen]
+        if investigation_id not in self.layer_reads:  # an unconverted case holds none
+            await self.ensure_layer(
+                investigation_id,
+                unit=principal.org_unit,
+                created_by=principal.id,
+                case_name=case_name,
+            )
         return await self.of_case(investigation_id, principal)
 
-    async def copy_case(self, from_investigation_id: str, to_investigation_id: str) -> None:
-        self.cases[to_investigation_id] = list(self.cases.get(from_investigation_id, []))
+    async def read_the_same_dataset(
+        self,
+        from_investigation_id: str,
+        to_investigation_id: str,
+        *,
+        case_name: str | None = None,
+        created_by: str | None = None,
+    ) -> None:
+        chosen = list(self.cases.get(from_investigation_id, []))
+        refuse_copying_drawn([self.datasets[c].kind for c in chosen if c in self.datasets])
+        self.cases[to_investigation_id] = chosen
+        if chosen:
+            parent = self.datasets[chosen[0]]
+            await self.ensure_layer(
+                to_investigation_id,
+                unit=parent.owning_unit,
+                created_by=created_by or parent.created_by,
+                case_name=case_name,
+            )
 
     async def list_all(self) -> list[Dataset]:
-        return sorted(self.datasets.values(), key=lambda d: (d.owning_unit, d.name))
+        return sorted(self._offered(), key=lambda d: (d.owning_unit, d.name))
 
     async def egress_of(self, dataset_ids: Sequence[str]) -> dict[str, Dataset]:
-        return {d: self.datasets[d] for d in dataset_ids if d in self.datasets}
+        held = {d: self.datasets[d] for d in dataset_ids if d in self.datasets}
+        for dataset_id, dataset in held.items():
+            if dataset.kind == ANALYST_LAYER and dataset.layer_of is not None:
+                others = [
+                    self.datasets[i]
+                    for i in await self.ids_of_case(dataset.layer_of)
+                    if i != dataset_id and i in self.datasets
+                ]
+                held[dataset_id] = as_its_case(dataset, others)
+        return held
 
     async def set_egress(
         self, dataset_id: str, egress: DatasetEgress
     ) -> tuple[DatasetEgress, Dataset]:
         held = self.datasets.get(dataset_id)
-        if held is None:
+        if held is None or held.kind == ANALYST_LAYER:
             raise UnknownDatasetEgressError(dataset_id)
         changed = held.model_copy(update={"egress": egress})
         self.datasets[dataset_id] = changed
         return held.egress, changed
+
+    async def set_promotion_policy(
+        self, dataset_id: str, policy: PromotionPolicy
+    ) -> tuple[PromotionPolicy, Dataset]:
+        held = self.datasets.get(dataset_id)
+        if held is None or held.kind == ANALYST_LAYER:
+            raise UnknownDatasetEgressError(dataset_id)
+        changed = held.model_copy(update={"promotion_policy": policy})
+        self.datasets[dataset_id] = changed
+        return held.promotion_policy, changed
 
 
 _BOOTSTRAP_SQL = """
@@ -237,32 +765,107 @@ CREATE INDEX IF NOT EXISTS datasets_unit_idx ON datasets (owning_unit, name);
 -- ADR-136 decision 2: every dataset, those made before it included, starts at `none`.
 ALTER TABLE datasets ADD COLUMN IF NOT EXISTS egress TEXT NOT NULL DEFAULT 'none'
     CHECK (egress IN ('none', 'contracted', 'any'));
+-- ADR-099 Amendments 12 and 13: the kind, and a layer's one case.
+ALTER TABLE datasets ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'source'
+    CHECK (kind IN ('source', 'composite', 'analyst_layer'));
+ALTER TABLE datasets ADD COLUMN IF NOT EXISTS layer_of TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS datasets_one_layer_per_case ON datasets (layer_of)
+    WHERE layer_of IS NOT NULL;
+CREATE TABLE IF NOT EXISTS composite_members (
+    composite_id TEXT NOT NULL REFERENCES datasets (id),
+    member_id TEXT NOT NULL REFERENCES datasets (id),
+    position INTEGER NOT NULL,
+    PRIMARY KEY (composite_id, member_id)
+);
 CREATE TABLE IF NOT EXISTS investigation_datasets (
     investigation_id TEXT NOT NULL,
     dataset_id TEXT NOT NULL REFERENCES datasets (id),
     position INTEGER NOT NULL,
     PRIMARY KEY (investigation_id, dataset_id)
 );
+-- ADR-144 Amendment 1 decision 2: the original case's layer an unconverted case reads.
+CREATE TABLE IF NOT EXISTS case_layer_reads (
+    investigation_id TEXT PRIMARY KEY,
+    layer_id TEXT NOT NULL REFERENCES datasets (id)
+);
+-- ADR-145 decision 8; ADR-143 Amendment 2 decision 3: the highest marking a dataset may hold.
+ALTER TABLE datasets ADD COLUMN IF NOT EXISTS highest_marking TEXT;
+-- ADR-143 Amendment 2 decision 5: the kind `drawn`, added to the kinds the column allows once.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+        WHERE t.relname = 'datasets' AND t.relnamespace = current_schema()::regnamespace
+        AND c.contype = 'c' AND pg_get_constraintdef(c.oid) LIKE '%drawn%'
+    ) THEN
+        ALTER TABLE datasets DROP CONSTRAINT IF EXISTS datasets_kind_check;
+        ALTER TABLE datasets ADD CONSTRAINT datasets_kind_check
+            CHECK (kind IN ('source', 'composite', 'analyst_layer', 'drawn'));
+    END IF;
+END $$;
+-- ADR-145 Amendment 4 decision 2: each dataset's one home case, which is no other's.
+CREATE TABLE IF NOT EXISTS home_cases (
+    dataset_id TEXT PRIMARY KEY REFERENCES datasets (id),
+    investigation_id TEXT NOT NULL UNIQUE,
+    made_at TIMESTAMPTZ NOT NULL,
+    made_by TEXT NOT NULL
+);
+-- ADR-143 Amendment 2 decision 7 (L3.9): a drawn dataset merged into another, once; its home case
+-- reads the target from then on, and the drawn dataset read-only.
+CREATE TABLE IF NOT EXISTS drawn_merged (
+    dataset_id TEXT PRIMARY KEY REFERENCES datasets (id),
+    into_dataset TEXT NOT NULL REFERENCES datasets (id),
+    load_id TEXT NOT NULL UNIQUE,
+    case_id TEXT NOT NULL,
+    merged_at TIMESTAMPTZ NOT NULL
+);
+-- ADR-145 decision 8: how a drawn item is promoted into the dataset.
+ALTER TABLE datasets ADD COLUMN IF NOT EXISTS promotion_policy TEXT NOT NULL
+    DEFAULT 'author_promotes'
+    CHECK (promotion_policy IN ('author_promotes', 'second_person_reviews'));
+-- Decision 7: Admin › System's settings for datasets.
+CREATE TABLE IF NOT EXISTS dataset_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
-_COLUMNS = "d.id, d.name, d.owning_unit, d.created_at, d.created_by, d.egress"
+_MEMBERS_SQL = (
+    "COALESCE((SELECT array_agg(m.member_id ORDER BY m.position) FROM composite_members m "
+    "WHERE m.composite_id = d.id), '{}'::text[]) AS members"
+)
+_COLUMNS = (
+    "d.id, d.name, d.owning_unit, d.created_at, d.created_by, d.egress, d.kind, d.layer_of, "
+    "d.highest_marking, d.promotion_policy, " + _MEMBERS_SQL
+)
 
 #: The name a unit's datasets may not share, case and spacing aside (`name_key`).
 _NAME_KEY_SQL = "lower(regexp_replace(btrim(name), '\\s+', ' ', 'g'))"
+#: Layers are left out of the names (module docstring): a refused name must not say one exists.
+_NAME_INDEX_WHERE = "WHERE kind <> 'analyst_layer'"
+#: ADR-143 decision 1: the condition every dataset list carries, so no list returns a layer. One
+#: constant, read at each query, so `test_analyst_layer_store.py` can plant it out (rule 15).
+_OFFERED = "d.kind <> 'analyst_layer'"
+#: ADR-099 Amendment 12: one row per case, built once no case names two.
+_ONE_PER_CASE_INDEX = "investigation_datasets_one_per_case"
 
 
 async def _tell_apart_and_index(conn: asyncpg.Connection) -> None:
     """Before the unique index: names a unit already holds twice are told apart, the earliest
     keeping its name and each later one a suffix, so a deployment made before ADR-099 Amendment 6
-    starts rather than failing to build the index."""
-    exists = await conn.fetchval(
-        "SELECT 1 FROM pg_indexes WHERE indexname = 'datasets_unit_name_unique'"
+    starts rather than failing to build the index. An index built before layers existed covers
+    every row; it is rebuilt to leave layers out."""
+    indexdef = await conn.fetchval(
+        "SELECT indexdef FROM pg_indexes WHERE indexname = 'datasets_unit_name_unique' "
+        "AND schemaname = current_schema()"
     )
-    if exists:
+    if indexdef is not None and "analyst_layer" in indexdef:
         return
+    if indexdef is not None:
+        await conn.execute("DROP INDEX datasets_unit_name_unique")
     rows = await conn.fetch(
         f"SELECT id, name, owning_unit, {_NAME_KEY_SQL} AS key FROM datasets "
-        "ORDER BY owning_unit, created_at, id"
+        f"{_NAME_INDEX_WHERE} ORDER BY owning_unit, created_at, id"
     )
     taken: dict[str, set[str]] = {}
     for row in rows:
@@ -278,8 +881,33 @@ async def _tell_apart_and_index(conn: asyncpg.Connection) -> None:
         await conn.execute("UPDATE datasets SET name = $1 WHERE id = $2", renamed, row["id"])
     await conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS datasets_unit_name_unique "
-        f"ON datasets (owning_unit, {_NAME_KEY_SQL})"
+        f"ON datasets (owning_unit, {_NAME_KEY_SQL}) {_NAME_INDEX_WHERE}"
     )
+
+
+async def index_one_dataset_per_case(conn: asyncpg.Connection) -> bool:
+    """Builds the one-row-per-case index when no case names two datasets; says whether it is
+    there. Run at every start and by the migration's real run, which is what makes it possible."""
+    if await conn.fetchval(
+        "SELECT 1 FROM pg_indexes WHERE indexname = $1 AND schemaname = current_schema()",
+        _ONE_PER_CASE_INDEX,
+    ):
+        return True
+    if await conn.fetchval(
+        "SELECT 1 FROM investigation_datasets GROUP BY investigation_id HAVING count(*) > 1 LIMIT 1"
+    ):
+        return False
+    await conn.execute(
+        f"CREATE UNIQUE INDEX IF NOT EXISTS {_ONE_PER_CASE_INDEX} "
+        "ON investigation_datasets (investigation_id)"
+    )
+    return True
+
+
+def _row(row: asyncpg.Record) -> Dataset:
+    values = dict(row)
+    values["members"] = list(values.get("members") or [])
+    return Dataset(**values)
 
 
 class PostgresDatasetStore:
@@ -295,7 +923,12 @@ class PostgresDatasetStore:
         async with pool.acquire() as conn:
             await conn.execute(_BOOTSTRAP_SQL)
             await _tell_apart_and_index(conn)
+            await index_one_dataset_per_case(conn)
         return cls(pool)
+
+    @property
+    def pool(self) -> asyncpg.Pool:
+        return self._pool
 
     async def close(self) -> None:
         await self._pool.close()
@@ -321,7 +954,7 @@ class PostgresDatasetStore:
                 f"SELECT {_COLUMNS} FROM datasets d WHERE d.id = $1", dataset.id
             )
         if row is not None:
-            return Dataset(**dict(row))
+            return _row(row)
         return await self._insert(
             dataset.model_copy(update={"name": _clean(dataset.name)}), suffix_if_taken=True
         )
@@ -329,25 +962,44 @@ class PostgresDatasetStore:
     async def add(self, dataset: Dataset) -> Dataset:
         return await self.register(dataset)
 
-    async def _insert(self, dataset: Dataset, *, suffix_if_taken: bool) -> Dataset:
+    async def _insert(
+        self, dataset: Dataset, *, suffix_if_taken: bool, conn: asyncpg.Connection | None = None
+    ) -> Dataset:
         name, n = dataset.name, 2
         while True:
             try:
-                async with self._pool.acquire() as conn:
-                    await conn.execute(
-                        "INSERT INTO datasets (id, name, owning_unit, created_at, created_by) "
-                        "VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING",
+                async with self._maybe(conn) as c, c.transaction():
+                    await c.execute(
+                        "INSERT INTO datasets (id, name, owning_unit, created_at, created_by, "
+                        "egress, kind, layer_of, highest_marking, promotion_policy) "
+                        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) "
+                        "ON CONFLICT (id) DO NOTHING",
                         dataset.id,
                         name,
                         dataset.owning_unit,
                         dataset.created_at,
                         dataset.created_by,
+                        dataset.egress,
+                        dataset.kind,
+                        dataset.layer_of,
+                        dataset.highest_marking,
+                        dataset.promotion_policy,
+                    )
+                    await c.executemany(
+                        "INSERT INTO composite_members (composite_id, member_id, position) "
+                        "VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                        [(dataset.id, m, i) for i, m in enumerate(dataset.members)],
                     )
                 return dataset.model_copy(update={"name": name})
             except asyncpg.UniqueViolationError as exc:
                 if not suffix_if_taken:
                     raise _taken(dataset.name) from exc
                 name, n = _suffixed(dataset.name, n), n + 1
+
+    def _maybe(self, conn: asyncpg.Connection | None) -> Any:
+        if conn is not None:
+            return _Borrowed(conn)
+        return self._pool.acquire()
 
     async def known(self, dataset_ids: Sequence[str]) -> set[str]:
         if not dataset_ids:
@@ -358,64 +1010,327 @@ class PostgresDatasetStore:
             )
         return {r["id"] for r in rows}
 
+    async def layer_ids(self) -> set[str]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("SELECT id FROM datasets WHERE kind = 'analyst_layer'")
+        return {r["id"] for r in rows}
+
+    async def composites_among(self, dataset_ids: Sequence[str]) -> set[str]:
+        if not dataset_ids:
+            return set()
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id FROM datasets WHERE id = ANY($1::text[]) AND kind = 'composite'",
+                list(set(dataset_ids)),
+            )
+        return {r["id"] for r in rows}
+
     async def list_for(self, reader: Principal) -> list[Dataset]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 f"SELECT {_COLUMNS} FROM datasets d WHERE d.owning_unit = $1 AND $2::boolean "
-                "ORDER BY d.name",
+                f"AND {_OFFERED} AND d.kind <> 'drawn' ORDER BY d.name",
                 reader.org_unit,
                 reads_dataset_names(reader),
             )
-        return [Dataset(**dict(r)) for r in rows]
+        return [_row(r) for r in rows]
 
     async def of_case(self, investigation_id: str, reader: Principal) -> list[Dataset]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 f"SELECT {_COLUMNS} FROM investigation_datasets c "
                 "JOIN datasets d ON d.id = c.dataset_id "
-                "WHERE c.investigation_id = $1 AND $2::boolean ORDER BY c.position",
+                f"WHERE c.investigation_id = $1 AND $2::boolean AND {_OFFERED} "
+                "ORDER BY c.position",
                 investigation_id,
                 reads_dataset_names(reader),
             )
-        return [Dataset(**dict(r)) for r in rows]
+        return [_row(r) for r in rows]
+
+    async def chosen_of_case(self, investigation_id: str) -> list[Dataset]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT {_COLUMNS} FROM investigation_datasets c "
+                "JOIN datasets d ON d.id = c.dataset_id "
+                "WHERE c.investigation_id = $1 AND d.kind <> 'analyst_layer' ORDER BY c.position",
+                investigation_id,
+            )
+        return [_row(r) for r in rows]
+
+    async def layer_of_case(self, investigation_id: str) -> str | None:
+        async with self._pool.acquire() as conn:
+            found: str | None = await conn.fetchval(
+                "SELECT id FROM datasets WHERE layer_of = $1 AND kind = 'analyst_layer'",
+                investigation_id,
+            )
+        return found
 
     async def ids_of_case(self, investigation_id: str) -> list[str]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT dataset_id FROM investigation_datasets WHERE investigation_id = $1 "
-                "ORDER BY position",
+                f"SELECT {_COLUMNS} FROM investigation_datasets c "
+                "JOIN datasets d ON d.id = c.dataset_id "
+                "WHERE c.investigation_id = $1 AND d.kind <> 'analyst_layer' ORDER BY c.position",
                 investigation_id,
             )
-        return [r["dataset_id"] for r in rows]
+        layer = await self.layer_of_case(investigation_id)
+        borrowed = None if layer else await self.read_only_layer_of(investigation_id)
+        held = read_set([_row(r) for r in rows], layer or borrowed)
+        if not held:
+            return held
+        # A merged drawing's case reads its drawn dataset too, read-only (decision 7).
+        async with self._pool.acquire() as conn:
+            drawn = await conn.fetch(
+                "SELECT dataset_id FROM drawn_merged WHERE case_id = $1 ORDER BY dataset_id",
+                investigation_id,
+            )
+        return list(dict.fromkeys([*held, *(r["dataset_id"] for r in drawn)]))
 
-    async def set_for_case(
-        self, investigation_id: str, dataset_ids: Sequence[str], principal: Principal
-    ) -> list[Dataset]:
-        ordered = _ordered(dataset_ids)
+    async def drawn_merged_of(self, dataset_id: str) -> DrawnMerged | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT dataset_id, into_dataset AS into, load_id, case_id, merged_at "
+                "FROM drawn_merged WHERE dataset_id = $1",
+                dataset_id,
+            )
+        return DrawnMerged(**dict(row)) if row is not None else None
+
+    async def merge_drawn(self, merged: DrawnMerged) -> None:
         async with self._pool.acquire() as conn, conn.transaction():
+            try:
+                await conn.execute(
+                    "INSERT INTO drawn_merged (dataset_id, into_dataset, load_id, case_id, "
+                    "merged_at) VALUES ($1, $2, $3, $4, $5)",
+                    merged.dataset_id, merged.into, merged.load_id, merged.case_id,
+                    merged.merged_at,
+                )  # fmt: skip
+            except asyncpg.UniqueViolationError as already:
+                raise DrawnAlreadyMerged(merged.dataset_id) from already
+            moved = await conn.execute(
+                "UPDATE investigation_datasets SET dataset_id = $3 "
+                "WHERE investigation_id = $1 AND dataset_id = $2",
+                merged.case_id, merged.dataset_id, merged.into,
+            )  # fmt: skip
+            if moved != "UPDATE 1":
+                raise DrawnAlreadyMerged(merged.dataset_id)
+
+    async def unmerge_drawn(self, dataset_id: str) -> DrawnMerged | None:
+        async with self._pool.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                "DELETE FROM drawn_merged WHERE dataset_id = $1 "
+                "RETURNING dataset_id, into_dataset AS into, load_id, case_id, merged_at",
+                dataset_id,
+            )
+            if row is None:
+                return None
+            await conn.execute(
+                "UPDATE investigation_datasets SET dataset_id = $2 "
+                "WHERE investigation_id = $1 AND dataset_id = $3",
+                row["case_id"], dataset_id, row["into"],
+            )  # fmt: skip
+        return DrawnMerged(**dict(row))
+
+    async def read_only_layer_of(self, investigation_id: str) -> str | None:
+        async with self._pool.acquire() as conn:
+            found: str | None = await conn.fetchval(
+                "SELECT layer_id FROM case_layer_reads WHERE investigation_id = $1",
+                investigation_id,
+            )
+        return found
+
+    async def case_of_layer(self, layer_id: str) -> str | None:
+        async with self._pool.acquire() as conn:
+            found: str | None = await conn.fetchval(
+                "SELECT layer_of FROM datasets WHERE id = $1 AND kind = 'analyst_layer'", layer_id
+            )
+        return found
+
+    async def composites_of(self, dataset_id: str) -> list[Dataset]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT {_COLUMNS} FROM datasets d WHERE d.kind = 'composite' AND EXISTS "
+                "(SELECT 1 FROM composite_members m WHERE m.composite_id = d.id "
+                "AND m.member_id = $1) ORDER BY d.name",
+                dataset_id,
+            )
+        return [_row(r) for r in rows]
+
+    async def cases_reading(self, dataset_id: str) -> list[str]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT c.investigation_id FROM investigation_datasets c "
+                "WHERE c.dataset_id = $1 OR c.dataset_id IN "
+                "(SELECT m.composite_id FROM composite_members m WHERE m.member_id = $1) "
+                "ORDER BY c.investigation_id",
+                dataset_id,
+            )
+        return [r["investigation_id"] for r in rows]
+
+    async def home_case_of(self, dataset_id: str) -> HomeCase | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT dataset_id, investigation_id, made_at, made_by FROM home_cases "
+                "WHERE dataset_id = $1",
+                dataset_id,
+            )
+        return HomeCase(**dict(row)) if row is not None else None
+
+    async def dataset_of_home_case(self, investigation_id: str) -> str | None:
+        async with self._pool.acquire() as conn:
+            found: str | None = await conn.fetchval(
+                "SELECT dataset_id FROM home_cases WHERE investigation_id = $1", investigation_id
+            )
+        return found
+
+    async def set_home_case(self, home: HomeCase) -> None:
+        async with self._pool.acquire() as conn:
+            try:
+                await conn.execute(
+                    "INSERT INTO home_cases (dataset_id, investigation_id, made_at, made_by) "
+                    "VALUES ($1, $2, $3, $4)",
+                    home.dataset_id,
+                    home.investigation_id,
+                    home.made_at,
+                    home.made_by,
+                )
+            except asyncpg.UniqueViolationError as already:
+                raise HomeCaseHeld(home.dataset_id) from already
+
+    async def owner_setting(self) -> DatasetOwnersMayBe:
+        async with self._pool.acquire() as conn:
+            value = await conn.fetchval(
+                "SELECT value FROM dataset_settings WHERE key = 'owners_may_be'"
+            )
+        return cast(DatasetOwnersMayBe, value or "people_and_teams")
+
+    async def set_owner_setting(self, value: DatasetOwnersMayBe) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO dataset_settings (key, value) VALUES ('owners_may_be', $1) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                value,
+            )
+
+    async def ensure_layer(
+        self, investigation_id: str, *, unit: str, created_by: str, case_name: str | None = None
+    ) -> str:
+        held = await self.layer_of_case(investigation_id)
+        if held is not None:
+            return held
+        if await self.read_only_layer_of(investigation_id) is not None:
+            raise ReadOnlyLayerError
+        layer = Dataset(
+            id=new_id(),
+            name=layer_name(case_name, investigation_id),
+            owning_unit=unit,
+            created_at=datetime.now(UTC),
+            created_by=created_by,
+            kind=ANALYST_LAYER,
+            layer_of=investigation_id,
+        )
+        try:
+            await self._insert(layer, suffix_if_taken=False)
+        except DatasetRefusedError:
+            # Two requests made the layer at once; the one-layer index kept the first.
+            pass
+        found = await self.layer_of_case(investigation_id)
+        assert found is not None
+        return found
+
+    async def create_composite(
+        self,
+        principal: Principal,
+        name: str,
+        member_ids: Sequence[str],
+        *,
+        suffix_if_taken: bool = False,
+    ) -> Dataset:
+        members = _members(member_ids)
+        async with self._pool.acquire() as conn:
             held = await conn.fetch(
-                "SELECT id FROM datasets WHERE id = ANY($1::text[]) AND owning_unit = $2",
-                ordered,
+                "SELECT id FROM datasets WHERE id = ANY($1::text[]) AND owning_unit = $2 "
+                "AND kind = 'source'",
+                members,
                 principal.org_unit,
             )
-            if {r["id"] for r in held} != set(ordered):
-                raise DatasetRefusedError("not every dataset is one of this unit's")
+        if {r["id"] for r in held} != set(members):
+            raise DatasetRefusedError("not every member is one of this unit's datasets")
+        composite = Dataset(
+            id=new_id(),
+            name=_clean(name),
+            owning_unit=principal.org_unit,
+            created_at=datetime.now(UTC),
+            created_by=principal.id,
+            kind=COMPOSITE,
+            members=members,
+        )
+        return await self._insert(composite, suffix_if_taken=suffix_if_taken)
+
+    async def create_drawn(
+        self, principal: Principal, name: str, *, highest_marking: str, home_case: str
+    ) -> Dataset:
+        drawn = await self._insert(
+            Dataset(
+                id=new_id(), name=_clean(name), owning_unit=principal.org_unit,
+                created_at=datetime.now(UTC), created_by=principal.id, kind=DRAWN,
+                highest_marking=highest_marking,
+            ),
+            suffix_if_taken=True,
+        )  # fmt: skip
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO investigation_datasets (investigation_id, dataset_id, position) "
+                "VALUES ($1, $2, 0)",
+                home_case,
+                drawn.id,
+            )
+        await self.ensure_layer(
+            home_case, unit=principal.org_unit, created_by=principal.id, case_name=drawn.name
+        )
+        return drawn
+
+    async def set_for_case(
+        self,
+        investigation_id: str,
+        dataset_ids: Sequence[str],
+        principal: Principal,
+        *,
+        case_name: str | None = None,
+    ) -> list[Dataset]:
+        chosen = _one(dataset_ids)
+        async with self._pool.acquire() as conn, conn.transaction():
+            held = await conn.fetchval(
+                "SELECT 1 FROM datasets WHERE id = $1 AND owning_unit = $2 "
+                "AND kind IN ('source', 'composite')",
+                chosen,
+                principal.org_unit,
+            )
+            if not held:
+                raise DatasetRefusedError("not one of this unit's datasets")
             await conn.execute(
                 "DELETE FROM investigation_datasets WHERE investigation_id = $1", investigation_id
             )
-            await conn.executemany(
+            await conn.execute(
                 "INSERT INTO investigation_datasets (investigation_id, dataset_id, position) "
-                "VALUES ($1, $2, $3)",
-                [(investigation_id, d, i) for i, d in enumerate(ordered)],
+                "VALUES ($1, $2, 0)",
+                investigation_id,
+                chosen,
+            )
+        if await self.read_only_layer_of(investigation_id) is None:  # unconverted: holds none
+            await self.ensure_layer(
+                investigation_id,
+                unit=principal.org_unit,
+                created_by=principal.id,
+                case_name=case_name,
             )
         return await self.of_case(investigation_id, principal)
 
     async def list_all(self) -> list[Dataset]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                f"SELECT {_COLUMNS} FROM datasets d ORDER BY d.owning_unit, d.name"
+                f"SELECT {_COLUMNS} FROM datasets d WHERE {_OFFERED} ORDER BY d.owning_unit, d.name"
             )
-        return [Dataset(**dict(r)) for r in rows]
+        return [_row(r) for r in rows]
 
     async def egress_of(self, dataset_ids: Sequence[str]) -> dict[str, Dataset]:
         if not dataset_ids:
@@ -425,14 +1340,26 @@ class PostgresDatasetStore:
                 f"SELECT {_COLUMNS} FROM datasets d WHERE d.id = ANY($1::text[])",
                 list(set(dataset_ids)),
             )
-        return {r["id"]: Dataset(**dict(r)) for r in rows}
+        held = {r["id"]: _row(r) for r in rows}
+        for dataset_id, dataset in list(held.items()):
+            if dataset.kind == ANALYST_LAYER and dataset.layer_of is not None:
+                others = [i for i in await self.ids_of_case(dataset.layer_of) if i != dataset_id]
+                async with self._pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        f"SELECT {_COLUMNS} FROM datasets d WHERE d.id = ANY($1::text[])", others
+                    )
+                order = {i: n for n, i in enumerate(others)}
+                ranked = sorted((_row(r) for r in rows), key=lambda d: order.get(d.id, 0))
+                held[dataset_id] = as_its_case(dataset, ranked)
+        return held
 
     async def set_egress(
         self, dataset_id: str, egress: DatasetEgress
     ) -> tuple[DatasetEgress, Dataset]:
         async with self._pool.acquire() as conn, conn.transaction():
             before = await conn.fetchval(
-                "SELECT egress FROM datasets WHERE id = $1 FOR UPDATE", dataset_id
+                "SELECT egress FROM datasets WHERE id = $1 AND kind <> 'analyst_layer' FOR UPDATE",
+                dataset_id,
             )
             if before is None:
                 raise UnknownDatasetEgressError(dataset_id)
@@ -441,21 +1368,94 @@ class PostgresDatasetStore:
                 dataset_id,
                 egress,
             )
-        return cast(DatasetEgress, before), Dataset(**dict(row))
+        return cast(DatasetEgress, before), _row(row)
 
-    async def copy_case(self, from_investigation_id: str, to_investigation_id: str) -> None:
+    async def set_promotion_policy(
+        self, dataset_id: str, policy: PromotionPolicy
+    ) -> tuple[PromotionPolicy, Dataset]:
+        async with self._pool.acquire() as conn, conn.transaction():
+            before = await conn.fetchval(
+                "SELECT promotion_policy FROM datasets WHERE id = $1 AND kind <> 'analyst_layer' "
+                "FOR UPDATE",
+                dataset_id,
+            )
+            if before is None:
+                raise UnknownDatasetEgressError(dataset_id)
+            row = await conn.fetchrow(
+                f"UPDATE datasets d SET promotion_policy = $2 WHERE d.id = $1 RETURNING {_COLUMNS}",
+                dataset_id,
+                policy,
+            )
+        return cast(PromotionPolicy, before), _row(row)
+
+    async def read_the_same_dataset(
+        self,
+        from_investigation_id: str,
+        to_investigation_id: str,
+        *,
+        case_name: str | None = None,
+        created_by: str | None = None,
+    ) -> None:
         async with self._pool.acquire() as conn:
+            kinds = await conn.fetch(
+                "SELECT d.kind FROM investigation_datasets c "
+                "JOIN datasets d ON d.id = c.dataset_id WHERE c.investigation_id = $1",
+                from_investigation_id,
+            )
+            refuse_copying_drawn([k["kind"] for k in kinds])
             await conn.execute(
                 "INSERT INTO investigation_datasets (investigation_id, dataset_id, position) "
-                "SELECT $2, dataset_id, position FROM investigation_datasets "
-                "WHERE investigation_id = $1 ON CONFLICT DO NOTHING",
+                "SELECT $2, c.dataset_id, c.position FROM investigation_datasets c "
+                "JOIN datasets d ON d.id = c.dataset_id "
+                "WHERE c.investigation_id = $1 AND d.kind <> 'analyst_layer' "
+                "ON CONFLICT DO NOTHING",
                 from_investigation_id,
                 to_investigation_id,
             )
+            parent = await conn.fetchrow(
+                "SELECT d.owning_unit, d.created_by FROM investigation_datasets c "
+                "JOIN datasets d ON d.id = c.dataset_id WHERE c.investigation_id = $1 "
+                "ORDER BY c.position LIMIT 1",
+                to_investigation_id,
+            )
+        if parent is not None:
+            await self.ensure_layer(
+                to_investigation_id,
+                unit=parent["owning_unit"],
+                created_by=created_by or parent["created_by"],
+                case_name=case_name,
+            )
+
+
+class _Borrowed:
+    """An `async with` over a connection already held, so `_insert` runs inside a caller's own
+    connection (the migration's transaction) or a fresh one alike."""
+
+    def __init__(self, conn: asyncpg.Connection) -> None:
+        self._conn = conn
+
+    async def __aenter__(self) -> asyncpg.Connection:
+        return self._conn
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
 
 
 __all__: Sequence[str] = (
+    "ANALYST_LAYER",
+    "COMPOSITE",
+    "SOURCE",
     "CaseDatasetsRequest",
+    "CreateCompositeRequest",
+    "DatasetKind",
+    "index_one_dataset_per_case",
+    "layer_egress",
+    "layer_name",
+    "as_its_case",
+    "compose_for_case",
+    "named_by_case",
+    "read_also",
+    "read_set",
     "CreateDatasetRequest",
     "Dataset",
     "DatasetRefusedError",

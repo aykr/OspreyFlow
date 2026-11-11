@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Collection, Mapping, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal, get_args
+from typing import Any, Literal, get_args
 
 import asyncpg
 from pydantic import BaseModel, Field, model_validator
@@ -26,12 +27,47 @@ from services.ingest.engine import RowKeyRunInProgress
 
 from conduit_common.identity import new_id
 from schemas.domain import Handling
-from schemas.ingest import LoadRecord, LoadReport, PipelineRunReport
+from schemas.ingest import (
+    LoadRecord,
+    LoadReport,
+    PipelineRunReport,
+    RowElements,
+    RunMetering,
+    SourceWatermark,
+)
 
-RunTrigger = Literal["manual", "schedule", "watch", "release"]
+from .run_quotas import QuotaLimit, QuotaRefused, quota_words
+
+#: `source_refresh` (ADR-110 Amendment 6 point 5): a run started by its source's refresh policy.
+RunTrigger = Literal["manual", "schedule", "watch", "release", "source_refresh", "external"]
 RunOutcome = Literal["running", "succeeded", "failed", "refused", "blocked", "skipped", "missed"]
 NotRunOutcome = Literal["refused", "blocked", "skipped", "missed"]
 _NOT_RUN = frozenset(get_args(NotRunOutcome))
+
+
+@dataclass(frozen=True)
+class Counted:
+    """What a run is counted under (ADR-141 decisions 3 and 6): its pipeline's dataset and unit."""
+
+    dataset_id: str | None
+    owning_unit: str | None
+
+
+@dataclass(frozen=True)
+class External:
+    """An orchestrator's trigger (ADR-141 decisions 10 and 12)."""
+
+    run_id: str
+    triggered_by: str
+
+
+class ExternalRunRecorded(Exception):
+    """The external run id is held by a run already (decision 12): nothing more is loaded."""
+
+    def __init__(self, run_id: str) -> None:
+        super().__init__(f"the external run id is already recorded, as run {run_id}")
+        self.run_id = run_id
+
 
 #: ADR-127 decision 6: the `LoadRecord` of each load the run made (a list: a pipeline run made one
 #: per branch), beside the run. A ledger made before it has the table without the column, which
@@ -69,10 +105,61 @@ ALTER TABLE loaded_row_keys ADD COLUMN IF NOT EXISTS fingerprint TEXT NOT NULL D
 CREATE INDEX IF NOT EXISTS loaded_row_keys_load_idx ON loaded_row_keys (load_id);
 CREATE INDEX IF NOT EXISTS loaded_row_keys_fingerprint_idx
     ON loaded_row_keys (recipe_id, investigation_id, fingerprint, load_id);
+-- ADR-110 Amendment 8 point 2: what each kept row wrote, by stored id. NULL for a key kept
+-- before it, which a full snapshot's withdrawal leaves in place and counts.
+ALTER TABLE loaded_row_keys ADD COLUMN IF NOT EXISTS node_ids TEXT[];
+ALTER TABLE loaded_row_keys ADD COLUMN IF NOT EXISTS edge_ids TEXT[];
+CREATE INDEX IF NOT EXISTS loaded_row_keys_node_ids_idx ON loaded_row_keys USING gin (node_ids);
+CREATE INDEX IF NOT EXISTS loaded_row_keys_edge_ids_idx ON loaded_row_keys USING gin (edge_ids);
+-- Amendment 8 points 4 and 5: the keys a full snapshot withdrew, moved here whole with the load
+-- that withdrew them, so a row that comes back is kept again in `loaded_row_keys` and the
+-- refresh's revert can tell that it has.
+CREATE TABLE IF NOT EXISTS withdrawn_row_keys (
+    recipe_id TEXT NOT NULL,
+    investigation_id TEXT NOT NULL,
+    row_key TEXT NOT NULL,
+    load_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL DEFAULT '',
+    node_ids TEXT[],
+    edge_ids TEXT[],
+    withdrawn_by_load TEXT NOT NULL,
+    PRIMARY KEY (recipe_id, investigation_id, row_key)
+);
+CREATE INDEX IF NOT EXISTS withdrawn_row_keys_by_idx ON withdrawn_row_keys (withdrawn_by_load);
+CREATE INDEX IF NOT EXISTS withdrawn_row_keys_load_idx ON withdrawn_row_keys (load_id);
+CREATE INDEX IF NOT EXISTS withdrawn_row_keys_node_ids_idx
+    ON withdrawn_row_keys USING gin (node_ids);
+CREATE INDEX IF NOT EXISTS withdrawn_row_keys_edge_ids_idx
+    ON withdrawn_row_keys USING gin (edge_ids);
+-- Amendment 15: the events each kept row wrote, by event_id, so a full snapshot withdraws a dropped
+-- row's own events and no other row's on the same link. NULL for a key kept before it, which a
+-- full snapshot's withdrawal leaves in place, its events too, and counts.
+ALTER TABLE loaded_row_keys ADD COLUMN IF NOT EXISTS event_ids TEXT[];
+ALTER TABLE withdrawn_row_keys ADD COLUMN IF NOT EXISTS event_ids TEXT[];
+-- ADR-110 Amendment 18: each kept row's link types ({edge id: type}); NULL for a row kept before.
+ALTER TABLE loaded_row_keys ADD COLUMN IF NOT EXISTS edge_types JSONB;
+ALTER TABLE withdrawn_row_keys ADD COLUMN IF NOT EXISTS edge_types JSONB;
 """
 
-#: The record's own id lists: what `unreverted_loads` leaves out, since it answers a question about
-#: a load, not about its elements.
+
+@dataclass(frozen=True)
+class KeptRow:
+    """A kept key and what its row wrote (ADR-110 Amendment 8 point 2, and its events by
+    Amendment 15); `None` for a key kept before rows recorded it, or recorded its events."""
+
+    row_key: str
+    load_id: str
+    node_ids: tuple[str, ...] | None
+    edge_ids: tuple[str, ...] | None
+    event_ids: tuple[str, ...] | None = None
+    #: An earlier full snapshot withdrew this key and its entry is still in `withdrawn_row_keys`:
+    #: the row came back. Moving it aside again would collide, so it is left (Amendment 15).
+    withdrawn_before: bool = False
+
+
+#: The record's own element lists: what `unreverted_loads` leaves out, since it answers a question
+#: about a load, not about its elements. `own_key_merges` (ADR-110 Amendment 16) is the heaviest of
+#: them, one stored link per returning row, and only the revert reads it (`load_record`).
 _ID_LISTS = (
     "created_node_ids",
     "rule_node_ids",
@@ -81,6 +168,9 @@ _ID_LISTS = (
     "merged_edge_ids",
     "merged_node_ids",
     "created_geometry_refs",
+    "withdrawn_node_ids",
+    "withdrawn_edge_ids",
+    "own_key_merges",
 )
 
 #: How long a second run of one recipe into one case waits for the first before it is refused, and
@@ -121,15 +211,36 @@ ALTER TABLE recipe_runs ADD COLUMN IF NOT EXISTS counts_toward_pause BOOLEAN NOT
 -- taken once.
 ALTER TABLE recipe_runs ADD COLUMN IF NOT EXISTS source_file TEXT;
 CREATE INDEX IF NOT EXISTS recipe_runs_recipe_idx ON recipe_runs (recipe_id, started_at DESC);
+-- The trigger's CHECK is the column's own, so a ledger made before a trigger was added refuses it:
+-- connecting puts the current list back (ADR-110 Amendment 6, `source_refresh`).
+ALTER TABLE recipe_runs DROP CONSTRAINT IF EXISTS recipe_runs_trigger_check;
+ALTER TABLE recipe_runs ADD CONSTRAINT recipe_runs_trigger_check
+    CHECK (trigger IN ({", ".join(f"'{t}'" for t in get_args(RunTrigger))}));
 {_ADD_LOAD_RECORDS}
 {_ADD_ROW_MARKINGS}
+-- ADR-110 Amendment 6 point 9: what a succeeded run cost (`RunMetering`); NULL before it.
+ALTER TABLE recipe_runs ADD COLUMN IF NOT EXISTS metering JSONB;
+-- ADR-141 decisions 3, 6, 10 and 12: the dataset and unit a run is counted under (quotas and
+-- Operations' roll-up), the orchestrator's own run id, and the service identity that triggered
+-- it. NULL for a run recorded before them.
+ALTER TABLE recipe_runs ADD COLUMN IF NOT EXISTS dataset_id TEXT;
+ALTER TABLE recipe_runs ADD COLUMN IF NOT EXISTS owning_unit TEXT;
+ALTER TABLE recipe_runs ADD COLUMN IF NOT EXISTS external_run_id TEXT;
+ALTER TABLE recipe_runs ADD COLUMN IF NOT EXISTS triggered_by TEXT;
+-- Decision 12: an external run id loads once. A refused trigger loaded nothing, so a retry of it
+-- may run; a run that started (running, succeeded or failed) holds the key.
+CREATE UNIQUE INDEX IF NOT EXISTS recipe_runs_external_once_idx
+    ON recipe_runs (recipe_id, external_run_id)
+    WHERE external_run_id IS NOT NULL AND outcome <> 'refused';
+CREATE INDEX IF NOT EXISTS recipe_runs_started_idx ON recipe_runs (started_at DESC);
 {_LOADED_ROW_KEYS}
 """
 
 _COLUMNS = (
     "run_id, recipe_id, recipe_version, investigation_id, trigger, slot, run_as, source_handling, "
     "started_at, finished_at, outcome, rows_read, nodes_created, nodes_referenced, edges_created, "
-    "rows_rejected, rows_held, load_id, failure, source_file, row_markings"
+    "rows_rejected, rows_held, load_id, failure, source_file, row_markings, metering, "
+    "dataset_id, owning_unit, external_run_id, triggered_by"
 )
 
 
@@ -160,6 +271,16 @@ class RecipeRun(BaseModel):
     #: marking alone, as it did before the column existed; a finished run that wrote no row has an
     #: empty list (the view still judges the source). Markings, never ids.
     markings: list[Handling] = Field(default_factory=list)
+    #: ADR-110 Amendment 6 point 9: a succeeded run's metering; `None` for any other, and for one
+    #: from before. Counts of the run's own: withheld with the others by every route.
+    metering: RunMetering | None = None
+    #: ADR-141: the dataset and unit the run is counted under; `None` for one recorded before.
+    dataset_id: str | None = None
+    owning_unit: str | None = None
+    #: ADR-141 decisions 10 and 12: for trigger `external`, the orchestrator's run id and the
+    #: service identity (an OIDC client's name) that triggered it; `run_as` is the owner.
+    external_run_id: str | None = None
+    triggered_by: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -176,7 +297,13 @@ def _row(record: asyncpg.Record) -> RecipeRun:
     # asyncpg hands JSONB back as text unless a codec is set, and this pool sets none.
     recorded = json.loads(raw) if isinstance(raw, str) else raw
     data["markings"] = None if recorded is None else [Handling.model_validate(m) for m in recorded]
+    metered = data.pop("metering")
+    data["metering"] = None if metered is None else RunMetering.model_validate_json(metered)
     return RecipeRun.model_validate(data)
+
+
+def _ids(elements: RowElements | None, field: str) -> list[str] | None:
+    return None if elements is None else list(getattr(elements, field))
 
 
 class RecipeRunStore:
@@ -206,13 +333,36 @@ class RecipeRunStore:
         source: Handling,
         now: datetime,
         source_file: str | None = None,
+        counted: Counted | None = None,
+        external: External | None = None,
+        within: Sequence[QuotaLimit] = (),
     ) -> str:
+        """Records the run as started. `external`: an orchestrator's trigger, whose run id is
+        claimed here, once (decision 12): a second start with it raises `ExternalRunRecorded`
+        naming the run that holds it, and inserts nothing. `within` (ADR-141 decision 6): the
+        quotas the start is held to, each counted again under a transaction lock of its own, so
+        the count and the row are one step and two starts cannot both take a quota's last run
+        (`QuotaRefused`, nothing inserted; the lane review of L1.7, item 11)."""
         run_id = new_id()
-        await self._insert(
-            run_id, recipe_id, recipe_version, investigation_id, trigger, slot, run_as, source,
-            started_at=now, finished_at=None, outcome="running", failure=None,
-            source_file=source_file,
-        )  # fmt: skip
+        async with self._pool.acquire() as conn, conn.transaction():
+            for limit in sorted(within, key=lambda q: (q.scope, q.key)):
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))", f"quota:{limit.scope}:{limit.key}"
+                )
+                column = "dataset_id" if limit.scope == "dataset" else "owning_unit"
+                today = await conn.fetchval(
+                    f"SELECT count(*) FROM recipe_runs WHERE started_at >= $1 AND {column} = $2 "
+                    "AND outcome IN ('running', 'succeeded', 'failed')",
+                    limit.since,
+                    limit.key,
+                )
+                if int(today or 0) >= limit.runs_per_day:
+                    raise QuotaRefused(quota_words(limit.scope, limit.runs_per_day))
+            await self._insert(
+                run_id, recipe_id, recipe_version, investigation_id, trigger, slot, run_as, source,
+                started_at=now, finished_at=None, outcome="running", failure=None,
+                source_file=source_file, counted=counted, external=external, conn=conn,
+            )  # fmt: skip
         return run_id
 
     async def finish(
@@ -222,8 +372,8 @@ class RecipeRunStore:
             await conn.execute(
                 "UPDATE recipe_runs SET outcome = 'succeeded', finished_at = $2, rows_read = $3, "
                 "nodes_created = $4, nodes_referenced = $5, edges_created = $6, "
-                "rows_rejected = $7, rows_held = $8, load_id = $9, row_markings = $10::jsonb "
-                "WHERE run_id = $1",
+                "rows_rejected = $7, rows_held = $8, load_id = $9, row_markings = $10::jsonb, "
+                "metering = $11::jsonb WHERE run_id = $1",
                 run_id,
                 now,
                 report.rows_read,
@@ -234,6 +384,7 @@ class RecipeRunStore:
                 report.rows_held,
                 report.load_id,
                 json.dumps([m.model_dump(mode="json") for m in report.markings]),
+                None if report.metering is None else report.metering.model_dump_json(),
             )
 
     async def add_record(
@@ -243,6 +394,8 @@ class RecipeRunStore:
         *,
         row_keys: Sequence[str] = (),
         row_key_fingerprint: str = "",
+        row_elements: Mapping[str, RowElements] | None = None,
+        withdrawn_row_keys: Sequence[str] = (),
     ) -> None:
         """Appends a load's record to its run (ADR-127 decision 6), when the load's graph
         transaction commits and so before the run can `finish`: a run that fails afterwards still
@@ -252,7 +405,12 @@ class RecipeRunStore:
         same transaction**: both land or neither does. The graph has committed already, so a crash
         between the two stores leaves rows loaded with neither (the run row stays `running`), and
         never a key for a row that did not load, nor a record whose keys were lost. A key already
-        kept is left as it was."""
+        kept is left as it was.
+
+        `row_elements` (ADR-110 Amendment 8 point 2) is what each key's row wrote, kept with it; a
+        key it has no entry for records none. `withdrawn_row_keys` (points 4 and 5) are the keys of
+        the record's recipe and case a full snapshot withdrew: moved to `withdrawn_row_keys` with
+        the record's load, in the same transaction."""
         async with self._pool.acquire() as conn, conn.transaction():
             await conn.execute(
                 "UPDATE recipe_runs SET load_records = COALESCE(load_records, '[]'::jsonb) "
@@ -261,18 +419,234 @@ class RecipeRunStore:
                 json.dumps([record.model_dump(mode="json")]),
             )
             keys = list(dict.fromkeys(row_keys))
+            elements = row_elements or {}
             for start in range(0, len(keys), _KEY_CHUNK):
+                chunk = keys[start : start + _KEY_CHUNK]
+                # Each key's id lists as one JSON array of arrays (an array of arrays cannot be
+                # ragged in Postgres): `null` for a key with no entry.
+                nodes = [_ids(elements.get(k), "node_ids") for k in chunk]
+                edges = [_ids(elements.get(k), "edge_ids") for k in chunk]
+                events = [_ids(elements.get(k), "event_ids") for k in chunk]
+                # ADR-110 Amendment 18: each link's type, `null` for a key with no entry.
+                types = [
+                    None if elements.get(k) is None else dict(elements[k].edge_types) for k in chunk
+                ]
                 await conn.execute(
                     "INSERT INTO loaded_row_keys "
-                    "(recipe_id, investigation_id, row_key, load_id, fingerprint) "
-                    "SELECT $1, $2, k, $4, $5 FROM unnest($3::text[]) AS k "
+                    "(recipe_id, investigation_id, row_key, load_id, fingerprint, node_ids, "
+                    "edge_ids, event_ids, edge_types) "
+                    "SELECT $1, $2, k.key, $4, $5, "
+                    "CASE WHEN n.ids = 'null' THEN NULL ELSE "
+                    "ARRAY(SELECT jsonb_array_elements_text(n.ids)) END, "
+                    "CASE WHEN e.ids = 'null' THEN NULL ELSE "
+                    "ARRAY(SELECT jsonb_array_elements_text(e.ids)) END, "
+                    "CASE WHEN v.ids = 'null' THEN NULL ELSE "
+                    "ARRAY(SELECT jsonb_array_elements_text(v.ids)) END, "
+                    "CASE WHEN t.types = 'null' THEN NULL ELSE t.types END "
+                    "FROM unnest($3::text[]) WITH ORDINALITY AS k(key, i) "
+                    "JOIN jsonb_array_elements($6::jsonb) WITH ORDINALITY AS n(ids, i) USING (i) "
+                    "JOIN jsonb_array_elements($7::jsonb) WITH ORDINALITY AS e(ids, i) USING (i) "
+                    "JOIN jsonb_array_elements($8::jsonb) WITH ORDINALITY AS v(ids, i) USING (i) "
+                    "JOIN jsonb_array_elements($9::jsonb) WITH ORDINALITY AS t(types, i) USING (i) "
                     "ON CONFLICT (recipe_id, investigation_id, row_key) DO NOTHING",
                     record.recipe_id,
                     record.investigation_id or "",
-                    keys[start : start + _KEY_CHUNK],
+                    chunk,
                     record.load_id,
                     row_key_fingerprint,
+                    json.dumps(nodes),
+                    json.dumps(edges),
+                    json.dumps(events),
+                    json.dumps(types),
                 )
+            withdrawn = list(dict.fromkeys(withdrawn_row_keys))
+            for start in range(0, len(withdrawn), _KEY_CHUNK):
+                await conn.execute(
+                    # A key already withdrawn and kept again is never moved a second time (its
+                    # first entry stands, Amendment 15): it stays kept, as the planner leaves it.
+                    "WITH moved AS (DELETE FROM loaded_row_keys k WHERE recipe_id = $1 "
+                    "AND investigation_id = $2 AND row_key = ANY($3::text[]) "
+                    "AND NOT EXISTS (SELECT 1 FROM withdrawn_row_keys w WHERE "
+                    "w.recipe_id = k.recipe_id AND w.investigation_id = k.investigation_id "
+                    "AND w.row_key = k.row_key) RETURNING *) "
+                    "INSERT INTO withdrawn_row_keys (recipe_id, investigation_id, row_key, "
+                    "load_id, fingerprint, node_ids, edge_ids, event_ids, edge_types, "
+                    "withdrawn_by_load) "
+                    "SELECT recipe_id, investigation_id, row_key, load_id, fingerprint, node_ids, "
+                    "edge_ids, event_ids, edge_types, $4 FROM moved",
+                    record.recipe_id,
+                    record.investigation_id or "",
+                    withdrawn[start : start + _KEY_CHUNK],
+                    record.load_id,
+                )
+
+    async def dropped_row_keys(
+        self, recipe_id: str, case: str, *, present: Collection[str]
+    ) -> list[KeptRow]:
+        """The keys the case keeps for the recipe that `present` (every key a full snapshot's rows
+        carry) does not, each with its record (ADR-110 Amendment 8 point 3). A withdrawn key is not
+        kept, so not dropped again. Every kept key is read and compared here: one pass over the
+        (recipe, case) part of the primary key, unmeasured at a million keys."""
+        dropped: list[KeptRow] = []
+        async with self._pool.acquire() as conn, conn.transaction():
+            async for row in conn.cursor(
+                "SELECT k.row_key, k.load_id, k.node_ids, k.edge_ids, k.event_ids, "
+                "EXISTS (SELECT 1 FROM withdrawn_row_keys w WHERE w.recipe_id = k.recipe_id "
+                "AND w.investigation_id = k.investigation_id AND w.row_key = k.row_key) "
+                "AS withdrawn_before FROM loaded_row_keys k "
+                "WHERE k.recipe_id = $1 AND k.investigation_id = $2 ORDER BY k.row_key",
+                recipe_id,
+                case,
+            ):
+                if row["row_key"] in present:
+                    continue
+                dropped.append(
+                    KeptRow(
+                        row_key=row["row_key"],
+                        load_id=row["load_id"],
+                        node_ids=None if row["node_ids"] is None else tuple(row["node_ids"]),
+                        edge_ids=None if row["edge_ids"] is None else tuple(row["edge_ids"]),
+                        event_ids=None if row["event_ids"] is None else tuple(row["event_ids"]),
+                        withdrawn_before=row["withdrawn_before"],
+                    )
+                )
+        return dropped
+
+    async def withdrawn_event_ids(self, load_id: str) -> list[str]:
+        """The events of the rows `load_id` withdrew, by the ids each row's key records (ADR-110
+        Amendment 15): what the run sets aside in the analytics store once its record is in. A key
+        has its own row's events and no other's, so nothing here depends on another row or case."""
+        ids: list[str] = []
+        # Read by a cursor, a bounded batch at a time: the answer grows with the rows withdrawn.
+        async with self._pool.acquire() as conn, conn.transaction():
+            async for r in conn.cursor(
+                "SELECT DISTINCT x FROM withdrawn_row_keys, unnest(event_ids) AS x "
+                "WHERE withdrawn_by_load = $1 ORDER BY x",
+                load_id,
+                prefetch=_KEY_CHUNK,
+            ):
+                ids.append(r["x"])
+        return ids
+
+    async def withdrawn_row_keys_among(
+        self, recipe_id: str, case: str, keys: Sequence[str]
+    ) -> set[str]:
+        """Which of these keys of the recipe and case an earlier full snapshot withdrew and has not
+        given back (Amendment 15): a row that comes back, whose link never left. Per recipe and
+        case, so nothing of another case is asked. In chunks, as `kept_row_keys`."""
+        found: set[str] = set()
+        unique = list(dict.fromkeys(keys))
+        async with self._pool.acquire() as conn:
+            for start in range(0, len(unique), _KEY_CHUNK):
+                rows = await conn.fetch(
+                    "SELECT row_key FROM withdrawn_row_keys WHERE recipe_id = $1 "
+                    "AND investigation_id = $2 AND row_key = ANY($3::text[])",
+                    recipe_id,
+                    case,
+                    unique[start : start + _KEY_CHUNK],
+                )
+                found.update(r["row_key"] for r in rows)
+        return found
+
+    async def withdrawn_row_links(
+        self, recipe_id: str, case: str, keys: Sequence[str]
+    ) -> dict[str, dict[str, str]]:
+        """ADR-110 Amendments 16 and 18: of these keys, those an earlier full snapshot of the
+        recipe in the case withdrew, each with the links its record holds and each link's own type
+        (`edge_types`). A returning row's merge into one of them is its own, read by that type. A
+        key kept before rows recorded their link types holds none, so it is never captured. Per
+        recipe and case, in chunks, as `withdrawn_row_keys_among`."""
+        found: dict[str, dict[str, str]] = {}
+        unique = list(dict.fromkeys(keys))
+        async with self._pool.acquire() as conn:
+            for start in range(0, len(unique), _KEY_CHUNK):
+                rows = await conn.fetch(
+                    "SELECT row_key, edge_ids, edge_types FROM withdrawn_row_keys "
+                    "WHERE recipe_id = $1 "
+                    "AND investigation_id = $2 AND row_key = ANY($3::text[])",
+                    recipe_id,
+                    case,
+                    unique[start : start + _KEY_CHUNK],
+                )
+                for r in rows:
+                    held = r["edge_types"]
+                    types = json.loads(held) if isinstance(held, str) else (held or {})
+                    found[r["row_key"]] = {e: types[e] for e in (r["edge_ids"] or ()) if e in types}
+        return found
+
+    async def withdrawn_keys_kept_again(self, load_id: str) -> int:
+        """How many of the keys `load_id` withdrew are kept again by a later load: its revert is
+        refused while any is (ADR-110 Amendment 8 point 5)."""
+        async with self._pool.acquire() as conn:
+            return int(
+                await conn.fetchval(
+                    "SELECT count(*) FROM withdrawn_row_keys w JOIN loaded_row_keys k "
+                    "USING (recipe_id, investigation_id, row_key) WHERE w.withdrawn_by_load = $1",
+                    load_id,
+                )
+            )
+
+    async def restore_withdrawn_row_keys(self, load_id: str) -> int:
+        """Moves the keys `load_id` withdrew back, each with the load that kept it and its record
+        (the refresh's revert). Idempotent; a key kept again meanwhile is left where it is, which
+        the revert refuses before it gets here."""
+        async with self._pool.acquire() as conn:
+            status = await conn.execute(
+                "WITH moved AS (DELETE FROM withdrawn_row_keys w WHERE withdrawn_by_load = $1 "
+                "AND NOT EXISTS (SELECT 1 FROM loaded_row_keys k WHERE k.recipe_id = w.recipe_id "
+                "AND k.investigation_id = w.investigation_id AND k.row_key = w.row_key) "
+                "RETURNING *) "
+                "INSERT INTO loaded_row_keys (recipe_id, investigation_id, row_key, load_id, "
+                "fingerprint, node_ids, edge_ids, event_ids, edge_types) "
+                "SELECT recipe_id, investigation_id, row_key, load_id, fingerprint, node_ids, "
+                "edge_ids, event_ids, edge_types FROM moved",
+                load_id,
+            )
+        return int(status.split()[-1])
+
+    async def watermark(self, recipe_id: str, case: str, source_id: str) -> SourceWatermark | None:
+        """The watermark an incremental refresh of `source_id` by this pipeline into this case reads
+        from (ADR-110 Amendment 6 point 1): the one the latest unreverted load of a *succeeded* run
+        reached. A failed run's is not kept, so the rows it did not finish are read again; a
+        reverted load's is not, so the rows it took back are read again. Latest by the run's start:
+        the executor's lock serialises a pipeline's runs. `None`: read every row."""
+        async with self._pool.acquire() as conn:
+            kept = await conn.fetchval(
+                "SELECT rec->'watermark' FROM recipe_runs, "
+                "jsonb_array_elements(load_records) AS rec "
+                "WHERE load_records IS NOT NULL AND outcome = 'succeeded' "
+                "AND rec->>'recipe_id' = $1 AND rec->>'investigation_id' = $2 "
+                "AND rec->>'reverted_at' IS NULL AND rec->'watermark'->>'source_id' = $3 "
+                "ORDER BY started_at DESC, rec->>'load_id' DESC LIMIT 1",
+                recipe_id,
+                case,
+                source_id,
+            )
+        return None if kept is None else SourceWatermark.model_validate_json(kept)
+
+    async def reads_past(self, load_id: str) -> int:
+        """How many unreverted loads of later runs read the same source incrementally, for the same
+        pipeline and case, past this load's watermark. The revert refuses while there is one: their
+        watermark would leave this load's rows unread for good. No record, or one with no
+        watermark: none."""
+        async with self._pool.acquire() as conn:
+            return int(
+                await conn.fetchval(
+                    "WITH me AS (SELECT r.started_at, mine.value AS mine FROM recipe_runs r, "
+                    "jsonb_array_elements(r.load_records) AS mine "
+                    "WHERE r.load_records IS NOT NULL AND mine.value->>'load_id' = $1 "
+                    "AND jsonb_typeof(mine.value->'watermark') = 'object' "
+                    "LIMIT 1) "
+                    "SELECT count(*) FROM me, recipe_runs r, "
+                    "jsonb_array_elements(r.load_records) AS rec "
+                    "WHERE r.load_records IS NOT NULL AND r.started_at > me.started_at "
+                    "AND rec->>'reverted_at' IS NULL "
+                    "AND rec->>'recipe_id' = me.mine->>'recipe_id' "
+                    "AND rec->>'investigation_id' = me.mine->>'investigation_id' "
+                    "AND rec->'watermark'->>'source_id' = me.mine->'watermark'->>'source_id'",
+                    load_id,
+                )
+            )
 
     async def kept_row_keys(self, recipe_id: str, case: str, keys: Sequence[str]) -> set[str]:
         """Which of `keys` the case has kept for the recipe, whatever version and whichever load:
@@ -299,8 +673,11 @@ class RecipeRunStore:
         million keys is a scan of that index and not of the table. Unmeasured."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT fingerprint, count(DISTINCT load_id) AS loads FROM loaded_row_keys "
-                "WHERE recipe_id = $1 AND investigation_id = $2 GROUP BY fingerprint",
+                "SELECT fingerprint, count(DISTINCT load_id) AS loads FROM ("
+                "SELECT fingerprint, load_id FROM loaded_row_keys "
+                "WHERE recipe_id = $1 AND investigation_id = $2 UNION ALL "
+                "SELECT fingerprint, load_id FROM withdrawn_row_keys "
+                "WHERE recipe_id = $1 AND investigation_id = $2) AS kept GROUP BY fingerprint",
                 recipe_id,
                 case,
             )
@@ -362,11 +739,16 @@ class RecipeRunStore:
         decision 6). By load id; idempotent: a second call finds none and returns 0."""
         if not load_ids:
             return 0
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
             status = await conn.execute(
                 "DELETE FROM loaded_row_keys WHERE load_id = ANY($1::text[])", list(load_ids)
             )
-        return int(status.split()[-1])
+            # A key these loads kept that a refresh withdrew is theirs too (ADR-110 Amendment 8
+            # point 3): released with them, so the refresh's revert has nothing to restore.
+            aside = await conn.execute(
+                "DELETE FROM withdrawn_row_keys WHERE load_id = ANY($1::text[])", list(load_ids)
+            )
+        return int(status.split()[-1]) + int(aside.split()[-1])
 
     async def add_geometries(self, run_id: str, load_id: str, refs: list[str]) -> None:
         """Records the geometry refs a load is about to insert, against that load's record."""
@@ -576,6 +958,8 @@ class RecipeRunStore:
         now: datetime,
         counts_toward_pause: bool = True,
         source_file: str | None = None,
+        counted: Counted | None = None,
+        external: External | None = None,
     ) -> str:
         """A slot that did not run, and why (decisions 2–4)."""
         if outcome not in _NOT_RUN:
@@ -584,7 +968,7 @@ class RecipeRunStore:
         await self._insert(
             run_id, recipe_id, recipe_version, investigation_id, trigger, slot, run_as, source,
             started_at=now, finished_at=now, outcome=outcome, failure=failure,
-            source_file=source_file,
+            source_file=source_file, counted=counted, external=external,
         )  # fmt: skip
         if not counts_toward_pause:
             async with self._pool.acquire() as conn:
@@ -609,27 +993,129 @@ class RecipeRunStore:
         outcome: RunOutcome,
         failure: str | None,
         source_file: str | None = None,
+        counted: Counted | None = None,
+        external: External | None = None,
+        conn: Any = None,
     ) -> None:
+        try:
+            if conn is not None:
+                await self._insert_row(
+                    conn, run_id, recipe_id, recipe_version, investigation_id, trigger, slot,
+                    run_as, source, started_at, finished_at, outcome, failure, source_file,
+                    counted, external,
+                )  # fmt: skip
+                return
+            async with self._pool.acquire() as held:
+                await self._insert_row(
+                    held, run_id, recipe_id, recipe_version, investigation_id, trigger, slot,
+                    run_as, source, started_at, finished_at, outcome, failure, source_file,
+                    counted, external,
+                )  # fmt: skip
+        except asyncpg.UniqueViolationError as error:
+            if external is None:
+                raise
+            held_run = await self.by_external(recipe_id, external.run_id)
+            raise ExternalRunRecorded(held_run.run_id if held_run else "") from error
+
+    @staticmethod
+    async def _insert_row(
+        conn: Any,
+        run_id: str,
+        recipe_id: str,
+        recipe_version: int,
+        investigation_id: str,
+        trigger: RunTrigger,
+        slot: datetime | None,
+        run_as: str,
+        source: Handling,
+        started_at: datetime,
+        finished_at: datetime | None,
+        outcome: RunOutcome,
+        failure: str | None,
+        source_file: str | None,
+        counted: Counted | None,
+        external: External | None,
+    ) -> None:
+        await conn.execute(
+            "INSERT INTO recipe_runs (run_id, recipe_id, recipe_version, "
+            "investigation_id, trigger, slot, run_as, source_handling, started_at, "
+            "finished_at, outcome, failure, source_file, dataset_id, owning_unit, "
+            "external_run_id, triggered_by) VALUES ($1, $2, $3, $4, $5, $6, $7, "
+            "$8::jsonb, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+            run_id,
+            recipe_id,
+            recipe_version,
+            investigation_id,
+            trigger,
+            slot,
+            run_as,
+            source.model_dump_json(),
+            started_at,
+            finished_at,
+            outcome,
+            failure,
+            source_file,
+            counted.dataset_id if counted else None,
+            counted.owning_unit if counted else None,
+            external.run_id if external else None,
+            external.triggered_by if external else None,
+        )
+
+    async def get(self, run_id: str) -> RecipeRun | None:
         async with self._pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO recipe_runs (run_id, recipe_id, recipe_version, investigation_id, "
-                "trigger, slot, run_as, source_handling, started_at, finished_at, outcome, "
-                "failure, source_file) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13)",
-                run_id,
-                recipe_id,
-                recipe_version,
-                investigation_id,
-                trigger,
-                slot,
-                run_as,
-                source.model_dump_json(),
-                started_at,
-                finished_at,
-                outcome,
-                failure,
-                source_file,
+            row = await conn.fetchrow(
+                f"SELECT {_COLUMNS} FROM recipe_runs WHERE run_id = $1", run_id
             )
+        return None if row is None else _row(row)
+
+    async def by_external(self, recipe_id: str, external_run_id: str) -> RecipeRun | None:
+        """The run holding an external run id (decision 12): the one that started, else the latest
+        refusal of it; `None` when the id was never sent."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT {_COLUMNS} FROM recipe_runs WHERE recipe_id = $1 "
+                "AND external_run_id = $2 ORDER BY (outcome = 'refused'), started_at DESC LIMIT 1",
+                recipe_id,
+                external_run_id,
+            )
+        return None if row is None else _row(row)
+
+    async def runs_since(
+        self, *, since: datetime, dataset_id: str | None = None, owning_unit: str | None = None
+    ) -> int:
+        """Runs that started (running, succeeded or failed) since `since`, of a dataset or a unit:
+        a quota's count (ADR-141 decision 6). A refused or skipped slot ran nothing."""
+        clause, args = (
+            ("dataset_id = $2", dataset_id) if dataset_id else ("owning_unit = $2", owning_unit)
+        )
+        async with self._pool.acquire() as conn:
+            value = await conn.fetchval(
+                "SELECT count(*) FROM recipe_runs WHERE started_at >= $1 AND "
+                f"{clause} AND outcome IN ('running', 'succeeded', 'failed')",
+                since,
+                args,
+            )
+        return int(value or 0)
+
+    async def window(self, *, since: datetime, units: Sequence[str] | None) -> list[RecipeRun]:
+        """Every run since `since` of `units` (`None`: every unit), for Operations (decision 3).
+        Bounded by the window (at most 90 days), never by a row limit: a roll-up of part of the
+        window would be a wrong total (rule 2)."""
+        async with self._pool.acquire() as conn:
+            if units is None:
+                rows = await conn.fetch(
+                    f"SELECT {_COLUMNS} FROM recipe_runs WHERE started_at >= $1 "
+                    "ORDER BY started_at DESC",
+                    since,
+                )
+            else:
+                rows = await conn.fetch(
+                    f"SELECT {_COLUMNS} FROM recipe_runs WHERE started_at >= $1 "
+                    "AND owning_unit = ANY($2::text[]) ORDER BY started_at DESC",
+                    since,
+                    list(units),
+                )
+        return [_row(r) for r in rows]
 
     async def for_recipe(self, recipe_id: str, *, limit: int = 50) -> list[RecipeRun]:
         """The recipe's runs, newest first."""
@@ -656,7 +1142,7 @@ class RecipeRunStore:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT DISTINCT source_file FROM recipe_runs WHERE recipe_id = $1 "
-                "AND trigger = 'watch' AND source_file IS NOT NULL",
+                "AND trigger IN ('watch', 'source_refresh') AND source_file IS NOT NULL",
                 recipe_id,
             )
         return {row["source_file"] for row in rows}
@@ -669,7 +1155,7 @@ class RecipeRunStore:
         async with self._pool.acquire() as conn:
             outcomes = await conn.fetch(
                 "SELECT outcome, counts_toward_pause FROM recipe_runs WHERE recipe_id = $1 "
-                "AND trigger IN ('schedule', 'watch') "
+                "AND trigger IN ('schedule', 'watch', 'source_refresh') "
                 "ORDER BY started_at DESC, run_id DESC LIMIT 50",
                 recipe_id,
             )

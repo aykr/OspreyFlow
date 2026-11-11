@@ -542,48 +542,54 @@ test("CAP-A2-C4", async ({ page }) => {
   await page.getByRole("button", { name: /^Open Intelligence reports/ }).click();
   await page.getByRole("button", { name: "Source: Intelligence reports" }).click();
   await page.waitForTimeout(2000);
-  await page.getByRole("button", { name: "Open source settings" }).click();
+  await page.getByRole("button", { name: "The draft's own settings" }).click();
   await page.waitForTimeout(3000);
   // The source's settings: the file, its marking and the columns that carry each row's marking.
   // (The fallback-published recipe shows no entity Map stage on the canvas: a finding.)
   await shot(page, "CAP-A2-C4-a");
   await page.getByRole("button", { name: "Back to the pipeline" }).click();
-  await page.getByRole("button", { name: "Verify", exact: true }).click();
-  await page.getByRole("button", { name: "Run verify" }).click();
+  await page.getByRole("button", { name: "Test", exact: true }).click();
+  await page.getByRole("button", { name: "Run the test" }).click();
   // A dry run over the profiled sample: nothing is written.
   await page.waitForTimeout(20000);
   await scrollAllToTop(page);
   await shot(page, "CAP-A2-C4-b");
 });
 
-/** Runs a published pipeline from its Publish screen and waits for the run's own outcome. */
+/** Runs a pipeline and waits for the run's own outcome (ADR-140 decision 14, redesign phase 2). A
+ * draft, on the Pipelines list, is opened and run with **Deploy and run now** on its Deploy screen; a
+ * deployed one is run from the **4 Runs** tab, chosen by its name. Either way the Studio ends on its
+ * Pipelines tab's list. */
 async function runNow(page: Page, open: RegExp): Promise<string> {
-  await page.getByRole("button", { name: open }).click();
-  const publish = page.getByRole("button", { name: "Publish", exact: true });
-  const run = page.getByRole("button", { name: "Run now" });
-  // A published recipe opens on its Publish screen; a draft opens on its canvas first. There the
-  // first "Publish" is the pipeline's Publish stage, which only moves to the Publish screen; the
-  // Publish button on that screen is what publishes it. On a deployment whose recipes were all
-  // published in earlier rehearsals the second press was never needed (found capturing a fresh
-  // GOV.UK-brand deployment, 31 October 2026).
-  try {
-    await run.waitFor({ timeout: 10_000 });
-  } catch {
-    await publish.click();
-    try {
-      await run.waitFor({ timeout: 10_000 });
-    } catch {
-      await publish.click();
-    }
+  const opener = page.getByRole("button", { name: open });
+  const row = page.getByRole("listitem").filter({ has: opener });
+  const isDraft = /· draft/.test((await row.textContent()) ?? "");
+  let runs: string;
+  if (isDraft) {
+    await opener.click();
+    // A draft with a canvas opens on it; its header's Deploy opens the Deploy screen.
+    await page.getByRole("button", { name: "Deploy", exact: true }).click();
+    runs = await runNowAndWait(page, page.getByRole("button", { name: "Deploy and run now" }), 240_000);
+    await page.waitForTimeout(3000);
+    await page.getByRole("button", { name: "← Back", exact: true }).click();
+  } else {
+    const label = open.source.replace(/^\^Open /, "").replace(/\\/g, "");
+    await page.getByRole("tab", { name: "4 Runs" }).click();
+    const choose = page.getByRole("combobox", { name: "Pipeline to run or schedule" });
+    const value = await choose
+      .locator("option")
+      .filter({ hasText: new RegExp(`^${label}`) })
+      .first()
+      .getAttribute("value");
+    await choose.selectOption(value ?? "");
+    await page.getByRole("button", { name: "Run now or schedule" }).click();
+    // The new run's own answer, never the runs list's older "Succeeded:" (step 9d finding 7).
+    runs = await runNowAndWait(page, page.getByRole("button", { name: "Run now", exact: true }), 240_000);
+    await page.waitForTimeout(3000);
   }
-  // The new run's own answer, never the runs list's older "Succeeded:" (step 9d finding 7).
-  const runs = await runNowAndWait(page, run, 240_000);
-  await page.waitForTimeout(3000);
-  // The Publish screen's own way back to the recipe list, by its exact name: `/Back/` also matched
-  // the rail's "Back to the investigation", which left the Studio (31 October 2026).
-  await page.getByRole("button", { name: "← Back", exact: true }).click();
-  // A pipeline with a canvas (the reports pipeline once published by the fallback) goes back to its
-  // canvas, not to the list: its "Pipelines" button is the way to the list (2 November 2026).
+  await page.getByRole("tab", { name: "3 Pipelines" }).click();
+  // A pipeline with a canvas goes back to its canvas, not to the list: its "Pipelines" button is the
+  // way to the list (2 November 2026).
   const toList = page.getByRole("button", { name: "Pipelines", exact: true });
   if (await toList.isVisible().catch(() => false)) await toList.click();
   return runs;
@@ -698,20 +704,32 @@ test("CAP-A2-C8-b", async ({ page }) => {
 /** The rule P1 deploys (`pid_monitoring.P1_RULE_NAME`). */
 const P1_RULE = "Calls to a number on a seized handset";
 
-/** The incoming folder `pid_files.write_files` writes the chapter-9 files to, as the Conduit sees
- * it: the demo loads them, the seed does not. */
-const INCOMING = "/var/lib/osprey/ingest/uploaded/prison-intelligence/incoming";
-
-/** Runs a published pipeline over one of the chapter-9 files from its Publish screen, as the data
- * engineer, and says what its runs list reads afterwards. */
+/** Loads one of chapter 9's files by its pipeline's folder watch (ADR-140 Amendment 3): the seed
+ * sets each chapter-9 pipeline to watch for its own file, paused; `--release-batch-2` has put the file
+ * in the dataset's folder. As the data engineer, on the Studio's **4 Runs** tab: choose the pipeline,
+ * **Run now or schedule**, **Resume schedule**, then **Read the runs again** until today's report
+ * names a watch run of the file (a file loads a minute after it settles). Logs that report. */
 async function loadIncoming(page: Page, open: RegExp, file: string): Promise<void> {
   await studio(page);
-  await page.getByRole("button", { name: open }).click();
-  const run = page.getByRole("button", { name: "Run now" });
-  await run.waitFor();
-  await page.getByLabel(/^Source file/).fill(`${INCOMING}/${file}`);
-  // The new run's own answer, never the runs list's older "Succeeded" (step 9d finding 7).
-  console.log(`${file}: ${await runNowAndWait(page, run)}`);
+  const label = open.source.replace(/^\^Open /, "").replace(/\\/g, "");
+  await page.getByRole("tab", { name: "4 Runs" }).click();
+  const choose = page.getByRole("combobox", { name: "Pipeline to run or schedule" });
+  const value = await choose.locator("option").filter({ hasText: new RegExp(`^${label}`) }).first().getAttribute("value");
+  await choose.selectOption(value ?? "");
+  await page.getByRole("button", { name: "Run now or schedule" }).click();
+  await page.getByRole("button", { name: "Resume schedule" }).click();
+  const today = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: "UTC" });
+  const report = page.getByRole("region", { name: "Run report" });
+  for (let waited = 0; waited < 240; waited += 15) {
+    await page.waitForTimeout(15_000);
+    await page.getByRole("button", { name: "Read the runs again" }).click();
+    const cell = page.getByRole("button", { name: new RegExp(`^${label}.*, ${today}: `) }).first();
+    if (await cell.isVisible().catch(() => false)) {
+      await cell.click();
+      if (((await report.textContent().catch(() => "")) ?? "").includes(`watch, ${file}`)) break;
+    }
+  }
+  console.log(`${file}: ${(await report.textContent().catch(() => "(no run report)")) ?? ""}`.slice(0, 600));
   await page.waitForTimeout(5000);
 }
 
@@ -762,7 +780,7 @@ test("CAP-A2-C9", async ({ page }) => {
   // so the shot shows it, not only the inbox's heading (2 November 2026); CAP-M4-a keeps the top. It is
   // aligned at the bottom so the hotlist stays in view: under the GOV.UK brand the whole page scrolls,
   // and aligning the inbox's heading at the top showed the footer instead.
-  await page.getByRole("button", { name: "Jump into investigation" }).first().evaluate((el) => el.scrollIntoView({ block: "end" }));
+  await page.getByRole("button", { name: "Open the alert" }).first().evaluate((el) => el.scrollIntoView({ block: "end" }));
   await page.waitForTimeout(1500);
   await shot(page, "CAP-A2-C9");
   await shot(page, "CAP-M4-b");
@@ -843,7 +861,7 @@ test("CAP-A2-C9S", async ({ page }) => {
   test.setTimeout(600_000);
   await studio(page);
   await page.getByRole("button", { name: /^Open Intelligence reports/ }).click();
-  await page.getByRole("button", { name: "Checks on load", exact: true }).click();
+  await page.getByRole("button", { name: "Load rules", exact: true }).click();
   const table = page.getByRole("table", { name: "Rules this pipeline may be checked by" });
   await expect(table.or(page.getByText(/No rule of this case/)).first()).toBeVisible({ timeout: 60_000 });
   // The Studio has no `main` landmark: waiting on one hung the test for its whole timeout
@@ -852,8 +870,8 @@ test("CAP-A2-C9S", async ({ page }) => {
   await page.waitForTimeout(1000);
   await shot(page, "CAP-A2-C9S-a");
   await page.getByRole("button", { name: "← Back to the pipeline" }).click();
-  await page.getByRole("button", { name: "Verify", exact: true }).click();
-  await page.getByRole("button", { name: "Run verify" }).click();
+  await page.getByRole("button", { name: "Test", exact: true }).click();
+  await page.getByRole("button", { name: "Run the test" }).click();
   const would = page.getByRole("heading", { name: "Alerts this sample would raise" });
   await expect(would).toBeVisible({ timeout: 240_000 });
   await would.scrollIntoViewIfNeeded();
@@ -1009,7 +1027,7 @@ test("CAP-A2-C6", async ({ page }) => {
   await shot(page, "CAP-A2-C6");
 });
 
-test("CAP-A2-C7", async ({ page, context }) => {
+test("CAP-A2-C7", async ({ page }) => {
   await principalStar(page);
   await page.getByRole("button", { name: "Show the timeline" }).click();
   // The window in which the phones were found: January to April 2026.
@@ -1027,18 +1045,18 @@ test("CAP-A2-C7", async ({ page, context }) => {
   await page.waitForTimeout(1500);
   console.log(`C7 counts: ${await counts(page).textContent()}`);
   await shot(page, "CAP-A2-C7-a");
-  const opened = context.waitForEvent("page", { timeout: 30_000 }).catch(() => null);
-  await page.getByRole("button", { name: "Branch to a new case" }).click();
-  // The branch opens in a tab of its own, or in this one; either way the shot is of the branch,
-  // marked ⑂ in the case switcher, never of the parent case.
-  const branch = (await opened) ?? page;
-  await branch.waitForLoadState();
-  // The branch's name is the case's own with its window ("… › 5 Jan – 30 Apr 2026, selected").
-  await expect(branch.getByRole("button", { name: /^Case: .+ › .+, selected$/ })).toBeVisible({
-    timeout: 60_000,
-  });
-  await branch.waitForTimeout(6000);
-  await shot(branch, "CAP-A2-C7-b");
+  // ADR-144 (L3.2b): the lit slice is saved as a private view of the case and opened as a
+  // read-only lens, named for its window ("5 Jan – 1 May 2026, selected"); never a case of its own.
+  await page.getByRole("button", { name: "Save as a view" }).click();
+  const name = page.getByLabel("View name");
+  await expect(name).toHaveValue(/, selected$/);
+  const called = await name.inputValue();
+  await page.getByRole("button", { name: "Save view" }).click();
+  await rail(page, "Cases").click();
+  await page.getByRole("button", { name: `Open ${called}` }).click();
+  await expect(page.getByRole("region", { name: "Open view" })).toContainText(called, { timeout: 60_000 });
+  await page.waitForTimeout(6000);
+  await shot(page, "CAP-A2-C7-b");
 });
 
 test("CAP-A2-C10-a", async ({ page }) => {

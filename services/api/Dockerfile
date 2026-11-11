@@ -35,6 +35,22 @@ COPY scripts ./scripts
 COPY connectors ./connectors
 COPY recipes ./recipes
 
+# ADR-147 Amendment 2 (the owner's ruling 1 of 9 November 2026, option A): the tier-1 basemap build
+# (planetiler) runs in the Conduit, so the image carries a Java 21 runtime: Eclipse Temurin, under
+# GPL-2.0 with the Classpath exception, the licence register's one recorded runtime exception
+# (`00_ARCHITECTURE.md` §7; `make licence-check` reads the label below). jlinked to the modules a JVM
+# program such as planetiler uses, without its tools, debug symbols or headers; the official image
+# pinned by its digest (the multi-architecture index, so arm64 and amd64 build alike): Temurin
+# 21.0.13+9, October 2026's update. trivy does not see a jlinked runtime, so the version label below
+# is held to the built image's /opt/java/release and `java -version` (CI's `trivy-image-api` job),
+# and the digest to the one `eclipse-temurin:21-jdk` resolves to on Docker Hub now (Build's
+# `make ci`), by the build folder's `java_runtime_check`; repin the digest and the label together.
+FROM eclipse-temurin:21-jdk@sha256:ebfbb18d11ff163ee83b21258acf12248af48d22a0fdfdc68fa1a1516c05976a AS java
+RUN jlink \
+      --add-modules java.base,java.compiler,java.desktop,java.instrument,java.logging,java.management,java.naming,java.net.http,java.prefs,java.scripting,java.security.jgss,java.sql,java.xml,jdk.crypto.ec,jdk.jfr,jdk.management,jdk.unsupported,jdk.zipfs \
+      --strip-debug --no-man-pages --no-header-files --compress=zip-6 \
+      --output /opt/jre
+
 FROM python:3.12-slim
 
 # Base-image OS packages lag the upstream image's own last-published point
@@ -43,19 +59,14 @@ FROM python:3.12-slim
 # on packages this service does not touch.
 RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 
-# **`git`, because the Conduit shells out to it and the image did not have it.**
-# `09_INGEST_STUDIO.md` §6: "Publishing writes the recipe to version control, not only to the
-# database. The studio is the editor; the repository is the record." `services/api/studio_publish.
-# py` implements that with `asyncio.create_subprocess_exec("git", ...)`, so the binary is a
-# runtime dependency of the Conduit in exactly the way a Python package is — and it was absent
-# from every image this project has ever built. Publish returned a bare 500
-# (`FileNotFoundError` from the exec) in every rendered deployment, while
-# `tests/ingest/test_studio_publish_pipeline.py` passed throughout because it runs on the host,
-# where `git` exists and the test `git init`s its own repository. Round 13bf, found walking the
-# chain over the wire. `tests/test_connectors_are_carried_into_the_image.py` is what fails if it
-# is dropped again.
-RUN apt-get update && apt-get install -y --no-install-recommends git \
-    && rm -rf /var/lib/apt/lists/*
+# No `git`: publishing commits a recipe in-process with dulwich (Apache-2.0), so nothing this image
+# carries execs the binary, which is GPL-2.0-only (the owner's ruling of 9 November 2026; ADR-140
+# Amendment 17). `tests/test_connectors_are_carried_into_the_image.py` fails if `git` is installed
+# again, and `make licence-check` names it as an offender.
+
+COPY --from=java /opt/jre /opt/java
+LABEL org.ospreyflow.runtime.java.licence="GPL-2.0-only WITH Classpath-exception-2.0"
+LABEL org.ospreyflow.runtime.java.version="21.0.13+9"
 
 RUN useradd --create-home --uid 10001 osprey
 WORKDIR /app
@@ -66,7 +77,8 @@ COPY --from=builder /app/scripts ./scripts
 COPY --from=builder /app/connectors ./connectors
 COPY --from=builder /app/recipes ./recipes
 
-ENV PATH="/app/.venv/bin:${PATH}" \
+ENV PATH="/app/.venv/bin:/opt/java/bin:${PATH}" \
+    JAVA_HOME="/opt/java" \
     PYTHONPATH="/app:/app/packages" \
     PYTHONUNBUFFERED=1 \
     HOME="/app"
@@ -88,8 +100,15 @@ RUN /app/.venv/bin/python -c "import duckdb; duckdb.connect().install_extension(
 # DuckDB file into it. Creating it with the right owner is what makes
 # `osprey-data` usable rather than merely mounted.
 RUN mkdir -p /var/lib/osprey/data && chown -R osprey:osprey /var/lib/osprey
+# ADR-135 Amendment 2 decision 2: the models file's folder. A named volume takes this folder's
+# owner and mode on first mount, so the Conduit's user can write it on any host.
+RUN mkdir -p /run/osprey/model-settings && chown osprey:osprey /run/osprey/model-settings \
+    && chmod 700 /run/osprey/model-settings
+# ADR-147 decision 1: the maps file's and the map key file's folder, made the same way.
+RUN mkdir -p /run/osprey/map-settings && chown osprey:osprey /run/osprey/map-settings \
+    && chmod 700 /run/osprey/map-settings
 
-USER osprey
+USER 10001:10001
 EXPOSE 8000
 
 # `GET /healthz` — `03_CONDUIT_MIDDLEWARE.md` §3.0, the owner's decision of

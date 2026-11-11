@@ -121,8 +121,11 @@ createRoot(container).render(
       views={[
         { id: "graph", label: "Graph", pressed: true, onSelect: () => window.__TOPBAR__!.views.push("graph") },
         { id: "map", label: "Map", pressed: false, onSelect: () => window.__TOPBAR__!.views.push("map") },
-        // ADR-111: as `App.tsx` offers it.
-        { id: "reports", label: "Reports", pressed: false, onSelect: () => window.__TOPBAR__!.views.push("reports") },
+      ]}
+      // ADR-145 Amendment 2: Matrix and Reports (ADR-111) under More views, as `App.tsx` offers them.
+      moreViews={[
+        { id: "matrix", label: "Matrix", pressed: false, onSelect: () => window.__TOPBAR__!.views.push("matrix") },
+        { id: "reports", label: "Figures", pressed: false, onSelect: () => window.__TOPBAR__!.views.push("reports") },
       ]}
       actions={<Button>Export ⚙</Button>}
       account={
@@ -147,18 +150,20 @@ createRoot(container).render(
     <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
       <LeftRail
         onHelp={() => { window.__TOPBAR__!.help = (window.__TOPBAR__!.help ?? 0) + 1; }}
+        // ADR-145 Amendment 2 (variant B): Cases and Explore on the rail, the rest under ⋯ More, as
+        // `App.tsx` splits them. Monitoring left the Glass for Rules and Monitoring (ADR-146 decision 2).
         items={[
           { id: "cases", label: "Cases", icon: "cases", onSelect: rail("cases") },
-          { id: "alerts", label: "Monitoring", icon: "alerts", onSelect: rail("alerts") },
+          { id: "explore", label: "Explore", icon: "explore", onSelect: rail("explore") },
+        ]}
+        more={[
           { id: "ownership", label: "Ownership", icon: "ownership", onSelect: rail("ownership") },
           { id: "history", label: "History", icon: "history", onSelect: rail("history") },
-          { id: "explore", label: "Explore", icon: "explore", onSelect: rail("explore") },
           { id: "questions", label: "Questions", icon: "questions", onSelect: rail("questions") },
-          { id: "ingest", label: "Ingest Studio", icon: "ingest", onSelect: rail("ingest") },
           // ADR-111 Amendment 3: the Superset boards, drawn inside the Glass.
           { id: "dashboards", label: "Dashboards", icon: "dashboards", onSelect: rail("dashboards") },
-          // ADR-110 Amendment 1: the Admin area, as `App.tsx` offers it to an administrator.
-          { id: "admin", label: "Admin", icon: "admin", onSelect: rail("admin") },
+          // ADR-139: Connection strength, which stayed in the Glass.
+          { id: "strength", label: "Connection strength", icon: "strength", onSelect: rail("strength") },
         ]}
       />
       {wantsCanvas ? (

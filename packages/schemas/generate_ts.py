@@ -23,20 +23,35 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from schemas.admin import ALL_MODELS as ADMIN_MODELS  # noqa: E402
 from schemas.analytics import ALL_MODELS as ANALYTICS_MODELS  # noqa: E402
+from schemas.boards import ALL_MODELS as BOARD_MODELS  # noqa: E402
+from schemas.case_views import ALL_MODELS as CASE_VIEW_MODELS  # noqa: E402
 from schemas.compute import ALL_MODELS as COMPUTE_PORT_MODELS  # noqa: E402
+from schemas.dataset_model import ALL_MODELS as DATASET_MODEL_MODELS  # noqa: E402
 from schemas.deployment import ALL_MODELS as DEPLOYMENT_MODELS  # noqa: E402
 from schemas.domain import ALL_MODELS as DOMAIN_MODELS  # noqa: E402
 from schemas.explore import ALL_MODELS as EXPLORE_MODELS  # noqa: E402
 from schemas.ingest import ALL_MODELS as INGEST_MODELS  # noqa: E402
+from schemas.list_connector import ALL_MODELS as LIST_CONNECTOR_MODELS  # noqa: E402
+from schemas.map_admin import ALL_MODELS as MAP_ADMIN_MODELS  # noqa: E402
 from schemas.mapconfig import ALL_MODELS as MAPCONFIG_MODELS  # noqa: E402
 from schemas.model import ALL_MODELS as MODEL_PORT_MODELS  # noqa: E402
+from schemas.model_admin import ALL_MODELS as MODEL_ADMIN_MODELS  # noqa: E402
 from schemas.monitoring import ALL_MODELS as MONITORING_MODELS  # noqa: E402
+from schemas.operations import ALL_MODELS as OPERATIONS_MODELS  # noqa: E402
 from schemas.packs import ALL_MODELS as PACK_MODELS  # noqa: E402
+from schemas.person_ownership import ALL_MODELS as OWNERSHIP_MODELS  # noqa: E402
 from schemas.profile import ALL_MODELS as PROFILE_MODELS  # noqa: E402
+from schemas.promotions import ALL_MODELS as PROMOTION_MODELS  # noqa: E402
 from schemas.provider_profile import ALL_MODELS as PROVIDER_PROFILE_MODELS  # noqa: E402
+from schemas.release import ALL_MODELS as RELEASE_MODELS  # noqa: E402
+from schemas.release import DatasetRelease  # noqa: E402
 from schemas.rights import ALL_MODELS as RIGHTS_MODELS  # noqa: E402
+from schemas.rule_editor import ALL_MODELS as RULE_EDITOR_MODELS  # noqa: E402
+from schemas.rule_standards import ALL_MODELS as RULE_STANDARDS_MODELS  # noqa: E402
 from schemas.screening import ALL_MODELS as SCREENING_MODELS  # noqa: E402
 from schemas.sentences import ALL_MODELS as SENTENCE_MODELS  # noqa: E402
+from schemas.sources import ALL_MODELS as SOURCE_MODELS  # noqa: E402
+from schemas.staging import ALL_MODELS as STAGING_MODELS  # noqa: E402
 from schemas.strength import ALL_MODELS as STRENGTH_MODELS  # noqa: E402
 from schemas.trends import ALL_MODELS as TREND_MODELS  # noqa: E402
 
@@ -50,6 +65,10 @@ ALL_MODELS: tuple[type[BaseModel], ...] = (
     *DOMAIN_MODELS,
     *ANALYTICS_MODELS,
     *INGEST_MODELS,
+    *STAGING_MODELS,
+    *SOURCE_MODELS,
+    *LIST_CONNECTOR_MODELS,
+    *RULE_EDITOR_MODELS,
     *PROFILE_MODELS,
     *MAPCONFIG_MODELS,
     *PROVIDER_PROFILE_MODELS,
@@ -62,9 +81,19 @@ ALL_MODELS: tuple[type[BaseModel], ...] = (
     *TREND_MODELS,
     *PACK_MODELS,
     *SENTENCE_MODELS,
+    *RULE_STANDARDS_MODELS,
     *SCREENING_MODELS,
     *MONITORING_MODELS,
     *STRENGTH_MODELS,
+    *DATASET_MODEL_MODELS,
+    *CASE_VIEW_MODELS,
+    *BOARD_MODELS,
+    *PROMOTION_MODELS,
+    *MODEL_ADMIN_MODELS,
+    *MAP_ADMIN_MODELS,
+    *OWNERSHIP_MODELS,
+    *OPERATIONS_MODELS,
+    *RELEASE_MODELS,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -98,6 +127,22 @@ def generate(out_dir: Path, models: Sequence[type[BaseModel]] = ALL_MODELS) -> N
     (out_dir / "index.ts").write_text("\n".join(index_lines) + "\n")
 
 
+#: ADR-140 Amendment 9 decision 4: the release manifest's schema, published so scripts and CI can
+#: check a bundle without OspreyFlow. Generated from `DatasetRelease`; `test_release_schema.py`
+#: fails when the committed file and the model drift apart.
+RELEASE_SCHEMA = REPO_ROOT / "packages" / "schemas" / "release.schema.json"
+
+
+def release_schema_text() -> str:
+    schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://ospreyflow.io/schemas/v1/release.schema.json",
+        **DatasetRelease.model_json_schema(by_alias=True),
+    }
+    return json.dumps(schema, indent=2, sort_keys=True) + "\n"
+
+
 if __name__ == "__main__":
     generate(REPO_ROOT / "packages" / "schemas" / "generated")
+    RELEASE_SCHEMA.write_text(release_schema_text())
     print(f"Generated {len(ALL_MODELS)} types.")

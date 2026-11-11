@@ -28,8 +28,10 @@ import { rowNumber } from "../../inspector/sourceLocator";
 import { OntologyRegistry } from "../../ontology/schema";
 import { createWorkingSet, type WorkingSet } from "../../workingset/store";
 import { alreadyLoadedWords } from "../alreadyLoaded";
+import { ExpertDisclosure } from "../dag/ExpertStepDrawer";
 import { WouldRaisePanel } from "./WouldRaisePanel";
 import { ProfileError, fetchDraft, fetchOntologySchema, runVerify } from "../api";
+import { RightButton } from "../studio/rightsGate";
 
 export interface VerifyScreenProps {
   apiBaseUrl: string;
@@ -37,12 +39,13 @@ export interface VerifyScreenProps {
   investigationId: string;
   bearerToken: string;
   recipeId: string;
-  onBack: () => void;
+  /** Absent when the screen is hosted in the pipeline's drawer (ADR-108 Amendment 6.1: nothing replaces the canvas, so there is nothing to go back to). */
+  onBack?: () => void;
 }
 
 const ERROR_MESSAGES: Record<string, string> = {
   recipe_not_ready_for_profile:
-    "This source isn't ready for Verify yet — go back to Connect and answer the location, handling marking and legal basis.",
+    "This source isn't ready for Test yet — go back to Connect and answer the location, handling marking and legal basis.",
   row_template_missing:
     "This source has no mapping yet — go to Map and save a row template before verifying.",
   connector_not_available: "This source's connector has no reader yet, so it can't be verified.",
@@ -66,6 +69,15 @@ interface EntityCountRow {
 interface EdgeCountRow {
   type: string;
   created: number;
+}
+
+/** The graph a dry run would make, as a throwaway working set the ordinary canvas draws: the one
+ * builder Test and the drawer's graph Preview (`dag/NodePreview.tsx`) share. */
+export function workingSetOfDryRun(report: VerifyReport): WorkingSet {
+  const ws = createWorkingSet();
+  for (const node of report.nodes ?? []) ws.graph.addNode(node.id, { data: node });
+  for (const edge of report.edges ?? []) ws.graph.addEdgeWithKey(edge.id, edge.source, edge.target, { data: edge });
+  return ws;
 }
 
 export function VerifyScreen({ apiBaseUrl,
@@ -98,15 +110,8 @@ export function VerifyScreen({ apiBaseUrl,
     setError(null);
     try {
       const result = await runVerify(apiBaseUrl, bearerToken, investigationId, recipeId);
-      const ws = createWorkingSet();
-      for (const node of result.nodes ?? []) {
-        ws.graph.addNode(node.id, { data: node });
-      }
-      for (const edge of result.edges ?? []) {
-        ws.graph.addEdgeWithKey(edge.id, edge.source, edge.target, { data: edge });
-      }
       setReport(result);
-      setWorkingSet(ws);
+      setWorkingSet(workingSetOfDryRun(result));
     } catch (err) {
       setError(friendlyError(err));
       setReport(null);
@@ -145,12 +150,12 @@ export function VerifyScreen({ apiBaseUrl,
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: "var(--sp-8)" }}>
-        <Button onClick={onBack}>← Back to the pipeline</Button>
-        <h1 style={{ fontSize: "1.1em", margin: 0 }}>Verify{draft ? ` — ${draft.label}` : ""}</h1>
+        {onBack && <Button onClick={onBack}>← Back to the pipeline</Button>}
+        <h1 style={{ fontSize: "1.1em", margin: 0 }}>Test{draft ? ` — ${draft.label}` : ""}</h1>
         <div style={{ flex: 1 }} />
-        <Button onClick={() => void handleRunVerify()} variant="primary" disabled={running}>
-          {running ? "Running…" : "Run verify"}
-        </Button>
+        <RightButton right="verify_pipelines" onClick={() => void handleRunVerify()} variant="primary" disabled={running}>
+          {running ? "Testing…" : "Run the test"}
+        </RightButton>
       </div>
 
       {error && (
@@ -171,7 +176,7 @@ export function VerifyScreen({ apiBaseUrl,
         <p style={{ color: "var(--text-secondary)" }}>
           A dry run over the profiled sample. Nothing is written, but an entity set to reference
           an existing one is looked up in the live graph, at your own clearance. Nothing is
-          published until Verify passes.
+          deployed until Test passes.
         </p>
       )}
 
@@ -247,6 +252,13 @@ export function VerifyScreen({ apiBaseUrl,
 
           {/* ADR-133 decision 6, stage (d): beside the rejections, the alerts the sample would
               raise under this pipeline's checks on load — judged as at the load, nothing written. */}
+          {/* ADR-140 decision 16: what each expert step disclosed, as every run report says it. */}
+          {(report.expert_steps ?? []).length > 0 && (
+            <Panel title="Expert steps">
+              <ExpertDisclosure steps={report.expert_steps} title="Expert steps in this test" />
+            </Panel>
+          )}
+
           <Panel title="Alerts this sample would raise">
             <WouldRaisePanel report={report} />
           </Panel>

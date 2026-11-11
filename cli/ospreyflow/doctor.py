@@ -187,6 +187,24 @@ class SystemProbes:
         text = self._run(["docker", "compose", "version"])
         return text.strip() if text else None
 
+    def model_key_states(self) -> dict[str, str] | None:
+        """ADR-135 Amendment 2 decision 9: each model engine's key state, as the running Conduit's
+        key path says (`set`, `none` or `lost`), or None where no deployment answers."""
+        if self._compose is None:
+            return None
+        text = self._run(
+            [*self._compose, "exec", "-T", "api", "python", "-m", "services.api.model_keys",
+             "status"]
+        )  # fmt: skip
+        if text is None:
+            return None
+        found: dict[str, str] = {}
+        for line in text.splitlines():  # `<name> set|none|lost`, as `ospreyflow.models` reads it
+            name, _, state = line.strip().partition(" ")
+            if name and state in ("set", "none", "lost"):
+                found[name] = state
+        return found
+
     def kube_context(self) -> str | None:
         """The context `kubectl` uses, when the cluster behind it answers."""
         context = self._run(["kubectl", "config", "current-context"])
@@ -415,6 +433,27 @@ def _port_check(probes: Probes, port: int) -> Check:
     )
 
 
+def model_key_checks(states: Mapping[str, str] | None) -> list[Check]:
+    """ADR-135 Amendment 2 decision 9: a key the gateway no longer holds (a restore from another
+    deployment, or its encryption key changed) is said by name; the engine is offered to no analyst
+    until the key is entered again. Nothing where no deployment answered."""
+    if not states:
+        return []
+    lost = sorted(name for name, state in states.items() if state == "lost")
+    if not lost:
+        return [Check("model-keys", True, "the model gateway holds every engine's key that is set")]
+    return [
+        Check(
+            "model-keys",
+            False,
+            f"the model gateway no longer holds the key of {', '.join(lost)}; "
+            f"{'that engine is' if len(lost) == 1 else 'those engines are'} offered to no analyst",
+            fix="enter each key again in Admin › Models, or run: ospreyflow models key <name>",
+            warn=True,
+        )
+    ]
+
+
 def run_doctor(
     mode: str,
     probes: Probes,
@@ -425,6 +464,7 @@ def run_doctor(
     server: ServerPlan | None = None,
     gpu: GpuPlan | None = None,
     joins_by_email: bool = False,
+    model_states: Mapping[str, str] | None = None,
 ) -> list[Check]:
     """Every check for `mode`, in the order a person should fix them. `ports` are a deployment's
     own when it is not the checkout's (ADR-138: one installed by name, at an address of its own).
@@ -438,7 +478,7 @@ def run_doctor(
         checks += gpu_checks(probes, gpu)
     if joins_by_email and not any(c.name == "organisation-trust-email" for c in checks):
         checks.append(trust_email_check())
-    return checks
+    return checks + model_key_checks(model_states)
 
 
 def _mode_checks(
@@ -700,7 +740,7 @@ TRUST_EMAIL_SAYS = (
     "arriving through the organisation's provider is joined, automatically, to the OspreyFlow "
     "account holding the same email address, with its roles and clearance. Anyone who can make the "
     "provider give that address, an address a person can set themselves or another tenant can "
-    "claim, takes that account over: the 2023 \"nOAuth\" account takeovers were exactly this."
+    'claim, takes that account over: the 2023 "nOAuth" account takeovers were exactly this.'
 )
 TRUST_EMAIL_FIX = (
     "Keep it on only with the organisation's security officer's written sign-off that every "
@@ -929,3 +969,214 @@ def format_check(check: Check) -> str:
     if check.warn:
         return f"⚠ {check.says} — {check.fix}"
     return f"✔ {check.says}" if check.ok else f"✘ {check.says} — {check.fix}"
+
+
+# ---- ADR-114 Amendment 37 decisions 4 and 5: the backups folder ---------------------------------
+
+#: `harness.backup.LEGACY_PLACEHOLDER` and `SET_NAME`: this command runs before the product's own
+#: Python, so it applies the backup's rule to `osprey.yaml` as a mapping;
+#: `test_the_doctor_and_the_backup_agree_on_the_folder` holds the two to one rule.
+LEGACY_BACKUPS_PLACEHOLDER = "/var/lib/osprey/backups"
+SET_NAME = re.compile(r"^(?P<stamp>\d{8}T\d{6}Z)-(?P<name>.+)-(?P<sha>[0-9A-Za-z]+)$")
+#: Decision 5: the folders a sync client copies by default, under the home folder, on macOS
+#: (iCloud Drive, the File Provider clients — Google Drive, OneDrive, Dropbox — and iCloud's
+#: Desktop and Documents).
+MACOS_SYNCED = ("Library/CloudStorage", "Library/Mobile Documents", "Documents", "Desktop")
+
+
+def _section(config: Mapping[str, object], *keys: str) -> Mapping[str, object]:
+    found: object = config
+    for key in keys:
+        found = found.get(key) if isinstance(found, Mapping) else None
+    return found if isinstance(found, Mapping) else {}
+
+
+def deployment_name_of(config: Mapping[str, object]) -> str:
+    """`deployment.name`, else the profile (`schemas.deployment.generated_folder`)."""
+    name = _section(config, "deployment").get("name")
+    return str(name or config.get("profile") or "local-lite")
+
+
+def backups_folder_of(config: Mapping[str, object], *, home: Path) -> Path:
+    """`harness.backup.backups_folder`'s folder: `components.storage.backups` when one is named,
+    else `~/OspreyFlow/backups`. The placeholder is a folder named only on Small on a server of
+    your own (no `external:`), where Amendment 33 always wrote one."""
+    value = _section(config, "components", "storage").get("backups")
+    own_server = config.get("profile") == "small" and not any(
+        _section(config, "external").values()
+    )
+    if value is None and own_server:
+        # Left out on a server of your own: the schema's default, where Amendment 33 wrote.
+        value = LEGACY_BACKUPS_PLACEHOLDER
+    text = str(value or "").strip()
+    placeholder = bool(text) and Path(text) == Path(LEGACY_BACKUPS_PLACEHOLDER)
+    if text and (not placeholder or own_server):
+        if text == "~" or text.startswith("~/"):
+            return home / text[2:]
+        return Path(text).expanduser()
+    return home / "OspreyFlow" / "backups"
+
+
+def _git_checkout(product: Path) -> Path | None:
+    """`harness.backup.checkout_root`: the product, or the folder above it, that holds `.git`.
+    None where neither does: the doctor may run where there is no checkout at all."""
+    for candidate in (product, product.parent):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def _is_inside(folder: Path, root: Path, *, ignore_case: bool = False) -> bool:
+    """`harness.backup.is_inside`: compared by the folder each existing ancestor is, so a link, a
+    mount of the checkout itself, or another letter case on a disk that ignores case is the folder
+    it shows; a root that does not exist yet is compared by spelling, without case where the disk
+    has none."""
+    target = folder.expanduser().resolve()
+    if root.exists():
+        for candidate in (target, *target.parents):
+            try:
+                if candidate.exists() and os.path.samefile(candidate, root):
+                    return True
+            except OSError:
+                continue
+    spelt = Path(os.path.abspath(root)).resolve()
+    if ignore_case:
+        return str(target).casefold().startswith(str(spelt).casefold().rstrip("/") + "/") or (
+            str(target).casefold() == str(spelt).casefold()
+        )
+    return target.is_relative_to(spelt)
+
+
+def _size(folder: Path) -> tuple[int, bool]:
+    """The bytes this account can read under `folder`, and whether any of it could not be read (a
+    server's sets are 0700, and may be root's)."""
+    total, unread = 0, False
+
+    def note(_error: OSError) -> None:
+        nonlocal unread
+        unread = True
+
+    for root, _dirs, files in os.walk(folder, onerror=note):
+        for name in files:
+            try:
+                total += (Path(root) / name).lstat().st_size
+            except OSError:
+                unread = True
+    return total, unread
+
+
+def _human(size: int) -> str:
+    for unit, scale in (("GB", 1024**3), ("MB", 1024**2), ("KB", 1024)):
+        if size >= scale:
+            return f"{size / scale:.1f} {unit}"
+    return f"{size} bytes"
+
+
+def _sets_in(folder: Path) -> list[Path]:
+    if not folder.is_dir():
+        return []
+    return sorted(
+        c for c in folder.iterdir() if c.is_dir() and SET_NAME.match(c.name) is not None
+    )
+
+
+def _left_behind(where: Path, sets: Sequence[Path], destination: Path) -> Check:
+    """Decision 4: named, with their size and the one command that moves them; never moved."""
+    import shlex
+
+    to = shlex.quote(str(destination))
+    moved = " ".join(shlex.quote(str(s)) for s in sets)
+    sizes = [_size(s) for s in sets]
+    unread = any(u for _b, u in sizes)
+    size = _human(sum(b for b, _u in sizes))
+    return Check(
+        "backups-left-behind",
+        True,
+        f"{len(sets)} backup set{'' if len(sets) == 1 else 's'}, "
+        f"{f'at least {size} (some of it could not be read by this account)' if unread else size}"
+        f", left in {where}: {', '.join(s.name for s in sets)}",
+        f"move {'it' if len(sets) == 1 else 'them'} to the backups folder with: "
+        f"mkdir -p {to} && mv {moved} {to}/"
+        + (" (as the sets' owner: prefix each command with sudo)" if unread else ""),
+        warn=True,
+    )
+
+
+def _synced_root(folder: Path, *, home: Path, system: str) -> Path | None:
+    """Decision 5: the root a sync client copies that holds `folder`, as given or as its links
+    resolve, or None."""
+    if system == "Darwin":
+        for root in MACOS_SYNCED:
+            if _is_inside(folder, home / root, ignore_case=True):
+                return home / root
+    for seen in dict.fromkeys((folder, folder.resolve())):
+        for index, part in enumerate(seen.parts):
+            # OneDrive's own folder: `OneDrive`, or `OneDrive - <organisation>` for a work account.
+            if part == "OneDrive" or part.startswith("OneDrive - "):
+                return Path(*seen.parts[: index + 1])
+    return None
+
+
+def backups_checks(
+    probes: Probes,
+    product: Path,
+    deployments: Sequence[tuple[str, Mapping[str, object]]],
+    *,
+    home: Path,
+) -> list[Check]:
+    """ADR-114 Amendment 37 decisions 4 and 5 for each deployment (`(name, its osprey.yaml)`; a
+    named one's own folder is `~/.ospreyflow/deployments/<name>`): sets left in the checkout's
+    `backups/`, a named deployment's old `backups/` or the top of the backups folder, and a backups
+    folder a sync client copies. Warnings only."""
+    checks: list[Check] = []
+    # A relative folder is the product's: `ospreyflow backup` runs the harness there.
+    folders = {
+        name: product / folder if not folder.is_absolute() else folder
+        for name, config in deployments
+        for folder in (backups_folder_of(config, home=home),)
+    }
+    fallback = home / "OspreyFlow" / "backups"
+
+    def home_of(set_name: str) -> Path:
+        name = SET_NAME.match(set_name)["name"]  # type: ignore[index]
+        return folders.get(name, next(iter(folders.values()), fallback)) / name
+
+    checkout = _git_checkout(product)
+    places = [product / "backups"]
+    if checkout is not None:
+        places.append(checkout / "backups")
+    places += [home / ".ospreyflow" / "deployments" / name / "backups" for name in folders]
+    places += list(dict.fromkeys(folders.values()))
+    for where in dict.fromkeys(places):
+        grouped: dict[Path, list[Path]] = {}
+        for found in _sets_in(where):
+            grouped.setdefault(home_of(found.name), []).append(found)
+        checks += [_left_behind(where, sets, to) for to, sets in grouped.items()]
+    for folder in dict.fromkeys(folders.values()):
+        darwin = probes.system() == "Darwin"
+        if checkout is not None and _is_inside(folder, checkout, ignore_case=darwin):
+            checks.append(
+                Check(
+                    "backups-in-checkout",
+                    False,
+                    f"The backups folder {folder} is inside the checkout ({checkout}), where "
+                    "every backup, and every update's own, is refused",
+                    "name a folder outside it as components.storage.backups, for example "
+                    "~/OspreyFlow/backups",
+                )
+            )
+        root = _synced_root(folder, home=home, system=probes.system())
+        if root is not None:
+            checks.append(
+                Check(
+                    "backups-synced",
+                    True,
+                    f"The backups folder {folder} is inside {root}, which a sync client copies; "
+                    "each backup holds the deployment's data and any real-data exception it was "
+                    "given, which are then copied off this machine",
+                    "name a folder outside it as folders.backups (components.storage.backups), "
+                    "for example ~/OspreyFlow/backups, unless that copy is intended",
+                    warn=True,
+                )
+            )
+    return checks

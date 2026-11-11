@@ -278,15 +278,19 @@ test("the source settings open from the first source's node by keyboard", async 
   await openPipeline(page);
   await page.getByRole("button", { name: "Source: Carrier B" }).focus();
   await page.keyboard.press("Enter");
-  const open = page.getByRole("button", { name: "Open source settings" });
+  const open = page.getByRole("button", { name: "The draft's own settings" });
   await open.focus();
   await page.keyboard.press("Enter");
   // The Connect gate whole: the file, the marking, the legal basis — proven by its own unit
   // tests; reaching it from the node is this test's.
   await expect(page.getByRole("button", { name: "Choose file…" })).toBeVisible();
-  await page.getByRole("button", { name: "Back to the pipeline" }).focus();
-  await page.keyboard.press("Enter");
+  // Phase 6 (ADR-108 Amendment 6.1): the Connect gate opens in the drawer, beside the pipeline,
+  // which never left; the drawer's Close goes back to the source node.
   await expect(page.getByRole("group", { name: "Pipeline" })).toBeVisible();
+  await page.getByRole("button", { name: "Close the drawer" }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("button", { name: "Choose file…" })).toBeHidden();
+  await expect(page.getByRole("button", { name: "The draft's own settings" })).toBeVisible();
   registerCovered(REGISTRY, "open-the-source-settings-by-keyboard");
 });
 
@@ -294,7 +298,7 @@ async function openSourceSettings(page: Page) {
   await openPipeline(page);
   await page.getByRole("button", { name: "Source: Carrier B" }).focus();
   await page.keyboard.press("Enter");
-  await page.getByRole("button", { name: "Open source settings" }).focus();
+  await page.getByRole("button", { name: "The draft's own settings" }).focus();
   await page.keyboard.press("Enter");
   await expect(page.getByRole("button", { name: "Choose file…" })).toBeVisible();
 }
@@ -360,7 +364,11 @@ test("the map editor opens from its node by keyboard", async ({ page }) => {
   await open.focus();
   await page.keyboard.press("Enter");
   // The map editor is the existing MapScreen, proven by its own specs; reaching it is this test's.
+  // Phase 6 (brief §6.5): the pipeline collapses to the strip across the top, never lost.
   await expect(page.getByRole("group", { name: "Pipeline" })).toBeHidden();
+  const strip = page.getByRole("navigation", { name: "Pipeline strip" });
+  await expect(strip.getByText("Map: Map")).toHaveAttribute("aria-current", "step");
+  await expect(strip.getByRole("button", { name: "Map: Map" })).toHaveCount(0);
   registerCovered(REGISTRY, "open-the-map-editor-by-keyboard");
 });
 
@@ -441,24 +449,8 @@ test("the deduplicate key is cleared in Connect by keyboard, and the PATCH carri
   registerCovered(REGISTRY, "clear-the-deduplicate-key-by-keyboard");
 });
 
-test("a second run's report says by keyboard how many rows the case already held", async ({ page }) => {
-  await serve(page, {}, {
-    published: true,
-    run: {
-      load_id: "L2", recipe_id: "r1", recipe_version: 1, rows_read: 40, rows_deduplicated: 0,
-      nodes_created: 0, nodes_referenced: 0, edges_created: 0, rejections: [], rows_already_loaded: 40,
-    },
-  });
-  const open = page.getByRole("button", { name: "Open Carrier B intake" });
-  await open.focus();
-  await page.keyboard.press("Enter");
-  const run = page.getByRole("button", { name: /Run now/ });
-  await run.focus();
-  await page.keyboard.press("Enter");
-  await expect(page.getByText("40 rows already loaded into this case, skipped")).toBeVisible();
-  await expect(page.getByText("Nodes created: 0")).toBeVisible();
-  registerCovered(REGISTRY, "read-rows-already-loaded-on-a-run-report-by-keyboard");
-});
+// "A second run's report says how many rows the case already held" moved to `ingest-studio.spec.ts`
+// with *Run now* (ADR-140 decision 14: Deploy neither runs nor schedules; running is the Runs tab's).
 
 test("verify says by keyboard how many rows the case already holds", async ({ page }) => {
   await serve(page, {}, {
@@ -468,9 +460,9 @@ test("verify says by keyboard how many rows the case already holds", async ({ pa
     },
   });
   await openPipeline(page);
-  await page.getByRole("button", { name: "Verify", exact: true }).focus();
+  await page.getByRole("button", { name: "Test", exact: true }).focus();
   await page.keyboard.press("Enter");
-  await page.getByRole("button", { name: "Run verify" }).focus();
+  await page.getByRole("button", { name: "Run the test" }).focus();
   await page.keyboard.press("Enter");
   await expect(page.getByText("40 rows already loaded into this case, would be skipped")).toBeVisible();
   registerCovered(REGISTRY, "read-rows-already-loaded-in-verify-by-keyboard");

@@ -39,6 +39,8 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from pydantic import ValidationError
+from services.api.alerts import AlertStore, SupersedeJournal, supersede_journalled
+from services.api.list_connector import ListStore
 from services.api.review import (
     RECOGNISE_OVERLAP_CHARS,
     RECOGNISE_WINDOW_CHARS,
@@ -50,18 +52,40 @@ from services.api.review import (
 from services.api.rule_evaluation import RuleGate
 from services.api.run_source import branch_location as _branch_location
 from services.api.run_source import pipeline_of, topological
-from services.api.studio_publish import LoadSink, run_published_recipe
+from services.api.studio_publish import (
+    LoadSink,
+    after_the_load,
+    load_published_recipe,
+    load_with_rules,
+    run_published_recipe,
+)
+from services.api.studio_staging import (
+    dataset_reference_lists,
+    row_reader,
+    source_tables,
+    subscribed_in,
+)
+from services.api.target_models import TargetModelStore
 from services.extract.candidates import ExtractionCandidate
 from services.extract.recognised import recognised_candidates
 from services.extract.writer import write_candidate
 from services.geocoder.match import match_place_mention
+from services.ingest.ceiling import DeploymentCeiling, refuse_fixed_markings_above_the_ceiling
 from services.ingest.engine import distinct_markings
 from services.ingest.geometries import POINT_GEOMETRY_VERSION
+from services.ingest.metering import StagingMeter
 from services.ingest.pipeline import (
+    STAGING_KINDS,
     SUPPORTED_EXTRACT_LIBRARIES,
     SUPPORTED_EXTRACT_MEDIA,
     SUPPORTED_GEOCODERS,
 )
+from services.ingest.recipe_rules import RecipeRuleError
+from services.ingest.reference_list_import import lists_for_run
+from services.ingest.staged_run import finish_staged_report, prepare_staged_load
+from services.ingest.staging import ObjectStorageConfig
+from services.ingest.staging_catalogue import StagingError
+from services.ingest.watermark import RefreshRead
 
 from conduit_common.identity import new_node_id
 from knowledge_adapters import REGISTRY
@@ -352,8 +376,12 @@ async def _run_enrich_stage(
     scheme: HandlingScheme,
     analytics: AnalyticsPort | None,
     online_geocode: OnlineGeocode | None,
+    alerts: AlertStore | None = None,
 ) -> tuple[EnrichStageReport, list[str]]:
-    """One enrich node's run. Returns the stage report and the `SAME_AS` edge ids it wrote."""
+    """One enrich node's run. Returns the stage report and the `SAME_AS` edge ids it wrote. Its
+    transaction goes through the alerts' repoint journal (`alerts`, ADR-109 Amendment 11): a
+    mention given an online point is superseded, its links cloned, and an alert citing one
+    follows it to its clone."""
     geocoder = str(node.config.get("geocoder", "local_gazetteer"))
     report = EnrichStageReport(node_id=node.id, geocoder=geocoder)
     edge_ids: list[str] = []
@@ -390,8 +418,7 @@ async def _run_enrich_stage(
     run_created = {node_id for branch in branches for node_id in branch.report.created_node_ids}
     to_ref = REGISTRY["geometry_ref"]
 
-    tx = await graph.begin_transaction()
-    try:
+    async def enrich(tx: str, cloned: SupersedeJournal) -> None:
         for mention in locations:
             name = mention.properties.get("name")
             if not name or mention.properties.get("geometry_ref"):
@@ -408,15 +435,13 @@ async def _run_enrich_stage(
                 coordinates = await online_geocode(str(name))
                 if coordinates is not None:
                     await _persist_online_point(
-                        graph, analytics, mention, coordinates, to_ref, principal, tx
+                        graph, analytics, mention, coordinates, to_ref, principal, tx, cloned
                     )
                     report.matched_online += 1
                     continue
             report.unmatched += 1
-    except Exception:
-        await graph.rollback_transaction(tx)
-        raise
-    await graph.commit_transaction(tx)
+
+    await supersede_journalled(alerts, graph, enrich)
     return report, edge_ids
 
 
@@ -428,10 +453,13 @@ async def _persist_online_point(
     to_ref: Callable[..., str],
     principal: Principal,
     tx: TxId,
+    on_link_cloned: SupersedeJournal | None = None,
 ) -> None:
     """An online geocode made durable: the point as a geometry-partition row (insert-only, keyed
     by its deterministic ref) and the mention superseded with that `geometry_ref` — a new node
-    revision, never an in-place edit."""
+    revision, never an in-place edit. `on_link_cloned`, the alerts' repoint journal, is told each
+    link the supersede clones and the mention's own new revision, before the commit (ADR-109
+    Amendments 11 and 12)."""
     lon, lat = coordinates
     ref = to_ref((str(lon), str(lat)), source_crs=_ONLINE_CRS)
     held = {
@@ -466,7 +494,109 @@ async def _persist_online_point(
         created_by=principal.id,
         created_at=now,
     )
-    await graph.supersede_node(mention.id, replacement, tx)
+    new = await graph.supersede_node(mention.id, replacement, tx, on_link_cloned=on_link_cloned)
+    if on_link_cloned is not None:
+        await on_link_cloned.superseded(mention.id, new)
+
+
+async def _run_staged_branch(
+    draft: StudioRecipeDraft,
+    principal: Principal,
+    *,
+    pipeline: PipelineGraph,
+    graph: GraphPort,
+    ontology: OntologySchema,
+    scheme: HandlingScheme,
+    load_id: str,
+    investigation_scope: str,
+    repo_root: Path,
+    analytics: AnalyticsPort | None,
+    media: MediaStore | None,
+    source_location: str | None,
+    rules: RuleGate | None,
+    sink: LoadSink | None,
+    withdraw_dropped: bool,
+    refresh: RefreshRead | None,
+    models: TargetModelStore | None,
+    storage: ObjectStorageConfig,
+    meter: StagingMeter | None,
+    list_store: ListStore | None = None,
+) -> BranchRunReport:
+    """A staged pipeline's one load (ADR-140 Amendment 12): every source node's whole file read
+    by a load of its own (`<load_id>:<node id>`), new for each run, so no two runs share a raw
+    file; the dataset's lists from their versions' files; the steps; then Map over the last table
+    through the same rule gate, ledger and lock as any load (`load_with_rules`). A refresh that
+    withdraws or reads incrementally was refused before (`run_published_pipeline`)."""
+    recipe = await asyncio.to_thread(load_published_recipe, draft, repo_root)
+    if not recipe.staging:
+        raise RecipeRuleError(
+            [f"Recipe {recipe.id!r} has staging steps on its pipeline but none in its file."]
+        )
+    # ADR-140 Amendment 13: the dataset's own lists and the deployment-wide ones it subscribes to.
+    # ADR-148 decision 10: what can be judged without rows (a marking no column sets) is refused
+    # before the step tables are written; `run_recipe` judges every row again before its own writes.
+    refuse_fixed_markings_above_the_ceiling(recipe, DeploymentCeiling.from_env())
+    references = await dataset_reference_lists(models, draft.dataset_id, storage, lists=list_store)
+    try:
+        read = await asyncio.to_thread(
+            source_tables, draft, pipeline, load_id=load_id, location=source_location
+        )
+        lists = await asyncio.to_thread(
+            lists_for_run,
+            recipe.staging,
+            references,
+            dataset_id=draft.dataset_id or "",
+            storage=storage,
+            subscribed=subscribed_in(references),
+        )
+        prepared = await prepare_staged_load(
+            recipe,
+            sources=read.tables,
+            lists=lists,
+            dataset_id=draft.dataset_id or "",
+            subscribed=subscribed_in(references),
+            load_id=load_id,
+            storage=storage,
+            # ADR-140 decision 12: a SQL step reads with the principal of the person the run is
+            # for, so a source row they may not read is absent from its tables.
+            may_read=row_reader(draft, read, principal, scheme),
+        )
+    except StagingError as refused:
+        raise RecipeRuleError(refused.problems) from refused
+    branch, events, held = await load_with_rules(
+        recipe,
+        prepared.rows,
+        principal,
+        graph=graph,
+        ontology=ontology,
+        load_id=load_id,
+        investigation_scope=investigation_scope,
+        source=prepared.table.name,
+        media=media,
+        rules=rules,
+        scheme=scheme,
+        sink=sink,
+        staged=prepared,
+    )
+    finish_staged_report(branch, prepared)
+    if meter is not None:
+        meter.add(prepared.rows_staged, prepared.parquet_bytes)
+    await after_the_load(
+        recipe,
+        prepared.rows,
+        branch,
+        events,
+        held,
+        principal,
+        row_numbers=None,
+        load_id=load_id,
+        analytics=analytics,
+        rules=rules,
+        scheme=scheme,
+        sink=sink,
+    )
+    output = next(n for n in pipeline.nodes if n.id == prepared.table.name)
+    return BranchRunReport(source_id=output.id, source_label=output.label, report=branch)
 
 
 async def run_published_pipeline(
@@ -487,13 +617,34 @@ async def run_published_pipeline(
     online_geocode: OnlineGeocode | None = None,
     rules: RuleGate | None = None,
     sink: LoadSink | None = None,
+    withdraw_dropped: bool = False,
+    refresh: RefreshRead | None = None,
+    alerts: AlertStore | None = None,
+    target_models: TargetModelStore | None = None,
+    staging_storage: ObjectStorageConfig | None = None,
+    staging_meter: StagingMeter | None = None,
+    list_store: ListStore | None = None,
 ) -> PipelineRunReport:
     """The whole pipeline, in topological order: branches, then extracts, then enriches.
+
+    A pipeline with staging steps (ADR-140 Amendment 12) runs its sources through the steps into
+    one Map, as one branch (`_run_staged_branch`): `target_models` names the dataset's lists, whose
+    rows a Lookup reads from their version's file in `staging_storage`, and `staging_meter` is
+    told the rows its steps staged and the bytes their Parquet took.
+
+    `withdraw_dropped` (ADR-110 Amendment 8 point 3) is a full snapshot's: refused for a pipeline
+    with more than one source, whose branches keep their row keys under one recipe, so one
+    branch's snapshot would take every other branch's rows for dropped. `refresh` is a source
+    refresh's read (Amendment 6 point 1), refused the same way when it withdraws or reads
+    incrementally: one source's watermark is no measure of another's rows.
 
     `source_location`, when given, overrides the location of every source node that does not
     carry its own — the same "today's fresh export" override `run_published_recipe` has, applied
     to the sources that read the draft's own recorded location. A source node carrying its own
-    `source_location` in its config keeps it."""
+    `source_location` in its config keeps it.
+
+    `alerts`: the alerts' repoint journal, which each enrich stage's supersedes go through (ADR-109
+    Amendment 11), whether or not the run has a rule gate."""
     # The one choice of pipeline and of each branch's file Verify makes too (`run_source`, build
     # order step 30), so a run cannot read a file Verify did not check.
     pipeline = pipeline_of(draft, repo_root)
@@ -502,9 +653,62 @@ async def run_published_pipeline(
         load_id=load_id, recipe_id=draft.recipe_id, recipe_version=draft.version
     )
     ordered = _topological(pipeline)
+    sources = [n for n in ordered if n.kind is PipelineNodeKind.SOURCE]
+    withdraw_dropped = withdraw_dropped or (refresh is not None and refresh.withdraws)
+    staged = any(n.kind in STAGING_KINDS for n in pipeline.nodes)
+    if staged and (withdraw_dropped or (refresh is not None and refresh.incremental)):
+        raise RecipeRuleError(
+            [
+                "This pipeline joins its sources through staging steps, so one source's snapshot "
+                "or watermark is no measure of the rows Map reads. Set the refresh to a full "
+                "snapshot that keeps dropped rows."
+            ]
+        )
+    if withdraw_dropped and len(sources) > 1:
+        raise RecipeRuleError(
+            [
+                f"This pipeline reads {len(sources)} sources, whose rows share one deduplication "
+                "key, so a full snapshot of one would withdraw the others' rows. Set the refresh "
+                "to keep dropped rows until each source has a key of its own (redesign phase 6)."
+            ]
+        )
+    if refresh is not None and refresh.incremental and len(sources) > 1:
+        raise RecipeRuleError(
+            [
+                f"This pipeline reads {len(sources)} sources, and an incremental refresh's "
+                "watermark is one source's: it would leave the others' rows unread. Set the "
+                "refresh to a full snapshot until each source has a key of its own (redesign "
+                "phase 6)."
+            ]
+        )
 
+    if staged:
+        report.branches.append(
+            await _run_staged_branch(
+                draft,
+                principal,
+                pipeline=pipeline,
+                graph=graph,
+                ontology=ontology,
+                scheme=scheme,
+                load_id=load_id,
+                investigation_scope=investigation_scope,
+                repo_root=repo_root,
+                analytics=analytics,
+                media=media,
+                source_location=source_location,
+                rules=rules,
+                sink=sink,
+                withdraw_dropped=withdraw_dropped,
+                refresh=refresh,
+                models=target_models,
+                storage=staging_storage or ObjectStorageConfig.from_env(),
+                meter=staging_meter,
+                list_store=list_store,
+            )
+        )
     for node in ordered:
-        if node.kind is not PipelineNodeKind.SOURCE:
+        if staged or node.kind is not PipelineNodeKind.SOURCE:
             continue
         branch_location = _branch_location(node, source_location)
         branch_report = await run_published_recipe(
@@ -521,6 +725,8 @@ async def run_published_pipeline(
             rules=rules,
             scheme=scheme,
             sink=sink,
+            withdraw_dropped=withdraw_dropped,
+            refresh=refresh if refresh is not None and refresh.incremental else None,
         )
         report.branches.append(
             BranchRunReport(
@@ -559,6 +765,7 @@ async def run_published_pipeline(
                 scheme=scheme,
                 analytics=analytics,
                 online_geocode=online_geocode,
+                alerts=alerts,
             )
             report.enriches.append(enrich_stage)
             report.touched_edge_ids.extend(edges)

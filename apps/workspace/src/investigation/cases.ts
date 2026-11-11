@@ -2,7 +2,8 @@
 // the dataset / case that I want to work on"). This lists the cases an account holds a level on
 // and creates a named one. It enforces nothing: the Conduit does (ADR-050), and answers a case the
 // account may not see with the same "not found" as one that does not exist.
-import { MONTHS, utcStamp } from "../time/utcStamp";
+import { utcStamp } from "../time/utcStamp";
+import { rememberCaseView } from "../views/lensHandoff";
 import { INVESTIGATION_ID_SESSION_KEY } from "./investigationId";
 
 export type AccessLevel = "viewer" | "editor" | "author";
@@ -40,7 +41,6 @@ export interface CaseListing {
   level: AccessLevel;
   created_at: string;
   created_by: string;
-  branched_from?: string | null;
   /** ADR-126: the case's domain packs, sorted; empty is the POLE core model. Every reader of the
    * case may see it: it says what kind of case it is, never what it holds. */
   domains?: DomainPack[];
@@ -57,7 +57,15 @@ export interface Dataset {
   id: string;
   name: string;
   owning_unit: string;
+  /** ADR-099 Amendment 12: a source, or a composite read as its members. An analyst layer is never
+   * sent to the Glass (ADR-143 decision 1). Older Conduits send neither field. */
+  kind?: "source" | "composite";
+  members?: string[];
 }
+
+/** What a new case reads (ADR-099 Amendment 12 item 6): one existing dataset, or a new one named
+ * here. There is no third choice: the Conduit no longer gives a case a dataset of its own. */
+export type CaseData = { datasetId: string } | { newDatasetName: string };
 
 /** The datasets of the caller's unit, for a new case to name. */
 export async function listDatasets(apiBaseUrl: string, bearerToken: string): Promise<Dataset[]> {
@@ -82,15 +90,16 @@ export async function caseDatasets(
   return (await response.json()) as Dataset[];
 }
 
-/** Changes what a case reads: its Author's. The Conduit refuses none, and any dataset not of the
- * Author's unit, with one answer. */
+/** Changes what a case reads: its Author's. Exactly one dataset, a source or a composite (ADR-099
+ * Amendment 12); the Conduit refuses two, none, and any dataset not of the Author's unit, with one
+ * answer. */
 export async function setCaseDatasets(
   apiBaseUrl: string,
   bearerToken: string,
   investigationId: string,
   datasetIds: string[],
 ): Promise<Dataset[]> {
-  if (datasetIds.length === 0) throw new Error("A case reads at least one dataset.");
+  if (datasetIds.length !== 1) throw new Error("A case reads exactly one dataset.");
   const response = await fetch(
     `${apiBaseUrl}/v1/investigations/${encodeURIComponent(investigationId)}/datasets`,
     {
@@ -100,29 +109,10 @@ export async function setCaseDatasets(
     },
   );
   if (response.status === 403) throw new Error("Only the case's Author can change what it reads.");
-  if (response.status === 422) throw new Error("One of those datasets is not one this case can read.");
+  if (response.status === 422) throw new Error("That dataset is not one this case can read.");
+  if (response.status === 409) throw new Error(await refusalWords(response, "This case's dataset cannot be changed"));
   if (!response.ok) throw new Error(`Could not change what this case reads (${response.status}).`);
   return (await response.json()) as Dataset[];
-}
-
-/** An Author's change of the case's domain models (ADR-126): `PATCH /v1/investigations/{id}` with
- * the packs alone. The Conduit refuses anyone else (403); the answer is the case as it now stands. */
-export async function changeCaseDomains(
-  apiBaseUrl: string,
-  bearerToken: string,
-  investigationId: string,
-  domains: readonly DomainPack[],
-): Promise<DomainPack[]> {
-  const response = await fetch(`${apiBaseUrl}/v1/investigations/${encodeURIComponent(investigationId)}`, {
-    method: "PATCH",
-    headers: { Authorization: `Bearer ${bearerToken}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ domains: sortedDomains(domains) }),
-  });
-  if (response.status === 403) throw new Error("Only the case's Author can change its domain models.");
-  if (response.status === 404) throw new Error("That case was not found.");
-  if (!response.ok) throw new Error(`Could not change the domain models (${response.status}).`);
-  const saved = (await response.json()) as { domains?: DomainPack[] };
-  return saved.domains ?? [];
 }
 
 /** What a case is called on screen. A case made before names existed has none; it is shown as
@@ -186,31 +176,47 @@ export async function createCase(
   apiBaseUrl: string,
   bearerToken: string,
   name: string,
-  datasetIds: string[] = [],
+  data: CaseData,
   domains: readonly DomainPack[] = [],
 ): Promise<{ id: string; name: string; domains?: DomainPack[] }> {
   const trimmed = name.trim();
   if (!trimmed) {
     throw new Error("A case needs a name.");
   }
-  // ADR-099: with none named, the Conduit gives the case a dataset of its own.
+  const reads =
+    "datasetId" in data
+      ? { dataset_ids: [data.datasetId] }
+      : { new_dataset_name: data.newDatasetName.trim() || trimmed };
   const response = await fetch(`${apiBaseUrl}/v1/investigations`, {
     method: "POST",
     headers: { Authorization: `Bearer ${bearerToken}`, "Content-Type": "application/json" },
     // ADR-126: the packs shown, `[]` when none is ticked, so the case counts as chosen (POLE).
-    body: JSON.stringify({
-      name: trimmed,
-      ...(datasetIds.length > 0 ? { dataset_ids: datasetIds } : {}),
-      domains: sortedDomains(domains),
-    }),
+    body: JSON.stringify({ name: trimmed, ...reads, domains: sortedDomains(domains) }),
   });
   if (response.status === 422) {
-    throw new Error("One of those datasets is not one this case can read.");
+    throw new Error(
+      "datasetId" in data
+        ? "That dataset is not one this case can read."
+        : "Your unit already has a dataset of that name; choose another name.",
+    );
   }
   if (!response.ok) {
     throw new Error(`Could not create the case (${response.status}).`);
   }
   return (await response.json()) as { id: string; name: string; domains?: DomainPack[] };
+}
+
+/** A refusal in the Conduit's own words (L3.H1: a dataset's home case is kept, `home_case_kept`),
+ * after `lead`: "This case cannot be removed: this is its dataset's home case, …". */
+async function refusalWords(response: Response, lead: string): Promise<string> {
+  try {
+    const body = (await response.json()) as { detail?: { message?: string } };
+    const said = body.detail?.message;
+    if (typeof said === "string" && said) return `${lead}: ${said}.`;
+  } catch {
+    /* no words sent: the lead alone */
+  }
+  return `${lead}.`;
 }
 
 /** A soft remove: the case leaves every list and answers "not found", and nothing is deleted from
@@ -231,6 +237,9 @@ export async function removeCase(
   if (response.status === 404) {
     throw new Error("That case was not found. It may already have been removed.");
   }
+  if (response.status === 409) {
+    throw new Error(await refusalWords(response, "This case cannot be removed"));
+  }
   if (!response.ok) {
     throw new Error(`The case could not be removed (${response.status}).`);
   }
@@ -244,11 +253,13 @@ export async function removeCase(
 }
 
 /** The URL the Glass already reads on load (`initialInvestigationId`). */
-export function caseUrl(id: string, view?: "ingest" | "questions"): string {
+export function caseUrl(id: string, view?: "ingest" | "questions", caseView?: string): string {
   // `from=case` makes the Glass sign back in by itself: the reload drops the in-memory sign-in
   // (`auth/launcherHandoff.ts`), and without it the person met the sign-in screen after every switch.
   const base = `/?investigation=${encodeURIComponent(id)}&from=case`;
-  return view ? `${base}&view=${view}` : base;
+  const withView = view ? `${base}&view=${view}` : base;
+  // ADR-144: a case opened on one of its views (`case_view`), shown as a lens on it.
+  return caseView ? `${withView}&case_view=${encodeURIComponent(caseView)}` : withView;
 }
 
 /** Switching case reloads the page on purpose: the working set, the cross-filter store and the
@@ -263,80 +274,29 @@ export function openCase(
   navigate(caseUrl(id, view));
 }
 
-function rootOf(byId: Map<string, CaseListing>, start: CaseListing): CaseListing {
-  let top = start;
-  const seen = new Set<string>([start.id]);
-  for (;;) {
-    const parent = top.branched_from ? byId.get(top.branched_from) : undefined;
-    if (!parent || seen.has(parent.id)) return top;
-    seen.add(parent.id);
-    top = parent;
-  }
+/** Opens a case on one of its views (ADR-144): the case is loaded as any switch loads it, and the
+ * view is then opened over it as a lens. */
+export function openCaseView(
+  caseId: string,
+  viewId: string,
+  navigate: (url: string) => void = (url) => window.location.assign(url),
+): void {
+  sessionStorage.setItem(INVESTIGATION_ID_SESSION_KEY, caseId);
+  rememberCaseView(caseId, viewId);
+  navigate(caseUrl(caseId, undefined, viewId));
 }
 
-/** The picker's rows (ADR-084 Amendment 3): each original case in `orderCases`' order, followed by
- * every branch in its family (as `branchFamily` groups them) oldest first, marked as a branch. A
- * branch whose original this account cannot see sits under its oldest visible ancestor, which then
- * heads the family. No case is left out. */
-export function nestCases(
-  cases: readonly CaseListing[],
-): Array<{ entry: CaseListing; branch: boolean }> {
-  const byId = new Map(cases.map((entry) => [entry.id, entry]));
-  const families = new Map<string, CaseListing[]>();
-  for (const entry of cases) {
-    const root = rootOf(byId, entry);
-    if (root.id !== entry.id) families.set(root.id, [...(families.get(root.id) ?? []), entry]);
-  }
-  const roots = orderCases(cases.filter((entry) => rootOf(byId, entry).id === entry.id));
-  return roots.flatMap((root) => [
-    { entry: root, branch: false },
-    ...(families.get(root.id) ?? [])
-      .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id))
-      .map((entry) => ({ entry, branch: true })),
-  ]);
+/** How a dataset is offered in a choice: its name, and for a composite how many it joins. */
+export function datasetChoiceLabel(dataset: Dataset): string {
+  const joins = dataset.kind === "composite" ? (dataset.members?.length ?? 0) : 0;
+  return joins > 0 ? `${dataset.name} (a composite of ${joins} datasets)` : dataset.name;
 }
-
 
 /** A dataset as the Glass names it: its name and its id, so two that read alike are told apart
  * (ADR-099 Amendment 6). An id of twelve characters or fewer (the seeds' `enron`) is shown whole;
  * a longer one (a ULID) by its last five. */
 export function datasetLabel(id: string, name: string): string {
   return `${name} · ${id.length <= 12 ? id : `\u2026${id.slice(-5)}`}`;
-}
-
-// --- A branch in its case's tree (ADR-084 Amendment 4) ------------------------------------------
-// The owner, 14 October 2026: "the current display method for the Branch and main case is very
-// confusing, i need a method to delete a branch as through the Glass view". A branch is shown beneath
-// its case, named for what it holds and when it was made rather than by repeating the case's name.
-
-const BRANCH_DEFAULT = /^Branch of .+ \((\d+) (?:node|nodes)\)$/;
-
-function shortStamp(made: Date): string {
-  const two = (n: number) => String(n).padStart(2, "0");
-  return `${made.getUTCDate()} ${MONTHS[made.getUTCMonth()]} ${two(made.getUTCHours())}:${two(made.getUTCMinutes())}`;
-}
-
-/** A branch's own name: as renamed by someone, or, while it keeps the name branching gave it, how
- * many nodes it was made from and when (UTC). */
-export function branchLabel(entry: Pick<CaseListing, "name" | "created_at">): string {
-  const name = entry.name.trim();
-  const made = new Date(entry.created_at);
-  const when = Number.isNaN(made.getTime()) ? "" : ` · ${shortStamp(made)}`;
-  const sized = BRANCH_DEFAULT.exec(name);
-  if (sized) {
-    const count = Number(sized[1]);
-    return `${count} ${count === 1 ? "node" : "nodes"}${when}`;
-  }
-  if (!name || name.startsWith("Branch of ")) return `Branch${when}`;
-  return name;
-}
-
-/** The case a branch came from, when this account can see it: where deleting the branch you are in
- * takes you. `null` for an original case, or a branch whose original is not listed. */
-export function returnFor(cases: readonly CaseListing[], id: string): CaseListing | null {
-  const entry = cases.find((c) => c.id === id);
-  if (!entry?.branched_from) return null;
-  return cases.find((c) => c.id === entry.branched_from) ?? null;
 }
 
 /** Renames a case (its Author only: the Conduit decides). */

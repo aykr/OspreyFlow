@@ -15,13 +15,18 @@ not the route must make its own (the scheduler's `check_case` does; the seed del
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+import logging
+import time
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from dataclasses import fields as dataclass_fields
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from services.ingest.metering import CountingMedia, StagingMeter, metering_of
+from services.ingest.staging import ObjectStorageConfig
+from services.ingest.watermark import RefreshRead
 from valkey.asyncio import Valkey
 
 from conduit_common.identity import new_id
@@ -37,25 +42,36 @@ from . import resolution_trigger as resolution_trigger_module
 from .alerts import AlertStore
 from .audit import AuditWriter
 from .auth import PrincipalResolver
+from .board_store import BoardItemStore
 from .change_stream import ChangeStreamEntry, ChangeStreamWriter, touched_node_ids
 from .config import ApiConfig
-from .evaluation import evaluate_hotlists_for_entry, evaluate_monitors_for_entry
+from .datasets import DatasetStore
+from .drawn_watches import DrawnWatchesFailed, DrawnWatchRun, holds_a_level_in, raise_into
+from .evaluation import DatasetReach, evaluate_hotlists_for_entry, evaluate_monitors_for_entry
 from .held_rows import HeldRowStore
 from .hotlists import HotlistStore
+from .investigations import InvestigationStore
 from .jobs import JobQueue
 from .kyc_expiries import KycExpiryStore
+from .list_connector import ListStore
 from .load_records import LedgerSink
 from .monitors import MonitorStore
 from .pattern_store import PatternStore
 from .pipeline_run import OnlineGeocode, RecogniserFor, run_published_pipeline
-from .recipe_runs import RecipeRunStore, RunTrigger
+from .recipe_runs import Counted, External, RecipeRunStore, RunTrigger
 from .review import ExtractionCandidateStore
 from .rule_evaluation import RuleGate
+from .run_quotas import QuotaLimit, QuotaRefused, QuotaStore
+from .run_quotas import judge as judge_quota
 from .screening import ScreeningListStore
 from .strength_influencers import InfluencerStore
 from .studio_map import resolve_source_handling
 from .studio_publish import LoadSink, run_published_recipe
+from .target_models import TargetModelStore
 from .typology_rules import TypologyRuleStore
+from .watch_reach import owner_reaches_dataset_in
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -89,6 +105,33 @@ class RecipeRunDeps:
     #: ADR-139: the installation's and each case's link-strength influencers, which a sentence's
     #: strength condition judges by. None: the weights file's defaults alone.
     influencers: InfluencerStore | None = None
+    #: ADR-140 Amendment 12: the datasets' models, whose reference lists a staged pipeline's
+    #: Lookups read, and the store their rows and the staged Parquet are kept in. None: no list
+    #: (a Lookup is refused in words) and the store the environment names.
+    target_models: TargetModelStore | None = None
+    staging_storage: ObjectStorageConfig | None = None
+    #: ADR-140 Amendment 13: the deployment-wide lists and each dataset's subscriptions. None: a
+    #: staged run reads the dataset's own lists alone.
+    list_store: ListStore | None = None
+    #: ADR-146 decision 3 (L2.11): how a sentence's named Studio list is read, within the rule's own
+    #: dataset (`rule_editor.rule_list_reader`). None: a rule naming a list cannot run here, and
+    #: says so as any run that cannot read what it needs.
+    rule_lists: Callable[[TypologyRule, str, str], Awaitable[list[Any]]] | None = None
+    #: ADR-146 decision 3: what a rule on a declared dataset reads (`rule_editor.rule_reach_of`).
+    rule_reach: Callable[[TypologyRule], Awaitable[list[str] | None]] | None = None
+    #: L2.10 review item 4: whether a watch's owner still reaches its dataset
+    #: (`watch_reach.owner_reaches_dataset_in`). None: a watch with a dataset is not matched (fail
+    #: closed). `from_state` always builds it from the state's own stores.
+    watch_reach: DatasetReach | None = None
+    #: L3.6 (ADR-143 Amendment 2 decision 8): the drawn watches a load is run against, and the
+    #: case read sets their owners are read in, and the cases' levels their owners must still
+    #: hold. None: no drawn watch is run (fail closed: no alert, nothing read). `from_state` reads
+    #: each from the state (`board_items`, `datasets`, `investigations`).
+    board_items: BoardItemStore | None = None
+    datasets: DatasetStore | None = None
+    investigations: Any | None = None
+    #: ADR-141 decision 6: the run quotas, judged before every run starts. None: no quota.
+    run_quotas: QuotaStore | None = None
 
     @classmethod
     def from_state(cls, state: Any) -> RecipeRunDeps:
@@ -100,6 +143,31 @@ class RecipeRunDeps:
             # An optional dependency (default None) the state does not hold is left None.
             optional = f.default is None
             values[f.name] = getattr(state, name, None) if optional else getattr(state, name)
+        if values.get("watch_reach") is None:
+            # L2.10 review round: the scheduled and folder-watched runs come this way. The check is
+            # built from the state's own stores, which every running Conduit holds, never from a
+            # field the state would have to be given (none is, so it would always be absent).
+            values["watch_reach"] = owner_reaches_dataset_in(
+                lambda: getattr(state, "datasets", None),
+                lambda: getattr(state, "investigations", None),
+            )
+        datasets = getattr(state, "datasets", None)
+        if datasets is not None:
+            # ADR-146 decision 3 (L2.11): the scheduled and folder-watched runs read a rule's named
+            # list and its dataset's reach (a composite's members) from the state's own stores, as
+            # the route's getters do (`app._rule_lists_of`, `app._rule_reach_from`); the state holds
+            # no attribute of either name, so read as fields they were always None on these runs.
+            from . import rule_editor
+
+            if values.get("rule_lists") is None:
+                values["rule_lists"] = rule_editor.rule_list_reader(
+                    datasets=datasets,
+                    models=getattr(state, "target_models", None),
+                    lists=getattr(state, "list_store", None),
+                    rows_kept=getattr(state, "list_rows", None),
+                )
+            if values.get("rule_reach") is None:
+                values["rule_reach"] = rule_editor.rule_reach_of(datasets)
         return cls(**values)
 
 
@@ -120,23 +188,134 @@ async def run_recipe_as(
     trigger: RunTrigger,
     slot: datetime | None = None,
     source_file: str | None = None,
+    refresh: RefreshRead | None = None,
+    external: External | None = None,
 ) -> LoadReport | PipelineRunReport:
-    """One run of a published recipe as `principal` (ADR-110 decision 1): the route's *Run now* and
+    """`refresh`: a source refresh's read of the file (ADR-110 Amendment 6 point 1), its mode and
+    watermark column from the source's policy.
+
+    One run of a published recipe as `principal` (ADR-110 decision 1): the route's *Run now* and
     the scheduler both come here, so a scheduled load is judged, published, watched and resolved
     exactly as a manual one, and every run is in the ledger (decision 6) — started before it
     loads, so one that dies with its Conduit shows as never finished rather than as nothing."""
-    started_at = datetime.now(UTC)
-    run_id = await deps.recipe_runs.start(
-        recipe_id=recipe.recipe_id,
-        recipe_version=recipe.version,
+    run_id, started_at = await begin_run(
+        deps,
+        principal=principal,
+        recipe=recipe,
         investigation_id=investigation_id,
         trigger=trigger,
         slot=slot,
-        run_as=principal.id,
-        source=resolve_source_handling(recipe),
-        now=started_at,
         source_file=source_file,
+        external=external,
     )
+    return await continue_run(
+        deps,
+        run_id=run_id,
+        started_at=started_at,
+        principal=principal,
+        recipe=recipe,
+        investigation_id=investigation_id,
+        source_location=source_location,
+        trigger=trigger,
+        refresh=refresh,
+    )
+
+
+async def begin_run(
+    deps: RecipeRunDeps,
+    *,
+    principal: Principal,
+    recipe: StudioRecipeDraft,
+    investigation_id: str,
+    trigger: RunTrigger,
+    slot: datetime | None = None,
+    source_file: str | None = None,
+    external: External | None = None,
+) -> tuple[str, datetime]:
+    """The run's start, before anything is read: its quotas judged (ADR-141 decision 6) — past
+    one, it is recorded *refused* (not counted toward a schedule's pause) and `QuotaRefused` is
+    raised in words — then its ledger row, which claims an external run id once
+    (`ExternalRunRecorded` when it is held already, decision 12)."""
+    started_at = datetime.now(UTC)
+    counted = Counted(dataset_id=recipe.dataset_id, owning_unit=recipe.owning_unit)
+    limits: list[QuotaLimit] = []
+    if deps.run_quotas is not None:
+        try:
+            limits = await judge_quota(
+                deps.run_quotas,
+                deps.recipe_runs,
+                dataset_id=recipe.dataset_id,
+                owning_unit=recipe.owning_unit,
+                now=started_at,
+            )
+        except QuotaRefused as refused:
+            await deps.recipe_runs.record_not_run(
+                recipe_id=recipe.recipe_id,
+                recipe_version=recipe.version,
+                investigation_id=investigation_id,
+                trigger=trigger,
+                slot=slot,
+                run_as=principal.id,
+                source=resolve_source_handling(recipe),
+                outcome="refused",
+                failure=str(refused),
+                now=started_at,
+                counts_toward_pause=False,
+                source_file=source_file,
+                counted=counted,
+                external=external,
+            )
+            raise
+    try:
+        run_id = await deps.recipe_runs.start(
+            recipe_id=recipe.recipe_id,
+            recipe_version=recipe.version,
+            investigation_id=investigation_id,
+            trigger=trigger,
+            slot=slot,
+            run_as=principal.id,
+            source=resolve_source_handling(recipe),
+            now=started_at,
+            source_file=source_file,
+            counted=counted,
+            external=external,
+            within=limits,
+        )
+    except QuotaRefused as refused:
+        # Another run took the quota's last place between the count and the row (item 11).
+        await deps.recipe_runs.record_not_run(
+            recipe_id=recipe.recipe_id,
+            recipe_version=recipe.version,
+            investigation_id=investigation_id,
+            trigger=trigger,
+            slot=slot,
+            run_as=principal.id,
+            source=resolve_source_handling(recipe),
+            outcome="refused",
+            failure=str(refused),
+            now=started_at,
+            counts_toward_pause=False,
+            source_file=source_file,
+            counted=counted,
+            external=external,
+        )
+        raise
+    return run_id, started_at
+
+
+async def continue_run(
+    deps: RecipeRunDeps,
+    *,
+    run_id: str,
+    started_at: datetime,
+    principal: Principal,
+    recipe: StudioRecipeDraft,
+    investigation_id: str,
+    source_location: str | None,
+    trigger: RunTrigger,
+    refresh: RefreshRead | None = None,
+) -> LoadReport | PipelineRunReport:
+    """The run `begin_run` started: read, judged, loaded, metered and finished in the ledger."""
     # ADR-127 decision 6: each load's record is appended to this row as its graph transaction
     # commits, so a run that fails after the commit still leaves it.
     sink = LedgerSink(
@@ -146,6 +325,11 @@ async def run_recipe_as(
         investigation_id=investigation_id,
         started_at=started_at,
     )
+    # ADR-110 Amendment 6 point 9: the run is timed, and what it puts to the object store counted.
+    media = CountingMedia(deps.media)
+    # ADR-140 Amendment 12: what a staged pipeline's steps staged, and their Parquet's bytes.
+    staging = StagingMeter()
+    clock = time.perf_counter()
     try:
         report = await _execute_recipe_run(
             deps,
@@ -155,6 +339,9 @@ async def run_recipe_as(
             source_location=source_location,
             trigger=trigger,
             sink=sink,
+            refresh=refresh,
+            media=media,
+            staging=staging,
         )
     except Exception as error:
         await deps.recipe_runs.fail(
@@ -164,6 +351,12 @@ async def run_recipe_as(
             markings=sink.markings,
         )
         raise
+    report.metering = metering_of(
+        report,
+        wall_seconds=time.perf_counter() - clock,
+        object_store_bytes=media.bytes_written,
+        staging=staging,
+    )
     await deps.recipe_runs.finish(run_id, report=report, now=datetime.now(UTC))
     return report
 
@@ -177,9 +370,16 @@ async def _execute_recipe_run(
     source_location: str | None,
     trigger: RunTrigger,
     sink: LoadSink,
+    refresh: RefreshRead | None = None,
+    media: MediaStore | None = None,
+    staging: StagingMeter | None = None,
 ) -> LoadReport | PipelineRunReport:
-    """The load itself, `run_studio_recipe`'s docstring has what each step is for."""
+    """`media`: the store the run puts to, counted for its metering; `deps.media` when not given.
+    `staging`: told what a staged pipeline's steps wrote (ADR-140 Amendment 12).
+
+    The load itself, `run_studio_recipe`'s docstring has what each step is for."""
     load_id = new_id()
+    media = media if media is not None else deps.media
     # ADR-109 ruling 1: the case's typology rules judge this load, at the point each declares.
     rules = await _rule_gate(
         investigation_id,
@@ -201,6 +401,8 @@ async def _execute_recipe_run(
         ontology=deps.ontology,
         recipe_id=recipe.recipe_id,
         influencers=deps.influencers,
+        rule_lists=deps.rule_lists,
+        rule_reach=deps.rule_reach,
     )
     report: LoadReport | PipelineRunReport
     if recipe.pipeline is not None:
@@ -218,11 +420,18 @@ async def _execute_recipe_run(
             recogniser_for=deps.recogniser_for,
             candidates=deps.extraction_candidates,
             analytics=deps.analytics,
-            media=deps.media,
+            media=media,
             source_location=source_location,
             online_geocode=deps.online_geocode,
             rules=rules,
             sink=sink,
+            refresh=refresh,
+            # ADR-109 Amendment 11: the enrich stage's supersedes go through the alerts' journal.
+            alerts=deps.alerts_store,
+            target_models=deps.target_models,
+            staging_storage=deps.staging_storage,
+            staging_meter=staging,
+            list_store=deps.list_store,
         )
         for branch in report.branches:
             await resolution_trigger_module.submit_post_ingest_resolution_jobs(
@@ -243,10 +452,11 @@ async def _execute_recipe_run(
             source_location=source_location,
             repo_root=deps.recipe_repo_root,
             analytics=deps.analytics,
-            media=deps.media,
+            media=media,
             rules=rules,
             scheme=deps.handling_scheme,
             sink=sink,
+            refresh=refresh,
         )
         await resolution_trigger_module.submit_post_ingest_resolution_jobs(
             report,
@@ -279,7 +489,13 @@ async def _execute_recipe_run(
             action_on_failure="watch_evaluation_failed",
             error_context={"load_id": load_id},
             principal_resolver=deps.principal_resolver,
+            watch_reach=deps.watch_reach,
         )
+        # L3.H1: the run's report says how many drawn-watch alerts it raised for its own principal.
+        report.drawn_watch_alerts = await _run_drawn_watches_best_effort(
+            deps, entry, dataset_id=recipe.dataset_id, principal=principal,
+            investigation_id=investigation_id, load_id=load_id,
+        )  # fmt: skip
     await deps.audit.record(
         principal=principal,
         action="run_studio_recipe",
@@ -326,6 +542,8 @@ async def _rule_gate(
     fail_closed: bool = True,
     recipe_id: str | None = None,
     influencers: InfluencerStore | None = None,
+    rule_lists: Callable[[TypologyRule, str, str], Awaitable[list[Any]]] | None = None,
+    rule_reach: Callable[[TypologyRule], Awaitable[list[str] | None]] | None = None,
 ) -> RuleGate | None:
     """The case's active typology rules for one load (ADR-109), or `None` when it has none.
     What the KYC and pattern typologies read is required, never defaulted: a route that left it
@@ -365,6 +583,8 @@ async def _rule_gate(
         ontology=ontology,
         on_hit=on_hit,
         influencers=influencers,
+        rule_lists=rule_lists,
+        rule_reach=rule_reach,
     )
 
 
@@ -374,6 +594,105 @@ def always_judges(rule: TypologyRule) -> bool:
     from .sentence_rules import is_deployment_wide, is_just_me
 
     return is_deployment_wide(rule) or is_just_me(rule)
+
+
+#: What a loader's own audit entry says when a drawn watch could not run: fixed words, since the
+#: failing watch may be another owner's (rule 7; L3.H2).
+DRAWN_WATCH_FAILED = "a drawn watch could not run"
+
+
+async def _run_drawn_watches_best_effort(
+    deps: RecipeRunDeps,
+    entry: ChangeStreamEntry,
+    *,
+    dataset_id: str | None,
+    principal: Principal,
+    investigation_id: str,
+    load_id: str,
+) -> int:
+    """The run path's drawn watches (`run_drawn_watches_best_effort`), with the run's stores."""
+    if deps.board_items is None or deps.datasets is None or deps.investigations is None:
+        return 0
+    return await run_drawn_watches_best_effort(
+        node_ids=entry.node_ids, dataset_id=dataset_id, principal=principal,
+        investigation_id=investigation_id, load_id=load_id, board_items=deps.board_items,
+        datasets=deps.datasets, investigations=deps.investigations, graph=deps.graph,
+        ontology=deps.ontology, principal_resolver=deps.principal_resolver,
+        alerts_store=deps.alerts_store, audit=deps.audit,
+    )  # fmt: skip
+
+
+async def run_drawn_watches_best_effort(
+    *,
+    node_ids: Sequence[str],
+    dataset_id: str | None,
+    principal: Principal,
+    investigation_id: str,
+    load_id: str,
+    board_items: BoardItemStore,
+    datasets: DatasetStore,
+    investigations: InvestigationStore,
+    graph: GraphPort,
+    ontology: OntologySchema,
+    principal_resolver: PrincipalResolver,
+    alerts_store: AlertStore,
+    audit: AuditWriter,
+) -> int:
+    """L3.6 (ADR-143 Amendment 2 decision 8; ADR-146 decision 4): every live drawn watch on the
+    dataset the load wrote into, run against the nodes it wrote or matched (`DrawnWatchRun`), each
+    match raised into the one queue as the watch owner's alert. Each owner is resolved afresh, as
+    for every watch (`_owner_resolver`), and read in their watch's case through the adapter.
+    Best effort, as the other watches: a failure is audited, never the load's. Every load runs it:
+    the run path (`run_recipe_as`) and a release of held rows (L3.H2), which is a load of its own.
+    Returns the alerts raised for `principal` alone (rule 7)."""
+    if dataset_id is None:
+        return 0
+    run = DrawnWatchRun(
+        items=board_items,
+        graph=graph,
+        ontology=ontology,
+        owner_of=_owner_resolver(principal, principal_resolver),
+        datasets=datasets,
+        holds_a_level=holds_a_level_in(investigations),
+        raise_alert=raise_into(alerts_store),
+    )
+    try:
+        return await run.after_load(
+            dataset_id, list(node_ids), load_id=load_id, counted_for=principal.id
+        )
+    except Exception as exc:  # noqa: BLE001 - as `_evaluate_watches_best_effort`'s: audited
+        # Another owner's watch failing never changes what the loader is told (rule 7), nor is its
+        # error, which may name that owner or their identity provider, written under the loader:
+        # fixed words under the loader, the detail under each failing watch's own owner.
+        await audit.record(
+            principal=principal,
+            action="watch_evaluation_failed",
+            investigation_id=investigation_id,
+            resolved_query={"load_id": load_id, "drawn_watches": True, "error": DRAWN_WATCH_FAILED},
+            result_cardinality=0,
+        )
+        if not isinstance(exc, DrawnWatchesFailed):
+            # Not one owner's (the board store, the dataset registry): the operator's log alone.
+            _log.warning("the drawn watches could not run for load %s", load_id, exc_info=exc)
+            return 0
+        for failure in exc.failures:
+            if failure.owner is None:
+                # Resolving the owner is what failed: there is no one to write it under but the
+                # operator's log.
+                _log.warning(
+                    "drawn watch %s could not run: its owner was not resolved",
+                    failure.watch.id, exc_info=failure.error,
+                )  # fmt: skip
+                continue
+            await audit.record(
+                principal=failure.owner,
+                action="watch_evaluation_failed",
+                investigation_id=failure.watch.case_id,
+                resolved_query={"load_id": load_id, "drawn_watch_id": failure.watch.id,
+                                "error": str(failure.error)},
+                result_cardinality=0,
+            )  # fmt: skip
+        return exc.counted
 
 
 async def _evaluate_watches_best_effort(
@@ -393,6 +712,7 @@ async def _evaluate_watches_best_effort(
     action_on_failure: str,
     principal_resolver: PrincipalResolver,
     error_context: dict[str, Any] | None = None,
+    watch_reach: DatasetReach | None = None,
 ) -> None:
     """Shared by every producer route wired to synchronous evaluation this stage
     (`run_studio_recipe`, `link_resolution_route`) — the identical `principal_for_owner` and the
@@ -421,6 +741,7 @@ async def _evaluate_watches_best_effort(
             valkey=valkey,
             principal_for_owner=_principal_for_owner,
             policy=config.hotlist_alert_policy,
+            reaches_dataset=watch_reach,
         )
         await evaluate_monitors_for_entry(
             entry,
@@ -431,6 +752,7 @@ async def _evaluate_watches_best_effort(
             audit=audit,
             valkey=valkey,
             principal_for_owner=_principal_for_owner,
+            reaches_dataset=watch_reach,
         )
     except Exception as exc:  # noqa: BLE001 - a best-effort side channel, see this function's
         # own docstring: must never fail the caller's own already-succeeded primary operation.

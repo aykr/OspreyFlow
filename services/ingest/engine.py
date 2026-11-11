@@ -34,7 +34,7 @@ import asyncio
 import functools
 import json
 import time
-from collections.abc import Hashable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -84,9 +84,11 @@ from schemas.ingest import (
     RecipeEdge,
     RecipeEntity,
     RejectionRecord,
+    RowElements,
 )
 from schemas.merge import aggregate_edge_writes, edge_write_key, merge_interval
 
+from .ceiling import DeploymentCeiling, refuse_rows_above_the_ceiling
 from .pipeline import recipe_packs
 from .recipe_rules import (
     RecipeRuleError,
@@ -196,6 +198,15 @@ def encode_key_parts(parts: Sequence[str | None]) -> str | None:
     does. Only a part with nothing in it is empty: a space is a part."""
     if any(part is None or part == "" for part in parts):
         return None
+    return hash_parts(parts)
+
+
+def hash_parts(parts: Sequence[str | None]) -> str:
+    """The one encoding of a row's identity: the SHA-256 of a JSON list of its parts, in order,
+    with fixed separators and no ASCII escaping. `encode_key_parts` gives it for a row with a key;
+    the staging catalogue (`staging_catalogue.source_table`) for every row, a row with no key
+    by all its cells, so a staged row's identity and a kept row's key never disagree for the same
+    parts."""
     encoded = json.dumps(list(parts), ensure_ascii=False, separators=(",", ":"))
     return sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -754,14 +765,59 @@ def recipe_handlings(recipe: Recipe, scheme: HandlingScheme | None = None) -> li
 
 
 def _provenance(
-    defaults: Mapping[str, Any], *, source: str, row_index: int, now: datetime
+    defaults: Mapping[str, Any],
+    *,
+    source: str,
+    row_index: int,
+    now: datetime,
+    row_refs: Mapping[int, Sequence[SourceRef]] | None = None,
 ) -> Provenance:
+    """`row_refs` (ADR-140 decision 11): for a staged table, by row position, the source rows the
+    row came from (`staging_catalogue.map_input`); the element records each of them, a Join's row
+    both sides', in place of the one row of `source`."""
     state = defaults.get("state", "asserted")
     return Provenance(
         state=ProvenanceState(state),
-        sources=[SourceRef(document_id=source, locator=f"row {row_index}", excerpt_hash="")],
+        sources=_row_sources(source, row_index, row_refs),
         first_seen=now,
     )
+
+
+def _refuse_staging_without_its_refs(
+    recipe: Recipe,
+    row_refs: Mapping[int, Sequence[SourceRef]] | None,
+    *,
+    stage_raw: bool | Callable[[], object] = True,
+) -> None:
+    """ADR-140 Amendment 11 (lane review round 1, item 4): a recipe with staging steps maps the last
+    step's table, never the raw rows of one source. Run without those rows' refs it would map the
+    wrong rows and record the wrong sources, so it is refused in words; it runs through
+    `staged_run.run_staged_recipe` (Test: `dry_run_staged_recipe`)."""
+    if stage_raw is not True and (not recipe.staging or row_refs is None):
+        # `03_CONDUIT_MIDDLEWARE.md` §5.1: every load stages its raw rows first. Only a staged run,
+        # which has written its sources' raw rows itself, may leave it to that (review round 2).
+        raise RecipeRuleError(
+            [
+                f"Recipe {recipe.id!r} is run without staging its raw rows, which only a staged "
+                "run (one that has staged its sources' rows itself) may do."
+            ]
+        )
+    if recipe.staging and row_refs is None:
+        raise RecipeRuleError(
+            [
+                f"Recipe {recipe.id!r} declares staging steps, so it runs through its staging "
+                "(each source table, then each step, then Map); it cannot be run over one "
+                "source's rows."
+            ]
+        )
+
+
+def _row_sources(
+    source: str, row_index: int, row_refs: Mapping[int, Sequence[SourceRef]] | None
+) -> list[SourceRef]:
+    if row_refs is not None:
+        return [ref.model_copy() for ref in row_refs[row_index]]
+    return [SourceRef(document_id=source, locator=f"row {row_index}", excerpt_hash="")]
 
 
 def preview_handling_and_provenance(
@@ -829,6 +885,8 @@ class _HeldLink:
     written_slots: list[int] = field(default_factory=list)
     #: The events of the rows that wrote this link, whose `edge_id` is the stored id once flushed.
     events: list[EventRecord] = field(default_factory=list)
+    #: The rows that wrote this link, each told its stored id once flushed (ADR-110 Amendment 8).
+    row_indices: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -845,6 +903,8 @@ class _RunState:
     #: the seeders, the basemap builder) means the run does not combine: it flushes each write as it
     #: is held, because without a scheme a restricted code's units cannot be told apart.
     scheme: HandlingScheme | None = None
+    #: ADR-140 decision 11: a staged table's source rows by row position (`_provenance`).
+    row_refs: Mapping[int, Sequence[SourceRef]] | None = None
     #: ADR-127 Amendment 19: the links held and not yet written, by `edge_write_key`, in the order
     #: each was first held.
     held_links: dict[tuple[Hashable, ...], _HeldLink] = field(default_factory=dict)
@@ -859,6 +919,15 @@ class _RunState:
     #: created is neither a new link nor a merge into another load's.
     created_edge_ids: list[EdgeId] = field(default_factory=list)
     merged_edge_ids: list[EdgeId] = field(default_factory=list)
+    #: ADR-110 Amendment 8 point 2: by row index, the nodes each row wrote or matched and the links
+    #: it wrote (stored ids, once flushed), each once, in the order first met.
+    row_nodes: dict[int, dict[NodeId, None]] = field(default_factory=dict)
+    row_edges: dict[int, dict[EdgeId, None]] = field(default_factory=dict)
+    #: ADR-110 Amendment 18: each link this load wrote, by its stored id, with its own edge type.
+    edge_types: dict[EdgeId, str] = field(default_factory=dict)
+    #: Amendment 15: by row index, the events each row wrote, by `event_id`, so a full snapshot
+    #: withdraws a dropped row's own events and never another row's on the same link.
+    row_events: dict[int, dict[str, None]] = field(default_factory=dict)
     #: Of `merged_edge_ids`, the links `_write_edge` merged into. The count told to the loader
     #: depends on whether they may read each (`_count_hidden_merges`); a `HOLDS` link is always
     #: counted at its write and is not among them.
@@ -889,6 +958,9 @@ class _RunState:
     #: caller that judges them before the commit (a pre-commit KYC rule cannot read the open
     #: transaction back). `None` when no caller asked.
     written: list[NodeWrite | EdgeWrite] | None = None
+    #: ADR-140 decision 13 (phase 8): the recipe's fuzzy match, if its last step is one
+    #: (`fuzzy_links.FuzzyPlan`): which elements are inferred, each row's score, and its SAME_AS.
+    fuzzy: Any = None
 
 
 class _ResolvedEntity:
@@ -1011,9 +1083,7 @@ def _resolve_row(
         )
         span = edge.temporal is not None and edge.temporal.valid_to is not None
         valid_to = (
-            _resolve_span_end(
-                edge.temporal.valid_to, row, connector_defaults=connector_defaults
-            )
+            _resolve_span_end(edge.temporal.valid_to, row, connector_defaults=connector_defaults)
             if edge.temporal is not None and edge.temporal.valid_to is not None
             else None
         )
@@ -1028,9 +1098,7 @@ def _resolve_row(
             {"kind": edge.content.kind, "text": text} if edge.content and text.strip() else None
         )
         handling = row_handling_override(recipe, edge.handling, row, scheme=scheme)
-        edges.append(
-            _ResolvedEdge(edge, properties, instant, content, handling, valid_to, span)
-        )
+        edges.append(_ResolvedEdge(edge, properties, instant, content, handling, valid_to, span))
 
     if scheme is not None:
         present: list[Handling] = [
@@ -1419,6 +1487,36 @@ def _resolve_markings(
         return most_restrictive_markings(recipe, scheme)
 
 
+def _note_row_node(state: _RunState, row_index: int, node_id: NodeId) -> None:
+    """A node this row wrote or matched, for its kept key's record (ADR-110 Amendment 8 point 2)."""
+    state.row_nodes.setdefault(row_index, {})[node_id] = None
+
+
+def _kept_row_elements(
+    state: _RunState, rows: Sequence[StagedRow], skip_row_indices: frozenset[int]
+) -> dict[str, RowElements]:
+    """Each kept key's record: what the rows carrying it wrote (one survivor per key in a file, so
+    one row, but a union whatever the count). Held rows are not kept and have none."""
+    nodes: dict[str, dict[NodeId, None]] = {}
+    edges: dict[str, dict[EdgeId, None]] = {}
+    events: dict[str, dict[str, None]] = {}
+    for row in rows:
+        if row.row_key is None or row.row_index in skip_row_indices:
+            continue
+        nodes.setdefault(row.row_key, {}).update(state.row_nodes.get(row.row_index, {}))
+        edges.setdefault(row.row_key, {}).update(state.row_edges.get(row.row_index, {}))
+        events.setdefault(row.row_key, {}).update(state.row_events.get(row.row_index, {}))
+    return {
+        key: RowElements(
+            node_ids=list(nodes[key]),
+            edge_ids=list(edges[key]),
+            event_ids=list(events[key]),
+            edge_types={e: state.edge_types[e] for e in edges[key] if e in state.edge_types},
+        )
+        for key in nodes
+    }
+
+
 def _note_referenced(state: _RunState, node_id: NodeId) -> None:
     """Remember a node matched by reference, once, unless this load created it (a node written by an
     earlier row and found again by a later one is this load's own, not one it merely touched)."""
@@ -1460,7 +1558,14 @@ async def _write_entity(
         _merge_override(state.recipe.defaults.provenance, entity.provenance),
         source=state.source,
         row_index=row_index,
+        row_refs=state.row_refs,
         now=now,
+    )
+    provenance = _fuzzy_provenance(
+        provenance,
+        state.fuzzy,
+        row_index,
+        state.fuzzy is not None and state.fuzzy.entity_inferred(entity),
     )
 
     if match_key is not None:
@@ -1612,6 +1717,7 @@ async def _write_held_content(
         _merge_override(state.recipe.defaults.provenance, entity.provenance),
         source=state.source,
         row_index=row_index,
+        row_refs=state.row_refs,
         now=now,
     )
     if document_id not in state.documents_written:
@@ -1650,6 +1756,7 @@ async def _write_held_content(
             state.nodes_referenced += 1
         else:
             state.nodes_created += 1
+    _note_row_node(state, row_index, document_id)
     holds = EdgeWrite(
         id=f"{document_id}:held-by:{holder_id}",
         type="HOLDS",
@@ -1740,15 +1847,21 @@ async def _write_edge(
         _merge_override(state.recipe.defaults.provenance, edge.provenance),
         source=state.source,
         row_index=row_index,
+        row_refs=state.row_refs,
         now=now,
+    )
+    provenance = _fuzzy_provenance(
+        provenance,
+        state.fuzzy,
+        row_index,
+        state.fuzzy is not None
+        and state.fuzzy.edge_inferred_by(edge.type, edge.from_ref, edge.to_ref),
     )
     # `01_DOMAIN_MODEL.md` §7: duplicate rows collapse to one event, but
     # every source row reference is retained on the survivor — every
     # collapsed duplicate's row index, not just the representative row's.
     for duplicate_index in duplicate_row_indices:
-        provenance.sources.append(
-            SourceRef(document_id=state.source, locator=f"row {duplicate_index}", excerpt_hash="")
-        )
+        provenance.sources.extend(_row_sources(state.source, duplicate_index, state.row_refs))
     interval = edge_interval(resolved.instant, resolved.valid_to, resolved.span)
 
     write = EdgeWrite(
@@ -1798,6 +1911,7 @@ async def _write_edge(
             load_id=state.load_id,
         )
         events.append(event)
+        state.row_events.setdefault(row_index, {})[event.event_id] = None
     # Held, not written: the run combines its writes to one per link and writes them at the end of
     # its rows (ADR-127 Amendment 19). The event, and this row's entry in `written`, take the
     # stored id of their link then.
@@ -1877,6 +1991,7 @@ async def _hold_edge(
         held.write = folded.write
     if event is not None:
         held.events.append(event)
+    held.row_indices.append(row_index)
     if record_written and state.written is not None:
         held.written_slots.append(len(state.written))
         state.written.append(write)
@@ -1923,6 +2038,9 @@ def _settle_link(state: _RunState, link: _HeldLink, edge_id: EdgeId) -> None:
         )
     for event in link.events:
         event.edge_id = edge_id
+    state.edge_types[edge_id] = link.write.type
+    for row_index in link.row_indices:
+        state.row_edges.setdefault(row_index, {})[edge_id] = None
     if state.written is not None:
         for slot in link.written_slots:
             state.written[slot] = state.written[slot].model_copy(update={"id": edge_id})
@@ -2009,6 +2127,8 @@ class _DryRunState:
     source: str
     now: datetime
     scheme: HandlingScheme | None = None
+    #: As `_RunState.row_refs`: Test records what the load records.
+    row_refs: Mapping[int, Sequence[SourceRef]] | None = None
     nodes: dict[NodeId, Node] = field(default_factory=dict)
     #: Keyed by (edge type, source id, target id, audience) — same-pair edges of one audience merge
     #: within the sample, mirroring `GraphArcadeDBAdapter.upsert_edges`'s real merge (ADR-102
@@ -2018,6 +2138,72 @@ class _DryRunState:
     edges_by_type: dict[str, DryRunEdgeCount] = field(default_factory=dict)
     local_index: dict[tuple[str, str, str], NodeId] = field(default_factory=dict)
     created_node_ids: set[NodeId] = field(default_factory=set)
+    #: As `_RunState.fuzzy`.
+    fuzzy: Any = None
+
+
+def _fuzzy_problems(recipe: Recipe) -> None:
+    """ADR-140 decision 13: a fuzzy match's SAME_AS names two elements of one type, the right one
+    written from its matched columns (`fuzzy_links.fuzzy_link_problems`), refused at run and
+    Test."""
+    from .fuzzy_links import fuzzy_link_problems
+
+    problems = fuzzy_link_problems(recipe)
+    if problems:
+        raise RecipeRuleError(problems)
+
+
+def _fuzzy_plan(recipe: Recipe, rows: Sequence[Mapping[str, str]]) -> Any:
+    from .fuzzy_links import fuzzy_plan
+
+    return fuzzy_plan(recipe, rows)
+
+
+def _fuzzy_provenance(
+    provenance: Provenance, plan: Any, row_index: int, inferred: bool
+) -> Provenance:
+    """R13 (ADR-006 Amendment 1 item 3): on a matched row, an element written from a fuzzy match's
+    matched columns, and the match's own SAME_AS, are `inferred`, with the match's score as their
+    confidence and the step as what inferred them. Never asserted, whatever the recipe's defaults
+    say (rule 5); a person confirms it."""
+    if plan is None or not inferred:
+        return provenance
+    score = plan.score(row_index)
+    if score is None:
+        return provenance
+    return provenance.model_copy(
+        update={
+            "state": ProvenanceState.INFERRED,
+            "extraction_confidence": score,
+            "extracted_by": f"fuzzy_match:{plan.step.id}",
+        }
+    )
+
+
+def _fuzzy_same_as(
+    plan: Any,
+    row_index: int,
+    refs: Mapping[str, NodeId],
+    handlings: Mapping[str, Handling],
+    scheme: HandlingScheme | None,
+) -> _ResolvedEdge | None:
+    """The row's SAME_AS, when the row matched and both elements it names were written or met:
+    between two nodes, never one (rule 6). Its marking is the stricter of the two elements'."""
+    if plan is None:
+        return None
+    score = plan.score(row_index)
+    left, right = plan.step.same_as.left, plan.step.same_as.right
+    if score is None or left not in refs or right not in refs or refs[left] == refs[right]:
+        return None
+    handling = handlings[left]
+    if scheme is not None:
+        handling = merge_handling(handlings[left], handlings[right], scheme)
+    return _ResolvedEdge(
+        plan.same_as_edge(),
+        plan.same_as_properties(score),
+        None,
+        handling=handling.model_dump(mode="json", exclude_none=True),
+    )
 
 
 async def _dry_run_entity(
@@ -2067,7 +2253,14 @@ async def _dry_run_entity(
         _merge_override(state.recipe.defaults.provenance, entity.provenance),
         source=state.source,
         row_index=row_index,
+        row_refs=state.row_refs,
         now=state.now,
+    )
+    provenance = _fuzzy_provenance(
+        provenance,
+        state.fuzzy,
+        row_index,
+        state.fuzzy is not None and state.fuzzy.entity_inferred(entity),
     )
     node_id = new_node_id()
     node = Node(
@@ -2144,7 +2337,15 @@ def _dry_run_edge(
         _merge_override(state.recipe.defaults.provenance, edge.provenance),
         source=state.source,
         row_index=row_index,
+        row_refs=state.row_refs,
         now=state.now,
+    )
+    provenance = _fuzzy_provenance(
+        provenance,
+        state.fuzzy,
+        row_index,
+        state.fuzzy is not None
+        and state.fuzzy.edge_inferred_by(edge.type, edge.from_ref, edge.to_ref),
     )
     interval = edge_interval(resolved.instant, resolved.valid_to, resolved.span)
     state.edges[key] = Edge(
@@ -2173,6 +2374,7 @@ async def dry_run_recipe(
     scheme: HandlingScheme | None = None,
     row_keys: RowKeys | None = None,
     investigation_scope: str | None = None,
+    row_refs: Mapping[int, Sequence[SourceRef]] | None = None,
 ) -> DryRunResult:
     """Verify (`09_INGEST_STUDIO.md` §5): the same `resolve_rows()` output
     Map's own preview machinery is built on, simulated instead of loaded.
@@ -2180,6 +2382,8 @@ async def dry_run_recipe(
     threads it onto `StagedRow`s that this function itself consumes and
     discards."""
     _require_scheme_to_judge_bound_handling(recipe, scheme)
+    _refuse_staging_without_its_refs(recipe, row_refs)
+    _fuzzy_problems(recipe)
     sample = list(rows)
     # Judged as the run judges (ADR-127 decision 5), by asking the store and writing nothing.
     already = await kept_among(recipe, sample, row_keys, investigation_scope)
@@ -2202,11 +2406,19 @@ async def dry_run_recipe(
         source=source,
         now=datetime.now(UTC),
         scheme=scheme,
+        row_refs=row_refs,
+        fuzzy=_fuzzy_plan(recipe, sample),
     )
     for staged_row in staged_rows:
         refs: dict[str, NodeId] = {}
+        handlings: dict[str, Handling] = {}
         for staged_entity in staged_row.entities:
             resolved_entity = _staged_entity_to_resolved(staged_entity, recipe)
+            handlings[staged_entity.ref] = _handling(
+                _merge_override(
+                    recipe.defaults.handling, _row_override(resolved_entity, resolved_entity.entity)
+                )
+            )
             node_id = await _dry_run_entity(
                 resolved_entity, row_index=staged_row.row_index, state=state
             )
@@ -2215,6 +2427,9 @@ async def dry_run_recipe(
         for staged_edge in staged_row.edges:
             resolved_edge = _staged_edge_to_resolved(staged_edge)
             _dry_run_edge(resolved_edge, refs, row_index=staged_row.row_index, state=state)
+        same_as = _fuzzy_same_as(state.fuzzy, staged_row.row_index, refs, handlings, scheme)
+        if same_as is not None:
+            _dry_run_edge(same_as, refs, row_index=staged_row.row_index, state=state)
 
     # `weight` here is a local, within-sample density signal — `min(1.0,
     # occurrences / 5)` — not `GraphArcadeDBAdapter._weigh_edge`'s real
@@ -2285,6 +2500,9 @@ async def run_recipe(
     written: list[NodeWrite | EdgeWrite] | None = None,
     scheme: HandlingScheme | None = None,
     row_keys: RowKeys | None = None,
+    row_refs: Mapping[int, Sequence[SourceRef]] | None = None,
+    stage_raw: bool | Callable[[], object] = True,
+    ceiling: DeploymentCeiling | None = None,
 ) -> tuple[LoadReport, list[EventRecord]]:
     """`row_keys` (ADR-127 decision 5): the store of loaded rows. A recipe with `deduplicate` skips
     a row whose key the case (`investigation_scope`) already kept, whatever the recipe's version,
@@ -2293,7 +2511,9 @@ async def run_recipe(
     `skip_row_indices`: rows resolved but not written — those a failing pre-commit rule holds
     (ADR-109 ruling 1); a held row's duplicates go with it, as they share its survivor.
     `row_numbers` as `resolve_rows` takes it. `written`, when given, receives every node this load
-    created and every link it wrote (ADR-109 phase F)."""
+    created and every link it wrote (ADR-109 phase F). `ceiling` (ADR-148 decision 10): the
+    deployment's highest marking, read from the rendered setting when not given, so no caller can
+    leave it out; a load with a row above it is refused whole before anything is staged."""
     if recipe.ontology_version != ontology.version:
         raise StaleRecipeError(
             f"recipe {recipe.id!r} targets ontology version {recipe.ontology_version}, but the "
@@ -2302,6 +2522,7 @@ async def run_recipe(
         )
     # ADR-120 D10, Amendment 1: the packs it names or writes, at the versions it was published at.
     check_recipe_pins(recipe, ontology)
+    _refuse_staging_without_its_refs(recipe, row_refs, stage_raw=stage_raw)
 
     # ADR-081 step D: refused again at run, before anything is written (Amendment 1 item 7).
     check_recipe_rules(
@@ -2316,6 +2537,7 @@ async def run_recipe(
         key_problems = deduplicate_list_problems(recipe.deduplicate)
         if key_problems:
             raise RecipeRuleError(key_problems)
+    _fuzzy_problems(recipe)
     _require_scheme_to_judge_bound_handling(recipe, scheme)
     if holds_content(recipe.row_template) and media is None:
         raise RecipeRuleError(
@@ -2337,10 +2559,24 @@ async def run_recipe(
     materialized_rows = await asyncio.to_thread(list, rows)
     # Before anything is staged or written: a run under a changed `deduplicate` is refused whole.
     already = await kept_among(recipe, materialized_rows, row_keys, investigation_scope)
-    storage = storage or ObjectStorageConfig.from_env()
+    # ADR-148 decision 10: the deployment's marking ceiling, judged over every row before raw
+    # staging, the first write, so a refused load leaves nothing behind.
     await asyncio.to_thread(
-        _stage_raw_rows, materialized_rows, storage=storage, load_id=load_id, source=source
+        refuse_rows_above_the_ceiling,
+        recipe,
+        materialized_rows,
+        ceiling if ceiling is not None else DeploymentCeiling.from_env(),
     )
+    storage = storage or ObjectStorageConfig.from_env()
+    # A staged run (`staged_run.run_staged_recipe`) passes its own raw staging (its sources' rows
+    # and the lists it read), run here, after the refusals above, as a plain run's is; the rows
+    # here are the table Map reads, never raw.
+    if stage_raw is True:
+        await asyncio.to_thread(
+            _stage_raw_rows, materialized_rows, storage=storage, load_id=load_id, source=source
+        )
+    elif stage_raw is not False:
+        await asyncio.to_thread(stage_raw)
 
     resolved = await asyncio.to_thread(
         functools.partial(
@@ -2378,6 +2614,8 @@ async def run_recipe(
         investigation_scope=investigation_scope,
         written=written,
         scheme=scheme,
+        row_refs=row_refs,
+        fuzzy=_fuzzy_plan(recipe, materialized_rows),
     )
     events: list[EventRecord] = []
 
@@ -2393,8 +2631,14 @@ async def run_recipe(
             continue
         now = datetime.now(UTC)
         refs: dict[str, NodeId] = {}
+        handlings: dict[str, Handling] = {}
         for staged_entity in staged_row.entities:
             resolved_entity = _staged_entity_to_resolved(staged_entity, recipe)
+            handlings[staged_entity.ref] = _handling(
+                _merge_override(
+                    recipe.defaults.handling, _row_override(resolved_entity, resolved_entity.entity)
+                )
+            )
             own_text = holds_own_text(resolved_entity.entity)
             node_id = await _write_entity(
                 resolved_entity,
@@ -2405,6 +2649,7 @@ async def run_recipe(
             )
             if node_id is not None:
                 refs[staged_entity.ref] = node_id
+                _note_row_node(state, staged_row.row_index, node_id)
                 if resolved_entity.content and media is not None and not own_text:
                     await _write_held_content(
                         resolved_entity,
@@ -2418,6 +2663,18 @@ async def run_recipe(
             resolved_edge = _staged_edge_to_resolved(staged_edge)
             await _write_edge(
                 resolved_edge,
+                refs,
+                row_index=staged_row.row_index,
+                duplicate_row_indices=staged_row.duplicate_row_indices,
+                now=now,
+                state=state,
+                events=events,
+            )
+        # ADR-140 decision 13: the fuzzy match's SAME_AS, scored and inferred, never a merge.
+        same_as = _fuzzy_same_as(state.fuzzy, staged_row.row_index, refs, handlings, scheme)
+        if same_as is not None:
+            await _write_edge(
+                same_as,
                 refs,
                 row_index=staged_row.row_index,
                 duplicate_row_indices=staged_row.duplicate_row_indices,
@@ -2447,6 +2704,7 @@ async def run_recipe(
                 if r.row_key is not None and r.row_index not in skip_row_indices
             )
         ),
+        kept_row_elements=_kept_row_elements(state, loaded_rows, skip_row_indices),
         nodes_created=state.nodes_created,
         nodes_referenced=state.nodes_referenced,
         edges_created=state.edges_created,

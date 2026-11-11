@@ -58,6 +58,7 @@ export type OntologyVersion = number | null;
 export type PackVersions = {
   [k: string]: number;
 } | null;
+export type ModelVersion = number | null;
 export type GitPath = string | null;
 export type PublishedByName = string | null;
 export type PublishedAt = string | null;
@@ -68,6 +69,8 @@ export type ScheduleSetAt = string | null;
 export type ScheduleCase = string | null;
 export type SchedulePaused = boolean;
 export type SchedulePausedReason = string | null;
+export type OwnedExternallyBy = string | null;
+export type FlaggedReason = string | null;
 export type DatasetId = string | null;
 export type Id = string;
 /**
@@ -75,7 +78,22 @@ export type Id = string;
  * purpose: rule 8 — no expression or scripting language in the Studio; every node is a declared
  * stage whose transforms remain Knowledge Adapters with golden files.
  */
-export type PipelineNodeKind = "domain_model" | "source" | "profile" | "map" | "extract" | "enrich" | "load";
+export type PipelineNodeKind =
+  | "domain_model"
+  | "source"
+  | "profile"
+  | "map"
+  | "extract"
+  | "enrich"
+  | "load"
+  | "lookup"
+  | "join"
+  | "filter"
+  | "derive"
+  | "union"
+  | "dedupe"
+  | "sql"
+  | "fuzzy_match";
 export type Label1 = string;
 export type Nodes = PipelineNode[];
 export type Source = string;
@@ -107,6 +125,7 @@ export interface StudioRecipeDraft {
   verified_at?: VerifiedAt;
   ontology_version?: OntologyVersion;
   pack_versions?: PackVersions;
+  model_version?: ModelVersion;
   git_path?: GitPath;
   published_by?: PrincipalId | null;
   published_by_name?: PublishedByName;
@@ -119,6 +138,8 @@ export interface StudioRecipeDraft {
   schedule_case?: ScheduleCase;
   schedule_paused?: SchedulePaused;
   schedule_paused_reason?: SchedulePausedReason;
+  owned_externally_by?: OwnedExternallyBy;
+  flagged_reason?: FlaggedReason;
   dataset_id?: DatasetId;
   pipeline?: PipelineGraph | null;
   [k: string]: unknown;

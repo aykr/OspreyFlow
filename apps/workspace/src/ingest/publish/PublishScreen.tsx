@@ -1,5 +1,6 @@
-// Stage 5 of the Ingest Studio — `spec/09_INGEST_STUDIO.md` §6. The recipe
-// is written, versioned and optionally scheduled. Every action here is
+// Deploy, and a deployed pipeline's runs and schedule — `spec/09_INGEST_STUDIO.md` §6, in the
+// words of ADR-140 decision 2: Publish is *Deploy as vN*, which commits a version and neither runs
+// nor schedules it; running and scheduling are the Runs tab's (`mode="operate"`). Every action here is
 // role-gated server-side (§8): publishing and scheduling need
 // `source_approver`, reopening a published recipe for a further edit needs
 // `source_author`, running it needs `loader` — this screen never hides an
@@ -9,17 +10,19 @@
 // error.
 import { useEffect, useState } from "react";
 
+import { ExpertDisclosure } from "../dag/ExpertStepDrawer";
 import type {
   LoadReportView,
   PipelineRunReportView,
   ScheduleRunView,
   StudioRecipeDraft,
 } from "../../../../../packages/schemas/generated";
-import { COUNTS_WITHHELD_REASON, runInWords, triggerInWords } from "../../admin/Schedules";
+import { COUNTS_WITHHELD_REASON, meteringInWords, runInWords, triggerInWords } from "../../admin/Schedules";
 import { Button } from "../../design/primitives/Button";
 import { Input } from "../../design/primitives/Input";
 import { Panel } from "../../design/primitives/Panel";
 import { alreadyLoadedWords } from "../alreadyLoaded";
+import { statusWords } from "../studio/vocabulary";
 import {
   StudioActionError,
   createNewVersion,
@@ -33,6 +36,12 @@ import {
 } from "../api";
 import { DEFAULT_TIMEZONE, ScheduleEditor } from "./ScheduleEditor";
 import { choiceOf, cronOf, type ScheduleChoice } from "./scheduleChoice";
+import { RightButton } from "../studio/rightsGate";
+import { drawnWatchWords } from "../../boards/drawnWatchWords";
+
+/** A deployed pipeline's schedule: its routes check `schedule_pipelines` and the source approver's studio
+ * role, which `publish_pipelines` gives (`require_studio_role`), so both are asked (the lane review of L1.8). */
+const SCHEDULE_RIGHTS = ["schedule_pipelines", "publish_pipelines"] as const;
 
 /** The run route answers one of two shapes; both carry index signatures in the generated types,
  * so `in` cannot discriminate them — a pipeline run is the one whose `branches` is a real list. */
@@ -52,7 +61,8 @@ export interface PublishScreenProps {
   recipeId: string | null;
   /** ADR-099 Amendment 3: the Studio works within a case, so there always is one. */
   investigationId: string;
-  onBack: () => void;
+  /** Absent when hosted in the pipeline's drawer (ADR-108 Amendment 6.1). */
+  onBack?: () => void;
   /** Fired once a recipe is chosen from the registry picker, so the host
    * (`IngestStudio`) can adopt it as the active draft — the same draft
    * Map/Verify would then also act on if the analyst switches tabs. */
@@ -62,6 +72,11 @@ export interface PublishScreenProps {
    * published recipe (§8) lands the analyst on a new `draft` row, not on
    * this screen still showing the now-superseded one. */
   onReopenedForEditing?: (draft: StudioRecipeDraft) => void;
+  /** `deploy` (the Pipelines tab): commit a version, or reopen one. `operate` (the Runs tab): run a
+   * deployed pipeline, set its schedule and folder watch, read its runs (ADR-140 decision 16). */
+  mode?: "deploy" | "operate";
+  /** Fired after a run, a deploy, or a schedule change, so the Runs tab can read its grid again. */
+  onRan?: () => void;
 }
 
 function RecipeRegistryPicker({
@@ -101,16 +116,16 @@ function RecipeRegistryPicker({
         padding: "var(--sp-16)",
       }}
     >
-      <h1 style={{ fontSize: "1.1em", margin: 0 }}>Publish</h1>
+      <h1 style={{ fontSize: "1.1em", margin: 0 }}>Deploy</h1>
       <p style={{ color: "var(--text-secondary)" }}>
-        Pick a recipe from your unit's registry — draft, published, flagged or superseded — to
-        publish it, change its schedule, reopen it for a further edit, or run it.
+        Pick a pipeline from your unit's registry — draft, deployed, needing attention or a previous
+        version — to deploy it or reopen it for a further edit.
       </p>
       {error && <div role="alert">{error}</div>}
       {recipes === null && !error && <p>Loading…</p>}
       {recipes && recipes.length === 0 && (
         <p style={{ color: "var(--text-secondary)" }}>
-          No recipes yet — start one in Connect first.
+          No pipelines yet — start one on the Pipelines tab first.
         </p>
       )}
       {recipes && recipes.length > 0 && (
@@ -118,7 +133,7 @@ function RecipeRegistryPicker({
           {recipes.map((r) => (
             <li key={r.recipe_id}>
               <Button onClick={() => onSelect(r)} style={{ width: "100%", textAlign: "left" }}>
-                {r.label} — {r.status} (v{r.version})
+                {r.label} — {statusWords(r.status)} (v{r.version})
               </Button>
             </li>
           ))}
@@ -131,12 +146,12 @@ function RecipeRegistryPicker({
 const ERROR_MESSAGES: Record<string, string> = {
   forbidden: "You don't hold the studio role this action needs.",
   studio_recipe_not_verified:
-    "This draft hasn't been verified since its last edit — go to Verify and run it again before publishing.",
-  studio_recipe_not_a_draft: "This recipe has already moved past draft — nothing to publish here.",
+    "This draft hasn't passed Test since its last edit — run Test again before deploying.",
+  studio_recipe_not_a_draft: "This pipeline has already moved past draft — nothing to deploy here.",
   studio_recipe_cannot_version:
-    "Only a published or flagged recipe can be reopened for a further edit.",
+    "Only a deployed pipeline, or one that needs attention, can be reopened for a further edit.",
   recipe_not_runnable:
-    "This recipe isn't published — a flagged, draft or superseded recipe can't be run.",
+    "This pipeline isn't deployed — a draft, a previous version or one that needs attention can't be run.",
   source_above_clearance:
     "This source is marked above your clearance, so you can't load it. A loader cleared for its marking must run it.",
 };
@@ -148,9 +163,9 @@ function friendlyError(err: unknown): string {
 
 const STATUS_LABEL: Record<string, string> = {
   draft: "Draft",
-  published: "Published",
-  flagged: "Flagged — ontology changed since publish",
-  superseded: "Superseded",
+  published: "Deployed",
+  flagged: "Needs attention — the ontology changed since it was deployed",
+  superseded: "Previous version",
 };
 
 export function PublishScreen({
@@ -161,6 +176,8 @@ export function PublishScreen({
   onBack,
   onSelectRecipe,
   onReopenedForEditing,
+  mode = "deploy",
+  onRan,
 }: PublishScreenProps) {
   const [draft, setDraft] = useState<StudioRecipeDraft | null>(null);
   // ADR-110 decision 7: the schedule as a structured choice in a named zone.
@@ -228,16 +245,22 @@ export function PublishScreen({
     return fresh;
   }
 
-  async function handlePublish() {
+  /** Deploy as vN (ADR-140 decision 14): commits the version and sets no schedule of its own — it
+   * carries whatever the draft already holds, which the Runs tab set. `andRun` is *Deploy and run
+   * now*, the common case: the same run *Run now* makes, once the version is committed. */
+  async function handlePublish(andRun: boolean) {
     setBusy(true);
     setError(null);
+    setLoadReport(null);
     try {
       await publishRecipe(apiBaseUrl, bearerToken, investigationId, recipeId, {
-        schedule_cron: cronOf(choice),
-        schedule_watch: scheduleWatch || null,
-        schedule_timezone: cronOf(choice) ? timezone : null,
+        schedule_cron: draft?.schedule_cron ?? null,
+        schedule_watch: draft?.schedule_watch ?? null,
+        schedule_timezone: draft?.schedule_cron ? (draft.schedule_timezone ?? null) : null,
       });
       await refresh();
+      if (andRun) setLoadReport(await runRecipe(apiBaseUrl, bearerToken, investigationId, recipeId));
+      onRan?.();
     } catch (err) {
       setError(friendlyError(err));
     } finally {
@@ -255,6 +278,7 @@ export function PublishScreen({
         schedule_timezone: cronOf(choice) ? timezone : null,
       });
       await refresh();
+      onRan?.();
     } catch (err) {
       setError(friendlyError(err));
     } finally {
@@ -267,6 +291,7 @@ export function PublishScreen({
     setError(null);
     try {
       setDraft(await setRecipeSchedulePaused(apiBaseUrl, bearerToken, investigationId, recipeId, paused));
+      onRan?.();
     } catch (err) {
       setError(friendlyError(err));
     } finally {
@@ -298,6 +323,7 @@ export function PublishScreen({
       // file is offered; the route refuses in words when that file has changed since.
       const report = await runRecipe(apiBaseUrl, bearerToken, investigationId, recipeId);
       setLoadReport(report);
+      onRan?.();
     } catch (err) {
       setError(friendlyError(err));
     } finally {
@@ -320,8 +346,11 @@ export function PublishScreen({
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: "var(--sp-8)" }}>
-        <Button onClick={onBack}>← Back</Button>
-        <h1 style={{ fontSize: "1.1em", margin: 0 }}>Publish{draft ? ` — ${draft.label}` : ""}</h1>
+        {mode === "deploy" && onBack && <Button onClick={onBack}>← Back</Button>}
+        <h1 style={{ fontSize: "1.1em", margin: 0 }}>
+          {mode === "deploy" ? "Deploy" : "Runs and schedule"}
+          {draft ? ` — ${draft.label}` : ""}
+        </h1>
         <div style={{ flex: 1 }} />
         <span
           style={{
@@ -360,12 +389,20 @@ export function PublishScreen({
             padding: "var(--sp-8)",
           }}
         >
-          The ontology has changed since this recipe was published (it targets version{" "}
-          {draft.ontology_version}). Its scheduled runs are blocked until someone reopens it,
-          checks the mapping still holds, and republishes.
+          This pipeline needs attention: the ontology has changed since it was deployed (it targets
+          version {draft.ontology_version}). Its scheduled runs are blocked until someone reopens it,
+          checks the mapping still holds, and deploys it again.
         </div>
       )}
 
+      {mode === "deploy" && status !== "draft" && (
+        <p style={{ margin: 0, color: "var(--text-secondary)", maxWidth: 560 }}>
+          Deploying commits a version; it does not run it or schedule it. This pipeline is run, and
+          its schedule and folder watch are set, on the Runs tab.
+        </p>
+      )}
+
+      {mode === "operate" && (
       <Panel title="Schedule">
         <div style={{ display: "flex", flexDirection: "column", gap: "var(--sp-8)", maxWidth: 480 }}>
           <ScheduleEditor
@@ -403,12 +440,13 @@ export function PublishScreen({
               : "This recipe belongs to no dataset, so it has no folder to watch."}
           </p>
           <p style={{ color: "var(--text-secondary)", fontSize: "0.85em" }}>
-            A recipe may be published unscheduled and run only on demand.
+            A pipeline may be deployed unscheduled and run only on demand.
           </p>
         </div>
       </Panel>
+      )}
 
-      {runs && (
+      {mode === "operate" && runs && (
         <Panel title="Runs">
           {runs.length === 0 ? (
             <p style={{ margin: 0, color: "var(--text-secondary)" }}>It has not run yet.</p>
@@ -429,44 +467,49 @@ export function PublishScreen({
         </Panel>
       )}
 
-      {status === "published" && (
+      {mode === "operate" && status === "published" && (
         <Panel title="Run">
           <p style={{ margin: 0, maxWidth: 480 }}>
-            Runs on the file Verify checked. If that file has changed since, or the source is
-            another file, Run says so and loads nothing: run Verify again first.
+            Runs on the file Test checked. If that file has changed since, or the source is
+            another file, Run says so and loads nothing: run Test again first.
           </p>
         </Panel>
       )}
 
       <div style={{ display: "flex", gap: "var(--sp-8)", flexWrap: "wrap" }}>
-        {status === "draft" && (
-          <Button onClick={() => void handlePublish()} variant="primary" disabled={busy}>
-            {busy ? "Publishing…" : "Publish"}
-          </Button>
+        {mode === "deploy" && status === "draft" && draft && (
+          <RightButton right="publish_pipelines" onClick={() => void handlePublish(false)} variant="primary" disabled={busy}>
+            {busy ? "Deploying…" : `Deploy as v${draft.version}`}
+          </RightButton>
         )}
-        {canEditSchedule && (
-          <Button onClick={() => void handleUpdateSchedule()} disabled={busy}>
+        {mode === "deploy" && status === "draft" && (
+          <RightButton right={["publish_pipelines", "run_pipelines"]} onClick={() => void handlePublish(true)} disabled={busy || !investigationId}>
+            Deploy and run now
+          </RightButton>
+        )}
+        {mode === "operate" && canEditSchedule && (
+          <RightButton right={SCHEDULE_RIGHTS} onClick={() => void handleUpdateSchedule()} disabled={busy}>
             {busy ? "Saving…" : "Update schedule"}
-          </Button>
+          </RightButton>
         )}
-        {canEditSchedule && (draft?.schedule_cron || draft?.schedule_watch) && (
-          <Button onClick={() => void handlePause(!draft.schedule_paused)} disabled={busy}>
+        {mode === "operate" && canEditSchedule && (draft?.schedule_cron || draft?.schedule_watch) && (
+          <RightButton right={SCHEDULE_RIGHTS} onClick={() => void handlePause(!draft.schedule_paused)} disabled={busy}>
             {draft.schedule_paused ? "Resume schedule" : "Pause schedule"}
-          </Button>
+          </RightButton>
         )}
-        {(status === "published" || status === "flagged") && (
-          <Button onClick={() => void handleReopen()} disabled={busy}>
+        {mode === "deploy" && (status === "published" || status === "flagged") && (
+          <RightButton right="edit_pipelines" onClick={() => void handleReopen()} disabled={busy}>
             {busy ? "Reopening…" : "Reopen for editing"}
-          </Button>
+          </RightButton>
         )}
-        {status === "published" && (
-          <Button
+        {mode === "operate" && status === "published" && (
+          <RightButton right="run_pipelines"
             onClick={() => void handleRun()}
             disabled={busy || !investigationId}
             title={investigationId ? undefined : "No investigation to attribute this load to yet"}
           >
             {busy ? "Running…" : "Run now"}
-          </Button>
+          </RightButton>
         )}
       </div>
 
@@ -484,11 +527,14 @@ export function PublishScreen({
             <li>Load id: {loadReport.load_id}</li>
             <li>Counts withheld — {COUNTS_WITHHELD_REASON}</li>
           </ul>
+          {/* ADR-140 decision 16: the expert steps are disclosed whether or not the counts are. */}
+          <ExpertDisclosure steps={loadReport.expert_steps} />
         </Panel>
       )}
 
       {loadReport && !loadReport.withheld && (
         <Panel title="Load result">
+          <ExpertDisclosure steps={loadReport.expert_steps} />
           <ul style={{ margin: 0, paddingLeft: "var(--sp-16)" }}>
             <li>Load id: {loadReport.load_id}</li>
             <li>Rows read: {loadReport.rows_read}</li>
@@ -504,12 +550,26 @@ export function PublishScreen({
             <li>Nodes referenced: {loadReport.nodes_referenced}</li>
             <li>Edges created: {loadReport.edges_created}</li>
             <li>Rows rejected: {(loadReport.rejections ?? []).length}</li>
+            {/* L3.H1 (ADR-146 decision 4): the drawn-watch alerts this load raised for the one who ran it. */}
+            {(loadReport.drawn_watch_alerts ?? 0) > 0 && <li>{drawnWatchWords(loadReport.drawn_watch_alerts ?? 0)}</li>}
             {(loadReport.rows_held ?? 0) > 0 && (
               <li>
-                Rows held for review: {loadReport.rows_held} — a reviewer releases or rejects them in Monitoring › Held rows
+                Rows held for review: {loadReport.rows_held} — a reviewer releases or rejects them on the Runs tab or in Monitoring › Held rows
               </li>
             )}
           </ul>
+          {/* ADR-110 Amendments 8 and 10: what a source refresh withdrew or left unread, in words. */}
+          {[...((loadReport as LoadReportView).refresh_notes ?? []),
+            ...(pipelineRunOf(loadReport)?.branches ?? []).flatMap((b) => b.report.refresh_notes ?? [])].length > 0 && (
+            <ul style={{ margin: 0, paddingLeft: "var(--sp-16)" }} aria-label="What the refresh did">
+              {[...((loadReport as LoadReportView).refresh_notes ?? []),
+                ...(pipelineRunOf(loadReport)?.branches ?? []).flatMap((b) => b.report.refresh_notes ?? [])].map((note, i) => (
+                <li key={i}>{note}</li>
+              ))}
+            </ul>
+          )}
+          {/* ADR-110 Amendment 6 point 9: what the run cost. */}
+          {loadReport.metering && <p className="label" style={{ margin: 0 }}>{`Cost: ${meteringInWords(loadReport.metering)}.`}</p>}
           {/* ADR-109 ruling 1: what the case's rules did to this load, in words — a held load must
               never read as a load that simply made nothing (rule 2). */}
           {(loadReport.rule_notes ?? []).length > 0 && (

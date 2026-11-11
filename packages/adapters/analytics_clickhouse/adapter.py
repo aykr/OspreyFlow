@@ -28,7 +28,7 @@ from typing import Any, cast
 from adapters.analytics_duckdb.access_filter import AccessFilter, SqlPredicate
 from adapters.analytics_duckdb.alert_facts import alert_predicate, series_expression
 from ontology.handling import HandlingScheme
-from ports.analytics import TrendLimitExceeded
+from ports.analytics import TrendLimitExceeded, refuse_an_amount_total_out_of_range
 from schemas.analytics import (
     ActivityRequest,
     ActivityResult,
@@ -69,6 +69,7 @@ from schemas.analytics import (
 from schemas.domain import Handling, Interval, Principal
 
 from .client import ClickHouseClient, utc_text
+from .schema import EVENT_COLUMNS
 
 #: The same columns a `CATEGORICAL` dimension may bucket by directly as the DuckDB adapter's.
 _TOP_LEVEL_FIELDS = frozenset({"edge_type", "source_id", "target_id", "cell_site", "direction"})
@@ -105,6 +106,18 @@ def _field_expression(field: str) -> str:
     return _property(name)
 
 
+def _decimal_amount(field: str | None) -> str:
+    """A declared amount as a decimal of 38 digits, 9 after the point, as the DuckDB adapter reads
+    it, so a total a rule compares is the same on both: read from the number's shortest text (0.1
+    and 0.2 make 0.3). One that is not such a decimal (1e30, inf) is NULL, no amount: summed and
+    counted as none. Running sums are Decimal256, so no total wraps (ADR-133 Amendment 10)."""
+    if field is None:
+        return "CAST(NULL AS Nullable(Decimal128(9)))"
+    # Rounded to 9 places first (as DuckDB's cast to DECIMAL(38, 9) rounds), so a tenth digit is
+    # never truncated here and rounded there.
+    return f"toDecimal128OrNull(toString(round(toFloat64OrNull({_field_expression(field)}), 9)), 9)"
+
+
 def _time(value: object) -> datetime:
     """ClickHouse's JSON gives a `DateTime64` as `YYYY-MM-DD hh:mm:ss.ffffff`, in the column's
     zone (UTC), and a `Date` as `YYYY-MM-DD`."""
@@ -116,9 +129,24 @@ def _time(value: object) -> datetime:
 
 def _row_to_event(row: Sequence[Any]) -> EventRecord:
     (
-        event_id, edge_id, edge_type, source_id, target_id, occurred_at, duration_s, cell_site,
-        lat, lon, direction, properties, investigation_scope, classification, handling_code,
-        owning_unit, originator, load_id,
+        event_id,
+        edge_id,
+        edge_type,
+        source_id,
+        target_id,
+        occurred_at,
+        duration_s,
+        cell_site,
+        lat,
+        lon,
+        direction,
+        properties,
+        investigation_scope,
+        classification,
+        handling_code,
+        owning_unit,
+        originator,
+        load_id,
     ) = row
     return EventRecord(
         event_id=event_id,
@@ -189,6 +217,10 @@ _COVERED = (
 #: and the `weekday_hours` predicate so the two cannot drift. UTC; weekday 0 = Monday.
 _WEEKDAY_SQL = "toInt32(toDayOfWeek(occurred_at)) - 1"
 _HOUR_SQL = "toInt32(toHour(occurred_at))"
+
+
+#: Event ids per statement when a refresh sets events aside (`withdraw_events_by_id`).
+_WITHDRAW_CHUNK = 1_000
 
 
 class AnalyticsClickHouseAdapter:
@@ -340,9 +372,7 @@ class AnalyticsClickHouseAdapter:
             )
         ]
         points = [
-            TrendPoint(
-                period_start=_time(p), series=None if g is None else str(g), value=float(v)
-            )
+            TrendPoint(period_start=_time(p), series=None if g is None else str(g), value=float(v))
             for p, g, v, _, _ in rows
         ]
         return TrendResult(
@@ -745,34 +775,46 @@ class AnalyticsClickHouseAdapter:
 
     # --- event_frequency (ADR-133 decision 1, stage (b)), as the DuckDB adapter's ---------------
 
-    async def event_frequency(
-        self, req: FrequencyRequest, principal: Principal
-    ) -> FrequencyResult:
+    async def event_frequency(self, req: FrequencyRequest, principal: Principal) -> FrequencyResult:
         predicate = self._predicate(req.filter, principal)
         subjects = req.filter.node_ids
         marks = ",".join("?" for _ in subjects)
-        amount = (
-            "CAST(NULL AS Nullable(Float64))"
-            if req.amount_property is None
-            else f"toFloat64OrNull({_field_expression(req.amount_property)})"
-        )
+        amount = _decimal_amount(req.amount_property)
         # Each event once per subject it touches: an event to itself is one event, not two.
         touched = (
-            f"SELECT source_id AS node, toUnixTimestamp64Milli(occurred_at) AS at, "
-            f"{amount} AS amount FROM events WHERE {predicate.where} AND source_id IN ({marks}) "
+            f"SELECT source_id AS node, occurred_at AS at, {amount} AS amount "
+            f"FROM events WHERE {predicate.where} AND source_id IN ({marks}) "
             "UNION ALL "
-            f"SELECT target_id AS node, toUnixTimestamp64Milli(occurred_at) AS at, "
-            f"{amount} AS amount FROM events "
+            f"SELECT target_id AS node, occurred_at AS at, {amount} AS amount FROM events "
             f"WHERE {predicate.where} AND target_id IN ({marks}) AND target_id != source_id"
         )
-        span_ms = int(req.span_days) * 86_400_000
+        # An event's span is every event of its subject from span_days before it up to and including
+        # its own instant, ties included, as DuckDB's RANGE … CURRENT ROW counts it. ClickHouse
+        # refuses a RANGE offset of 2^31 or more (25 days in milliseconds is past it; L2.10's live
+        # run, ClickHouse 25.8), so: each event's running count, non-null amounts and sum up to and
+        # with its instant (a RANGE frame with no offset), less the running figures of the last
+        # instant strictly before `at - span_days` (an ASOF JOIN on the DateTime64 itself, exact to
+        # the microsecond the column holds). Sorting, not pairing: n log n per subject. The sums are
+        # Decimal, so the subtraction is exact.
+        days = int(req.span_days)
         rows = await self._ch.rows(
-            "SELECT node, max(n), max(total) FROM ("
-            "  SELECT node, count() OVER span AS n, sum(amount) OVER span AS total "
-            f"  FROM ({touched}) "
-            "  WINDOW span AS (PARTITION BY node ORDER BY at "
-            f"  RANGE BETWEEN {span_ms} PRECEDING AND CURRENT ROW)"
-            ") GROUP BY node",
+            f"WITH touched AS ({touched}), "
+            "running AS ("
+            "  SELECT node, at, count() OVER w AS c, count(amount) OVER w AS nn, "
+            "  sum(toDecimal256(ifNull(amount, toDecimal128(0, 9)), 9)) OVER w AS s "
+            "  FROM touched "
+            "  WINDOW w AS (PARTITION BY node ORDER BY at "
+            "  RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
+            ") "
+            "SELECT a.node, max(a.c - b.c), "
+            "max(if(a.nn = b.nn, CAST(NULL AS Nullable(Float64)), toFloat64(a.s - b.s))), "
+            # Decimal256 cannot wrap; a span's total past the limit is refused all the same, as the
+            # DuckDB adapter must refuse it (ADR-133 Amendment 10).
+            "max(abs(toFloat64(a.s - b.s))) "
+            f"FROM (SELECT node, at - INTERVAL {days} DAY AS cut, c, nn, s FROM running) AS a "
+            "ASOF LEFT JOIN running AS b ON a.node = b.node AND a.cut > b.at "
+            # An event with nothing before its span joins no row: its figures less zeros.
+            "GROUP BY a.node SETTINGS join_use_nulls = 0",
             [*predicate.params, *subjects, *predicate.params, *subjects],
         )
         window = req.filter.window
@@ -791,8 +833,10 @@ class AnalyticsClickHouseAdapter:
             [*unbounded.params, *upper_params, *subjects,
              *unbounded.params, *upper_params, *subjects],
         )  # fmt: skip
+        refuse_an_amount_total_out_of_range(*(None if g is None else float(g) for *_, g in rows))
         found = {
-            str(node): (int(n), None if total is None else float(total)) for node, n, total in rows
+            str(node): (int(n), None if total is None else float(total))
+            for node, n, total, _ in rows
         }
         return FrequencyResult(
             nodes={
@@ -807,19 +851,13 @@ class AnalyticsClickHouseAdapter:
 
     # --- account_activity (ADR-133 decision 2, stage (c)) -------------------------------------
 
-    async def account_activity(
-        self, req: ActivityRequest, principal: Principal
-    ) -> ActivityResult:
+    async def account_activity(self, req: ActivityRequest, principal: Principal) -> ActivityResult:
         window = req.filter.window
         assert window is not None and window.valid_from is not None and window.valid_to is not None
         unbounded = self._predicate(req.filter.model_copy(update={"window": None}), principal)
         subjects = req.filter.node_ids
         marks = ",".join("?" for _ in subjects)
-        amount = (
-            "CAST(NULL AS Nullable(Float64))"
-            if req.amount_property is None
-            else f"toFloat64OrNull({_field_expression(req.amount_property)})"
-        )
+        amount = _decimal_amount(req.amount_property)
         touched = (
             f"SELECT source_id AS node, occurred_at, {amount} AS amount FROM events "
             f"WHERE {unbounded.where} AND occurred_at <= ? AND source_id IN ({marks}) "
@@ -832,9 +870,10 @@ class AnalyticsClickHouseAdapter:
         baseline_start = start - timedelta(days=req.baseline_days)
         recent, before = "occurred_at >= ?", "occurred_at < ? AND occurred_at >= ?"
         rows = await self._ch.rows(
-            f"SELECT node, countIf({recent}), sumIf(amount, {recent} AND amount IS NOT NULL), "
+            f"SELECT node, countIf({recent}), "
+            f"sumIf(toDecimal256(amount, 9), {recent} AND amount IS NOT NULL), "
             f"countIf({recent} AND amount IS NOT NULL), "
-            f"countIf({before}), sumIf(amount, {before} AND amount IS NOT NULL), "
+            f"countIf({before}), sumIf(toDecimal256(amount, 9), {before} AND amount IS NOT NULL), "
             f"countIf({before} AND amount IS NOT NULL), "
             "minIf(occurred_at, occurred_at >= ?), maxIf(occurred_at, occurred_at < ?), "
             "countIf(occurred_at < ?) "
@@ -845,11 +884,16 @@ class AnalyticsClickHouseAdapter:
              *unbounded.params, window.valid_to, *subjects,
              *unbounded.params, window.valid_to, *subjects],
         )  # fmt: skip
+        # A sumIf over amounts none of which is present is NULL, not 0: no total to refuse.
+        refuse_an_amount_total_out_of_range(
+            *(None if t is None else float(t) for row in rows for t in (row[2], row[5]))
+        )
         nodes: dict[str, NodeActivity] = {}
         for row in rows:
             node, n_recent, t_recent, a_recent, n_base, t_base, a_base, first, last, n_before = row
-            # ClickHouse's sumIf of nothing is 0, and minIf/maxIf of nothing a zero date: read
-            # through the counts, so an absent total or time is `None` as the contract says.
+            # ClickHouse's sumIf over no amount present is NULL (over no row at all, 0), and
+            # minIf/maxIf of nothing a zero date: each read through its count, so an absent total or
+            # time is `None` as the contract says.
             nodes[str(node)] = NodeActivity(
                 recent_count=int(n_recent),
                 recent_total=float(t_recent) if int(a_recent) else None,
@@ -898,7 +942,73 @@ class AnalyticsClickHouseAdapter:
         removed = int(row[0])
         if removed:
             await self._ch.command("ALTER TABLE events DELETE WHERE load_id = ?" + _SYNC, [load_id])
-        return removed
+        # ADR-110 Amendment 8 point 1: those set aside too, so no restore brings them back.
+        (row,) = await self._ch.rows(
+            "SELECT count() FROM withdrawn_events WHERE load_id = ?", [load_id]
+        )
+        aside = int(row[0])
+        if aside:
+            await self._ch.command(
+                "ALTER TABLE withdrawn_events DELETE WHERE load_id = ?" + _SYNC, [load_id]
+            )
+        return removed + aside
+
+    async def withdraw_events_by_id(self, event_ids: Sequence[str], load_id: str) -> int:
+        """`AnalyticsPort.withdraw_events_by_id`: exactly these events copied to `withdrawn_events`,
+        marked with `load_id`, then deleted from `events` (the mutation waited for). ClickHouse has
+        no transaction across the two, so each step is safe to repeat: an event already copied is
+        not copied again, and a rerun after a failure between them finishes the move."""
+        unique = list(dict.fromkeys(event_ids))
+        moved = 0
+        # In bounded chunks: no statement grows with the rows withdrawn.
+        for start in range(0, len(unique), _WITHDRAW_CHUNK):
+            ids = unique[start : start + _WITHDRAW_CHUNK]
+            (row,) = await self._ch.rows("SELECT count() FROM events WHERE has(?, event_id)", [ids])
+            found = int(row[0])
+            if found:
+                await self._ch.command(
+                    # The ids bound once (`WITH`): the parameters ride in the request's URL.
+                    f"INSERT INTO withdrawn_events ({EVENT_COLUMNS}, withdrawn_by_load) "
+                    f"WITH ? AS ids SELECT {EVENT_COLUMNS}, ? FROM events WHERE has(ids, event_id) "
+                    "AND event_id NOT IN "
+                    "(SELECT event_id FROM withdrawn_events WHERE has(ids, event_id))",
+                    [ids, load_id],
+                )
+                await self._ch.command(
+                    "ALTER TABLE events DELETE WHERE has(?, event_id)" + _SYNC, [ids]
+                )
+            moved += found
+        return moved
+
+    async def restore_withdrawn_events(self, load_id: str) -> int:
+        """`AnalyticsPort.restore_withdrawn_events`: the events `load_id` set aside, copied back as
+        they were, then deleted from `withdrawn_events`; each step safe to repeat, as above. Read
+        and copied in bounded chunks, by event id: no statement grows with the events restored."""
+        moved = 0
+        after = ""
+        while True:
+            page = await self._ch.rows(
+                "SELECT DISTINCT event_id FROM withdrawn_events "
+                "WHERE withdrawn_by_load = ? AND event_id > ? ORDER BY event_id LIMIT ?",
+                [load_id, after, _WITHDRAW_CHUNK],
+            )
+            ids = [str(r[0]) for r in page]
+            if not ids:
+                break
+            await self._ch.command(
+                f"INSERT INTO events ({EVENT_COLUMNS}) "
+                f"WITH ? AS ids SELECT {EVENT_COLUMNS} FROM withdrawn_events "
+                "WHERE withdrawn_by_load = ? AND has(ids, event_id) "
+                "AND event_id NOT IN (SELECT event_id FROM events WHERE has(ids, event_id))",
+                [ids, load_id],
+            )
+            moved += len(ids)
+            after = ids[-1]
+        if moved:
+            await self._ch.command(
+                "ALTER TABLE withdrawn_events DELETE WHERE withdrawn_by_load = ?" + _SYNC, [load_id]
+            )
+        return moved
 
     async def events_of_load_among(self, load_id: str, event_ids: Sequence[str]) -> set[str]:
         """`AnalyticsPort.events_of_load_among`: by `event_id` and `load_id`, no access step.

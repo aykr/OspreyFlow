@@ -41,12 +41,10 @@ describe("Home's figures", () => {
   const home = summariseHome(BASE);
 
   it("counts the team's queue and what is claimed by the reader, and says which cases it could not read", () => {
-    expect(home.glass.map((f) => f.text)).toEqual([
-      "3 alerts in your team's queue, 1 claimed by you",
-      "The queue of 1 case could not be read",
-      "2 cases open to you, last worked on Operation Ledger — AML review",
-    ]);
-    expect(home.glass[1]!.tone).toBe("error");
+    // ADR-146 decision 2: the alerts are Rules and Monitoring's, on its card.
+    expect(home.rules.map((f) => f.text)).toEqual(["3 alerts in your team's queue, 1 claimed by you", "The queue of 1 case could not be read"]);
+    expect(home.rules[1]!.tone).toBe("error");
+    expect(home.glass.map((f) => f.text)).toEqual(["2 cases open to you, last worked on Operation Ledger — AML review"]);
   });
 
   it("counts rows still held and recipes flagged", () => {
@@ -90,11 +88,13 @@ describe("Home's figures", () => {
   it("lists what needs the reader, newest first: their own and unclaimed alerts, held rows by case, failing pulls", () => {
     expect(home.attention.map((a) => [a.place, a.title])).toEqual([
       ["admin", "osprey-dashboard-compliance-board is not updating"],
-      ["glass", "KYC screening alert in Operation Ledger — AML review"],
+      ["rules", "KYC screening alert in Operation Ledger — AML review"],
       ["ingest", "2 rows held for review in Operation Ledger — AML review"],
-      ["glass", "KYC screening alert in Operation Ledger — AML review"],
+      ["rules", "KYC screening alert in Operation Ledger — AML review"],
     ]);
     expect(home.attention[3]!.detail).toBe("Finding a2 in words. Claimed by you.");
+    // ADR-146 decision 6: an alert's row opens the alert, so it carries the alert's id.
+    expect(home.attention.filter((a) => a.place === "rules").every((a) => a.alertId)).toBe(true);
     expect(home.attention.some((a) => a.detail.includes("a3"))).toBe(false);
   });
 
@@ -147,5 +147,69 @@ describe("the team queue's count", () => {
   it("counts open and claimed alerts, never decided ones", () => {
     const at = (status: string) => ({ alert: { status } });
     expect(openInQueue([at("open"), at("claimed"), at("closed"), at("open")])).toBe(3);
+  });
+
+  // ADR-146 decision 6 (G9): a close proposed for a second person is still open, for the banner's
+  // Monitoring count (which reads this) as for Home.
+  it("counts a proposed close as open", () => {
+    const at = (status: string) => ({ alert: { status } });
+    expect(openInQueue([at("closing"), at("open"), at("closed")])).toBe(2);
+  });
+
+  it("counts a proposed close as open on Home", () => {
+    const withClosing: HomeInputs = {
+      ...BASE,
+      perCase: { ...BASE.perCase, c1: { ...BASE.perCase.c1!, alerts: [alert("a5", "closing", "u-other", "2026-10-13T08:00:00Z")] } },
+    };
+    expect(summariseHome(withClosing).rules[0]!.text).toBe("1 alert in your team's queue, 0 claimed by you");
+  });
+});
+
+// ADR-146 Amendment 2 point 3: a reader of the queue whom Rules and Monitoring is not offered to (the
+// Data Engineer) is refused its rows and given its counts: Home says how many, and lists no alert.
+describe("the queue as counts alone", () => {
+  it("reads the counts when the rows are refused, and lists no alert", async () => {
+    const asked: string[] = [];
+    const fetcher = (async (url: string) => {
+      const path = url.replace("http://api", "");
+      asked.push(path);
+      if (path === "/v1/investigations") return new Response(JSON.stringify(CASES));
+      if (path.endsWith("/alert-queue")) return new Response(JSON.stringify({ detail: { error: "queue_rows_not_offered" } }), { status: 403 });
+      if (path.endsWith("/alert-queue/counts")) return new Response(JSON.stringify({ open: 2, claimed: 1, closing: 0 }));
+      return new Response("{}", { status: 404 });
+    }) as unknown as typeof fetch;
+    const read = await loadHome({ apiBaseUrl: "http://api", bearerToken: "t", rights: new Set(["read_alert_queue"]),
+                                  me: "u-me", lastCaseId: null, now: NOW, fetcher });  // prettier-ignore
+    expect(read.perCase.c1!.alerts).toBeUndefined();
+    expect(read.perCase.c1!.alertCounts).toEqual({ open: 2, claimed: 1, closing: 0 });
+    const home = summariseHome(read);
+    expect(home.attention.filter((r) => r.place === "rules")).toEqual([]);
+    expect(home.rules.map((f) => f.text)).toEqual(["6 alerts open in your cases' queues"]);
+  });
+
+  it("asks for no counts where the rows are given", async () => {
+    const asked: string[] = [];
+    const fetcher = (async (url: string) => {
+      const path = url.replace("http://api", "");
+      asked.push(path);
+      if (path === "/v1/investigations") return new Response(JSON.stringify(CASES));
+      if (path.endsWith("/alert-queue")) return new Response("[]");
+      return new Response("{}", { status: 404 });
+    }) as unknown as typeof fetch;
+    await loadHome({ apiBaseUrl: "http://api", bearerToken: "t", rights: new Set(["read_alert_queue"]),
+                     me: "u-me", lastCaseId: null, now: NOW, fetcher });  // prettier-ignore
+    expect(asked.filter((p) => p.endsWith("/counts") && p.includes("alert-queue"))).toEqual([]);
+  });
+});
+
+describe("an alert row's rule group (ADR-145 Amendment 4 decision 10)", () => {
+  it("names the group the figures count the alert under, for the Reports Viewer's Open the dashboard", () => {
+    const hotlist = { ...alert("h1", "open", null, "2026-10-13T08:00:00Z"), kind: "hotlist" };
+    const read = summariseHome({ ...BASE, perCase: { c1: { alerts: [alert("a1", "open", null, "2026-10-13T06:46:00Z"), hotlist] } } });
+    const rules = read.attention.filter((a) => a.alertId).map((a) => [a.alertId, a.alertRule]);
+    expect(rules).toEqual(expect.arrayContaining([
+      ["a1", { label: "typology", typology: alert("a1", "open", null, "").alert.typology ?? "" }],
+      ["h1", { label: "hotlists", typology: "" }],
+    ]));  // prettier-ignore
   });
 });

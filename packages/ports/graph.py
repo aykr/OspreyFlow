@@ -9,7 +9,7 @@ above this port may see it.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, runtime_checkable
 
@@ -19,6 +19,7 @@ from schemas.domain import (
     EdgeId,
     EdgeWrite,
     ExpandRequest,
+    Grading,
     ListNodesPage,
     NeighbourhoodStats,
     Node,
@@ -42,6 +43,7 @@ from schemas.explore import (
     SharedContacts,
     TypeCounts,
 )
+from schemas.ingest import LinkPriorState
 from schemas.strength import (
     ActiveInfluencer,
     LinkStrength,
@@ -73,6 +75,57 @@ class StoredNode:
     reverted: bool
     #: Replaced by a correction (`supersede_node`): the successor is a node of its own.
     superseded: bool = False
+    #: That successor's id, as the store holds it (ADR-109 Amendment 10: the alert store's repoint
+    #: settle follows it to the newest revision). Not part of equality, so what the revert compares
+    #: is unchanged.
+    superseded_by: str | None = field(default=None, compare=False)
+
+
+@dataclass(frozen=True)
+class RestoredElements:
+    """What `GraphPort.restore_withdrawn` brought back: the nodes and links that load had withdrawn
+    and that are live again. A link left withdrawn because its pair was written again since is not
+    among them."""
+
+    node_ids: tuple[NodeId, ...] = ()
+    edge_ids: tuple[EdgeId, ...] = ()
+
+
+class NotPromotable(Exception):
+    """`GraphPort.promote_elements` refused whole, before anything is written: one of the ids is
+    not a live element (missing, reverted, withdrawn or superseded). Says how many, never which."""
+
+    def __init__(self, count: int) -> None:
+        super().__init__(f"{count} element(s) cannot be promoted: not live")
+        self.count = count
+
+
+@dataclass(frozen=True)
+class PromotionReverted:
+    """What `GraphPort.revert_promotion` took the dataset back from, or `withdraw_layer`
+    withdrew."""
+
+    nodes: int = 0
+    edges: int = 0
+
+
+#: `supersede_node`'s report of one cloned link: the original's id, its clone's, and the original's
+#: type (two types may hold one id, ADR-110 Amendment 18), awaited before the transaction commits.
+LinkCloned = Callable[[str, str, str], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class DatasetFootprint:
+    """What `GraphPort.dataset_footprints` says of one dataset, for one reader: how many live nodes
+    and links of it the reader may read, the size of their stored properties (the length of the
+    properties as the store renders them, counted in the store) and the file sizes of its pictures
+    (image Documents' `size_bytes`). Numbers only."""
+
+    nodes: int = 0
+    edges: int = 0
+    properties_bytes: int = 0
+    #: A picture attached before `size_bytes` was written counts 0.
+    picture_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -82,6 +135,11 @@ class StoredLink:
 
     reverted: bool
     superseded: bool
+    #: The link that replaced it, as the store holds it (ADR-109 Amendment 10). Not part of
+    #: equality, so what the revert compares is unchanged.
+    superseded_by: str | None = field(default=None, compare=False)
+    #: How many link types hold the id (ADR-110 Amendment 18: two may). Not part of equality.
+    held_by: int = field(default=1, compare=False)
 
 
 class RarityTooLarge(Exception):
@@ -194,7 +252,14 @@ class GraphPort(Protocol):
         back is whichever the store answered last: the port does not choose between them."""
         ...
 
-    async def supersede_node(self, node_id: NodeId, replacement: NodeWrite, tx: TxId) -> NodeId:
+    async def supersede_node(
+        self,
+        node_id: NodeId,
+        replacement: NodeWrite,
+        tx: TxId,
+        *,
+        on_link_cloned: LinkCloned | None = None,
+    ) -> NodeId:
         """`01_DOMAIN_MODEL.md` §2.4: "Nodes are versioned, not
         overwritten. A correction writes a new revision and points the old
         one forward." Writes `replacement` as a new node at
@@ -212,11 +277,22 @@ class GraphPort(Protocol):
         every TinkerPop-family store), so a correction does not silently
         disconnect the corrected node from its own network. The
         superseded originals of those edges are excluded from ordinary
-        reads the same way `node_id` itself now is."""
+        reads the same way `node_id` itself now is.
+
+        Each original also names its clone as `superseded_by` (its stored
+        state, `stored_link_states`), and each clone is reported to
+        `on_link_cloned` as `(old, new, old_type)` inside `tx`, before its
+        commit: an alert citing the original follows it to the clone
+        through the alert store's repoint journal, as it follows a
+        `supersede_edge` (`06_DECISIONS.md` ADR-109 Amendment 11)."""
         ...
 
-    async def supersede_edge(self, edge_id: EdgeId, replacement: EdgeWrite, tx: TxId) -> EdgeId:
-        """The same operation as `supersede_node`, for an edge. `§3`:
+    async def supersede_edge(
+        self, edge_id: EdgeId, replacement: EdgeWrite, tx: TxId, *, old_type: str
+    ) -> EdgeId:
+        """The same operation as `supersede_node`, for an edge. `old_type` is the old link's own
+        type (the ontology's name), which every caller holds: the old link is read and marked in
+        that type alone, never another type holding the same id (ADR-110 Amendment 18). `§3`:
         an edge carries `AuditStub` too, and `01_DOMAIN_MODEL.md` §5's
         `Judgement.supporting`/`contradicting` can name an `EdgeId`
         directly — a correction to the evidence itself must leave that
@@ -296,7 +372,15 @@ class GraphPort(Protocol):
         Access-filtered exactly like every other read: a node whose
         identifier matches but whose handling excludes `principal` must not
         appear, count toward `limit`, or otherwise be detectable — the same
-        existence-leak discipline `find_node` itself already proves."""
+        existence-leak discipline `find_node` itself already proves.
+
+        A node in a `gazetteer-*` dataset matches a request reader on its
+        `name` alone, never on its gazetteer's source identifiers (rule 7,
+        ADR-147 Amendment 1 decision 3b), inside the traversal, so neither
+        a hit nor its absence tells the reader an identifier. No node of any
+        dataset matches a request reader on an identifier only a gazetteer
+        carries (`GAZETTEER_ONLY_IDENTIFIERS`, Amendment 3), as none is sent
+        one; a search on those alone matches nothing."""
         ...
 
     async def suggest_locations(
@@ -348,7 +432,13 @@ class GraphPort(Protocol):
 
         Never truncates silently (rule 2): returns at most `limit` nodes and sets `more` when
         another visible node matched. Access-filtered like every read (rule 3): a node whose
-        `handling` excludes `principal` must not appear, count toward `limit` or set `more`."""
+        `handling` excludes `principal` must not appear, count toward `limit` or set `more`.
+
+        A node in a `gazetteer-*` dataset matches a request reader on its `name` alone, never on
+        its gazetteer's source identifiers (rule 7, ADR-147 Amendment 1 decision 3b), inside the
+        traversal, so the rows, `more` and any count follow it. No node of any dataset matches a
+        request reader on an identifier only a gazetteer carries (`GAZETTEER_ONLY_IDENTIFIERS`,
+        Amendment 3)."""
         ...
 
     async def expand(self, req: ExpandRequest, principal: Principal) -> Subgraph: ...
@@ -416,6 +506,21 @@ class GraphPort(Protocol):
     async def neighbourhood_stats(
         self, node_id: NodeId, principal: Principal
     ) -> NeighbourhoodStats: ...
+
+    async def dataset_footprints(
+        self, dataset_ids: Sequence[str], principal: Principal
+    ) -> dict[str, DatasetFootprint]:
+        """ADR-143 Amendment 2 decision 2: for each dataset asked, what `principal` may read of it,
+        as counts: its live nodes and links, their properties' size and its pictures' file sizes.
+        Admin › Datasets reads each case's analyst layer this way, for cases the administrator is
+        no member of: the dataset is the one asked, in place of the principal's own, and
+        **everything else is the access step every read uses** (classification, handling code and
+        unit, reverted and superseded; a link counts only with both ends readable by those, its
+        ends in whichever dataset, so a link drawn from a loaded node counts), so a hidden
+        item is in no count and no size (rule 3; ADR-124 decision 10). Counted in the store's own
+        query: no element, id, label, property or object ref leaves it. Every id asked is answered,
+        zeros for one with nothing readable, so the answer says nothing of which exist."""
+        ...
 
     async def type_counts(self, principal: Principal) -> TypeCounts:
         """`06_DECISIONS.md` ADR-100: how many nodes of each entity type and links of each link
@@ -654,7 +759,10 @@ class GraphPort(Protocol):
     ) -> None:
         """Marks existing elements reverted (`AuditStub.reverted`,
         `01_DOMAIN_MODEL.md` §2.4) — `services/ingest/load_revert.py` is
-        the only caller. A reverted element is invisible to every read
+        its caller for a load, and `scripts/revert_promotion.py` (through
+        `drawn_merge.MergeCommit.undo_writes`) for a drawn merge's own
+        writes, its copies and links (ADR-143 Amendment 7). A reverted
+        element is invisible to every read
         method afterwards, any principal, the same way a hidden record is
         invisible to an unauthorised one; it is never actually deleted, so
         the audit trail stays intact. No `principal` argument, matching
@@ -668,14 +776,72 @@ class GraphPort(Protocol):
         anything is written. Setting the flag again changes nothing, so a rerun is safe."""
         ...
 
-    async def live_edges_touching(self, node_ids: Sequence[NodeId]) -> set[EdgeId]:
+    async def withdraw_elements(
+        self, node_ids: Sequence[NodeId], edge_ids: Sequence[EdgeId], load_id: str, tx: TxId
+    ) -> None:
+        """ADR-110 Amendment 6 point 3, as Amendment 15 leaves it: no refresh calls this since
+        Amendment 15 (a full snapshot withdraws its dropped rows' events alone, never an element);
+        it stays in the port, with its conformance, for `restore_withdrawn`'s records made before.
+        Each live one of `node_ids`/`edge_ids` is set reverted, so every read leaves it out for
+        every reader with no read changed, and `audit.withdrawn_by_load` records the refresh.
+        An element already reverted is left as it is (it is not this load's to
+        restore). Unknown ids and none are a safe no-op; resolved as `revert_elements` resolves
+        them, refusing an ambiguous id."""
+        ...
+
+    async def restore_withdrawn(self, load_id: str, tx: TxId) -> RestoredElements:
+        """The revert of the refresh `load_id`: every element it withdrew is live again, its
+        `withdrawn_by_load` cleared. Nothing else is touched, never an element reverted for another
+        reason (the revert of the load that made it clears `withdrawn_by_load`, so it is not found
+        here), and never a link whose pair (type and ends) has a live link written since: each link
+        is written once, so that one stays withdrawn. Running it again restores nothing."""
+        ...
+
+    async def promote_elements(
+        self,
+        node_ids: Sequence[NodeId],
+        edge_ids: Sequence[EdgeId],
+        dataset_id: str,
+        load_id: str,
+        tx: TxId,
+    ) -> None:
+        """ADR-143 decision 8: a promotion's one load. Each element gains `dataset_id` in its
+        `datasets` (ADR-099 decision 2's union: the same element, never a copy, never a merge of
+        two) and is stamped `promoted_by_load = load_id`; nothing else of it changes (its marking,
+        its provenance, its `analyst_drawn` class). Every id must be a live element not promoted by
+        another load already, or the call raises `NotPromotable` before anything is written (all
+        or nothing). A backend write, as
+        `revert_elements` is: no principal; the caller checks what the proposer may promote."""
+        ...
+
+    async def revert_promotion(self, load_id: str, dataset_id: str, tx: TxId) -> PromotionReverted:
+        """The revert of promotion `load_id`: `dataset_id` taken back from exactly the elements
+        that load promoted, and their stamp cleared, so each is in the analyst layer only again.
+        Nothing else is touched; running it again takes back nothing."""
+        ...
+
+    async def withdraw_layer(
+        self, dataset_id: str, withdrawal: str, tx: TxId
+    ) -> PromotionReverted:
+        """A removed case's layer deleted (ADR-143 Amendment 2 decision 1): every live element
+        whose `datasets` is exactly `[dataset_id]` is set reverted (`withdrawn_by_load =
+        withdrawal`), never deleted, so the audit keeps it. An element holding another dataset too
+        (one promoted from the layer) is never touched."""
+        ...
+
+    async def live_edges_touching(
+        self, node_ids: Sequence[NodeId], tx: TxId | None = None
+    ) -> set[EdgeId]:
         """ADR-127 Amendment 6. The ids of the live links (neither reverted nor superseded) with
         one of `node_ids` at either end, **whatever the caller may read**: no principal, no access
         step. For the revert alone, to tell whether a link outside the load being reverted rests on
         a node the load created (a later load may only have referenced the node, which its record
         keeps as a count). A route must never call it
         (`tests/test_unfiltered_node_lookup_confined.py`). Each id once however often given; no ids
-        give the empty set; a bare `str` is a `TypeError`."""
+        give the empty set; a bare `str` is a `TypeError`. Given `tx`, read inside that open
+        transaction (ADR-143 Amendment 5 decisions 8 and 12: a promotion's revert reads and writes
+        as one view), so a link it has written and not yet committed is seen; only a link between
+        nodes already committed is tested (the revert reads before it writes)."""
         ...
 
     async def live_nodes_naming_geometry(
@@ -696,17 +862,75 @@ class GraphPort(Protocol):
         another load or by an upload, and a fresh create over a reverted node), so this is how the
         revert tells that a node it created has since been written by someone else, and whether an
         earlier attempt already reverted it, and whether a correction has superseded it (its
-        successor is in no load's record). For the revert alone. No ids give `{}`; a bare `str` is
+        successor is in no load's record), and the node that superseded it (`superseded_by`, which
+        the alert store's repoint settle follows, ADR-109 Amendment 10). Graph data for the revert
+        and that settle alone (rule 3): never passed to a reader. No ids give `{}`; a bare `str` is
         a `TypeError`."""
         ...
 
-    async def stored_link_states(self, edge_ids: Sequence[EdgeId]) -> dict[EdgeId, StoredLink]:
-        """As `stored_writes`, for links: each stored link's `reverted` and `superseded` flags,
-        whatever the caller may read, each id found through its type's unique `id` index, over every
-        edge type. An id no link holds is absent. An id two types hold is answered as the worst of
-        them (superseded if either is, reverted only if both are). For the revert alone, which
-        refuses a load whose created link an analyst has changed. No ids give `{}`; a bare `str`
-        is a `TypeError`."""
+    async def stored_link_states(
+        self, edge_ids: Sequence[EdgeId], *, edge_type: str | None = None
+    ) -> dict[EdgeId, StoredLink]:
+        """As `stored_writes`, for links: each stored link's `reverted` and `superseded` flags and
+        its successor (`superseded_by`), whatever the caller may read, each id found through its
+        type's unique `id` index, over every edge type, or `edge_type`'s alone when given (another
+        type holding the id is then never reached). An id no link holds is absent. Over every type,
+        an id two types hold is answered as the worst of them (superseded if either is, reverted
+        only if both are), with `held_by` the number of types holding it. For the revert, which
+        refuses a load whose created link an analyst has changed, and the alert store's repoint
+        settle (ADR-109 Amendment 10) alone: never passed to a reader (rule 3). No ids give `{}`;
+        a bare `str` is a `TypeError`."""
+        ...
+
+    async def read_link_state(
+        self, edge_id: EdgeId, edge_type: str, tx: TxId | None = None
+    ) -> LinkPriorState | None:
+        """ADR-110 Amendment 16: the link of `edge_type` (the ontology's name) holding `edge_id`,
+        exactly as stored, whatever the caller may read, through that type's unique `id` index
+        alone (Amendment 18: a read names its type, so another type holding the id is never
+        reached or told of); inside `tx` when given, so a load reads it before its own write in the
+        same transaction. `None` if no link of that type holds the id. Graph data for the revert
+        alone (rule 3): never passed to a view, report or log.
+
+        **Opaque.** The state is the adapter's own stored form: `edge_type` is the ontology's name
+        for the link's type, and `stored` is the record as the adapter keeps it.
+        On ArcadeDB that is every stored property of the link (its `id`, ends, flattened and nested
+        handling, `reverted`, `superseded_by` when set, `datasets`, `properties` and their
+        flattened copies, `occurrences`, `weight`, `weight_components`, `provenance`, `basis`,
+        `interval`, `audit`) except the store's own `@` fields and the flattened `valid_from` and
+        `valid_to`, which a restore derives from `interval`. None of these changes unless the link
+        is written: nothing the store keeps for itself (a read time, a counter) is among them, so a
+        link nobody wrote reads back to the same `stored_digest`.
+        It means something only to `restore_link_state` on the same adapter, which puts it back
+        exactly (the conformance suite's round trip); no caller reads or interprets its parts,
+        beyond `handling`, `revision` and `load_id`."""
+        ...
+
+    async def restore_link_state(self, state: LinkPriorState, tx: TxId) -> bool:
+        """ADR-110 Amendment 16: puts the link back exactly as `state.stored` holds it, only while
+        the link still reads back to `state.left_digest` (as the load left it, `stored_digest`),
+        checked inside `tx`. `True` once it is back (and, nothing written, when it already reads
+        back to `state.stored`, so a rerun finishes); `False`, nothing changed, for anything else:
+        written since by any writer (a later load, a correction's `superseded_by`, a revert, a
+        re-stamp of its datasets, a provenance strip), absent, or a state with no `left_digest`.
+        The write is to the state's own type alone, never another type holding the same id. The
+        link keeps `state.handling`, never a weaker marking. A write: the stamping wrapper's
+        guards and after-write hooks run."""
+        ...
+
+    async def regrade_drawn(self, element_id: str, grading: Grading, original: Grading) -> bool:
+        """Sets one live drawn node's or link's grade and its original (`provenance.drawn.grading`
+        and `original_grading`) in place, and nothing else: no second write merges into it, so a
+        link's occurrences, weight (ADR-120) and audit are left as they are, and a node keeps its
+        resolution state (`06_DECISIONS.md` ADR-143 Amendment 6). Returns True when exactly that
+        element was changed; False, writing nothing, when `element_id` names no live element
+        (none, reverted or superseded) or one with no drawn assertion. An id held by two types
+        raises `AmbiguousElementId`. `scripts/grading_change.py` is the only caller.
+
+        No `principal` argument, like `strip_provenance_references`: an operator's write on the
+        stored body, never a read, never routed through the Conduit. The named exception to
+        ADR-080's "every change is a supersede": nothing is superseded, and the change is recorded
+        in the audit trail by the command, with the original kept beside the new grade."""
         ...
 
     async def strip_provenance_references(self, prefix: str) -> int:

@@ -19,7 +19,11 @@ from typing import Any, cast
 import duckdb
 
 from ontology.handling import HandlingScheme
-from ports.analytics import TrendLimitExceeded
+from ports.analytics import (
+    AmountTotalOutOfRange,
+    TrendLimitExceeded,
+    refuse_an_amount_total_out_of_range,
+)
 from schemas.analytics import (
     ActivityRequest,
     ActivityResult,
@@ -61,6 +65,7 @@ from schemas.domain import Handling, Interval, Principal
 
 from .access_filter import AccessFilter, SqlPredicate
 from .alert_facts import FACT_COLUMNS, HANDLING_COLUMNS, alert_predicate, series_expression
+from .schema import EVENT_COLUMNS
 
 #: Event columns a `CATEGORICAL` dimension may bucket by directly. Anything
 #: else is looked up inside the JSON `properties` column — validated as a
@@ -123,6 +128,19 @@ def _as_utc(value: object) -> datetime:
 #: and the `weekday_hours` predicate so the two cannot drift. UTC; weekday 0 = Monday.
 _WEEKDAY_SQL = "CAST(isodow(occurred_at) AS INTEGER) - 1"
 _HOUR_SQL = "CAST(hour(occurred_at) AS INTEGER)"
+
+
+#: Event ids per statement when a refresh sets events aside (`withdraw_events_by_id`).
+_WITHDRAW_CHUNK = 1_000
+
+
+def _decimal_amount(field: str | None) -> str:
+    """A declared amount as a decimal of 38 digits, 9 after the point, as the ClickHouse adapter
+    reads it, so a total a rule compares is the same on both (0.1 and 0.2 make 0.3). One that is not
+    such a decimal (1e30, inf) is NULL, no amount."""
+    if field is None:
+        return "CAST(NULL AS DECIMAL(38, 9))"
+    return f"TRY_CAST(TRY_CAST({_field_expression(field)} AS DOUBLE) AS DECIMAL(38, 9))"
 
 
 class AnalyticsDuckDBAdapter:
@@ -722,11 +740,7 @@ class AnalyticsDuckDBAdapter:
         predicate = self._predicate(req.filter, principal)
         subjects = req.filter.node_ids
         marks = ",".join("?" for _ in subjects)
-        amount = (
-            "NULL"
-            if req.amount_property is None
-            else f"TRY_CAST({_field_expression(req.amount_property)} AS DOUBLE)"
-        )
+        amount = _decimal_amount(req.amount_property)
         # Each event once per subject it touches: an event to itself is one event, not two.
         touched = (
             f"SELECT source_id AS node, occurred_at, {amount} AS amount FROM events "
@@ -736,15 +750,22 @@ class AnalyticsDuckDBAdapter:
             f"WHERE {predicate.where} AND target_id IN ({marks}) AND target_id <> source_id"
         )
         params = [*predicate.params, *subjects, *predicate.params, *subjects]
-        rows = self._con.execute(
-            "SELECT node, MAX(n), MAX(total) FROM ("
-            "  SELECT node, COUNT(*) OVER span AS n, SUM(amount) OVER span AS total "
-            f"  FROM ({touched}) "
-            "  WINDOW span AS (PARTITION BY node ORDER BY occurred_at "
-            f"  RANGE BETWEEN INTERVAL {int(req.span_days)} DAY PRECEDING AND CURRENT ROW)"
-            ") GROUP BY node",
-            params,
-        ).fetchall()
+        try:
+            rows = self._con.execute(
+                "SELECT node, MAX(n), MAX(total), MAX(ABS(guard)) FROM ("
+                "  SELECT node, COUNT(*) OVER span AS n, SUM(amount) OVER span AS total, "
+                # A DOUBLE beside the decimal, which cannot overflow, to refuse a total past the
+                # limit; the decimal window's own overflow is the same refusal.
+                "  SUM(CAST(amount AS DOUBLE)) OVER span AS guard "
+                f"  FROM ({touched}) "
+                "  WINDOW span AS (PARTITION BY node ORDER BY occurred_at "
+                f"  RANGE BETWEEN INTERVAL {int(req.span_days)} DAY PRECEDING AND CURRENT ROW)"
+                ") GROUP BY node",
+                params,
+            ).fetchall()
+        except duckdb.OutOfRangeException as overflow:
+            raise AmountTotalOutOfRange from overflow
+        refuse_an_amount_total_out_of_range(*(guard for *_, guard in rows))
         # The first ever: the same filter and access step without the window's start.
         window = req.filter.window
         unbounded = self._predicate(
@@ -766,7 +787,9 @@ class AnalyticsDuckDBAdapter:
                  *unbounded.params, *upper_params, *subjects],
             ).fetchall()
         )  # fmt: skip
-        found = {node: (int(n), None if total is None else float(total)) for node, n, total in rows}
+        found = {
+            node: (int(n), None if total is None else float(total)) for node, n, total, _ in rows
+        }
         return FrequencyResult(
             nodes={
                 node: NodeFrequency(
@@ -790,11 +813,7 @@ class AnalyticsDuckDBAdapter:
         unbounded = self._predicate(req.filter.model_copy(update={"window": None}), principal)
         subjects = req.filter.node_ids
         marks = ",".join("?" for _ in subjects)
-        amount = (
-            "NULL"
-            if req.amount_property is None
-            else f"TRY_CAST({_field_expression(req.amount_property)} AS DOUBLE)"
-        )
+        amount = _decimal_amount(req.amount_property)
         touched = (
             f"SELECT source_id AS node, occurred_at, {amount} AS amount FROM events "
             f"WHERE {unbounded.where} AND occurred_at <= ? AND source_id IN ({marks}) "
@@ -806,19 +825,28 @@ class AnalyticsDuckDBAdapter:
         start, baseline_start = window.valid_from, window.valid_from - timedelta(
             days=req.baseline_days
         )
-        rows = self._con.execute(
-            "SELECT node, "
-            "COUNT(*) FILTER (WHERE occurred_at >= ?), "
-            "SUM(amount) FILTER (WHERE occurred_at >= ?), "
-            "COUNT(*) FILTER (WHERE occurred_at < ? AND occurred_at >= ?), "
-            "SUM(amount) FILTER (WHERE occurred_at < ? AND occurred_at >= ?), "
-            "MIN(occurred_at) FILTER (WHERE occurred_at >= ?), "
-            "MAX(occurred_at) FILTER (WHERE occurred_at < ?) "
-            f"FROM ({touched}) GROUP BY node",
-            [start, start, start, baseline_start, start, baseline_start, start, start,
-             *unbounded.params, window.valid_to, *subjects,
-             *unbounded.params, window.valid_to, *subjects],
-        ).fetchall()  # fmt: skip
+        try:
+            rows = self._con.execute(
+                "SELECT node, "
+                "COUNT(*) FILTER (WHERE occurred_at >= ?), "
+                "SUM(amount) FILTER (WHERE occurred_at >= ?), "
+                "COUNT(*) FILTER (WHERE occurred_at < ? AND occurred_at >= ?), "
+                "SUM(amount) FILTER (WHERE occurred_at < ? AND occurred_at >= ?), "
+                "MIN(occurred_at) FILTER (WHERE occurred_at >= ?), "
+                "MAX(occurred_at) FILTER (WHERE occurred_at < ?), "
+                # A plain SUM of a DECIMAL(38, 9) can wrap silently past its range: a DOUBLE
+                # beside it, which cannot, refuses such a total instead (ADR-133 Amendment 10).
+                "SUM(CAST(amount AS DOUBLE)) FILTER (WHERE occurred_at >= ?), "
+                "SUM(CAST(amount AS DOUBLE)) FILTER (WHERE occurred_at < ? AND occurred_at >= ?) "
+                f"FROM ({touched}) GROUP BY node",
+                [start, start, start, baseline_start, start, baseline_start, start, start,
+                 start, start, baseline_start,
+                 *unbounded.params, window.valid_to, *subjects,
+                 *unbounded.params, window.valid_to, *subjects],
+            ).fetchall()  # fmt: skip
+        except duckdb.OutOfRangeException as overflow:
+            raise AmountTotalOutOfRange from overflow
+        refuse_an_amount_total_out_of_range(*(t for row in rows for t in row[7:]))
         return ActivityResult(
             nodes={
                 node: NodeActivity(
@@ -829,7 +857,7 @@ class AnalyticsDuckDBAdapter:
                     first_in_window=None if first is None else _as_utc(first),
                     last_before_window=None if last is None else _as_utc(last),
                 )
-                for node, recent, recent_total, baseline, baseline_total, first, last in rows
+                for node, recent, recent_total, baseline, baseline_total, first, last, *_ in rows
             }
         )
 
@@ -869,12 +897,67 @@ class AnalyticsDuckDBAdapter:
         )
 
     async def retract_load(self, load_id: str) -> int:
-        """`AnalyticsPort.retract_load`: the rows this load wrote, by its id alone. A row with no
-        `load_id` is `NULL`, which `= ?` never matches, so unattributed events stay."""
+        """`AnalyticsPort.retract_load`: the rows this load wrote, by its id alone, those a refresh
+        set aside included (ADR-110 Amendment 8 point 1). A row with no `load_id` is `NULL`, which
+        `= ?` never matches, so unattributed events stay."""
         removed = self._con.execute(
             "DELETE FROM events WHERE load_id = ? RETURNING event_id", [load_id]
         ).fetchall()
-        return len(removed)
+        aside = self._con.execute(
+            "DELETE FROM withdrawn_events WHERE load_id = ? RETURNING event_id", [load_id]
+        ).fetchall()
+        return len(removed) + len(aside)
+
+    async def withdraw_events_by_id(self, event_ids: Sequence[str], load_id: str) -> int:
+        """`AnalyticsPort.withdraw_events_by_id`: exactly these events moved to `withdrawn_events`,
+        marked with `load_id`, in one transaction; no access step. An event already set aside is not
+        in `events`, so it stays with the load that set it aside."""
+        ids = list(dict.fromkeys(event_ids))
+        if not ids:
+            return 0
+        moved = 0
+        self._con.execute("BEGIN TRANSACTION")
+        try:
+            # In bounded chunks, one transaction: no statement grows with the rows withdrawn.
+            for start in range(0, len(ids), _WITHDRAW_CHUNK):
+                chunk = ids[start : start + _WITHDRAW_CHUNK]
+                placeholders = ",".join("?" for _ in chunk)
+                self._con.execute(
+                    f"INSERT INTO withdrawn_events ({EVENT_COLUMNS}, withdrawn_by_load) "
+                    f"SELECT {EVENT_COLUMNS}, ? FROM events WHERE event_id IN ({placeholders})",
+                    [load_id, *chunk],
+                )
+                moved += len(
+                    self._con.execute(
+                        f"DELETE FROM events WHERE event_id IN ({placeholders}) RETURNING event_id",
+                        chunk,
+                    ).fetchall()
+                )
+            self._con.execute("COMMIT")
+        except BaseException:
+            self._con.execute("ROLLBACK")
+            raise
+        return moved
+
+    async def restore_withdrawn_events(self, load_id: str) -> int:
+        """`AnalyticsPort.restore_withdrawn_events`: the events `load_id` set aside, moved back
+        exactly as they were, in one transaction."""
+        self._con.execute("BEGIN TRANSACTION")
+        try:
+            self._con.execute(
+                f"INSERT INTO events ({EVENT_COLUMNS}) "
+                f"SELECT {EVENT_COLUMNS} FROM withdrawn_events WHERE withdrawn_by_load = ?",
+                [load_id],
+            )
+            moved = self._con.execute(
+                "DELETE FROM withdrawn_events WHERE withdrawn_by_load = ? RETURNING event_id",
+                [load_id],
+            ).fetchall()
+            self._con.execute("COMMIT")
+        except BaseException:
+            self._con.execute("ROLLBACK")
+            raise
+        return len(moved)
 
     async def events_of_load_among(self, load_id: str, event_ids: Sequence[str]) -> set[str]:
         """`AnalyticsPort.events_of_load_among`: by `event_id` and `load_id`, no access step."""

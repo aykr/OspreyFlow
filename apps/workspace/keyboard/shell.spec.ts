@@ -89,24 +89,70 @@ test("the marking strip and the top bar take 20 and 44 pixels, and the rail 48 w
 
 test("each rail entry is reached and pressed by keyboard", async ({ page }) => {
   await page.goto("/keyboard/top-bar-harness.html");
-  for (const name of ["Cases", "Monitoring", "Ownership", "History", "Explore", "Questions", "Ingest Studio", "Dashboards", "Admin"]) {
+  // ADR-145 Amendment 2 (variant B): the rail keeps Cases and Explore. Monitoring is no longer the
+  // Glass's at all: Rules and Monitoring is a place of its own (ADR-146 decision 2).
+  for (const name of ["Cases", "Explore"]) {
     await page.getByRole("navigation", { name: "Workspace" }).getByRole("button", { name }).focus();
     await page.keyboard.press("Enter");
   }
-  expect(await page.evaluate(() => window.__TOPBAR__?.rail)).toEqual(["cases", "alerts", "ownership", "history", "explore", "questions", "ingest", "dashboards", "admin"]);
-  // The owner's answer of 1 November 2026: watches are in Monitoring's Watches tab, not the rail.
+  expect(await page.evaluate(() => window.__TOPBAR__?.rail)).toEqual(["cases", "explore"]);
+  // Watches are with the rules in Rules and Monitoring (ADR-146 decision 4), not the rail.
   await expect(page.getByRole("navigation", { name: "Workspace" }).getByRole("button", { name: "Watches" })).toHaveCount(0);
+  await expect(page.getByRole("navigation", { name: "Workspace" }).getByRole("button", { name: /Monitoring/ })).toHaveCount(0);
   registerCovered(REGISTRY, "rail-entries-by-keyboard");
 });
 
-test("each view is chosen by keyboard, Reports among them", async ({ page }) => {
+// ADR-145 Amendment 2 (rule 13): each destination under the rail's ⋯ More, opened and chosen by
+// keyboard, and Escape closes the menu back onto ⋯.
+test("each destination under the rail's More is reached and chosen by keyboard", async ({ page }) => {
   await page.goto("/keyboard/top-bar-harness.html");
-  for (const name of ["Map", "Reports", "Graph"]) {
-    await page.getByRole("button", { name, exact: true }).focus();
+  const rail = page.getByRole("navigation", { name: "Workspace" });
+  for (const name of ["Ownership", "History", "Questions", "Dashboards", "Connection strength"]) {
+    await rail.getByRole("button", { name: "More" }).focus();
+    await page.keyboard.press("Enter");
+    await rail.getByRole("group", { name: "More" }).getByRole("button", { name }).focus();
+    await page.keyboard.press("Enter");
+    await expect(rail.getByRole("group", { name: "More" })).toHaveCount(0);
+  }
+  expect(await page.evaluate(() => window.__TOPBAR__?.rail)).toEqual(["ownership", "history", "questions", "dashboards", "strength"]);
+  await rail.getByRole("button", { name: "More" }).focus();
+  await page.keyboard.press("Enter");
+  await page.keyboard.press("Escape");
+  await expect(rail.getByRole("group", { name: "More" })).toHaveCount(0);
+  await expect(rail.getByRole("button", { name: "More" })).toBeFocused();
+  registerCovered(REGISTRY, "rail-more-by-keyboard");
+});
+
+test("each view is chosen by keyboard, Matrix and Figures under More views", async ({ page }) => {
+  await page.goto("/keyboard/top-bar-harness.html");
+  await page.getByRole("button", { name: "Map", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  for (const name of ["Figures", "Matrix"]) {
+    await page.getByRole("button", { name: "More views" }).focus();
+    await page.keyboard.press("Enter");
+    await page.getByRole("group", { name: "More views" }).getByRole("button", { name }).focus();
     await page.keyboard.press("Enter");
   }
-  expect(await page.evaluate(() => window.__TOPBAR__?.views)).toEqual(["map", "reports", "graph"]);
+  await page.getByRole("button", { name: "Graph", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  expect(await page.evaluate(() => window.__TOPBAR__?.views)).toEqual(["map", "reports", "matrix", "graph"]);
   registerCovered(REGISTRY, "views-chosen-by-keyboard");
+  registerCovered(REGISTRY, "more-views-by-keyboard");
+});
+
+// ADR-145 decision 4 (Amendment 2): the column opens with the Inspector only, the other panels folded
+// beneath it in their order, each opened by one keypress on its name.
+test("the column opens with the Inspector only, and each folded panel opens with one keypress", async ({ page }) => {
+  await page.goto("/keyboard/panel-frames-harness.html?defaults=1");
+  const header = (name: string) => page.getByRole("button", { name, exact: true });
+  await expect(header("Inspector")).toHaveAttribute("aria-expanded", "true");
+  for (const name of ["Metrics", "Query builder"]) await expect(header(name)).toHaveAttribute("aria-expanded", "false");
+  for (const name of ["Metrics", "Query builder"]) {
+    await header(name).focus();
+    await page.keyboard.press("Enter");
+    await expect(header(name)).toHaveAttribute("aria-expanded", "true");
+  }
+  registerCovered(REGISTRY, "open-a-folded-panel-by-keyboard");
 });
 
 test("the rail shows its names, and hides them again, by keyboard", async ({ page }) => {
@@ -114,10 +160,10 @@ test("the rail shows its names, and hides them again, by keyboard", async ({ pag
   const rail = page.getByRole("navigation", { name: "Workspace" });
   await rail.getByRole("button", { name: "Show names" }).focus();
   await page.keyboard.press("Enter");
-  await expect(rail.getByText("History")).toBeVisible();
+  await expect(rail.getByText("Explore")).toBeVisible();
   await expect(rail.getByRole("button", { name: "Hide names" })).toBeFocused();
   await page.keyboard.press("Enter");
-  await expect(rail.getByText("History")).toHaveCount(0);
+  await expect(rail.getByText("Explore")).toHaveCount(0);
   registerCovered(REGISTRY, "rail-shows-and-hides-names-by-keyboard");
 });
 
@@ -128,6 +174,165 @@ test("the rail's Help is reached and pressed by keyboard", async ({ page }) => {
   await page.keyboard.press("Enter");
   expect(await page.evaluate(() => window.__TOPBAR__?.help)).toBe(1);
   registerCovered(REGISTRY, "help-from-the-rail-by-keyboard");
+});
+
+// ADR-145 decisions 1 and 3 and Amendment 4 (rule 13): the place switcher, by keyboard, under both
+// brands — in the bar, and inside the GOV.UK header — listing only the places the rights open, Rules
+// and Monitoring the fourth (ADR-146 decision 2).
+for (const brand of ["ospreyflow", "govuk"] as const) {
+  test(`${brand}: the place switcher lists only the places the rights open, and moves between them by keyboard`, async ({ page }) => {
+    await page.goto(`/keyboard/places-harness.html?brand=${brand}&rights=investigate,edit_pipelines,triage_alerts,read_alert_queue,manage_people`);
+    const places = page.getByRole("navigation", { name: "Places" });
+    await expect(places.getByRole("button")).toHaveText(["The Glass", "Ingest Studio", "Rules and Monitoring", "Admin"]);
+    if (brand === "govuk") await expect(page.locator(".govuk-header").getByRole("navigation", { name: "Places" })).toHaveCount(1);
+    await expect(places.getByRole("button", { name: "The Glass" })).toHaveAttribute("aria-current", "page");
+    await places.getByRole("button", { name: "Ingest Studio" }).focus();
+    await page.keyboard.press("Enter");
+    await expect(page.getByRole("region", { name: "You are in the Ingest Studio" })).toBeVisible();
+    await expect(places.getByRole("button", { name: "Ingest Studio" })).toHaveAttribute("aria-current", "page");
+    await places.getByRole("button", { name: "Rules and Monitoring" }).focus();
+    await page.keyboard.press("Enter");
+    await expect(page.getByRole("region", { name: "You are in Rules and Monitoring" })).toBeVisible();
+    await expect(places.getByRole("button", { name: "Rules and Monitoring" })).toHaveAttribute("aria-current", "page");
+    await places.getByRole("button", { name: "Admin" }).focus();
+    await page.keyboard.press("Enter");
+    await expect(page.getByRole("region", { name: "You are in Admin" })).toBeVisible();
+    expect(await page.evaluate(() => window.__PLACES__?.chosen)).toEqual(["ingest", "rules", "admin"]);
+    registerCovered(REGISTRY, "switch-place-by-keyboard");
+    registerCovered(REGISTRY, "switch-to-rules-and-monitoring-by-keyboard");
+  });
+}
+
+test("a reader's switcher offers the Glass alone", async ({ page }) => {
+  await page.goto("/keyboard/places-harness.html?rights=investigate,read_reports,read_alert_queue");
+  await expect(page.getByRole("navigation", { name: "Places" }).getByRole("button")).toHaveText(["The Glass"]);
+  await expect(page.getByRole("button", { name: /in the Ingest Studio/ })).toHaveCount(0);
+});
+
+// ADR-146 decision 2: the open-alert count rides on the switcher's Rules and Monitoring, its count in
+// its name, and is gone from the Glass's banner; from Rules and Monitoring the switcher returns to the
+// Glass's view that was open.
+test("Rules and Monitoring carries the count, and the Glass is returned to its last view by keyboard", async ({ page }) => {
+  await page.goto("/keyboard/places-harness.html?badge=1&rights=investigate,triage_alerts,read_alert_queue");
+  const places = page.getByRole("navigation", { name: "Places" });
+  await expect(places.getByRole("button", { name: "Rules and Monitoring 3 open" })).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "In the Glass" }).getByRole("button", { name: /Monitoring/ })).toHaveCount(0);
+  await page.getByRole("button", { name: "Map", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  await places.getByRole("button", { name: "Rules and Monitoring 3 open" }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("rules, alerts, on case kestrel")).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Workspace" })).toHaveCount(0);
+  await places.getByRole("button", { name: "The Glass" }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("glass, map, on case kestrel")).toBeVisible();
+  registerCovered(REGISTRY, "back-to-the-glass-from-rules-and-monitoring-by-keyboard");
+});
+
+// ADR-145 decision 2 (rule 13): the banner's cross-link, there and back, keeping the case and the view.
+test("the banner's cross-link goes to the Studio and back to the same case and view by keyboard", async ({ page }) => {
+  await page.goto("/keyboard/places-harness.html?rights=investigate,edit_pipelines");
+  await page.getByRole("button", { name: "Map", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("glass, map, on case kestrel")).toBeVisible();
+  await page.getByRole("button", { name: "Open Prison intel in the Ingest Studio ↗" }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("ingest, ingest, on case kestrel")).toBeVisible();
+  // Another case, chosen in the Studio: the real `openCase`, which reloads the page.
+  await page.getByRole("button", { name: "Case: Kestrel" }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("ingest, ingest, on case harrier")).toBeVisible();
+  await page.getByRole("button", { name: "← Back to case Harrier in the Glass" }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("region", { name: "You are in the Glass" })).toBeVisible();
+  await expect(page.getByText("glass, map, on case harrier")).toBeVisible();
+  expect(await page.evaluate(() => window.__PLACES__?.crossed)).toEqual(["to-glass"]);
+  registerCovered(REGISTRY, "banner-cross-link-by-keyboard");
+});
+
+// Messages is drawn for one node, which a reload does not keep: crossing from it, changing case in the
+// Studio and coming Back returns to the view open before Messages, not to an empty Messages.
+test("from Messages, the cross-link and a case change in the Studio come Back to the view before it", async ({ page }) => {
+  await page.goto("/keyboard/places-harness.html?rights=investigate,edit_pipelines");
+  for (const name of ["Map", "Messages"]) {
+    await page.getByRole("button", { name, exact: true }).focus();
+    await page.keyboard.press("Enter");
+  }
+  await expect(page.getByText("glass, dossier, on case kestrel")).toBeVisible();
+  await page.getByRole("button", { name: "Open Prison intel in the Ingest Studio ↗" }).focus();
+  await page.keyboard.press("Enter");
+  await page.getByRole("button", { name: "Case: Kestrel" }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("ingest, ingest, on case harrier")).toBeVisible();
+  await page.getByRole("button", { name: "← Back to case Harrier in the Glass" }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("glass, map, on case harrier")).toBeVisible();
+});
+
+// ADR-145 decision 1 (rule 13): the Glass's sections in the banner, Case · Boards; Boards is coming and
+// does nothing. Monitoring left for Rules and Monitoring (ADR-146 decision 2).
+test("the banner's sections are Case and Boards, Case reached by keyboard and Boards coming", async ({ page }) => {
+  await page.goto("/keyboard/places-harness.html?rights=investigate,read_alert_queue,triage_alerts");
+  const sections = page.getByRole("navigation", { name: "In the Glass" });
+  await expect(sections.getByRole("button")).toHaveText(["Case", "Boards (coming)"]);
+  await expect(sections.getByRole("button", { name: "Boards (coming)" })).toHaveAttribute("aria-disabled", "true");
+  await page.getByRole("button", { name: "Map", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  await sections.getByRole("button", { name: "Boards (coming)" }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("glass, map, on case kestrel")).toBeVisible();
+  await sections.getByRole("button", { name: "Case" }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("glass, graph, on case kestrel")).toBeVisible();
+  registerCovered(REGISTRY, "banner-sections-by-keyboard");
+});
+
+// ADR-146 decision 6 (rule 13): Home's Needs your attention opens the alert, not its case.
+test("an alert on Home, focused, is opened at its address by Enter", async ({ page }) => {
+  await page.route("**/*/v1/**", (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
+  await page.goto("/keyboard/start-harness.html?figures=1&rights=investigate,triage_alerts,read_alert_queue");
+  const row = page.getByRole("region", { name: "Needs your attention" }).getByRole("button", { name: /KYC screening alert/ });
+  await row.focus();
+  await page.keyboard.press("Enter");
+  await expect.poll(() => page.evaluate(() => window.__START__)).toEqual({ opened: null, alert: "al-14" });
+  registerCovered(REGISTRY, "open-an-alert-from-home-by-keyboard");
+});
+
+// ADR-146 decision 2 (rule 13): Rules and Monitoring's card on Home, by its key R, and with no case
+// open, a case chosen for it opens on the place (`openCaseOnRules`, `/rules?investigation=…`).
+test("Rules and Monitoring's card opens by its key, and a case is chosen for it by keyboard", async ({ page }) => {
+  const CASES = [{ id: "c1", name: "Operation Ledger (synthetic demo)", level: "author", created_at: "2026-10-01T09:00:00Z", created_by: "a" }];
+  await page.route("**/*/v1/**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(new URL(route.request().url()).pathname === "/v1/investigations" ? CASES : []) }),
+  );
+  await page.goto("/keyboard/start-harness.html?rights=investigate,triage_alerts,read_alert_queue");
+  await expect(page.getByRole("region", { name: "Rules and Monitoring" })).toBeVisible();
+  await page.locator("body").focus();
+  await page.keyboard.press("r");
+  await expect(page.getByRole("heading", { name: "Choose the case whose alerts to work" })).toBeVisible();
+  await page.getByRole("button", { name: "Operation Ledger (synthetic demo)", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  await expect.poll(() => page.evaluate(() => window.__START__?.opened)).toEqual({ id: "c1", view: "rules" });
+  await expect(page.getByText("Workspace on c1, rules")).toBeVisible();
+  registerCovered(REGISTRY, "open-rules-and-monitoring-from-home-by-keyboard");
+});
+
+// ADR-145 decision 1 (rule 13): Home's cards are the switcher's list, reached by Tab and opened by
+// Enter; a place the rights do not open has no card at all.
+test("Home's cards are the places the rights open, each reached by Tab and opened by keyboard", async ({ page }) => {
+  await page.route("**/*/v1/**", (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
+  await page.goto("/keyboard/start-harness.html?rights=investigate,edit_pipelines");
+  await expect(page.getByRole("region", { name: "Admin" })).toHaveCount(0);
+  const reached: string[] = [];
+  for (let i = 0; i < 40 && reached.length < 2; i++) {
+    await page.keyboard.press("Tab");
+    const name = await page.evaluate(() => document.activeElement?.textContent ?? "");
+    if (/^Open /.test(name) && !reached.includes(name)) reached.push(name);
+  }
+  expect(reached.map((n) => n.replace(/[GIA]$/, "").trim())).toEqual(["Open The Glass", "Open Ingest Studio"]);
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("heading", { name: "Choose the case to load into" })).toBeVisible();
+  registerCovered(REGISTRY, "home-place-cards-by-keyboard");
 });
 
 // ADR-132: the skip link, the one keyboard action the deployment brand adds, under both brands

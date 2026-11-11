@@ -31,9 +31,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import asyncpg
 import yaml
@@ -89,12 +90,25 @@ ALTER TABLE studio_recipes ADD COLUMN IF NOT EXISTS schedule_set_at TIMESTAMPTZ;
 ALTER TABLE studio_recipes ADD COLUMN IF NOT EXISTS schedule_case TEXT;
 ALTER TABLE studio_recipes ADD COLUMN IF NOT EXISTS schedule_paused BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE studio_recipes ADD COLUMN IF NOT EXISTS schedule_paused_reason TEXT;
+-- ADR-140 Amendment 4: why a deployed recipe needs attention (the ontology, or its source's
+-- governance); NULL when it does not, or for one flagged before the reason was kept.
+ALTER TABLE studio_recipes ADD COLUMN IF NOT EXISTS flagged_reason TEXT;
 -- ADR-120 D10, Amendment 1: the pack versions it was published against; NULL until published
 -- (and for one published before pinning, until the start-up backfill stamps it).
 ALTER TABLE studio_recipes ADD COLUMN IF NOT EXISTS pack_versions JSONB;
 -- Build order step 30: each file the last Verify read, with the SHA-256 of its bytes; NULL when no
 -- Verify recorded one (before this column, or a seed's say-so). Cleared with `verified_at`.
 ALTER TABLE studio_recipes ADD COLUMN IF NOT EXISTS verified_sources JSONB;
+-- ADR-141 decision 11: a pipeline whose schedule is handed to an orchestrator, kept by pipeline
+-- (not by version, so a new deployed version stays owned externally): the one client that may
+-- trigger it, and the person who marked it, whom every external run acts as, in their case.
+CREATE TABLE IF NOT EXISTS studio_external_owners (
+    recipe_id TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    case_id TEXT NOT NULL,
+    set_at TIMESTAMPTZ NOT NULL
+);
 """
 
 #: ADR-120 Amendment 1, decision 4: the versions the packs stood at when pinning began, which is
@@ -398,8 +412,15 @@ def _row_to_draft(row: asyncpg.Record) -> StudioRecipeDraft:
         schedule_paused=bool(data.get("schedule_paused") or False),
         schedule_paused_reason=data.get("schedule_paused_reason"),
         dataset_id=data.get("dataset_id"),
+        flagged_reason=data.get("flagged_reason"),
     )
 
+
+#: Why a deployed recipe needs attention (ADR-140 Amendment 4), in the words the Studio shows.
+ONTOLOGY_CHANGED = "the ontology changed since it was deployed"
+SOURCE_GOVERNANCE_CHANGED = (
+    "its source's governance changed since it was deployed: deploy it again under the new marking"
+)
 
 _SOURCE_DECLARATIONS = ("units", "handling_columns")
 
@@ -427,6 +448,27 @@ def carry_source_declarations(
     except ValueError as exc:
         raise SourceDeclarationsInvalidError(str(exc)) from exc
     return merged
+
+
+@dataclass(frozen=True)
+class ExternalOwner:
+    """ADR-141 decision 11: who an owned-externally pipeline's runs act as, and its one client."""
+
+    recipe_id: str
+    client_id: str
+    owner: str
+    case_id: str
+
+    def applied_to(self, recipe: StudioRecipeDraft) -> StudioRecipeDraft:
+        """The recipe as an external run reads it: its owner and case the marker's, so the
+        scheduler's own owner checks judge the right person (decision 10)."""
+        return recipe.model_copy(
+            update={
+                "schedule_owner": self.owner,
+                "schedule_case": self.case_id,
+                "owned_externally_by": self.client_id,
+            }
+        )
 
 
 class StudioRecipeStore:
@@ -668,9 +710,7 @@ class StudioRecipeStore:
         `sources` (build order step 30): each file that Verify read, with its hash, which a *Run
         now* is held to (`verified_sources`). None given (the seed's say-so, where no Verify ran)
         records none, and such a run is not held to one."""
-        recorded = (
-            json.dumps([source.model_dump() for source in sources]) if sources else None
-        )
+        recorded = json.dumps([source.model_dump() for source in sources]) if sources else None
         async with self._pool.acquire() as conn:
             await conn.execute(
                 "UPDATE studio_recipes SET verified_at = $1, verified_sources = $4::jsonb "
@@ -789,6 +829,63 @@ class StudioRecipeStore:
             )
         return await self.get(recipe_id)
 
+    # --- ADR-141 decision 11: owned externally ---------------------------------------------------
+
+    async def set_external_owner(
+        self, recipe_id: str, *, client_id: str, owner: str, case: str, now: datetime
+    ) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO studio_external_owners (recipe_id, client_id, owner, case_id, set_at) "
+                "VALUES ($1, $2, $3, $4, $5) ON CONFLICT (recipe_id) DO UPDATE SET "
+                "client_id = EXCLUDED.client_id, owner = EXCLUDED.owner, "
+                "case_id = EXCLUDED.case_id, set_at = EXCLUDED.set_at",
+                recipe_id,
+                client_id,
+                owner,
+                case,
+                now,
+            )
+
+    async def clear_external_owner(self, recipe_id: str) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute("DELETE FROM studio_external_owners WHERE recipe_id = $1", recipe_id)
+
+    async def external_owner(self, recipe_id: str) -> ExternalOwner | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT recipe_id, client_id, owner, case_id FROM studio_external_owners "
+                "WHERE recipe_id = $1",
+                recipe_id,
+            )
+        return None if row is None else ExternalOwner(**dict(row))
+
+    async def deployed(self, recipe_id: str) -> StudioRecipeDraft | None:
+        """The pipeline's deployed version (`published`), or `None`: the version an external run
+        runs, whose own number a pinned run must name (ADR-141 decision 11)."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM studio_recipes WHERE recipe_id = $1 AND status = $2 "
+                "ORDER BY version DESC LIMIT 1",
+                recipe_id,
+                StudioRecipeStatus.PUBLISHED.value,
+            )
+        return None if row is None else _row_to_draft(row)
+
+    async def paused_of(self, units: Sequence[str] | None) -> list[StudioRecipeDraft]:
+        """The paused schedules of `units` (`None`: every unit), for Operations' health, filtered
+        in the `WHERE` (rule 3; the lane review of L1.7, item 5): another unit's pipeline is never
+        read to be dropped."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM studio_recipes WHERE status = ANY($1::text[]) "
+                "AND schedule_paused AND (schedule_cron IS NOT NULL OR schedule_watch IS NOT NULL) "
+                "AND ($2::text[] IS NULL OR owning_unit = ANY($2::text[])) ORDER BY label",
+                [StudioRecipeStatus.PUBLISHED.value, StudioRecipeStatus.FLAGGED.value],
+                None if units is None else list(units),
+            )
+        return [_row_to_draft(r) for r in rows]
+
     async def scheduled(self) -> list[StudioRecipeDraft]:
         """Every recipe with a schedule, at its current version (published or flagged), paused or
         not — read by the scheduler (ADR-110 decision 2), a backend pass like the KYC sweep, so it
@@ -830,6 +927,18 @@ class StudioRecipeStore:
                 cron,
                 timezone,
                 now,
+                [StudioRecipeStatus.PUBLISHED.value, StudioRecipeStatus.FLAGGED.value],
+            )
+
+    async def clear_watch(self, recipe_id: str) -> None:
+        """`scripts.migrate_sources` alone (ADR-110 Amendment 6 point 7): the recipe's folder watch,
+        moved onto its source, is cleared at its current version. Its cron schedule, owner, case and
+        pause stay; a recipe left with no schedule keeps them unused."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE studio_recipes SET schedule_watch = NULL "
+                "WHERE recipe_id = $1 AND status = ANY($2::text[])",
+                recipe_id,
                 [StudioRecipeStatus.PUBLISHED.value, StudioRecipeStatus.FLAGGED.value],
             )
 
@@ -1158,7 +1267,7 @@ class StudioRecipeStore:
         log/audit."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "UPDATE studio_recipes SET status = $1 "
+                "UPDATE studio_recipes SET status = $1, flagged_reason = $5 "
                 "WHERE status = $2 AND ("
                 "(ontology_version IS NOT NULL AND ontology_version != $3) "
                 "OR (pack_versions IS NOT NULL AND jsonb_typeof(pack_versions) = 'object' "
@@ -1171,8 +1280,112 @@ class StudioRecipeStore:
                 StudioRecipeStatus.PUBLISHED.value,
                 current_ontology_version,
                 json.dumps(current_pack_versions),
+                ONTOLOGY_CHANGED,
             )
         return [row["recipe_id"] for row in rows]
+
+    async def flag_for_source(self, dataset_id: str, location: str, reason: str) -> list[str]:
+        """ADR-140 Amendment 4 (the owner's ruling): a source's governance was edited, so every
+        deployed recipe of its dataset reading it needs attention, its scheduled and watched runs
+        blocked (ADR-110 decision 4) until it is deployed again under the new governance. A recipe
+        reads the source it names by location (the source node writes it to the draft). Returns
+        the labels flagged, for the route to say."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "UPDATE studio_recipes SET status = $1, flagged_reason = $2 "
+                # The draft keeps its location inside `content` (`_content_json`), not a column.
+                "WHERE status = $3 AND dataset_id = $4 "
+                "AND content::jsonb ->> 'source_location' = $5 "
+                "RETURNING label",
+                StudioRecipeStatus.FLAGGED.value,
+                reason,
+                StudioRecipeStatus.PUBLISHED.value,
+                dataset_id,
+                location,
+            )
+        return [row["label"] for row in rows]
+
+    async def flag_for_model(
+        self, dataset_id: str, flagged: Sequence[tuple[str, str]]
+    ) -> list[str]:
+        """ADR-140 decision 5 (R12): *Make live* of the dataset's domain model changed or retired a
+        type each of these deployed recipes writes, so each needs attention, its scheduled and
+        watched runs blocked (ADR-110 decision 4) until it is deployed again under the new model.
+        `flagged` is `(recipe_id, reason)` pairs, each recipe's reason naming its own types. Only a
+        published recipe of this dataset is flagged; one already flagged keeps its first reason; a
+        recipe named twice takes its first reason. Returns the labels flagged, sorted, for the
+        route to say. L3.1b, ratified by the studio lane (`test_studio_recipes_store.py`)."""
+        # One reason per recipe, the first given: `UPDATE ... FROM` would pick among repeats.
+        once: dict[str, str] = {}
+        for recipe_id, reason in flagged:
+            once.setdefault(recipe_id, reason)
+        if not once:
+            return []
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "UPDATE studio_recipes r SET status = $1, flagged_reason = f.reason "
+                "FROM unnest($2::text[], $3::text[]) AS f(recipe_id, reason) "
+                "WHERE r.recipe_id = f.recipe_id AND r.status = $4 AND r.dataset_id = $5 "
+                "RETURNING r.label",
+                StudioRecipeStatus.FLAGGED.value,
+                list(once),
+                list(once.values()),
+                StudioRecipeStatus.PUBLISHED.value,
+                dataset_id,
+            )
+        return sorted(row["label"] for row in rows)
+
+    async def current_for_migration(self) -> list[StudioRecipeDraft]:
+        """Every recipe at every status but a previous version, across every dataset: for
+        `scripts.migrate_sources` alone, an operator's command run with no request and no reader
+        (ADR-140 Amendment 4). No route calls it."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM studio_recipes WHERE status <> $1 ORDER BY dataset_id, label",
+                StudioRecipeStatus.SUPERSEDED.value,
+            )
+        return [_row_to_draft(r) for r in rows]
+
+    async def follow_source(
+        self,
+        dataset_id: str,
+        location: str,
+        handling: dict[str, Any],
+        legal_basis: str | None,
+    ) -> list[str]:
+        """ADR-140 Amendment 4: a draft reading an edited source takes its new handling and legal
+        basis at once, and its Test no longer stands (as after any edit), so it is tested and
+        deployed under the new governance. A deployed recipe's committed governance is never
+        rewritten here: it is flagged instead (`flag_for_source`). Returns the labels."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "UPDATE studio_recipes SET content = jsonb_set(jsonb_set(content::jsonb, "
+                "'{handling}', $3::jsonb), '{legal_basis}', "
+                "COALESCE(to_jsonb($4::text), 'null'::jsonb))::text, "
+                "verified_at = NULL, verified_sources = NULL "
+                "WHERE status = $5 AND dataset_id = $1 "
+                "AND content::jsonb ->> 'source_location' = $2 RETURNING label",
+                dataset_id,
+                location,
+                json.dumps(handling),
+                legal_basis,
+                StudioRecipeStatus.DRAFT.value,
+            )
+        return [row["label"] for row in rows]
+
+    async def using_source(self, dataset_id: str, location: str) -> list[StudioRecipeDraft]:
+        """The source page's lineage: each recipe of the dataset reading `location`, at its latest
+        version but a previous one."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM studio_recipes WHERE dataset_id = $1 "
+                "AND content::jsonb ->> 'source_location' = $2 "
+                "AND status <> $3 ORDER BY label, version",
+                dataset_id,
+                location,
+                StudioRecipeStatus.SUPERSEDED.value,
+            )
+        return [_row_to_draft(r) for r in rows]
 
     async def backfill_pack_versions(
         self,

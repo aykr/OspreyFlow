@@ -272,7 +272,8 @@ curl -L -o planetiler.jar \
 
 PYTHONPATH=.:packages .venv/bin/python3 -m scripts.build_local_basemap \
   --region berkshire --output-dir <a directory outside this checkout> \
-  --planetiler-jar ./planetiler.jar --osprey-config <your osprey.yaml>
+  --planetiler-jar ./planetiler.jar --osprey-config <your osprey.yaml> \
+  --unit unit-1   # the unit that holds the demo case (required; refused if it holds nothing)
 PYTHONPATH=.:packages .venv/bin/python3 -m scripts.verify_map <your osprey.yaml>
 ```
 
@@ -394,10 +395,14 @@ PYTHONPATH=.:packages .venv/bin/python3 -m tools.mint_dev_token \
   --roles analyst,source_author,source_approver,loader
 ```
 
-A rendered deployment's own `--demo-analyst` subject already holds all four (`harness/realm.py`),
-so this step is only for the hand-run stack.
+A rendered deployment's demo analyst, `osprey-demo-analyst`, holds the Analyst role alone
+(`harness/realm.py`; ADR-113 decision 8 took its Data Engineer role away), so it is not offered the
+Studio (ADR-145): on a rendered deployment sign in as `osprey-demo-engineer` for this, and on the
+hand-run stack mint the token above.
 
-Then, in the Glass: **Ingest Studio → Connect → "Choose file…"** and pick a file from your own
+Then, from the Glass: **Ingest Studio** in the place switcher (in the top bar, after the mark; inside
+the GOV.UK header under that brand — since 7 November 2026 it is no longer on the rail, ADR-145)
+**→ Connect → "Choose file…"** and pick a file from your own
 computer (it is uploaded to the deployment's `uploaded` folder and selected), or choose one already
 on the server from the list beneath it. Answer the gate questions (handling — the classification may
 be left blank and is then recorded as PUBLIC — legal basis, connector), and continue to Profile →
@@ -740,27 +745,52 @@ this operator-facing guide adjudicates or grants.
 
 A demonstration deployment (`ospreyflow install`, which registers the demo accounts) has four accounts, one per
 seat, each opening exactly its own rail (`spec/06_DECISIONS.md` ADR-113 decision 8). Their passwords
-are in `deploy/generated/<profile>/deployment.env`, never printed:
+are in `deploy/generated/<profile>/deployment.env`, never printed.
+
+**What moved on 7 November 2026 (ADR-145, three places).** The Ingest Studio and Admin left the
+Glass's rail: they are places in the **place switcher** in the top bar (inside the GOV.UK header under
+that brand), and Home shows a card for each place the account opens and none for another. *Proposed
+types* left the rail too: it is a section of Admin, under *Data*. The Studio has no rail; a line under the top bar says
+where you are ("You are in the Glass · Case … · reads …"), and for an account holding both the Glass
+and the Studio it carries the way across, *Open … in the Ingest Studio ↗* and *← Back to case … in the
+Glass*, which replaces the Studio rail's *Back to the investigation*. In the Glass the same line carries
+*Case · Boards · Monitoring*; *Boards* says "(coming)" and does nothing yet. Since ADR-145 Amendment 2
+(the case screen lightened, 7 November 2026) *Monitoring*, with its open-alert count, is reached from
+that line; the rail keeps *Cases* and *Explore*, with *Ownership*, *History*, *Questions* and
+*Dashboards* under its ⋯ *More*; the view switch keeps *Graph* and *Map*, with *Matrix* and *Reports*
+under *More views*; and the right-hand column opens with the Inspector only. Each account is offered
+exactly the places its rights open and can use (table below; ADR-145 Amendment 1): the Studio for
+whoever may read its pipelines (`edit_pipelines`), Admin for whoever holds the right of one of its built sections,
+the Glass for whoever holds a right a case's routes need. A place an account is not offered refuses
+it. No role lost a right; the Studio's pipeline-run history now needs a pipeline right, so the
+analyst and the report viewer, who had no screen for it, are no longer answered there. Admin
+(ADR-145 Amendment 3) is a side list of sections in groups: *People* (People and roles, Roles,
+Dashboard identities), *Data* (Datasets, Connections, Proposed types), *Running* (Operations, System),
+*Policies* (Grading scheme, Approval rights, Uploads), *Audit* and *Demo packs*, each shown only to an
+account holding its right. Roles, the three Policies and Audit say "(coming)" and what they will
+hold. Under `?brand=govuk` the list is a GOV.UK side navigation.
 
 | Account | Role | What it shows | Password variable |
 | --- | --- | --- | --- |
-| `osprey-demo-analyst` | Analyst | the investigation: graph, map, alerts, ownership, reports | `OSPREY_DEMO_ANALYST_PASSWORD` |
-| `osprey-demo-engineer` | Data Engineer | the Ingest Studio: pipelines, rules, held rows | `OSPREY_DEMO_ENGINEER_PASSWORD` |
-| `osprey-demo-report-viewer` | Reports Viewer | Reports and Dashboards only — no graph | `OSPREY_DEMO_REPORT_VIEWER_PASSWORD` |
-| `osprey-demo-admin` | Administrator (and Analyst, Data Engineer) | everything, and the Admin area | `OSPREY_DEMO_ADMIN_PASSWORD` |
+| `osprey-demo-analyst` | Analyst | the Glass: graph, map, alerts, ownership, reports | `OSPREY_DEMO_ANALYST_PASSWORD` |
+| `osprey-demo-engineer` | Data Engineer | the Ingest Studio (pipelines), the Glass (its rules and held rows are Monitoring's) and Admin › Operations | `OSPREY_DEMO_ENGINEER_PASSWORD` |
+| `osprey-demo-report-viewer` | Reports Viewer | the Glass: Reports and Dashboards only — no graph | `OSPREY_DEMO_REPORT_VIEWER_PASSWORD` |
+| `osprey-demo-admin` | Administrator (and Analyst, Data Engineer) | all three places: the Glass, the Ingest Studio and Admin | `OSPREY_DEMO_ADMIN_PASSWORD` |
 
 The engineer holds Editor and the report viewer Viewer on the synthetic demo cases; neither is ever
 granted on a real dataset (rule 9).
 
 **The reporting walkthrough** (all synthetic, on "Operation Ledger — AML review"):
 
-1. **As the analyst** — *Reports* in the top bar: the case's figures, counted for the reader.
-2. **As the admin** — *Admin → Dashboards*: register a dashboard identity (its secret is shown once;
+1. **As the analyst** — *More views → Reports* in the top bar (ADR-145 Amendment 2): the case's
+   figures, counted for the reader.
+2. **As the admin** — *Admin* in the place switcher, then *Dashboard identities* in its side list (under *People*): register a dashboard identity (its secret is shown once;
    put it in `REPORT_SYNC_DASHBOARDS`); its *Figures* column says when it last pulled.
 3. **As the case's Author** — *Cases → Who can open this case*: give the dashboard's account id
    Viewer. report-sync pulls the case as that identity within 15 minutes (restart `report-sync` to
    pull now); every pull is in the export ledger.
-4. **As the report viewer** — *Dashboards* in the rail, or *Reports → Dashboards*: the Superset board,
+4. **As the report viewer** — *Dashboards* under the rail's ⋯ *More* (since ADR-145 Amendment 2), or
+   *Reports → Dashboards*: the Superset board,
    branded OspreyFlow, drawn inside the Glass with no second sign-in. It opens only for someone who
    could count every figure on it (ADR-111 Amendment 3).
 5. **Superset itself** — `http://localhost:8088`, *Sign in with Keycloak* as the admin, for building
@@ -865,14 +895,19 @@ The last three chapters of the Prison Intelligence demo's Act 2 (`spec/06_DECISI
 Intelligence Dataset (synthetic demo)". Chapters 1 to 8 and Act 1 are unchanged.
 
 **Before chapter 9:** `python -m scripts.seed_internal prison-intelligence --release-batch-2` lists its three
-files; they are loaded in that order. Use four signed-in browser profiles: the analyst, the data engineer,
+files; they are loaded in that order. Each loads by its pipeline's **folder watch** (ADR-140 Amendment 3): the
+seed, and every reset, set *Seized media*, *Visit bookings* and *PIN phone first contacts* each to watch for its
+own file, **paused**, so nothing loads until the engineer resumes it at its step. To load one, as the engineer,
+on the Studio's **4 Runs** tab: choose the pipeline under *Pipeline to run or schedule*, **Run now or schedule**,
+**Resume schedule**; the file loads about a minute later, and **Read the runs again** shows its run (trigger
+*watch*) in today's cell. Use four signed-in browser profiles: the analyst, the data engineer,
 the report viewer and the admin (the case's Author).
 
 **Chapter 9** (as the persona named):
 1. Analyst, *Monitoring → Watches*: hotlist the coordinator's number (*Only me*, the default).
-2. Engineer: run *Seized media* over the second seized-phone batch. **H1**, in the Watches tab's alert inbox,
-   explained as before (ADR-130).
-3. Engineer: run *Visit bookings* over `pid_visit_bookings.csv`. **H2**, high, in *Monitoring → Queue*: the
+2. Engineer: resume *Seized media*'s watch (above); it loads the second seized-phone batch. **H1**, in the
+   Watches tab's alert inbox, explained as before (ADR-130).
+3. Engineer: resume *Visit bookings*' watch; it loads `pid_visit_bookings.csv`. **H2**, high, in *Monitoring → Queue*: the
    coordinator has booked a social visit to the third group member for Saturday 9 May 2026, booked on the
    Monday. The booking is a record; no visit is written.
 4. Case Author (the admin account; a rule for the case team needs the Author level, and the demo analyst
@@ -881,11 +916,11 @@ the report viewer and the admin (the case's Author).
    after each load commits), **Show the drawn pattern**, **Preview on the last 90 days**, **Deploy the
    sentence**. Only after step 3: deployed before the bookings load, it would also flag the coordinator's
    number.
-5. Engineer: the *Intelligence reports* pipeline's **Checks on load** lists the rule, and its **Verify** says
+5. Engineer: the *Intelligence reports* pipeline's **Load rules** lists the rule, and its **Test** says
    the rule cannot be judged in a dry run (it reads links from the stored graph). *PIN phone first contacts*
-   was published by the seed with no canvas, so its own Checks on load is reached only through **Reopen for
+   was deployed by the seed with no canvas, so its own Load rules are reached only through **Reopen for
    editing** (a new version); every case rule judges it while nothing is chosen.
-6. Engineer: run *PIN phone first contacts* over `pid_pin_new_contacts.csv`. **S1**, high, for the case team,
+6. Engineer: resume *PIN phone first contacts*' watch; it loads `pid_pin_new_contacts.csv`. **S1**, high, for the case team,
    on the number nobody owns, which the third group member's PIN account called twice.
 
 **Chapter 10:** close H2 as *Referred* (the owner's alone, so at once); propose S1's close as *Referred*
@@ -905,21 +940,90 @@ once). A hotlist entry cannot be removed in the Glass: keep the first rehearsal'
 again. The alert trend counts the week alerts were raised in by the clock, so rehearsals the same week add to
 it. The reset reverts the three loads (and with the first contacts, S1's node, closing S1); it cannot undo
 the hotlist, its alerts and H2's close, the rule, the trends or the pack's items. Since 3 November (ADR-127
-Amendment 45) it leaves chapter 9's three files released ("kept …"), so they need not be released again.
+Amendment 45) it leaves chapter 9's three files released ("kept …"), so they need not be released again;
+since 6 November (ADR-140 Amendment 3) it also sets the three watches again, paused, and writes each kept file
+again, so the next rehearsal's watch takes it.
 
 **Chapter 4's draft** (ADR-127 Amendment 45, 3 November): the seed, and every reset, leave the *Intelligence
 reports* pipeline as a draft holding the whole branch (source, Profile, Map, Load) and the committed map,
-not verified and not published. Chapter 4 opens it, walks Profile and the map, runs **Verify** (one row
-rejected: the teaching row's number written with a letter O), corrects that row, publishes and runs it, then
-runs *Report incidents*. The row is corrected by choosing a corrected copy of the file at the source
-(*Open source settings*, **Choose file…**, **Save**; a copy with `07700 900603` for `07700 900 6O3`, made
-before the demo): a value map refuses every value it does not list, so it cannot mend one row. Verify then
-reads 350 reports and rejects none, and the run and Verify read the same file (the source node names none
+not tested and not deployed. Chapter 4 opens it on the Studio's **3 Pipelines** tab, walks Profile and the
+map, runs **Test** (one row rejected: the teaching row's number written with a letter O), corrects that row,
+presses **Deploy** then **Deploy and run now**, then runs *Report incidents* from the **4 Runs** tab (choose it
+under *Pipeline to run or schedule*, **Run now or schedule**, **Run now**). Since ADR-140 Amendment 2
+(6 November 2026) Deploy commits a version and does not run it; running and scheduling are the
+Runs tab's. The row is corrected by choosing a corrected copy of the file at the source
+(the source node's *The draft's own settings*, **Choose file…**, **Save**; a copy with `07700 900603` for `07700 900 6O3`, made
+before the demo): a value map refuses every value it does not list, so it cannot mend one row. Test then
+reads 350 reports and rejects none, and the run and Test read the same file (the source node names none
 of its own). Walked on GOV.UK on 3 November: about 55 seconds of clicks and waits for the reports (40 of
 them the run) and 31 for the incidents; `--check` then reads Ch5 229 and 68. The reset puts the draft back exactly, its name included. The fallback
 (`--publish-reports-fallback`) publishes the committed file over whatever was left on the draft, a renamed
 draft or a half-added branch included; it does not correct the teaching row, so chapter 5 then reads 228
 reports and 67 naming people rather than 229 and 68.
+
+**Chapter 4 in the Studio's drawer and guided mode** (ADR-140 Amendment 8, 7 November 2026; walked live from scratch
+on 8 November, Amendment 10, though not yet from the seeded draft): the pipeline opens in **guided mode**, every person's default, as a numbered list of
+its steps beside a picture of the pipeline; **Expert** (the header's mode switch, kept for the person
+in their browser) shows the canvas instead, and either opens the same **drawer** beside the pipeline.
+Each click above that opened a screen now opens it in the drawer, with the pipeline still in view:
+the source step's *The draft's own settings* (then **Choose file…**, **Save**, and the drawer's
+**Close**), the profile step's *Open profile*, and the header's **Test** (**Run the test**) and
+**Deploy** (**Deploy as vN**, **Deploy and run now**). A step's drawer also has **Preview**, which shows
+the rows a source reads, or the graph Map or Load would make, and **does not count as Test**: Deploy
+still refuses a draft until Test has run since its last edit. *Open map editor* collapses the pipeline
+to a strip across the top (a step on it goes back to the pipeline). In the map editor a column is bound
+by dragging it, or by keyboard: **Choose** on the column, then **Bind ‹column› here** on the binding.
+
+**Building chapter 4's pipeline from scratch** (ADR-140 Amendment 10, 8 November 2026).
+The seeded draft above stays the demo's path: building the map takes about eighty bindings, far too
+long to show live. This is the same map made by hand, for a rehearsal or a data engineer's training.
+It makes the seeded draft's map, but not its pipeline: a new pipeline has no domain-model step, so its
+Deploy pins no pack where the seeded draft pins NIEM v3 (Amendment 10 records the difference). `keyboard/ingest-studio.spec.ts` walks these steps
+by keys alone and checks the saved map equals `pid_intel_reports_recipe.yaml`'s; they were walked
+live on 8 November (`apps/workspace/live/studio-reports-walk.spec.ts`, Amendment 10 has the figures).
+1. On the **2 Sources** tab, **Register a source**, **Next**, choose `pid_intel_reports.csv` under
+   **File**, **Next**. Give it its marking (*OFFICIAL*, handling code *P*, originator and owning unit
+   `fenwick-moor-security`), the units its rows may name (`fenwick-moor-security, regional-intel-unit`)
+   and its legal basis (*Synthetic demonstration data*), then **Register** and **Open in a pipeline**.
+   The seed registers no source, so a case seeded fresh needs this step once.
+2. On the **3 Pipelines** tab, type *Intelligence reports* in **Pipeline name**, then **New pipeline**.
+   It opens in guided mode. **Source: New source**: choose the file under **Registered source**, then
+   **Use this source**: its marking, units and legal basis come with it. **Preview**, then
+   **Run preview**, shows its rows.
+3. **Settings**, then *The draft's own settings*. Under *Columns that carry the marking*, type each
+   part's column, the same name as the part (`classification`, `handling_code`, `action_code`,
+   `sanitisation_code`, `originator`, `owning_unit`): registering a source declares none. Under *Skip
+   rows this case has already loaded*, type `report_ref` in **Key column name** and press Enter. Then
+   **Save** and **Close the drawer**.
+4. **Map: Map**, then **Open map editor**. Add each of the map's eleven entities with **+ entity**, in
+   the committed file's order: the report (`Document`), three areas (`Location`), three prisoners and
+   three outside people (`Person`), and the number (`Endpoint`). Each entity's ref, its match-on and the
+   column each property takes are `pid_intel_reports_recipe.yaml`'s `row_template`: for instance the
+   report's `message_id` takes `report_ref`, `sent_at` takes `submitted_at` and `document_kind` takes
+   `category`, and the number's `value_raw` takes `phone_mentioned`. For each:
+   - set **Entity ref**, **POLE class**, **Entity type** and **Match on**, then *reference existing*;
+   - add each property under **Add a property** and bind its column (**Choose** the column, then
+     **Bind ‹column› here**). The number's `value_normalised` and `e164` take the `msisdn` **Transform**,
+     its `endpoint_kind` is a **Literal** `msisdn`, and an outside person's `given_names` and
+     `date_of_birth` are **Optional**;
+   - for every entity but the report and the first area, tick **Conditional element** and choose the
+     column it waits on (*is not null*): the second and third areas on `area_ref_2` and `area_ref_3`,
+     each prisoner on `subject_N`, each outside person on `subject_N_nino`, the number on
+     `phone_mentioned`;
+   - on the report, set **Its own text** to *Document text* from `report_text`;
+   - tick **Override handling for this element** and set each of the six parts to *From column ‹part›*.
+     The editor says which part is unbound, and the save refuses a map that leaves one.
+5. Add the ten `MENTIONED_IN` links under **From entity**, **To entity** and **Link type**, then
+   **Add link**: each area, person and the number to the report. Give each the same condition as its
+   first end, and bind its six handling parts the same way.
+6. Under the unmapped columns, give `subject_1_role`, `subject_2_role`, `subject_3_role` and
+   `reviewer_initials` their notes in **Note for ignoring ‹column›**, then **Ignore ‹column›**.
+7. **Save draft**. Then **Test** (**Run the test**) and **Deploy** (**Deploy as v1**): from here it is
+   chapter 4 as above.
+
+An expert-mode edit of it: **Expert**, then **+ Extract** on the canvas (fed by Map). Open
+**Extract: Extract**, choose an **Extraction library**, then **Apply extract settings**. The edit is the
+pipeline's, and the map is not saved again. Test runs again before Deploy.
 
 ## 9. Related documents
 

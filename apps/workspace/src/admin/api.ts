@@ -1,15 +1,33 @@
 // The Admin area's calls (`06_DECISIONS.md` ADR-110 Amendment 1, ADR-112): people's roles,
 // dashboard identities and the system's health, all through the Conduit — never the identity
 // provider directly. Shapes are the generated ones.
+import { rightName, rolesHolding, whyNotByRole, type Right } from "../help/roles";
 import type {
   AccessInput,
+  AdminPeopleRows,
+  AuditSectionPage,
+  ConnectionTest,
+  OperationsAgeing,
+  PromotionAlertSetting,
+  CustomRole,
+  CustomRoleVersion,
+  DisablePlan,
+  OwnedTransfer,
+  RolesCatalogue,
+  Team,
   AdminDataset,
+  AdminDatasetAuthors,
+  AdminDatasetCases,
   AdminSchedule,
   DashboardIdentity,
+  DatasetOwnerSetting,
   DemoPackStatus,
   InviteInput,
+  LayerDeleted,
+  LayerDryRun,
   OrganisationArrival,
   PersonAccount,
+  PersonOwnership,
   RegisteredDashboard,
   ScheduleRunView,
   SignInDelivery,
@@ -49,9 +67,40 @@ async function failure(response: Response): Promise<Error> {
   if (body.error === "not_allowed" && typeof detail === "string") return new Error(detail);
   if (body.error === "identity_provider_refused" && typeof detail === "string") return new Error(detail);
   if (body.error === "dataset_not_found") return new Error("That dataset is no longer there.");
+  // ADR-145 decision 10: Audit's filters refused in the Conduit's words.
+  if (body.error === "audit_filters" && typeof detail === "string") return new Error(`Not read: ${detail}.`);
+  // ADR-143 Amendment 2 decision 1, ADR-145 Amendment 4: a dry run or a change of owner, refused in
+  // the Conduit's words, which say why and who can.
+  if (
+    typeof detail === "string" &&
+    ["not_an_author", "case_open", "case_not_linked", "composite_read_only", "owner_needed", "no_layer"].includes(
+      body.error ?? "",
+    )
+  ) {
+    // ADR-145 Amendment 4 decision 12 (L2.5c): a refusal carrying a right says the roles that
+    // hold it, never the people; the block is the Author level, so it is not told to ask for it.
+    const right = (body as { right?: unknown }).right;
+    return new Error(typeof right === "string" ? `${detail} ${authorAlsoNeeds(right as Right)}` : detail);
+  }
   if (response.status === 409 && typeof body.error === "string" && typeof detail === "string") return new Error(detail);
+  // ADR-145 Amendment 5: roles, teams, case levels and Disable…, refused in the Conduit's words.
+  if (typeof detail === "object" && detail !== null && typeof (detail as { message?: unknown }).message === "string")
+    return new Error((detail as { message: string }).message);
+  // ADR-145 Amendment 4 decision 12 (L2.7): a right refused says which roles hold it, never who.
+  if (typeof detail === "object" && detail !== null && (detail as { error?: string }).error === "right_required") {
+    const right = (detail as { right?: unknown }).right;
+    if (typeof right === "string") return new Error(`Not done. ${whyNotByRole(right as Right)}`);
+  }
   if (response.status === 403) return new Error("Your account does not hold the right for this.");
   return new Error(`The Admin area could not complete that (${response.status}).`);
+}
+
+/** What an Author also needs, by the roles that hold it, never the people (decision 12). */
+export function authorAlsoNeeds(right: Right): string {
+  const roles = rolesHolding(right);
+  if (roles.length === 0) return `An Author also needs ${rightName(right)}, which no built-in role has.`;
+  const named = roles.length === 1 ? `the ${roles[0]!} role has` : `the ${roles.slice(0, -1).join(", ")} and ${roles.at(-1)!} roles have`;
+  return `An Author also needs ${rightName(right)}, which ${named}.`;
 }
 
 async function call<T>(api: AdminApi, path: string, init: RequestInit = {}): Promise<T> {
@@ -97,10 +146,43 @@ export const listDemoPacks = (api: AdminApi) => call<DemoPackStatus[]>(api, "dem
 export const systemStatus = (api: AdminApi) => call<SystemStatus>(api, "system");
 // ADR-136 decision 2: each dataset's egress, set by an administrator, audited by the Conduit.
 export const listDatasets = (api: AdminApi) => call<AdminDataset[]>(api, "datasets");
+// ADR-140 Amendment 13 (L2.7): *Test connection*, in words; nothing read is answered.
+export const testConnection = (api: AdminApi, connectionId: string) =>
+  call<ConnectionTest>(api, `connections/${encodeURIComponent(connectionId)}/test`, { method: "POST" });
 export const setDatasetEgress = (api: AdminApi, datasetId: string, egress: AdminDataset["egress"]) =>
   call<AdminDataset>(api, `datasets/${encodeURIComponent(datasetId)}/egress`, {
     method: "PUT",
     body: JSON.stringify({ egress }),
+  });
+// ADR-145 decision 8 and Amendment 4 decision 6: Admin › Datasets' policy, Authors, linked cases and
+// a removed case's dry runs; decision 7: Admin › System's *Dataset owners may be*.
+const dataset = (datasetId: string, what: string) => `datasets/${encodeURIComponent(datasetId)}/${what}`;
+export const setPromotionPolicy = (api: AdminApi, datasetId: string, policy: AdminDataset["promotion_policy"]) =>
+  call<AdminDataset>(api, dataset(datasetId, "promotion-policy"), {
+    method: "PUT",
+    body: JSON.stringify({ promotion_policy: policy }),
+  });
+export const datasetAuthors = (api: AdminApi, datasetId: string) =>
+  call<AdminDatasetAuthors>(api, dataset(datasetId, "authors"));
+export const changeDatasetOwners = (api: AdminApi, datasetId: string, people: string[]) =>
+  call<AdminDatasetAuthors>(api, dataset(datasetId, "owners"), { method: "PUT", body: JSON.stringify({ people }) });
+export const datasetCases = (api: AdminApi, datasetId: string) =>
+  call<AdminDatasetCases>(api, dataset(datasetId, "cases"));
+export const layerDryRun = (api: AdminApi, datasetId: string, caseId: string, action: LayerDryRun["action"]) =>
+  call<LayerDryRun>(api, `datasets/${encodeURIComponent(datasetId)}/cases/${encodeURIComponent(caseId)}/${action}/dry-run`, {
+    method: "POST",
+  });
+// ADR-143 Amendment 5 (L2.5c): Admin's own Delete of a removed case's layer, after its dry run; for
+// a dataset of the administrator's own unit, any other answered as no dataset.
+export const deleteRemovedLayer = (api: AdminApi, datasetId: string, caseId: string) =>
+  call<LayerDeleted>(api, `datasets/${encodeURIComponent(datasetId)}/cases/${encodeURIComponent(caseId)}/delete`, {
+    method: "POST",
+  });
+export const datasetOwnerSetting = (api: AdminApi) => call<DatasetOwnerSetting>(api, "settings/dataset-owners");
+export const setDatasetOwnerSetting = (api: AdminApi, value: DatasetOwnerSetting["owners_may_be"]) =>
+  call<DatasetOwnerSetting>(api, "settings/dataset-owners", {
+    method: "PUT",
+    body: JSON.stringify({ owners_may_be: value }),
   });
 // ADR-110 decision 8: Schedules and runs.
 const schedule = (recipeId: string, what: string) => `schedules/${encodeURIComponent(recipeId)}/${what}`;
@@ -116,4 +198,65 @@ export const changeSchedule = (api: AdminApi, recipeId: string, cron: string, ti
   call<AdminSchedule>(api, `schedules/${encodeURIComponent(recipeId)}`, {
     method: "PUT",
     body: JSON.stringify({ cron, timezone }),
+  });
+
+// ADR-145 decisions 6 and 7 and Amendment 5: roles, teams, the People rows and Disable….
+export const listRoles = (api: AdminApi) => call<RolesCatalogue>(api, "roles");
+export const createRole = (api: AdminApi, name: string, rights: string[]) =>
+  call<CustomRole>(api, "roles", { method: "POST", body: JSON.stringify({ name, rights }) });
+export const changeRole = (api: AdminApi, roleId: string, name: string, rights: string[]) =>
+  call<CustomRole>(api, `roles/${encodeURIComponent(roleId)}`, { method: "PUT", body: JSON.stringify({ name, rights }) });
+export const makeTeam = (api: AdminApi, roleId: string, displayName: string, mailbox: string) =>
+  call<Team>(api, `roles/${encodeURIComponent(roleId)}/team`, {
+    method: "PUT",
+    body: JSON.stringify({ display_name: displayName, mailbox }),
+  });
+export const setTeamLead = (api: AdminApi, roleId: string, lead: string) =>
+  call<Team>(api, `teams/${encodeURIComponent(roleId)}/lead`, { method: "PUT", body: JSON.stringify({ lead }) });
+export const setTeamCover = (api: AdminApi, roleId: string, cover: string | null, until: string | null) =>
+  call<Team>(api, `teams/${encodeURIComponent(roleId)}/cover`, { method: "PUT", body: JSON.stringify({ cover, until }) });
+export const peopleRows = (api: AdminApi) => call<AdminPeopleRows>(api, "people/rows");
+export const disablePlan = (api: AdminApi, userId: string) => call<DisablePlan>(api, person(userId, "disable-plan"));
+// ADR-145 Amendment 8 (L3.8, read by L2.5b): whether the person owns items this administrator may
+// not see, said and never named; the items themselves come in the plan.
+export const personOwnership = (api: AdminApi, userId: string) =>
+  call<PersonOwnership>(api, person(userId, "ownership"));
+export const transferAndDisable = (api: AdminApi, userId: string, transfers: OwnedTransfer[]) =>
+  call<PersonAccount>(api, person(userId, "disable"), { method: "POST", body: JSON.stringify({ transfers }) });
+
+/** *Name an Author* (R1): a case of your unit with no Author is given one (ADR-145 Amendment 5). */
+export const nameAnAuthor = (api: AdminApi, caseId: string, account: string) =>
+  call<void>(api, `cases/${encodeURIComponent(caseId)}/authors/${encodeURIComponent(account)}`, { method: "PUT" });
+export const roleVersions = (api: AdminApi, roleId: string) =>
+  call<CustomRoleVersion[]>(api, `roles/${encodeURIComponent(roleId)}/versions`);
+
+/** Admin › Audit's filters (ADR-145 decision 10): each narrows what the Conduit reads as you. */
+export interface AuditQuery {
+  held_in: "case_and_admin" | "rules" | "models";
+  kind?: string;
+  who?: string;
+  case?: string;
+  dataset?: string;
+  since?: string;
+  until?: string;
+  offset?: number;
+  limit?: number;
+}
+/** Each record its own route, each declaring its rights: the stream (`read_audit`), a case's rule
+ * audit (and `read_rule_audit`, for the Administrator), the engines' history (and `manage_models`). */
+export const readAudit = (api: AdminApi, query: AuditQuery) => {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query))
+    if (key !== "held_in" && value !== undefined && value !== "") params.set(key, String(value));
+  const q = params.toString();
+  if (query.held_in === "rules") return call<AuditSectionPage>(api, `audit/rules?${q}`);
+  if (query.held_in === "models") return call<AuditSectionPage>(api, `audit/models?${q}`);
+  return call<AuditSectionPage>(api, `audit?${q}`);
+};
+/** Operations' ageing (ADR-145 decision 9): what ages and when, and the promotions waiting. */
+export const operationsAgeing = (api: AdminApi) => call<OperationsAgeing>(api, "operations/ageing");
+export const setPromotionAlertDays = (api: AdminApi, days: number) =>
+  call<PromotionAlertSetting>(api, "settings/promotion-alert-days", {
+    method: "PUT",
+    body: JSON.stringify({ alert_after_days: days }),
   });

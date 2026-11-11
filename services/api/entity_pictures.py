@@ -53,7 +53,9 @@ from schemas.domain import (
     SourceRef,
 )
 
+from .alerts import AlertStore, purge_copies, repointing_alerts
 from .change_provenance import PICTURE_MARKER, without_link_ids
+from .dataset_scope import DrawnOnItsBoard, refuse_in_a_composite_case
 from .document_content import DOCUMENT_TYPE, UploadRefusedError
 from .email_extraction import _node_from_write
 from .link_ids import as_stored
@@ -166,7 +168,11 @@ class EntityPictureService:
         *,
         scheme: HandlingScheme | None = None,
         audit: PictureAudit | None = None,
+        alerts: AlertStore | None = None,
     ) -> None:
+        #: The alerts that may cite a picture link this replaces: each is repointed to its
+        #: successor (ADR-109 Amendment 10). `None` only for a test of the service's own.
+        self._alerts = alerts
         self._audit = audit
         self._working_set = working_set
         self._graph = graph
@@ -283,6 +289,10 @@ class EntityPictureService:
                 f"the marking {handling.classification} is one you could not read yourself"
             )
         entity = await entity_of()
+        if entity.provenance.drawn is not None:
+            # ADR-105 Amendment 3: a drawn node's picture is given on its board, where the Document
+            # and its link are written into the case's layer, never stamped into the source.
+            raise DrawnOnItsBoard
         depicts = self._ontology.edge_type(DEPICTS)
         if depicts is None or entity.type not in depicts.to_types:
             raise UploadRefusedError(f"a {entity.type} cannot have a picture of its own")
@@ -292,6 +302,8 @@ class EntityPictureService:
         if skip_if_picture_history and await self._has_picture_history(node_id, principal):
             return None
         before = (await self._current([node_id], principal)).get(node_id)
+        # ADR-099 Amendment 15: a composite is read-only; refused before any file is stored.
+        await refuse_in_a_composite_case()
 
         ref = reference_for(data, content_type)
         document_id = f"content:{sha256(ref.encode()).hexdigest()[:32]}"
@@ -315,7 +327,14 @@ class EntityPictureService:
         document = NodeWrite(
             id=document_id,
             type=DOCUMENT_TYPE,
-            properties={"title": name, "media_kind": "image", "object_ref": ref},
+            # `size_bytes`: so Admin › Datasets counts the picture in its layer's size, taken in
+            # the store (ADR-143 Amendment 2 decision 2; `GraphPort.dataset_footprints`).
+            properties={
+                "title": name,
+                "media_kind": "image",
+                "object_ref": ref,
+                "size_bytes": len(data),
+            },  # fmt: skip
             provenance=provenance,
             handling=handling,
             created_by=principal.id,
@@ -349,18 +368,29 @@ class EntityPictureService:
                 },
                 result_cardinality=1,
             )
-        tx = await self._graph.begin_transaction()
-        try:
-            await self._graph.upsert_nodes([document], tx)
-            if before is None:
-                (link,) = as_stored([link], await self._graph.upsert_edges([link], tx))
-            else:
-                replaced = await self._graph.supersede_edge(before[0].id, link, tx)
-                (link,) = as_stored([link], [replaced])
-        except Exception:
-            await self._graph.rollback_transaction(tx)
-            raise
-        await self._graph.commit_transaction(tx)
+        async with repointing_alerts(self._alerts, self._graph) as repoint:
+            tx = await self._graph.begin_transaction()
+            try:
+                await self._graph.upsert_nodes([document], tx)
+                if before is None:
+                    (link,) = as_stored([link], await self._graph.upsert_edges([link], tx))
+                else:
+                    replaced = await self._graph.supersede_edge(
+                        before[0].id, link, tx, old_type=before[0].type
+                    )
+                    await repoint.record(before[0].id, replaced, old_type=before[0].type)
+                    (link,) = as_stored([link], [replaced])
+            except Exception:
+                # Its commit never sent, nothing recorded can land: the record goes with it.
+                repoint.never_committed()
+                await self._graph.rollback_transaction(tx)
+                raise
+            await self._graph.commit_transaction(tx)
+        # The moved alerts' re-marked nodes leave every working set that stored a copy at the old
+        # marking (ADR-109 Amendment 10): a stored copy is served from the store, not read again.
+        if repoint.remarked_nodes:
+            await purge_copies(self._working_set, repoint.remarked_nodes)
+            await repoint.purged()
         return _Attached(document=document, link=link, before=before)
 
     async def set(
@@ -481,8 +511,10 @@ class EntityPictureService:
         self, investigation_id: str, node_id: str, principal: Principal
     ) -> DeltaReplaceEdge:
         """Supersedes the entity's picture with a copy whose `shown` is false; the Document and the
-        old link stay, as evidence and in the link's history."""
-        await self._entity(investigation_id, node_id, principal)
+        old link stay, as evidence and in the link's history. A drawn node's picture is removed
+        on its board, never here (ADR-105 Amendment 3)."""
+        if (await self._entity(investigation_id, node_id, principal)).provenance.drawn is not None:
+            raise DrawnOnItsBoard
         # Read in full: the successor is built from this link's own sources (ADR-130 Amendment 2,
         # "a read that is written back"). Still read for `principal`, so the access filter applies.
         with sources_in_full():
@@ -490,6 +522,7 @@ class EntityPictureService:
         if current is None:
             raise PictureNotFoundError(node_id)
         old, _ = current
+        await refuse_in_a_composite_case()  # ADR-099 Amendment 15, once the picture is read
         # Still withheld after the full read (a record stored so): the successor would carry the
         # removal's own marker and nothing else, replacing every stored source. Not found, as
         # `link_changes._in_full` answers it.
@@ -514,13 +547,25 @@ class EntityPictureService:
             created_by=principal.id,
             created_at=now,
         )
-        tx = await self._graph.begin_transaction()
-        try:
-            await self._graph.supersede_edge(old.id, write, tx)
-        except Exception:
-            await self._graph.rollback_transaction(tx)
-            raise
-        await self._graph.commit_transaction(tx)
+        async with repointing_alerts(self._alerts, self._graph) as repoint:
+            tx = await self._graph.begin_transaction()
+            try:
+                await repoint.record(
+                    old.id,
+                    await self._graph.supersede_edge(old.id, write, tx, old_type=old.type),
+                    old_type=old.type,
+                )
+            except Exception:
+                # Its commit never sent, nothing recorded can land: the record goes with it.
+                repoint.never_committed()
+                await self._graph.rollback_transaction(tx)
+                raise
+            await self._graph.commit_transaction(tx)
+        # The moved alerts' re-marked nodes leave every working set that stored a copy at the old
+        # marking (ADR-109 Amendment 10): a stored copy is served from the store, not read again.
+        if repoint.remarked_nodes:
+            await purge_copies(self._working_set, repoint.remarked_nodes)
+            await repoint.purged()
         # The successor belongs to every dataset the link did (the store merges them), so what it
         # is sent as is judged against all of them (ADR-130 Amendment 2).
         return await self._working_set.replace_edge(

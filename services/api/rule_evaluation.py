@@ -31,8 +31,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from typing import Any, Literal
 
 from services.ingest.typologies import (
     MoneyFlow,
@@ -73,6 +74,13 @@ from schemas.domain import (
 
 from .alerts import AlertStore
 from .audit import AuditWriter
+from .dataset_scope import (
+    CompositeReadOnlyError,
+    analyst_layer,
+    analyst_writes_into,
+    read_only_layer,
+    reads_a_composite,
+)
 from .held_rows import HeldRowStore
 from .hotlists import HotlistStore
 from .kyc_expiries import KycExpiryStore
@@ -265,6 +273,14 @@ RULE_AUDIT_ACTIONS: tuple[str, ...] = (
     "rule_change_rejected",
     "rule_changed",
     "load_checks_set",
+    # L2.10's carry: the daily sweep's failure for a rule, said where a person sees it (*Changes*).
+    "rule_evaluation_failed",
+    # ADR-146 decision 3 (L2.11): "every change is audited and listed in *Changes*" — a draft
+    # saved, tested (never its count, rule 7), made live, or asked to go live.
+    "rule_draft_saved",
+    "rule_tested",
+    "rule_made_live",
+    "rule_make_live_proposed",
 )
 
 
@@ -441,6 +457,50 @@ async def judge(
     ]
 
 
+#: Why an alert was raised without its `Alert` node, one per path that withholds it (ADR-146
+#: decision 10): its referents restricted for different units (no single safe marking); a referent
+#: whose marking could not be read in the load; a cited link that could not be read.
+NodeWithheld = Literal[
+    "units", "unseen_referent", "unreadable_link", "originals_layer", "read_only_dataset"
+]
+WITHHELD_WORDS: dict[str, str] = {
+    "units": "its referents' restricted markings belong to different units",
+    "unseen_referent": "the marking of something it names could not be read, so no node was "
+    "written rather than one marked by a guess",
+    "unreadable_link": "a link it cites could not be read (taken back or replaced since it was "
+    "found), so no node was written rather than one marked by a guess",
+    "originals_layer": "it rests on the layer of the case this one was made from, which it reads "
+    "and writes nothing into, so no node was written rather than one that names its subject "
+    "elsewhere",
+    "read_only_dataset": "the dataset it would be written into is read-only here, so no node was "
+    "written; the alert is in the queue without it",
+}
+
+
+class PartlyRaised(Exception):  # noqa: N818 - a run that failed part-way, not a kind of error
+    """A run outside a load (a scheduled slot, a re-screening) that failed after raising some
+    alerts: what it raised is kept and counted, and the failure is said with it (L2.10's carry: a
+    failed slot counted none, and a failed re-screening dropped the rule's raised count)."""
+
+    def __init__(self, raised: int, cause: BaseException, *, customers: int = 0) -> None:
+        super().__init__(str(cause))
+        self.raised = raised
+        self.customers = customers
+        self.cause = cause
+
+
+class UnseenAlertReferent(RuntimeError):
+    """A referent node whose marking cannot be read (`_referent_handlings`): no node is written
+    rather than one marked by a guess. A `RuntimeError`, as it always was, so every caller that
+    caught one still does; `raise_committed` catches this alone (the lane-reviewer's L2.10 note)."""
+
+
+class UnreadableAlertLink(RuntimeError):
+    """A link an alert cites whose marking cannot be read (reverted or superseded since the
+    finding was judged): its node is withheld rather than marked by a guess, wherever the alert is
+    raised (ADR-146 decision 10)."""
+
+
 async def _referent_handlings(
     graph: GraphPort,
     scheme: HandlingScheme,
@@ -449,13 +509,25 @@ async def _referent_handlings(
     known: Mapping[str, Handling],
 ) -> list[Handling]:
     """The markings an alert must not be lower than: every cited event's, everything it writes
-    alongside, and every referenced node's as stored. A node not yet committed (written in this
-    very load's transaction) cannot be read back: its marking as written (`known`) stands in, else
+    alongside, every referenced node's and every cited link's as stored (the links since ADR-146
+    decision 10: a link marked above its ends left the node, and the words it carries, readable by
+    someone who may not see the link). A node or link not yet committed (written in this very
+    load's transaction) cannot be read back: its marking as written (`known`) stands in, else
     `unseen` — the highest marking the load's recipe could give it."""
     handlings = [e.handling for e in finding.events]
     pending = {w.id: w.handling for w in finding.pending}
     handlings.extend(pending.values())
     reader = service_principal(scheme)
+    cited = sorted({e for e in finding.edge_ids if e not in pending and e not in known})
+    handlings.extend(known[e] for e in finding.edge_ids if e not in pending and e in known)
+    stored = {e.id: e.handling for e in await graph.get_edges(cited, reader)} if cited else {}
+    for edge_id in cited:
+        if edge_id in stored:
+            handlings.append(stored[edge_id])
+        elif unseen is not None:
+            handlings.append(unseen)
+        else:
+            raise UnreadableAlertLink(f"alert link {edge_id} could not be read for its marking")
     for node_id in finding.node_ids:
         if node_id in pending:
             continue
@@ -468,8 +540,51 @@ async def _referent_handlings(
         elif unseen is not None:
             handlings.append(unseen)
         else:
-            raise RuntimeError(f"alert referent {node_id} could not be read for its marking")
+            raise UnseenAlertReferent(f"alert referent {node_id} could not be read for its marking")
     return handlings
+
+
+class _AlertInAReadOnlyLayer(Exception):
+    """An alert resting on what an unconverted case reads of its original's layer: its node would
+    carry the layer's subjects' names, and such a case writes into no layer (ADR-144 Amendment 1
+    decision 2), so the node is withheld and the queue row still raised."""
+
+
+async def _alert_datasets(graph: GraphPort, scheme: HandlingScheme, finding: Finding) -> list[str]:
+    """What an alert's own node and `ALERTED_ON` links name, and what it writes alongside.
+
+    - In a case reading a composite (read-only for now; ADR-099 Amendment 15 item 2): the case's
+      analyst layer, made here if it has none. An `ALERTED_ON` from the layer's node to a member's
+      node is the layer's link, and changes no member.
+    - In any other case, an alert any of whose referents or cited links lives in the case's layer
+      goes into that layer too, its node and `ALERTED_ON` included (rule 3, the orchestrator's
+      ruling of 7 November 2026): the node's words begin with a subject's name, and in the source
+      they would put a name drawn or marked in this case, and one more `Alert` in the counts, in
+      front of every other case reading that source. In a case not yet converted, resting on its
+      original's layer, it is withheld (`_AlertInAReadOnlyLayer`).
+    - Otherwise nothing is named, and the stamping graph places them in the case's dataset."""
+    if await reads_a_composite():
+        return await analyst_writes_into()
+    if read_only_layer() is not None:
+        # A case made from another and not yet converted writes nothing (L3.2 item 3, the
+        # review's round 2): its alert is withheld, its queue row raised, as for its original's
+        # layer before.
+        raise _AlertInAReadOnlyLayer
+    layers = {layer for layer in (analyst_layer(), read_only_layer()) if layer is not None}
+    if not layers:
+        return []
+    reader = service_principal(scheme)
+    pending = {w.id for w in finding.pending}
+    node_ids = [n for n in finding.node_ids if n not in pending]
+    nodes = await graph.get_nodes(node_ids, reader) if node_ids else []
+    edges = await graph.get_edges(list(finding.edge_ids), reader) if finding.edge_ids else []
+    named = [*(d for n in nodes for d in n.datasets), *(d for e in edges for d in e.datasets)]
+    touched = set(named) & layers
+    if not touched:
+        return []
+    if read_only_layer() in touched:
+        raise _AlertInAReadOnlyLayer
+    return await analyst_writes_into()
 
 
 async def write_alert_node(
@@ -482,26 +597,58 @@ async def write_alert_node(
     load_id: str | None = None,
     known: Mapping[str, Handling] | None = None,
     writes: RuleWrites | None = None,
-) -> str | None:
+) -> tuple[str | None, Finding]:
     """The `Alert` node and its `ALERTED_ON` links, in `tx` — at the highest marking of what it
     references, `inferred`, attributed to the rule (ruling 2; rules 3 and 5) — after anything the
     finding writes alongside (`pending`). `None` when no single marking is safe
-    (`alert_handling`): the node is withheld, the queue row still raised."""
+    (`alert_handling`): the node is withheld, the queue row still raised. Returned with the finding
+    as stored: a pending write the store merged into one it already held (a second screening hit
+    on the same match) is cited by the stored id, never the write's own, which no link holds and
+    which the queue's check would read as hidden from every reader (L2.8b)."""
     record = writes if writes is not None else RuleWrites()
-    from .sentence_rules import is_just_me
+    from .sentence_rules import writes_no_alert_node
 
-    if is_just_me(finding.rule):
-        return None  # an alert for its author alone puts nothing in the case's graph
+    if writes_no_alert_node(finding.rule):
+        # An alert for its author alone, or routed to a named team, puts nothing in the case's
+        # graph: its node would carry its words to members the queue does not show it to.
+        return None, finding
+    into = await _alert_datasets(graph, scheme, finding)  # `_AlertInAReadOnlyLayer`: no node
     if finding.pending:
-        pending_nodes = [w for w in finding.pending if isinstance(w, NodeWrite)]
-        pending_edges = [w for w in finding.pending if isinstance(w, EdgeWrite)]
-        record.node_ids.extend(await graph.upsert_nodes(pending_nodes, tx))
-        record.edges(pending_edges, await graph.upsert_edges(pending_edges, tx))
+        # What the finding writes alongside (a screening hit's listed party, as the list asserts
+        # it, and its inferred `SAME_AS`) is new and the rule's own: in a composite case it goes
+        # into the layer with the alert. A link of the layer's is of another audience than a
+        # member's, so it never merges into one; a write naming a dataset of its own keeps it, and
+        # the stamping graph judges it.
+        pending = [w if w.datasets or not into else w.model_copy(update={"datasets": into})
+                   for w in finding.pending]  # fmt: skip
+        pending_nodes = [w for w in pending if isinstance(w, NodeWrite)]
+        stored_nodes = list(await graph.upsert_nodes(pending_nodes, tx))
+        record.node_ids.extend(stored_nodes)
+        renamed = {w.id: i for w, i in zip(pending_nodes, stored_nodes, strict=True) if w.id != i}
+        pending_edges = [
+            w.model_copy(update={"source": renamed.get(w.source, w.source),
+                                 "target": renamed.get(w.target, w.target)})  # fmt: skip
+            for w in pending
+            if isinstance(w, EdgeWrite)
+        ]
+        stored_edges = list(await graph.upsert_edges(pending_edges, tx))
+        record.edges(pending_edges, stored_edges)
+        renamed.update(
+            {w.id: i for w, i in zip(pending_edges, stored_edges, strict=True) if w.id != i}
+        )
+        if renamed:
+            finding = replace(
+                finding,
+                subject=renamed.get(finding.subject, finding.subject),
+                node_ids=[renamed.get(i, i) for i in finding.node_ids],
+                edge_ids=[renamed.get(i, i) for i in finding.edge_ids],
+                pending=(),
+            )
     marking = alert_handling(
         scheme, await _referent_handlings(graph, scheme, finding, unseen, known or {})
     )
     if marking is None:
-        return None
+        return None, finding
     now = datetime.now(UTC)
     provenance = Provenance(
         state=ProvenanceState.INFERRED,
@@ -526,6 +673,7 @@ async def write_alert_node(
         created_by=finding.deployer.id,
         created_at=now,
         load_id=load_id,
+        datasets=into,
     )
     (node_id,) = await graph.upsert_nodes([node], tx)
     record.node_ids.append(node_id)
@@ -541,11 +689,12 @@ async def write_alert_node(
             created_by=finding.deployer.id,
             created_at=now,
             load_id=load_id,
+            datasets=into,
         )
         for target in finding.node_ids
     ]
     record.edges(alerted, await graph.upsert_edges(alerted, tx))
-    return node_id
+    return node_id, finding
 
 
 def alert_row(finding: Finding, alert_node_id: str | None, investigation_id: str) -> Alert:
@@ -598,11 +747,20 @@ class PreCommitVerdict:
     """What the case's pre-commit rules decided about one load, before its commit."""
 
     findings: list[tuple[Finding, str | None]] = field(default_factory=list)
+    #: Why each finding raised with no node was withheld, by its place in `findings`.
+    withheld: dict[int, NodeWithheld] = field(default_factory=dict)
     #: Rows a failing rule could not judge, by original row number, with the failing rule and why.
     hold: dict[int, tuple[TypologyRule, str]] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     #: What the rules wrote into the load's transaction, for the load's record.
     writes: RuleWrites = field(default_factory=RuleWrites)
+
+
+def held_because(rule: TypologyRule) -> str:
+    """Why a row a rule matched is held, in words a reviewer of the row may read: the rule and its
+    typology, never the finding's own words, which name what its deployer read (ADR-146 decision
+    10; L2.8b's Q2)."""
+    return f"it matched “{rule.name}” ({rule.params.typology.replace('_', ' ')})"
 
 
 @dataclass
@@ -638,6 +796,12 @@ class RuleGate:
     #: ontology a sentence's drawn pattern is read back against.
     hotlists: HotlistStore | None = None
     ontology: OntologySchema | None = None
+    #: ADR-146 decision 3 (L2.11's list picker): a sentence's named Studio list, read within the
+    #: rule's own dataset (`rule_editor.rule_list_reader`). None where no run reads one.
+    rule_lists: Callable[[TypologyRule, str, str], Awaitable[list[Any]]] | None = None
+    #: ADR-146 decision 3: what a rule on a declared dataset reads, its composite's members with it
+    #: (`rule_editor.rule_reach_of`). None: the rule's dataset id alone, as before L2.11.
+    rule_reach: Callable[[TypologyRule], Awaitable[list[str] | None]] | None = None
     #: ADR-133 decision 6, stage (d): what a hit of a rule does at this pipeline, as its "Checks on
     #: load" step chose ("alert" or "hold"), by rule id. A rule not named keeps its author's choice.
     on_hit: dict[str, str] = field(default_factory=dict)
@@ -676,11 +840,23 @@ class RuleGate:
         return await self.expiries.record(self.investigation_id, pairs)
 
     async def _deployer(self, rule: TypologyRule) -> Principal | None:
-        deployer = await self.principal_for_owner(rule.owner_id)
-        if deployer is not None and rule.dataset_id is not None:
-            deployer = deployer.model_copy(update={"datasets": [rule.dataset_id]})
+        from .rule_schedule import holds_a_writing_right
         from .sentence_rules import is_deployment_wide
 
+        deployer = await self.principal_for_owner(rule.owner_id)
+        if deployer is not None and not is_deployment_wide(rule) and not holds_a_writing_right(
+            deployer
+        ):
+            # ADR-146 Amendment 6 decision 13: a rule runs as its author only while they hold a
+            # right to have written it, at a load as on a schedule (a whole-deployment rule is the
+            # administrator's, approved by a second person: its own rights, ADR-133 decision 7).
+            return None
+        if deployer is not None and rule.dataset_id is not None:
+            reach: list[str] | None = [rule.dataset_id]
+            if self.rule_reach is not None:
+                reach = await self.rule_reach(rule)
+            # A case that no longer reads the rule's dataset reads nothing through it (rule 3).
+            deployer = deployer.model_copy(update={"datasets": reach or []})
         if deployer is not None and is_deployment_wide(rule):
             # ADR-133 decision 1: a deployment-wide sentence judges each case's loads within that
             # case's datasets (the loader's), as its administrator author may read them.
@@ -818,7 +994,9 @@ class RuleGate:
         written: Sequence[NodeWrite | EdgeWrite] = (),
     ) -> PreCommitVerdict:
         verdict = PreCommitVerdict()
-        known = {w.id: w.handling for w in written if isinstance(w, NodeWrite)}
+        # What this load wrote, nodes and links, cannot be read back before the commit: each
+        # stands in at its marking as written, never at the recipe's highest (`unseen`).
+        known = {w.id: w.handling for w in written}
         for rule in (r for r in self.rules if r.trigger == "pre_commit"):
             flow_rows = self._rows_for(rule, events, written)
             reason: str | None = None
@@ -869,35 +1047,55 @@ class RuleGate:
                 for finding in fresh:
                     rows = rows_of_finding(finding, events, written)
                     for row in rows:
-                        verdict.hold.setdefault(row, (rule, f"it matched: {finding.words}"))
+                        verdict.hold.setdefault(row, (rule, held_because(rule)))
                     verdict.notes.append(
                         f"Rule “{rule.name}” matched {len(rows)} row(s); they are held for "
                         "review, not loaded."
                     )
                 continue
             for finding in fresh:
-                try:
-                    node_id = await write_alert_node(
-                        self.graph,
-                        self.scheme,
-                        finding,
-                        tx,
-                        unseen=unseen,
-                        load_id=load_id,
-                        known=known,
-                        writes=verdict.writes,
-                    )
-                except RuntimeError:
-                    # A referent's marking cannot be known: no node rather than a guessed one.
-                    node_id = None
-                verdict.findings.append((finding, node_id))
+                node_id, why, stored = await self._alert_node_in_load(
+                    finding, tx, unseen=unseen, load_id=load_id, known=known, writes=verdict.writes
+                )
+                if why is not None:
+                    verdict.withheld[len(verdict.findings)] = why
+                verdict.findings.append((stored, node_id))
             if fresh:
                 verdict.notes.append(f"Rule “{rule.name}” raised {len(fresh)} alert(s).")
         return verdict
 
+    async def _alert_node_in_load(
+        self,
+        finding: Finding,
+        tx: TxId,
+        *,
+        unseen: Handling | None,
+        load_id: str | None,
+        known: Mapping[str, Handling],
+        writes: RuleWrites,
+    ) -> tuple[str | None, NodeWithheld | None, Finding]:
+        """The finding's `Alert` node in the load's transaction, or why there is none, and the
+        finding as stored (`write_alert_node`)."""
+        try:
+            node_id, stored = await write_alert_node(
+                self.graph, self.scheme, finding, tx, unseen=unseen, load_id=load_id, known=known,
+                writes=writes,
+            )  # fmt: skip
+        except UnreadableAlertLink:
+            return None, "unreadable_link", finding
+        except _AlertInAReadOnlyLayer:
+            return None, "originals_layer", finding
+        except RuntimeError:
+            # A referent's marking cannot be known: no node rather than a guessed one.
+            return None, "unseen_referent", finding
+        return node_id, ("units" if node_id is None else None), stored
+
     async def after_commit(self, verdict: PreCommitVerdict) -> list[Alert]:
         """The queue rows for what `pre_commit` wrote into the committed graph."""
-        return [await self._raise_row(f, node_id) for f, node_id in verdict.findings]
+        return [
+            await self._raise_row(f, node_id, withheld=verdict.withheld.get(i))
+            for i, (f, node_id) in enumerate(verdict.findings)
+        ]
 
     async def _rests_on(self, finding: Finding, node_id: str | None) -> list[Handling] | None:
         """Every handling the alert rests on — its entities, its own node, the links and the
@@ -915,7 +1113,9 @@ class RuleGate:
             *(e.handling for e in finding.events),
         ]
 
-    async def _raise_row(self, finding: Finding, node_id: str | None) -> Alert:
+    async def _raise_row(
+        self, finding: Finding, node_id: str | None, *, withheld: NodeWithheld | None = None
+    ) -> Alert:
         alert = alert_row(finding, node_id, self.investigation_id)
         await self.alert_store.save(alert, handlings=await self._rests_on(finding, node_id))
         await self._remember(finding)
@@ -925,15 +1125,19 @@ class RuleGate:
             "trigger": finding.rule.trigger,
             "words": finding.words,
             "node_ids": finding.node_ids,
+            # Every link and transaction the finding cites, so the audit read withholds the entry,
+            # and its words, from a reader who may not see them (ADR-146 decision 10; L2.8b).
+            "edge_ids": list(alert.edge_ids),
+            "event_ids": list(alert.event_ids),
         }
         await self._audit("rule_fired", detail, 1)
-        from .sentence_rules import is_just_me
+        from .sentence_rules import writes_no_alert_node
 
-        if node_id is None and not is_just_me(finding.rule):
+        if node_id is None and not writes_no_alert_node(finding.rule):
             await self._audit(
                 "alert_node_withheld",
                 {"rule_id": finding.rule.id, "alert_id": alert.id, "node_ids": finding.node_ids,
-                 "reason": "its referents' restricted markings belong to different units"},
+                 "reason": WITHHELD_WORDS[withheld] if withheld else "no reason was recorded"},
             )
         return alert
 
@@ -943,20 +1147,46 @@ class RuleGate:
         """A finding raised outside any load's transaction (after commit, or by the daily sweep):
         its node in a transaction of its own, then its queue row. `writes` collects what it wrote,
         for the record of the load it follows."""
-        from .sentence_rules import is_just_me
+        from .sentence_rules import writes_no_alert_node
 
-        if is_just_me(finding.rule):
+        if writes_no_alert_node(finding.rule):
             return await self._raise_row(finding, None)  # nothing goes into the case's graph
         tx = await self.graph.begin_transaction()
         try:
-            node_id = await write_alert_node(
+            node_id, stored = await write_alert_node(
                 self.graph, self.scheme, finding, tx, load_id=load_id, writes=writes
             )
+        except UnreadableAlertLink:
+            # As the load path does for an unseen referent: no node rather than a guessed one, the
+            # row still raised (the queue's full check withholds it from anyone who may not see its
+            # evidence), so one reverted link never stops a sweep. A node still stops the raise.
+            await self.graph.rollback_transaction(tx)
+            return await self._raise_row(finding, None, withheld="unreadable_link")
+        except _AlertInAReadOnlyLayer:
+            await self.graph.rollback_transaction(tx)
+            return await self._raise_row(finding, None, withheld="originals_layer")
+        except (CompositeReadOnlyError, UnseenAlertReferent) as error:
+            # L2.10's carry: outside a load, as in one, a node that cannot be written (a read-only
+            # dataset) or marked (a referent's marking not known, `_referent_handlings`) leaves the
+            # row raised without it, said in the audit, so one finding never stops a sweep. Not
+            # for a finding that writes alongside (a screening hit's listed party and `SAME_AS`):
+            # its row would cite what was never written, so its refusal stands.
+            await self.graph.rollback_transaction(tx)
+            if finding.pending:
+                raise
+            why: NodeWithheld = (
+                "read_only_dataset"
+                if isinstance(error, CompositeReadOnlyError)
+                else "unseen_referent"
+            )
+            return await self._raise_row(finding, None, withheld=why)
         except Exception:
             await self.graph.rollback_transaction(tx)
             raise
         await self.graph.commit_transaction(tx)
-        return await self._raise_row(finding, node_id)
+        return await self._raise_row(
+            stored, node_id, withheld="units" if node_id is None else None
+        )
 
     async def seen(self, finding: Finding) -> bool:
         return await self._seen(finding)

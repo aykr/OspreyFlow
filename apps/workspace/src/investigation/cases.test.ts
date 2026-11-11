@@ -6,7 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { INVESTIGATION_ID_SESSION_KEY } from "./investigationId";
-import { type CaseListing, caseIsOpenable, caseUrl, createCase, listCases, nestCases, openCase, removeCase } from "./cases";
+import { caseIsOpenable, caseUrl, createCase, listCases, openCase, openCaseView, removeCase, setCaseDatasets } from "./cases";
 
 const fetchMock = vi.fn();
 
@@ -52,26 +52,30 @@ describe("createCase", () => {
   it("posts the trimmed name and returns the new case", async () => {
     respond(201, { id: "new-1", name: "Enron" });
 
-    const created = await createCase("http://api", "tok", "  Enron  ");
+    const created = await createCase("http://api", "tok", "  Enron  ", { datasetId: "enron" });
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("http://api/v1/investigations");
     expect(init.method).toBe("POST");
-    expect(JSON.parse(init.body as string)).toEqual({ name: "Enron", domains: [] });
+    expect(JSON.parse(init.body as string)).toEqual({ name: "Enron", dataset_ids: ["enron"], domains: [] });
     expect(created.id).toBe("new-1");
   });
 
   it("sends the domain models chosen, sorted as the catalogue lists them", async () => {
     respond(201, { id: "new-1", name: "Enron", domains: ["fibo", "niem"] });
 
-    await createCase("http://api", "tok", "Enron", [], ["niem", "fibo"]);
+    await createCase("http://api", "tok", "Enron", { newDatasetName: "Enron data" }, ["niem", "fibo"]);
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(JSON.parse(init.body as string)).toEqual({ name: "Enron", domains: ["fibo", "niem"] });
+    expect(JSON.parse(init.body as string)).toEqual({
+      name: "Enron",
+      new_dataset_name: "Enron data",
+      domains: ["fibo", "niem"],
+    });
   });
 
   it("refuses a blank name without calling the server", async () => {
-    await expect(createCase("http://api", "tok", "   ")).rejects.toThrow(/name/i);
+    await expect(createCase("http://api", "tok", "   ", { newDatasetName: "" })).rejects.toThrow(/name/i);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
@@ -85,8 +89,15 @@ describe("opening a case", () => {
     expect(caseUrl("c1", "ingest")).toBe("/?investigation=c1&from=case&view=ingest");
   });
 
-  it("opens a case branched for questions on its Questions panel (ADR-098 decision 4)", () => {
-    expect(caseUrl("b1", "questions")).toBe("/?investigation=b1&from=case&view=questions");
+  it("opens a case on its Questions panel (ADR-098 decision 4)", () => {
+    expect(caseUrl("c1", "questions")).toBe("/?investigation=c1&from=case&view=questions");
+  });
+
+  it("opens a case on one of its views, as a lens (ADR-144)", () => {
+    const navigate = vi.fn();
+    openCaseView("case-9", "view 1", navigate);
+    expect(sessionStorage.getItem(INVESTIGATION_ID_SESSION_KEY)).toBe("case-9");
+    expect(navigate).toHaveBeenCalledWith("/?investigation=case-9&from=case&case_view=view%201");
   });
 
   it("remembers it for the sign-in round trip before navigating", () => {
@@ -118,6 +129,12 @@ describe("removing a case", () => {
     await expect(removeCase("http://api", "tok", "c1")).rejects.toThrow(/permission/i);
     vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 404 })));
     await expect(removeCase("http://api", "tok", "c1")).rejects.toThrow(/not found|already/i);
+    // L3.H1: a dataset's home case is refused in the Conduit's own words, never a bare 409.
+    const kept = { detail: { error: "home_case_kept", message: "this is its dataset's home case, which holds the dataset's reports, alerts and promotion reviews, so it is kept while the dataset exists" } };
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 409, json: async () => kept })));
+    await expect(removeCase("http://api", "tok", "c1")).rejects.toThrow(
+      "This case cannot be removed: this is its dataset's home case, which holds the dataset's reports, alerts and promotion reviews, so it is kept while the dataset exists.",
+    );
   });
 
   it("forgets the case if it was the one remembered for this tab", async () => {
@@ -128,42 +145,6 @@ describe("removing a case", () => {
     sessionStorage.setItem(INVESTIGATION_ID_SESSION_KEY, "other");
     await removeCase("http://api", "tok", "c1");
     expect(sessionStorage.getItem(INVESTIGATION_ID_SESSION_KEY)).toBe("other");
-  });
-});
-
-describe("nestCases", () => {
-  function listing(id: string, created: string, branchedFrom: string | null = null, name = id): CaseListing {
-    return { id, name, level: "author", created_at: created, created_by: "a", branched_from: branchedFrom };
-  }
-
-  it("puts each case's branches beneath it, oldest branch first, roots in the usual order", () => {
-    const cases = [
-      listing("enron", "2026-10-01T00:00:00Z"),
-      listing("b4", "2026-10-04T12:00:00Z", "enron"),
-      listing("b2", "2026-10-04T10:00:00Z", "enron"),
-      listing("fixture", "2026-10-02T00:00:00Z"),
-      listing("b2-of-b2", "2026-10-04T11:00:00Z", "b2"),
-    ];
-    expect(nestCases(cases).map(({ entry, branch }) => [entry.id, branch])).toEqual([
-      ["fixture", false],
-      ["enron", false],
-      ["b2", true],
-      ["b2-of-b2", true],
-      ["b4", true],
-    ]);
-  });
-
-  it("lists a branch whose original the account cannot see under its oldest visible ancestor", () => {
-    const cases = [listing("b2", "2026-10-04T10:00:00Z", "not-visible"), listing("b3", "2026-10-04T11:00:00Z", "b2")];
-    expect(nestCases(cases).map(({ entry, branch }) => [entry.id, branch])).toEqual([
-      ["b2", false],
-      ["b3", true],
-    ]);
-  });
-
-  it("drops no case", () => {
-    const cases = [listing("a", "2026-01-01T00:00:00Z"), listing("b", "2026-01-02T00:00:00Z", "a")];
-    expect(nestCases(cases)).toHaveLength(2);
   });
 });
 
@@ -194,46 +175,12 @@ describe("caseIsOpenable", () => {
   });
 });
 
-// ADR-084 Amendment 4 (the owner, 14 October 2026: "the current display method for the Branch and main
-// case is very confusing, i need a method to delete a branch as through the Glass view").
-describe("a branch, named and placed in its case's tree", () => {
-  const listing = (over: Partial<CaseListing>): CaseListing => ({
-    id: "x", name: "", level: "author", created_at: "2026-10-14T16:40:00Z", created_by: "a", ...over,
-  });
-
-  it("is called by its size and when it was made, unless someone renamed it", async () => {
-    const { branchLabel } = await import("./cases");
-    expect(branchLabel(listing({ name: "Branch of Operation Ledger (synthetic demo) (2 nodes)" }))).toBe("2 nodes · 14 Oct 16:40");
-    expect(branchLabel(listing({ name: "Branch of Operation Ledger (1 node)" }))).toBe("1 node · 14 Oct 16:40");
-    expect(branchLabel(listing({ name: "Branch of Enron (2)" }))).toBe("Branch · 14 Oct 16:40");
-    expect(branchLabel(listing({ name: "Midland Pallets route" }))).toBe("Midland Pallets route");
-  });
-
-  it("goes back to the case it came from, or the oldest one this account can see", async () => {
-    const { returnFor } = await import("./cases");
-    const root = listing({ id: "r" });
-    const b1 = listing({ id: "b1", branched_from: "r" });
-    const b2 = listing({ id: "b2", branched_from: "b1" });
-    const orphan = listing({ id: "o", branched_from: "gone" });
-    expect(returnFor([root, b1, b2], "b2")?.id).toBe("b1");
-    expect(returnFor([root, b1, b2], "b1")?.id).toBe("r");
-    expect(returnFor([root, b1, b2], "r")).toBeNull();
-    expect(returnFor([orphan], "o")).toBeNull();
-  });
-
-  it("is renamed through the case's own route, refused in words", async () => {
-    const { renameCase } = await import("./cases");
-    const calls: [string, RequestInit][] = [];
-    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
-      calls.push([url, init]);
-      return new Response("{}", { status: calls.length === 1 ? 200 : 403 });
-    }));
-    await renameCase("http://test.invalid", "tok", "b1", "  Midland Pallets route ");
-    expect(calls[0]?.[0]).toBe("http://test.invalid/v1/investigations/b1");
-    expect(calls[0]?.[1].method).toBe("PATCH");
-    expect(JSON.parse(String(calls[0]?.[1].body))).toEqual({ name: "Midland Pallets route" });
-    await expect(renameCase("http://test.invalid", "tok", "b1", "x")).rejects.toThrow(
-      "Only the case's Author can rename it.",
+describe("changing what a case reads (L3.H1)", () => {
+  it("refuses a dataset's home case in the Conduit's own words", async () => {
+    const kept = { detail: { error: "home_case_kept", message: "this is its dataset's home case, which holds the dataset's reports, alerts and promotion reviews, so it keeps reading its dataset while the dataset exists" } };
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 409, json: async () => kept })));
+    await expect(setCaseDatasets("http://api", "tok", "home-1", ["ds-b"])).rejects.toThrow(
+      "This case's dataset cannot be changed: this is its dataset's home case, which holds the dataset's reports, alerts and promotion reviews, so it keeps reading its dataset while the dataset exists.",
     );
   });
 });

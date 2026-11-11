@@ -21,13 +21,14 @@ its id lists (`report_view`)."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime
 from typing import Protocol, overload
 
 from services.ingest.engine import distinct_markings
 from services.ingest.load_ledger import load_record_from_report
+from services.ingest.snapshot_withdrawal import DroppedRow
 
 from ontology.errors import HandlingSchemeError
 from ontology.handling import HandlingScheme, principal_may_view
@@ -40,6 +41,8 @@ from schemas.ingest import (
     PipelineRunReport,
     PipelineRunReportView,
     RejectionRecord,
+    RowElements,
+    SourceWatermark,
 )
 
 
@@ -51,6 +54,8 @@ class _RunLedger(Protocol):
         *,
         row_keys: Sequence[str] = (),
         row_key_fingerprint: str = "",
+        row_elements: Mapping[str, RowElements] | None = None,
+        withdrawn_row_keys: Sequence[str] = (),
     ) -> None: ...
 
     async def fingerprints(self, recipe_id: str, case: str) -> dict[str, int]: ...
@@ -72,6 +77,24 @@ class _RunLedger(Protocol):
     ) -> None: ...
 
     async def mark_uncovered(self, run_id: str, load_id: str) -> None: ...
+
+    async def watermark(
+        self, recipe_id: str, case: str, source_id: str
+    ) -> SourceWatermark | None: ...
+
+    async def dropped_row_keys(
+        self, recipe_id: str, case: str, *, present: Collection[str]
+    ) -> Sequence[DroppedRow]: ...
+
+    async def withdrawn_event_ids(self, load_id: str) -> list[str]: ...
+
+    async def withdrawn_row_keys_among(
+        self, recipe_id: str, case: str, keys: Sequence[str]
+    ) -> set[str]: ...
+
+    async def withdrawn_row_links(
+        self, recipe_id: str, case: str, keys: Sequence[str]
+    ) -> dict[str, dict[str, str]]: ...
 
 
 class LedgerSink:
@@ -116,6 +139,9 @@ class LedgerSink:
             ),
             row_keys=report.kept_row_keys,
             row_key_fingerprint=report.row_key_fingerprint or "",
+            # ADR-110 Amendment 8 point 2: what each kept row wrote, kept with its key.
+            row_elements=report.kept_row_elements,
+            withdrawn_row_keys=report.withdrawn_row_keys,
         )
 
     async def kept(self, recipe_id: str, case: str, keys: Sequence[str]) -> set[str]:
@@ -126,6 +152,28 @@ class LedgerSink:
 
     def hold_row_keys(self, recipe_id: str, case: str) -> AbstractAsyncContextManager[None]:
         return self._ledger.hold_row_keys(recipe_id, case)
+
+    # ADR-110 Amendments 8 point 3 and 15: what a full snapshot's withdrawal asks of the ledger.
+    async def dropped_row_keys(
+        self, recipe_id: str, case: str, *, present: Collection[str]
+    ) -> Sequence[DroppedRow]:
+        return await self._ledger.dropped_row_keys(recipe_id, case, present=present)
+
+    async def withdrawn_event_ids(self, load_id: str) -> list[str]:
+        return await self._ledger.withdrawn_event_ids(load_id)
+
+    async def withdrawn_row_keys_among(
+        self, recipe_id: str, case: str, keys: Sequence[str]
+    ) -> set[str]:
+        return await self._ledger.withdrawn_row_keys_among(recipe_id, case, keys)
+
+    async def withdrawn_row_links(
+        self, recipe_id: str, case: str, keys: Sequence[str]
+    ) -> dict[str, dict[str, str]]:
+        return await self._ledger.withdrawn_row_links(recipe_id, case, keys)
+
+    async def watermark(self, recipe_id: str, case: str, source_id: str) -> SourceWatermark | None:
+        return await self._ledger.watermark(recipe_id, case, source_id)
 
     async def geometries(self, load_id: str, refs: Sequence[str]) -> None:
         await self._ledger.add_geometries(self._run_id, load_id, list(refs))
@@ -233,25 +281,32 @@ def report_view(
     withheld = not may_see_counts(report.markings, reader, scheme)
     if isinstance(report, LoadReport):
         if withheld:
+            # ADR-140 decision 16: the expert steps are disclosed in every run report, withheld or
+            # not: they are the pipeline's settings, never a count or a row's value.
             return LoadReportView(
                 load_id=report.load_id,
                 recipe_id=report.recipe_id,
                 recipe_version=report.recipe_version,
+                expert_steps=report.expert_steps,
                 withheld=True,
             )
         return _load_view(report, reader, scheme)
+    expert_steps = [d for b in report.branches for d in b.report.expert_steps]
     if withheld:
         return PipelineRunReportView(
             load_id=report.load_id,
             recipe_id=report.recipe_id,
             recipe_version=report.recipe_version,
+            expert_steps=expert_steps,
             withheld=True,
         )
     data = report.model_dump(
         include=set(PipelineRunReportView.model_fields) - {"branches", "rejections"}
     )
+    data.pop("expert_steps", None)
     return PipelineRunReportView(
         **data,
+        expert_steps=expert_steps,
         rejections=_readable_rejections(report.rejections, reader, scheme),
         branches=[
             BranchRunReportView(

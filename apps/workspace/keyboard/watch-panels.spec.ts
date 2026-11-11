@@ -6,16 +6,17 @@
 // Every native `Input`/`Select`'s own Tab-reachability gets no case here — only an action with
 // real state mutation or a real network call does, the same exemption `query-builder.spec.ts`
 // already establishes for its own native controls. `/v1/hotlists`, `/v1/monitors`, `/v1/patterns`,
-// `/v1/alerts` and `/v1/alerts/{id}/jump` are intercepted so every result is deterministic — the
+// and `/v1/alerts` are intercepted so every result is deterministic — the
 // same "real network call, mocked at the transport" shape every other keyboard spec in this
 // directory already uses.
 import { expect, test, type Page } from "@playwright/test";
 
 import { assertAllCovered, registerCovered, WATCH_PANEL_ACTIONS } from "./actionRegistry";
+import { chooseByTyping } from "./chooseByTyping";
 
 declare global {
   interface Window {
-    __WATCH_HARNESS__?: { openedInvestigationId: string | null };
+    __WATCH_HARNESS__?: { openedAlertId: string | null };
   }
 }
 
@@ -40,6 +41,8 @@ async function tabToButtonNamed(page: Page, name: string, maxTabs = 30): Promise
     maxTabs,
   );
 }
+
+
 
 test("submitting the hotlist form creates a hotlist and it appears in the list, reachable by keyboard alone", async ({
   page,
@@ -244,78 +247,78 @@ test("submitting the monitor form turns a saved pattern into a monitor, reachabl
   registerCovered("WATCH_PANEL_ACTIONS", "submit-create-monitor");
 });
 
-test("jumping from an alert calls the real jump route and shows the result, reachable by keyboard alone", async ({
-  page,
-}) => {
-  await page.route("**/*/v1/investigations/*/hotlists", async (route) => {
-    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ hotlists: [] }) });
-  });
-  await page.route("**/*/v1/investigations/*/monitors", async (route) => {
-    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ monitors: [] }) });
-  });
-  await page.route("**/*/v1/investigations/*/patterns", async (route) => {
-    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ patterns: [] }) });
-  });
-  await page.route("**/*/v1/investigations/*/alerts", async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({
-        alerts: [
-          {
-            id: "alert-1",
-            rule_id: "hotlist:hl-1",
-            owner_id: "analyst-1",
-            mode: "full",
-            referent_node_ids: ["n1"],
-            evidence_available: true,
-            investigation_id: "inv-source-1",
-            created_at: "2026-09-22T00:00:00Z",
-            hotlist: { identifier: "07700 900918", kept_as_written: false, review_date: "2027-01-31" },
-            fired_on: [
-              {
-                type: "Endpoint",
-                label: "+447700900918",
-                files: [{ name: "pid_seized_comms_batch2.csv", row: 3 }],
-                more_files: 0,
-              },
-            ],
-          },
-        ],
-      }),
-    });
-  });
-  await page.route("**/*/v1/investigations/*/alerts/alert-1/jump", async (route) => {
-    await route.fulfill({
-      status: 201,
-      contentType: "application/json",
-      body: JSON.stringify({
-        investigation: {
-          id: "inv-branch-1",
-          created_at: "2026-09-22T00:00:00Z",
-          created_by: "analyst-1",
-          owning_unit: "unit-1",
-          branched_from: "inv-source-1",
-        },
-        seeded_count: 1,
-      }),
-    });
-  });
+async function serveWatches(page: Page): Promise<{ sent: { method: string; path: string; body: unknown }[] }> {
+  const state = { sent: [] as { method: string; path: string; body: unknown }[] };
+  const fulfil = (body: unknown, status = 200) => ({ status, contentType: "application/json", body: JSON.stringify(body) });
+  await page.route("**/*/v1/**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const path = url.pathname.replace("/v1/investigations/inv-1/", "");
+    if (request.method() !== "GET") state.sent.push({ method: request.method(), path, body: request.postDataJSON() });
+    if (url.pathname === "/v1/investigations")
+      return route.fulfill(fulfil([{ id: "inv-1", name: "Case", level: "editor", created_at: "", created_by: "", datasets: ["Prison intel"], dataset_ids: ["ds-1"] }]));
+    if (path === "hotlists" && request.method() === "GET")
+      return route.fulfill(fulfil({ hotlists: [], audience_default: "only_me", audience_editable: true }));
+    if (path === "hotlists") return route.fulfill(fulfil({ id: "h-1" }, 201));
+    if (path === "patterns")
+      return route.fulfill(fulfil({ patterns: [{ id: "sp1", pattern_id: "pat-1", version: 1, name: "Common contacts", owner_id: "analyst-1", created_at: "2026-10-01T00:00:00Z", definition: { nodes: [], edges: [] } }] }));
+    if (path === "monitors" && request.method() === "GET")
+      return route.fulfill(fulfil({ monitors: [{ id: "mo-1", pattern_id: "pat-1", owner_id: "analyst-1", status: "active", created_at: "2026-10-01T00:00:00Z", every: "daily", hour: 6 }] }));
+    if (path === "monitors") return route.fulfill(fulfil({ id: "mo-2", pattern_id: "pat-1", owner_id: "analyst-1", status: "active", created_at: "2026-10-01T00:00:00Z" }, 201));
+    if (path === "monitors/mo-1/schedule")
+      return route.fulfill(fulfil({ id: "mo-1", pattern_id: "pat-1", owner_id: "analyst-1", status: "active", created_at: "2026-10-01T00:00:00Z", ...(request.postDataJSON() as object) }));
+    if (path === "raised-alerts") return route.fulfill(fulfil({ id: "a-raised" }, 201));
+    return route.fulfill(fulfil({}, 404));
+  });  // prettier-ignore
+  return state;
+}
 
+test("a watched pattern's own schedule is set by keyboard (ADR-146 decision 4, G16)", async ({ page }) => {
+  const state = await serveWatches(page);
   await page.goto("/keyboard/watch-panels-harness.html");
-  await expect(page.getByText("Hotlist: 07700 900918 · review by 31 Jan 2027")).toBeVisible();
-  await tabToButtonNamed(page, "Jump into investigation");
-  await page.keyboard.press("Enter");
+  const schedule = page.getByRole("combobox", { name: "How often Common contacts runs on its own" });
+  await chooseByTyping(page, schedule, "never");
+  await expect.poll(() => state.sent.find((s) => s.path === "monitors/mo-1/schedule")?.body).toEqual({ every: "never", hour: 6, weekday: null });
+  registerCovered("WATCH_PANEL_ACTIONS", "set-a-watched-patterns-schedule-by-keyboard");
+});
 
-  await expect(page.getByTestId("jump-seeded-summary")).toBeVisible();
-  registerCovered("WATCH_PANEL_ACTIONS", "alert-row-jump");
-
-  await tabToButtonNamed(page, "Open investigation");
+test("an entity is watched for, from the Glass, by keyboard (ADR-146 decision 4)", async ({ page }) => {
+  const state = await serveWatches(page);
+  await page.goto("/keyboard/watch-panels-harness.html");
+  await tabToButtonNamed(page, "Watch for this");
   await page.keyboard.press("Enter");
-  await expect
-    .poll(() => page.evaluate(() => window.__WATCH_HARNESS__?.openedInvestigationId))
-    .toBe("inv-branch-1");
-  registerCovered("WATCH_PANEL_ACTIONS", "jump-result-open-investigation");
+  await expect.poll(() => state.sent.find((s) => s.path === "hotlists")?.body).toMatchObject({ identifier: "+447700900918" });
+  await expect(page.getByText(/Watching for \+447700900918/)).toBeVisible();
+  registerCovered("WATCH_PANEL_ACTIONS", "watch-for-an-entity-by-keyboard");
+});
+
+test("a saved pattern is saved as a watch, from the Glass, by keyboard (ADR-146 decision 4)", async ({ page }) => {
+  const state = await serveWatches(page);
+  await page.goto("/keyboard/watch-panels-harness.html");
+  await tabToButtonNamed(page, "Save as a watch");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => state.sent.find((s) => s.path === "monitors")?.body).toEqual({ pattern_id: "pat-1" });
+  registerCovered("WATCH_PANEL_ACTIONS", "save-a-pattern-as-a-watch-by-keyboard");
+});
+
+test("an alert is raised to the dataset, by keyboard (ADR-146 decision 7)", async ({ page }) => {
+  const state = await serveWatches(page);
+  await page.goto("/keyboard/watch-panels-harness.html");
+  await tabToButtonNamed(page, "Raise an alert…");
+  await page.keyboard.press("Enter");
+  // The title takes focus as the form opens.
+  await expect(page.getByRole("textbox", { name: "Title of the alert" })).toBeFocused();
+  await page.keyboard.type("Two people at one flat");
+  await page.getByRole("textbox", { name: "Why, in words: the reason for the alert" }).focus();
+  await page.keyboard.type("Seen together twice");
+  await chooseByTyping(page, page.getByRole("combobox", { name: "Where the alert goes" }), "dataset");
+  await tabToButtonNamed(page, "Raise the alert");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => state.sent.find((s) => s.path === "raised-alerts")?.body).toMatchObject({
+    title: "Two people at one flat", reason: "Seen together twice", to: "dataset", dataset_id: "ds-1", node_ids: ["n1", "n2"],
+  });  // prettier-ignore
+  await expect(page.getByRole("status")).toHaveText(/Raised to the dataset/);
+  registerCovered("WATCH_PANEL_ACTIONS", "raise-an-alert-by-keyboard");
 });
 
 test("every registered watch-panel action has its own proving test case above", () => {

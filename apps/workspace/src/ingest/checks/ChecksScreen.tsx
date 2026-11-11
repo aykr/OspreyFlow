@@ -10,13 +10,15 @@ import type { LoadCheck, LoadChecksView } from "../../../../../packages/schemas/
 import { Button } from "../../design/primitives/Button";
 import { Select } from "../../design/primitives/Select";
 import { fetchChecks, saveChecks } from "../api";
+import { RightButton } from "../studio/rightsGate";
 
 export interface ChecksScreenProps {
   apiBaseUrl: string;
   investigationId: string;
   bearerToken: string;
   recipeId: string;
-  onBack: () => void;
+  /** Absent when the screen is hosted in the pipeline's drawer (ADR-108 Amendment 6.1: nothing replaces the canvas, so there is nothing to go back to). */
+  onBack?: () => void;
 }
 
 type OnHit = "alert" | "hold";
@@ -79,7 +81,7 @@ export function ChecksScreen({ apiBaseUrl, investigationId, bearerToken, recipeI
       .then((saved) => {
         setView(saved);
         setChoice(initialChoice(saved));
-        setSaid(`Saved: ${(saved.checks ?? []).length} rule(s) attached to this pipeline. Run Verify to see the alerts its sample would raise.`);
+        setSaid(`Saved: ${(saved.checks ?? []).length} rule(s) attached to this pipeline. Run Test to see the alerts its sample would raise.`);
       })
       .catch((e: Error) => setProblem(e.message))
       .finally(() => setBusy(false));
@@ -89,8 +91,8 @@ export function ChecksScreen({ apiBaseUrl, investigationId, bearerToken, recipeI
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "var(--sp-16)", padding: "var(--sp-16)", height: "100%", overflow: "auto" }}>
       <div style={{ display: "flex", alignItems: "center", gap: "var(--sp-8)" }}>
-        <Button onClick={onBack}>← Back to the pipeline</Button>
-        <h1 style={{ fontSize: "1.1em", margin: 0 }}>Checks on load</h1>
+        {onBack && <Button onClick={onBack}>← Back to the pipeline</Button>}
+        <h1 style={{ fontSize: "1.1em", margin: 0 }}>Load rules</h1>
       </div>
       <p className="label" style={{ margin: 0, maxWidth: 720 }}>
         Choose which rules judge this pipeline&apos;s loads and what a hit does here. Rules are written by
@@ -167,9 +169,9 @@ export function ChecksScreen({ apiBaseUrl, investigationId, bearerToken, recipeI
         </table>
       )}
       <div>
-        <Button variant="primary" disabled={busy || !view} onClick={save}>
-          Save the checks
-        </Button>
+        <RightButton right="edit_pipelines" variant="primary" disabled={busy || !view} onClick={save}>
+          Save the load rules
+        </RightButton>
       </div>
     </div>
   );

@@ -16,7 +16,7 @@ export type EdgeIds = EdgeId[];
 export type EventIds = string[];
 export type ValidFrom = string;
 export type ValidTo = string | null;
-export type Trigger = ("pre_commit" | "post_commit" | "schedule") | null;
+export type Trigger = ("pre_commit" | "post_commit" | "schedule" | "list_refresh") | null;
 export type Status = "open" | "claimed" | "closing" | "closed";
 export type Assignee = string | null;
 export type Disposition = ("true_positive" | "false_positive" | "duplicate" | "no_further_action" | "referred") | null;
@@ -27,12 +27,17 @@ export type CloseProposedBy = string | null;
 export type CloseProposedAt = string | null;
 export type Severity = ("low" | "medium" | "high") | null;
 export type Team = string | null;
+export type RoutedTeam = string | null;
+export type SuppressedUntil = string | null;
+export type SuppressReason = string | null;
+export type SuppressedBy = string | null;
 export type Summary = string;
 export type Type = string;
 export type ProvenanceState = "asserted" | "inferred" | "unresolved";
 export type DocumentId = string;
 export type Locator = string;
 export type ExcerptHash = string;
+export type SourceLoadId = string | null;
 export type Sources = SourceRef[];
 export type SourcesWithheld = boolean;
 export type ExtractedBy = string | null;
@@ -40,6 +45,19 @@ export type ExtractionConfidence = number | null;
 export type FirstSeen = string;
 export type LastConfirmed = string | null;
 export type PrincipalId = string;
+export type ProvenanceClass = "analyst_drawn";
+export type DrawnItemId = string;
+export type DrawnBoardId = string;
+export type DrawnCaseId = string;
+export type DrawnLabel = string;
+export type GradingSchemeName = string;
+export type GradeSource = string;
+export type GradeIntelligence = string;
+export type GradeHandling = string;
+export type DrawnOriginalGrading = Grading | null;
+export type DrawnSourceNote = string | null;
+export type DrawnIcon = string | null;
+export type Gazetteer = string | null;
 export type Classification = string;
 export type HandlingCode = string;
 export type ActionCode = string | null;
@@ -59,6 +77,7 @@ export type LoadId = string | null;
 export type RecipeId = string | null;
 export type RecipeVersion = number | null;
 export type Reverted = boolean;
+export type WithdrawnByLoad = string | null;
 export type Datasets = string[];
 export type Nodes = Node[];
 export type Type1 = string;
@@ -78,12 +97,28 @@ export type EventId = string;
 export type OccurredAt = string;
 export type Amount = number | null;
 export type Transactions = ExplainedTransaction[];
-export type Kind = "typology" | "hotlist" | "monitor";
+export type Kind = "typology" | "hotlist" | "monitor" | "analyst" | "drawn_watch";
 export type Severity1 = "low" | "medium" | "high";
 export type Audience = "case" | "team" | "owner";
 export type Team1 = string | null;
 export type CloseProposedByName = string | null;
 export type AssigneeName = string | null;
+export type Identifier = string;
+export type KeptAsWritten = boolean;
+export type ReviewDate1 = string;
+export type FiredOn = FiredOn1[] | null;
+export type Type2 = string;
+export type Label = string;
+export type Name = string;
+export type Row = number | null;
+export type Rows = number | null;
+export type Records = number | null;
+export type Files = FiredFile[];
+export type MoreFiles = number;
+export type SourcesWithheld1 = boolean;
+export type TeamName = string | null;
+export type Suppressed = boolean;
+export type Lead = boolean;
 
 /**
  * What fired an alert, for the reader (ADR-109 phase B): the entities it concerns and its
@@ -103,6 +138,11 @@ export interface AlertExplanation {
   team?: Team1;
   close_proposed_by_name?: CloseProposedByName;
   assignee_name?: AssigneeName;
+  hotlist?: AlertHotlist | null;
+  fired_on?: FiredOn;
+  team_name?: TeamName;
+  suppressed?: Suppressed;
+  lead?: Lead;
   [k: string]: unknown;
 }
 /**
@@ -118,11 +158,9 @@ export interface AlertExplanation {
  * investigation_scope`. Threaded from `ChangeStreamEntry.investigation_id`, itself threaded from
  * whichever producer route was investigation-scoped at the point the triggering write happened
  * (ingest); `None` for a producer that genuinely has no single investigation in scope (the
- * corpus-wide resolution trigger). B14's "jump" branches a new investigation from this field via
- * `InvestigationStore.create(principal, branched_from=...)` — the identical mechanism
- * `branch_investigation` already uses, not new investigation-linking infrastructure. `None` here
- * means the jump starts an unbranched investigation instead of one carrying that link, disclosed
- * to the analyst rather than silently omitted.
+ * corpus-wide resolution trigger). B14's "jump" opens a case of the jumper's own from the
+ * alert; since L3.2 that case records no case it came from (ADR-144 Amendment 1), and the jump's
+ * audit row names this one.
  */
 export interface Alert {
   id: Id;
@@ -150,6 +188,10 @@ export interface Alert {
   close_proposed_at?: CloseProposedAt;
   severity?: Severity;
   team?: Team;
+  routed_team?: RoutedTeam;
+  suppressed_until?: SuppressedUntil;
+  suppress_reason?: SuppressReason;
+  suppressed_by?: SuppressedBy;
   [k: string]: unknown;
 }
 export interface Interval {
@@ -180,13 +222,49 @@ export interface Provenance {
   first_seen: FirstSeen;
   last_confirmed?: LastConfirmed;
   confirmed_by?: PrincipalId | null;
+  drawn?: DrawnAssertion | null;
+  gazetteer?: Gazetteer;
   [k: string]: unknown;
 }
 export interface SourceRef {
   document_id: DocumentId;
   locator: Locator;
   excerpt_hash: ExcerptHash;
+  load_id?: SourceLoadId;
   [k: string]: unknown;
+}
+/**
+ * ADR-143 decision 4: on the provenance of every drawn node and link. A drawn item is asserted
+ * by its author, not model-derived: rule 5's `inferred` is for the matches it raises, not for
+ * it.
+ */
+export interface DrawnAssertion {
+  provenance_class?: ProvenanceClass;
+  item_id: DrawnItemId;
+  asserted_by: PrincipalId;
+  board_id: DrawnBoardId;
+  case_id: DrawnCaseId;
+  label: DrawnLabel;
+  grading: Grading;
+  original_grading?: DrawnOriginalGrading;
+  source_note?: DrawnSourceNote;
+  source_document?: DocumentId | null;
+  icon?: DrawnIcon;
+}
+/**
+ * A grade in one scheme, kept with its scheme so a later change of scheme (L3.7) keeps the
+ * original beside the new one (C13).
+ *
+ * A grade of a built-in scheme is checked against its parts here. A grade of a scheme file's
+ * scheme (Amendment 6) is checked where a grade enters, against the deployment's scheme: the
+ * board routes and the grading change. A stored one is read as stored, since an original may be of
+ * a scheme the deployment no longer has.
+ */
+export interface Grading {
+  scheme?: GradingSchemeName;
+  source: GradeSource;
+  intelligence: GradeIntelligence;
+  handling: GradeHandling;
 }
 export interface Handling {
   classification: Classification;
@@ -216,6 +294,7 @@ export interface AuditStub {
   recipe_id?: RecipeId;
   recipe_version?: RecipeVersion;
   reverted?: Reverted;
+  withdrawn_by_load?: WithdrawnByLoad;
   [k: string]: unknown;
 }
 export interface Edge {
@@ -267,5 +346,44 @@ export interface ExplainedTransaction {
   target_id: NodeId;
   occurred_at: OccurredAt;
   amount?: Amount;
+  [k: string]: unknown;
+}
+/**
+ * ADR-130 decision 1: the hotlist a `hotlist:` alert came from, read at display time and only
+ * for the hotlist's owner. The identifier is as typed (else as stored).
+ */
+export interface AlertHotlist {
+  identifier: Identifier;
+  kept_as_written: KeptAsWritten;
+  review_date: ReviewDate1;
+  [k: string]: unknown;
+}
+/**
+ * ADR-130 decision 1: what a matched node is, and where it was read from. `files` are in the
+ * order of first appearance, at most five; `more_files` counts the rest.
+ *
+ * ADR-130 Amendment 1: when the node belongs to a dataset the reader's case does not read, its
+ * sources are not said at all: `sources_withheld` is true, `files` is empty and `more_files` 0.
+ */
+export interface FiredOn1 {
+  type: Type2;
+  label: Label;
+  files: Files;
+  more_files: MoreFiles;
+  sources_withheld?: SourcesWithheld1;
+  [k: string]: unknown;
+}
+/**
+ * One source file of a matched node: its name (the final path segment of the document id; two
+ * loads' `calls.csv` are two entries), and what is cited in it. `row` is the single row (its
+ * offset under the header, counted from 0; the Glass shows it counted from 1, ADR-131) when
+ * exactly one `row N` is cited and nothing else; otherwise `rows` counts the distinct `row N`
+ * locators and `records` the distinct locators of any other form (ADR-130 Amendment 1).
+ */
+export interface FiredFile {
+  name: Name;
+  row?: Row;
+  rows?: Rows;
+  records?: Records;
   [k: string]: unknown;
 }

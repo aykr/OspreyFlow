@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
-// ADR-115 E3 and decision 7: Home after sign-in, every signed-in person's landing with no case open.
-// All three places for everyone; one the person cannot use dimmed, with the role it needs; only the
-// first usable place's button in brass; G, I and A open them from anywhere on the page.
+// ADR-115 E3: Home after sign-in, every signed-in person's landing with no case open. ADR-145 decision
+// 1 and N6: a card for each place the person's rights open and none for another (replacing ADR-115
+// decision 7's dimmed panels); only the first card's button in brass; G, I and A open them from
+// anywhere on the page.
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -12,11 +13,12 @@ import { HomePage } from "./HomePage";
 afterEach(cleanup);
 
 const SUMMARY: HomeSummary = {
-  glass: [{ tone: "warn", text: "3 alerts in your team's queue, 1 claimed by you" }],
+  glass: [{ tone: "info", text: "1 case open to you" }],
+  rules: [{ tone: "warn", text: "3 alerts in your team's queue, 1 claimed by you" }],
   studio: [{ tone: "warn", text: "2 rows held for review" }],
   admin: [{ tone: "ok", text: "3 of 3 services healthy" }],
-  attention: [{ place: "glass", tone: "warn", title: "KYC screening alert in Operation Ledger", detail: "A match. Claimed by you.",
-                at: "2026-10-13T06:46:00Z", caseId: "c1" }],  // prettier-ignore
+  attention: [{ place: "rules", tone: "warn", title: "KYC screening alert in Operation Ledger", detail: "A match. Claimed by you.",
+                at: "2026-10-13T06:46:00Z", caseId: "c1", alertId: "al-1" }],  // prettier-ignore
   recent: [{ id: "c1", name: "Operation Ledger", level: "Editor", entities: 68, created: "2026-10-11T09:00:00Z" }],
   services: [{ name: "Graph store", ok: true }],
   held: 2,
@@ -43,26 +45,94 @@ describe("Home", () => {
     expect(screen.getByText(/Your roles: Analyst\./)).toBeTruthy();
   });
 
-  it("shows all three places to everyone; one the person cannot use names the role it needs", () => {
+  it("shows a card for each place the person's rights open, and none for another", () => {
     const { chose } = home(["investigate"]);
-    expect(screen.getAllByRole("region").map((r) => r.getAttribute("aria-label")).slice(0, 3)).toEqual([
-      "Glass", "Ingest Studio", "Admin area",
-    ]);
-    expect(panel("Ingest Studio").getByText("You need the Data Engineer role for this. Ask an administrator to add it.")).toBeTruthy();
-    expect(panel("Admin area").getByText("You need the Admin role for this. Ask an administrator to add it.")).toBeTruthy();
-    expect(panel("Ingest Studio").queryByRole("button")).toBeNull();
-    fireEvent.click(panel("Glass").getByRole("button", { name: /^Open Glass/ }));
+    const cards = () => screen.getAllByRole("region").map((r) => r.getAttribute("aria-label")).filter((n) => n !== "Needs your attention" && n !== "Ways of working");
+    expect(cards()).toEqual(["The Glass"]);
+    expect(screen.queryByRole("region", { name: "Ingest Studio" })).toBeNull();
+    expect(screen.queryByText(/You need the .* role/)).toBeNull();
+    fireEvent.click(panel("The Glass").getByRole("button", { name: /^Open The Glass/ }));
     expect(chose).toHaveBeenCalledWith("glass");
+    cleanup();
+    home(["edit_pipelines", "operate_schedules"]);
+    expect(cards()).toEqual(["Ingest Studio", "Admin"]);
+  });
+
+  it("opens an alert from Needs your attention at its address, not its case (ADR-146 decision 6)", () => {
+    const openAlert = vi.fn();
+    const { opened, chose } = home(["investigate", "triage_alerts", "read_alert_queue"], { onOpenAlert: openAlert });
+    expect(panel("Rules and Monitoring").getByText("3 alerts in your team's queue, 1 claimed by you")).toBeTruthy();
+    fireEvent.click(within(screen.getByRole("region", { name: "Needs your attention" })).getByRole("button", { name: /KYC screening alert/ }));
+    expect(openAlert).toHaveBeenCalledWith("al-1");
+    expect(opened).not.toHaveBeenCalled();
+    // Its card's key, R, opens the place.
+    fireEvent.keyDown(window, { key: "r" });
+    expect(chose).toHaveBeenLastCalledWith("rules");
+  });
+
+  it("keeps a reader's alerts on the Glass, opening the case, where Rules and Monitoring is hidden", () => {
+    // A Reports Viewer reads the queue but works no alert (ADR-145 Amendment 4 decision 10).
+    const openAlert = vi.fn();
+    const { opened } = home(["read_alert_queue", "read_reports"], { onOpenAlert: openAlert });
+    expect(screen.queryByRole("region", { name: "Rules and Monitoring" })).toBeNull();
+    expect(panel("The Glass").getByText("3 alerts in your team's queue, 1 claimed by you")).toBeTruthy();
+    fireEvent.click(within(screen.getByRole("region", { name: "Needs your attention" })).getByRole("button", { name: /KYC screening alert/ }));
+    expect(opened).toHaveBeenCalledWith("c1", "glass");
+    expect(openAlert).not.toHaveBeenCalled();
+  });
+
+  it("offers a Reports Viewer, on an alert's row, its case's Figures and its dashboard and nothing else (ADR-145 Amendment 4 decision 10)", () => {
+    const openAlert = vi.fn();
+    const journey = vi.fn();
+    const summary: HomeSummary = {
+      ...SUMMARY,
+      attention: [{ ...SUMMARY.attention[0]!, alertRule: { label: "typology", typology: "kyc_screening" } }],
+    };
+    const chose = vi.fn();
+    const opened = vi.fn();
+    render(
+      <HomePage rights={new Set(["read_alert_queue", "read_reports"])} person={PERSON} summary={summary} onChoose={chose}
+                onOpenCase={opened} onOpenAlert={openAlert} onAlertJourney={journey} account={null} marking="OFFICIAL"
+                now={new Date("2026-10-13T09:00:00Z")} />,  // prettier-ignore
+    );
+    const row = within(screen.getByRole("region", { name: "Needs your attention" })).getByRole("group", { name: /KYC screening alert/ });
+    expect(within(row).getAllByRole("button").map((b) => b.textContent)).toEqual(["Open in its case", "Open the dashboard"]);
+    const start = { caseId: "c1", alertId: "al-1", title: "KYC screening alert in Operation Ledger", rule: { label: "typology", typology: "kyc_screening" }, at: "2026-10-13T06:46:00Z" };
+    fireEvent.click(within(row).getByRole("button", { name: "Open in its case" }));
+    expect(journey).toHaveBeenLastCalledWith(start, "figures");
+    fireEvent.click(within(row).getByRole("button", { name: "Open the dashboard" }));
+    expect(journey).toHaveBeenLastCalledWith(start, "board");
+    expect(openAlert).not.toHaveBeenCalled();
+    expect(opened).not.toHaveBeenCalled();
+  });
+
+  it("keeps the alert's own address for a reader Rules and Monitoring is offered to, with no journey", () => {
+    const openAlert = vi.fn();
+    const journey = vi.fn();
+    const summary: HomeSummary = {
+      ...SUMMARY,
+      attention: [{ ...SUMMARY.attention[0]!, alertRule: { label: "typology", typology: "kyc_screening" } }],
+    };
+    render(
+      <HomePage rights={new Set(["read_alert_queue", "triage_alerts", "investigate"])} person={PERSON} summary={summary}
+                onChoose={vi.fn()} onOpenCase={vi.fn()} onOpenAlert={openAlert} onAlertJourney={journey} account={null}
+                marking="OFFICIAL" now={new Date("2026-10-13T09:00:00Z")} />,  // prettier-ignore
+    );
+    const attention = within(screen.getByRole("region", { name: "Needs your attention" }));
+    expect(attention.queryByRole("button", { name: "Open in its case" })).toBeNull();
+    fireEvent.click(attention.getByRole("button", { name: /KYC screening alert/ }));
+    expect(openAlert).toHaveBeenCalledWith("al-1");
+    expect(journey).not.toHaveBeenCalled();
   });
 
   it("gives brass to the first usable place only", () => {
     home(["investigate", "edit_pipelines", "manage_people"]);
-    expect(panel("Glass").getByRole("button", { name: /^Open Glass/ }).className).toContain("btn--primary");
+    expect(panel("The Glass").getByRole("button", { name: /^Open The Glass/ }).className).toContain("btn--primary");
     expect(panel("Ingest Studio").getByRole("button", { name: /^Open Ingest Studio/ }).className).not.toContain("btn--primary");
-    expect(panel("Admin area").getByRole("button", { name: /^Open Admin area/ }).className).not.toContain("btn--primary");
+    expect(panel("Admin").getByRole("button", { name: /^Open Admin/ }).className).not.toContain("btn--primary");
   });
 
-  it("opens a usable place with its key from anywhere on the page, and never a gated one", () => {
+  it("opens a place with its key from anywhere on the page, and never one the rights do not open", () => {
     const { chose } = home(["investigate", "manage_people"]);
     fireEvent.keyDown(window, { key: "i" });
     expect(chose).not.toHaveBeenCalled();
@@ -83,7 +153,7 @@ describe("Home", () => {
 
   it("lists each place's figures, what needs the person, and their cases", () => {
     const { opened } = home(["investigate", "read_alert_queue"]);
-    expect(panel("Glass").getByText("3 alerts in your team's queue, 1 claimed by you")).toBeTruthy();
+    expect(panel("The Glass").getByText("3 alerts in your team's queue, 1 claimed by you")).toBeTruthy();
     const attention = within(screen.getByRole("region", { name: "Needs your attention" }));
     expect(attention.getByText("KYC screening alert in Operation Ledger")).toBeTruthy();
     expect(attention.getByText("1 item")).toBeTruthy();
@@ -94,17 +164,23 @@ describe("Home", () => {
     expect(cases.getByText("68").className).toContain("value");
   });
 
-  it("shows a person with no role every place gated, and nothing to show in words, not an error", () => {
+  it("shows a person with no role no place, and says so and that there is nothing to show, in words", () => {
     // ADR-099 Amendment 11 and ADR-114 Amendment 33: an arrival through the organisation's sign-in,
     // or anyone given a unit before a role. The Conduit names them no dataset; Home says so plainly.
     const empty: HomeSummary = { ...SUMMARY, glass: [], studio: [], admin: [], attention: [], recent: [], services: [], held: 0 };
     home([], { person: { ...PERSON, roles: [] }, summary: empty });
     expect(screen.getByText(/Your roles: none yet\./)).toBeTruthy();
-    expect(panel("Glass").getByText("You need the Analyst role for this. Ask an administrator to add it.")).toBeTruthy();
-    for (const name of ["Glass", "Ingest Studio", "Admin area"]) expect(panel(name).queryByRole("button")).toBeNull();
+    expect(screen.getByText("Your account opens no place yet. Ask an administrator to give you a role.")).toBeTruthy();
+    for (const name of ["The Glass", "Ingest Studio", "Admin"]) expect(screen.queryByRole("region", { name })).toBeNull();
     expect(screen.getByText("Nothing needs you now.")).toBeTruthy();
     expect(screen.getByText("No cases to show.")).toBeTruthy();
     expect(screen.queryByRole("table", { name: "Recent cases" })).toBeNull();
+  });
+
+  it("says when the rights could not be read, not that a role is missing", () => {
+    home([], { rightsUnread: true });
+    expect(screen.getByText(/could not be read just now, so no place is offered/)).toBeTruthy();
+    expect(screen.queryByText(/Ask an administrator to give you a role/)).toBeNull();
   });
 
   it("shows only the attention rows of places the person can use", () => {
@@ -112,9 +188,9 @@ describe("Home", () => {
     expect(screen.queryByText("KYC screening alert in Operation Ledger")).toBeNull();
   });
 
-  it("draws no figure in the picture of a place the person cannot use", () => {
-    home(["investigate", "read_held_rows"]);
-    expect(panel("Ingest Studio").queryByText(/held/)).toBeNull();
+  it("draws the held rows in the Studio's picture for a person it opens for", () => {
+    home(["edit_pipelines"]);
+    expect(panel("Ingest Studio").getByText(/2 held/)).toBeTruthy();
   });
 
   it("steps through the ways of working, saying which one of four, politely", () => {
@@ -138,7 +214,7 @@ describe("Home", () => {
 
   it("says it is reading while the figures are on their way", () => {
     home(["investigate"], { summary: null });
-    expect(panel("Glass").getByText("Reading…")).toBeTruthy();
+    expect(panel("The Glass").getByText("Reading…")).toBeTruthy();
   });
 });
 

@@ -14,10 +14,25 @@ is made from the deployment's own schema, and is checked against it on every cha
 <!-- document-control:begin -->
 ## Document control
 
-**Version 1.55** · 2026-11-05 · For OspreyFlow v0.4.12 · Issued
+**Version 1.70** · 2026-11-11 · For OspreyFlow v0.5.0 · Issued
 
 | Version | Date | What changed |
 | --- | --- | --- |
+| 1.70 | 2026-11-11 | §13's synced-folder warning names a Windows home folder under WSL's `/mnt/c/` in words. |
+| 1.69 | 2026-11-10 | Describes v0.5.0. No change to its content. |
+| 1.68 | 2026-11-10 | Rules' L2.10 and platform-b's P6 as built, no longer *coming*. §9.8: a rule's alerts routed to one team (*‹Team› only*), read by its members and the home case's Authors, enforced in the query; the lead's or cover's *Give to* and *Suppress until…*. §10a: the case map's *Gazetteers in this case's dataset*, with *Add* and *Remove* for `run_pipelines` |
+| 1.67 | 2026-11-10 | §8's commands: `ospreyflow release export` and `import [--dry-run]` (a dataset's release as a YAML bundle) and `ospreyflow run` (an orchestrator's trigger as a service identity), the studio lane's L1.7 (ADR-140 Amendment 9 decision 4, ADR-141). |
+| 1.66 | 2026-11-10 | Appendix A: `deployment.highest_marking`, the deployment's marking ceiling (studio-b's L1.10, ADR-148 Amendment 2): a load or an import marked above it is refused before anything is written. |
+| 1.65 | 2026-11-10 | §13: *Where sets are* names the checkout as the folder holding `OspreyFlow_Core`, since the guide ships in Core and never names the build folder. |
+| 1.64 | 2026-11-10 | The backups folder as built (platform-b's P5b; ADR-114 Amendments 37 and 38). §13: every install's set in `<backups folder>/<deployment>/`, the folder asked at setup (`folders.backups`, the Folders screen's **Backups folder**, the prompt); new *Where sets are, and cleaning them up*, *A synced folder* and *Cleaning up*; Small on your own server's `server.backups` its older name. §1a.1, §5a.3, the files table, §14's update row and appendix A's `components.storage.backups` say where sets now go. §5: the answers file's `folders.backups`. No longer coming; appendix A's row is the schema's own. Admin's L2.5b and L2.5c as built: §9.9, *Disable…* lists and transfers views, boards, link-type proposals and drawn items' watches, the recipient cleared to the item's marking (ADR-145 Amendment 9) and holding its case's level, and refuses to disable someone who owns items you may not see; §9.10, Admin's own *Delete ‹case›'s layer now* after its dry run. |
+| 1.63 | 2026-11-10 | Admin's L2.7 and platform's P5 as built. §9.1: Proposed types removed, Connections' four kinds, Grading scheme built. §9.2: the role tips, *What each role and level lets a person do*, the refusal that names the roles, `write_sql_transforms` given on its own. §8: `map build --unit`. §10a: the unit the place names are held by, and a dataset's gazetteers (on screen, coming). |
+| 1.62 | 2026-11-10 | §9.10: Admin's screen offers the dry runs, though its delete route exists, named. |
+| 1.61 | 2026-11-10 | Promotion as built (case lane's L3.4). §9.10: a removed case's layer merged or deleted by the dataset's Authors in the Ingest Studio, Admin's dry runs. §9.11: promotions waiting for review, listed and overdue. §9.2: its words are copies of `help/roles.ts`, held to it by a test. §9.9: Disable's confirming button. |
+| 1.60 | 2026-11-09 | Brought up to the product as built (docs lane, D2a). §9.1: Admin as a place of its own, its sections and each one's right, the coming ones said so. §9.2: the roles in the Glass's own words, the places each opens, every right in plain words, custom roles and the Super user. §9.3: the invite form as built. §9.5 and §9.6: where lists and influencers now live. New §9.8 teams and leads, §9.9 Disable and what a person owns, §9.10 datasets, their Authors and linked cases, §9.11 Operations and Audit. §10.1: Admin › Models. New §10a: Admin › Maps. §12: the Alert monitoring board in the Glass. §13: backups to a folder named at setup, coming. The architecture has its own guide now. |
+| 1.59 | 2026-11-09 | §7: `grading.scheme`, the scheme drawn items are graded in (a built-in scheme or a scheme file). §8: `ospreyflow grading change`, its dry run and its change (ADR-143 decision 11 and Amendment 6). Appendix A regenerated: the `grading` section. |
+| 1.58 | 2026-11-09 | Appendix A regenerated: `connectors.private_hosts`, the private hosts or networks an operator admits the Studio's SQL and API connectors to, and `connectors.secrets`, the connection secrets only the Conduit is given (ADR-140 Amendment 15). |
+| 1.57 | 2026-11-08 | §8: `ospreyflow map list`, `map verify`, `map prefetch` and `map build` (ADR-147). Appendix A regenerated: a WMTS provider's `credential_param`. |
+| 1.56 | 2026-11-08 | Appendix A regenerated from the deployment schema: `components.source_path`'s description, reworded without a build-calendar note. |
 | 1.55 | 2026-11-05 | Describes v0.4.12 (v0.4.11 was not released). No change to its content. |
 | 1.54 | 2026-11-05 | Describes v0.4.11. No change to its content. |
 | 1.53 | 2026-11-05 | The owner's rulings (build order step 33; ADR-112 Amendment 3, ADR-114 Amendment 33 "Step 33"): §5a.1, someone whose email an account holds can be joined to that account in Admin → People, or the account removed; joining by email (`sign_in.organisation.trust_email`, off by default) and its account-takeover risk; §7 the answer; §8 what `repair-sign-in` now also does; §9.1 and new §9.7, removing someone and joining an organisation account; §16 the refusal's new answers, an empty *Refused organisation sign-ins*, the Conduit needing `view-events`, a refused removal, and the joining-by-email warning. Appendix A: `governance.organisation_provider.trust_email`. |
@@ -85,13 +100,16 @@ is made from the deployment's own schema, and is checked against it on every cha
 
 ## How OspreyFlow is built
 
+The [architecture guide](architecture-guide.md) describes it in full, for a reader deciding whether it
+fits; this is what an administrator needs.
+
 ![Level 0: the people who use OspreyFlow, its three tiers joined by four ports, and the identity provider, reporting, data in and the optional outside services beside it](images/architecture/level-0.svg)
 
 Three tiers; everything that passes between them crosses one of four typed ports:
 
 | Tier | What it is |
 | --- | --- |
-| **The Glass** | The browser workspace — the graph, map, timeline and reports, the Ingest Studio and the Admin area — one web application |
+| **The Glass** | The browser workspace, one web application with four places: the Glass itself (the graph, map, timeline and figures), the Ingest Studio, Rules and Monitoring, and Admin |
 | **The Conduit** | The API (FastAPI). Every request is checked against the person making it: access control is applied inside each query to the stores, never after |
 | **The Vault** | The stores: the graph store (ArcadeDB), the analytics database (DuckDB inside the Conduit, or ClickHouse shared by several Conduits), search (OpenSearch, or PostgreSQL full-text), PostgreSQL, the object store, and the models |
 
@@ -285,7 +303,7 @@ second checkout or worktree is needed.
 
 **Every command takes `--name`**: `ospreyflow start --name crime-demo`, `ospreyflow status --name
 aml-govuk`, `ospreyflow demo add hmp --name crime-demo`, `ospreyflow backup --name aml-govuk` (whose
-backups are kept in the deployment's own folder). Without `--name`, a command acts on the deployment
+whose sets go to `<backups folder>/aml-govuk/`, section 13). Without `--name`, a command acts on the deployment
 last used, or on the only one there is.
 
 ```
@@ -788,7 +806,7 @@ more than three quarters of the server is refused.
 
 ### 5a.3 Backups
 
-`ospreyflow backup` writes each set to `server.backups` (default `~/OspreyFlow/backups`), readable
+`ospreyflow backup` writes each set to `<server.backups>/<deployment>/` (default `~/OspreyFlow/backups`), readable
 by its owner only. A set never holds the certificate's key or `deployment.env`; it does hold the
 case data and the people's identities. Nothing is registered with the operating system, so schedule
 it with the service account's own crontab (`crontab -e`), beside the organisation's snapshots of the
@@ -940,6 +958,7 @@ Every question `install` asks can be answered in this file; unknown settings are
 | `components.dashboards` | Superset and report sync on (`true`, the default) or off |
 | `folders.ingest` | The folder the Ingest Studio lists (absolute, or from `~`); default `~/OspreyFlow/ingest` |
 | `folders.tiles` | Where a built basemap lives; default `~/OspreyFlow/basemap` |
+| `folders.backups` | Where `ospreyflow backup` writes, each deployment's sets in `<this>/<deployment name>/`; never inside the checkout (absolute, or from `~`); default `~/OspreyFlow/backups` (section 13) |
 | `models.local_only` | `true` (default): no case content leaves the deployment |
 | `demo_packs` | A list of pack ids (section 11) |
 | `paysim_file` | The downloaded PaySim file, when `paysim` is chosen |
@@ -955,6 +974,7 @@ Every question `install` asks can be answered in this file; unknown settings are
 | `starter` | A starter, `<theme>-<domain>` (section 1a): fills in the answers below that are not given |
 | `appearance.brand`, `appearance.service_name`, `appearance.organisation`, `appearance.phase` | The look (appendix A's `appearance`); `govuk` needs `service_name`, which names the whole service |
 | `demo_accounts` | `true` (default) makes the demo accounts; `false` makes none (the `blank` starter's answer) |
+| `grading.scheme` | `5x5x5` (default), `3x5x2`, or a scheme file (`.yaml`, beside `osprey.yaml`): the scheme drawn items are graded in. Changed later only by `ospreyflow grading change` (§8), which changes the items and this setting together |
 
 The answers become `osprey.yaml` (appendix A): `mode` sets `profile`, `components.dashboards` sets
 both `reporting.sync` and `reporting.superset`, and the address is `http://ospreyflow.localhost` for
@@ -981,6 +1001,15 @@ server (with `server.certificate`, `key` and `ca` as `network.tls`, `server.back
 | `ospreyflow models` | Lists the model engines, each role's default engine, and whether each provider's key is present (yes or no — never the key) |
 | `ospreyflow models key <name>` | Sets or replaces a provider's key, from `OSPREY_MODEL_KEY_<NAME>` in the terminal or a hidden prompt; writes it to `deployment.env` alone and restarts the model gateway (and the Conduit when the key's presence changes) |
 | `ospreyflow models remove-key <name>` | Removes a provider's key; the provider stays enabled but shows "no key" and is not offered to analysts |
+| `ospreyflow grading change --to <scheme> --mapping <file> --dry-run` | Says how many drawn items each line of the mapping (every grade of the old scheme to one of the new) would move, writes nothing, and gives the token the change needs. `--to` is `5x5x5`, `3x5x2` or a scheme file: a YAML file with `scheme` (a name of its own), `source`, `intelligence` and `handling`, each its list of grades. Runs beside a running deployment |
+| `ospreyflow grading change --to <scheme> --mapping <file> --confirm <token> [--stop-api]` | Changes every live drawn item's grade, each keeping the grade it had before beside the new one; refused unless the token is the dry run's for the items as they are now, and while the Conduit runs unless `--stop-api` says to stop it. After the change it sets `grading.scheme` (a scheme file kept beside `osprey.yaml`), applies the settings and starts the Conduit. A refusal names the items it concerns and changes nothing; a run stopped part way leaves the Conduit stopped: run the dry run and the change again |
+| `ospreyflow release export <dataset> --name <name> --release-version <version> --out <folder>` | Writes the dataset's release as a YAML bundle into a new, empty folder: `release.yaml` (`apiVersion: ospreyflow.io/v1`, `kind: DatasetRelease`, checked by `packages/schemas/release.schema.json`), the domain model, each published pipeline and each reference list's definition, and a small list's rows as a CSV named by its checksum. Never a credential, loaded data, case membership, an owner or a licensed screening list's rows. Does what Studio › Releases' *Export* does, as you: set `OSPREY_TOKEN` to your own sign-in token (and `OSPREY_API_URL` for another deployment's address). A pipeline marked above what you may view is left out, and the command says how many |
+| `ospreyflow release import <folder> --dataset <id> [--dry-run]` | Reads a bundle whole (every file's SHA-256, nothing it does not list) and lands the model, the pipelines and the lists as drafts in the dataset, each pipeline through the Studio's own save gates; with `--dry-run`, says what it would write and writes nothing. A refusal writes nothing. Nothing goes live: make the model live in the Studio |
+| `ospreyflow run <dataset> <pipeline> --external-run-id <id> [--version <n>\|latest] [--wait] [--fail-on held\|rejections>N%]` | Triggers a deployed pipeline as the deployment's service identity (`OSPREY_TOKEN_URL`, `OSPREY_CLIENT_ID`, `OSPREY_CLIENT_SECRET`, by client credentials); the run acts as the pipeline's owner, never as the identity. The same `--external-run-id` again loads nothing more. `--wait` waits for the run; `--fail-on` exits 2 when held rows or the share of rejected rows meets it, or when the run's counts are withheld. Exits 1 on a refusal, in words |
+| `ospreyflow map list` | Lists the map providers, each with its tier, whether its key is set (never the key) and its state; the local basemap, the place-name fonts and the prefetch areas |
+| `ospreyflow map verify` | Checks every provider's attribution, and a tier-4 service's projection and zooms, in the Conduit |
+| `ospreyflow map prefetch` | Fetches every prefetch area's tiles now, saying for each how many were fetched and any failure in plain words |
+| `ospreyflow map build <region> --unit <unit> [--planetiler-jar <path>]` | Builds the tier-1 basemap in the Conduit (the jar copied into the tiles folder first), and its place names as the gazetteer dataset `gazetteer-osm-<region>`, held by `--unit` (required; an unknown unit, or a re-build for another unit, is refused) |
 | `ospreyflow uninstall [--keep-data] [--yes]` | Removes the containers; with `--keep-data` the data volumes stay, and the next install of the same deployment finds them; without it cases, accounts and indexes go too. Your checkout, `osprey.yaml` and your own folders are never touched. (Before the stores had named volumes, section 13, a reinstall did not find the stores' data) |
 
 Every command takes `--name <name>` to act on a deployment kept by name, or `--name default` for the
@@ -996,7 +1025,7 @@ makes keep a volume even when its claim is deleted).
 
 One front proxy is the deployment's only door. Under the address in `network.public_origin`:
 
-- the **Glass** — with the Ingest Studio and the Admin area inside it — at the name itself;
+- the **Glass** — with its four places, the Ingest Studio, Rules and Monitoring and Admin among them — at the name itself;
 - **sign-in** (Keycloak) at `id.`;
 - **dashboards** (Superset) at `bi.`, when dashboards are on.
 
@@ -1014,9 +1043,9 @@ on this computer only.
 | Where | What |
 | --- | --- |
 | `osprey.yaml` (the checkout) | The deployment's settings; never a secret |
-| `~/.ospreyflow/deployments/<name>/` | A deployment kept by name (section 1a.1): its own `osprey.yaml`, every file rendered from it, its `deployment.env` (`600`) and its `backups/`; `~/.ospreyflow/current` names the one last used |
+| `~/.ospreyflow/deployments/<name>/` | A deployment kept by name (section 1a.1): its own `osprey.yaml`, every file rendered from it, its `deployment.env` (`600`), and any `backups/` an earlier release wrote there (new sets go to the backups folder, section 13); `~/.ospreyflow/current` names the one last used |
 | `deploy/generated/<profile>/` | The deployment: `compose.yaml`, `deployment.env` (every password and key it made), `Caddyfile`, `glass.json`, `realm.json`, `litellm.yaml`, `versions.lock`, `RUNBOOK.md`, `state/` |
-| `backups/` | Backup sets |
+| `backups/` | Backup sets an earlier release wrote here; no longer written, and `ospreyflow doctor` names any left (section 13) |
 | `.install/` | The guided page's draft and answers; a release install's verified lock |
 | `.cloud/` | OpenTofu's state for a Small server or an Enterprise cluster, and the cluster's kubeconfig — keep it private |
 | Your ingest and basemap folders | As the answers named them |
@@ -1052,40 +1081,125 @@ Everyone signs in through the deployment's identity provider; the password is on
 its own sign-in page. What a person may do is their **roles**; what they may see is their
 **clearance**, unit and handling codes, and the cases they are given.
 
-### 9.1 The Admin area
+### 9.1 The Admin place
 
-Signed in with an administration right, choose **Admin** on Start. Each tab shows only to someone
-holding its right:
+**Admin** is one of the four places (key `A`); Home and the place switcher offer it to whoever holds
+one of its sections' rights. A side list groups its sections, each shown only to someone holding its
+right, and each section's routes refuse anyone without it, so hiding a section is never the control.
+Under the GOV.UK theme the list is a GOV.UK side navigation.
 
-| Tab | Right | What it does |
-| --- | --- | --- |
-| People and roles | `manage_people` | Invite people; set their roles, clearance, unit and handling codes; disable, re-enable; reset a sign-in; remove an account; join someone the organisation's sign-in refused to their account (section 9.7) |
-| Dashboards | `manage_dashboards` | Register a dashboard's account (its secret shown once), see when it last pulled, remove it |
-| Schedules and runs | `operate_schedules` | Every scheduled or watched pipeline: pause, resume, run now, change its time, its runs |
-| System | `administer_system` | Each component's health — **Acting for people** among them, which says "The Conduit cannot act for people: run `ospreyflow repair-sign-in`" when the identity provider refuses the Conduit's own credential — the models in use, the version and whether an update exists |
-| Datasets | `administer_system` | Every dataset and its egress — whether its material may be sent to a hosted model engine (section 10) |
-| Demo packs | `administer_system` | Which packs are loaded, and the command that adds one |
+| Group | Section | Right | What it does |
+| --- | --- | --- | --- |
+| People | **People and roles** | `manage_people` | Invite people; set their roles, clearance, unit and handling codes; the Super user preset; **Disable…** with its transfers (section 9.9), re-enable; reset a sign-in; remove an account; join someone the organisation's sign-in refused to their account (section 9.7); name an Author for a case that has none |
+| People | **Roles** | `manage_people` | The built-in roles and their rights; custom roles; teams, their leads and cover (sections 9.2 and 9.8) |
+| People | **Dashboard identities** | `manage_dashboards` | Register a dashboard's account (its secret shown once), see when it last pulled, remove it |
+| Data | **Datasets** | `administer_system` | Every dataset's kind, unit, highest marking, egress, promotion policy, Authors and linked cases (section 9.10) |
+| Data | **Connections** | `administer_system` | The named connections pipelines read through: files, a SQL database, an HTTP API or JSON files |
+| Running | **Operations** | `operate_schedules` | Every scheduled or watched pipeline (pause, resume, run now, change its time, its runs), and promotions waiting for review (section 9.11) |
+| Running | **System** | `administer_system` | Each component's health, the models in use, the version and whether an update exists, and who dataset owners may be |
+| Running | **Models** | `manage_models` | Model engines, each job's model, their keys, limits and usage (section 10.1) |
+| Running | **Maps** | `manage_geospatial` | Map providers and their keys, the local basemap, prefetch areas (section 10a) |
+| Policies | **Grading scheme** | `administer_system` | The deployment's grading scheme, read-only, with **Copy the grading change command** (section 8) |
+| Policies | **Approval rights** (coming) | `administer_system` | Who may approve each kind of decision, and a warning where fewer than two can |
+| Policies | **Uploads** (coming) | `administer_system` | The largest picture an analyst may add, and the formats accepted |
+| Audit | **Audit** | `read_audit` | The audit log, filtered by who, what and when (section 9.11) |
+| Demo packs | **Demo packs** | `administer_system` | Which packs are loaded, and the command that adds one |
+
+**System → Acting for people** says "The Conduit cannot act for people: run `ospreyflow
+repair-sign-in`" when the identity provider refuses the Conduit's own credential.
 
 ![Admin → People and roles: each person's roles, with Access, Disable and Reset sign-in](images/admin/01-people.png)
 
 ### 9.2 Roles
 
-| Role | For |
-| --- | --- |
-| **Analyst** | Cases: investigate, edit the graph, confirm what models proposed, alerts and rules, exports, watches; proposing and approving connection-strength influencers |
-| **Data Engineer** | Pipelines: build, verify, publish, run and schedule them; the source files they load; held rows; screening lists. (It also carries the right to revert a load, which no screen or command uses yet) |
-| **Admin** (`osprey-admin`) | The Admin area; the ontology and the map; the audit and export ledgers; proposing and approving connection-strength influencers |
-| **Reports Viewer** | Reports and data feeds; the alert queue, read-only |
+The words below are the Glass's own, copied from `help/roles.ts`, the file the help page
+*Roles, teams and Authors* reads them from; a test (`test_guide_role_words.py`) fails if a copy here
+says anything different.
 
-A single right can be given on its own. **Nobody can be given more than the person giving it
-holds** — clearance included — which is why the first administrator holds the highest clearance.
+| Role | What it is for | Places it opens |
+| --- | --- | --- |
+| **Analyst** | Investigates cases, works alerts and keeps watches. Reads figures and boards. | The Glass, Rules and Monitoring |
+| **Data Engineer** | Builds and runs pipelines, reviews promotions into a dataset and decides held rows. | The Glass, the Ingest Studio, Admin (Operations) |
+| **Administrator** (`osprey-admin`) | Looks after people, roles, teams, datasets and the deployment. Does not investigate by being one. | Admin, the Glass |
+| **Reports Viewer** | Reads a case's figures and the dashboards, and sees the alerts on cases they can read. Never works an alert. | The Glass |
+| **Rule author** | Writes the rules that raise alerts, and works the alerts in the queue. | The Glass, Rules and Monitoring |
+| **Super user** (a preset) | Analyst, Data Engineer and Rule author together, given as three roles. Still never the second person on their own work. | All four |
+
+**Custom roles.** Admin → Roles lists the built-in roles with their rights (**Copy ‹role› into a new
+role**) and the deployment's own under **Custom roles**, each with **Edit**, **Copy**, its versions and
+who holds it. **New role** asks for a **Role name** and its rights, grouped as Cases, Investigation (the
+Glass), Alerts and rules, Ingest Studio, Reporting, Administration and Other. **Nobody can give more
+than the person giving it holds** — clearance included — which is why the first administrator holds
+the highest clearance. A single right can also be given on its own. Each built-in role, a custom
+role, a team and its lead have a short tip in Roles, and People folds open **What each role and level
+lets a person do**. A refusal for a missing right names the roles that have it: "You need ‹Right›; the
+‹Role› role has it. Ask an administrator to give it to you." (in Admin, after "Not done.").
+`write_sql_transforms`, the Ingest Studio's expert steps, is in no built-in role: give it on its own
+(developer guide, section 3.4b).
+
+Each right, in plain words:
+
+| Right | Lets a person |
+| --- | --- |
+| `create_case` | Start a case. |
+| `share_case` | Give people a level in a case. |
+| `remove_case` | Remove a case they are an Author of. |
+| `export` | Export from a case, through the export checks. |
+| `export_override` | Export an item that asks its originator first, with a reason. |
+| `investigate` | Search, expand, follow paths and filter in a case. |
+| `edit_graph` | Add and change entities and links in a case. |
+| `confirm_inferred` | Confirm what a model suggested, so it is no longer inferred. |
+| `extract_files` | Add files to a case, run extraction and decide its findings. |
+| `resolve_entities` | Say two entities are the same, or not. |
+| `record_assessment` | Record judgements, gaps and assumptions. |
+| `ask_model` | Ask the model a question about a case. |
+| `run_analysis` | Run analyses such as communities and centrality. |
+| `propose_link_type` | Propose a new type of link. |
+| `draw_on_boards` | Draw on a case's boards. |
+| `promote_to_dataset` | Propose a drawn item for the dataset. |
+| `propose_types` | Propose a new entity type. |
+| `read_alert_queue` | See the alerts in a case's queue. |
+| `triage_alerts` | Claim, close and hand back alerts. |
+| `deploy_rules` | Turn rules on and off for a case. |
+| `read_rule_audit` | Read who changed which rule, and when. |
+| `read_held_rows` | See rows a load held back for review. |
+| `decide_held_rows` | Release or reject held rows. |
+| `trace_ownership` | Trace ownership and neighbourhood risk. |
+| `keep_watches` | Keep watches and hotlists. |
+| `load_screening_lists` | Load and refresh licensed screening lists. |
+| `author_rules` | Write the rules that raise alerts. |
+| `manage_strength_influencers` | Change what makes a link strong. |
+| `edit_pipelines` | Build and change pipelines. |
+| `verify_pipelines` | Test a pipeline against its sample. |
+| `publish_pipelines` | Deploy a pipeline. |
+| `run_pipelines` | Run a pipeline. |
+| `schedule_pipelines` | Put a pipeline on a schedule. |
+| `add_ingest_files` | Add files for a pipeline to load. |
+| `revert_loads` | Take back a load. |
+| `edit_target_model` | Change a dataset's domain model. |
+| `review_promotions` | Review items proposed for a dataset. |
+| `accept_types` | Accept a proposed type into a domain model. |
+| `merge_datasets` | Merge a drawn dataset into another. |
+| `read_reports` | Read a case's figures and the dashboards. |
+| `read_report_feed` | Download a case's figures for a dashboard. |
+| `read_data_feeds` | See the data feeds a case's pipelines send. |
+| `administer_system` | Change how the deployment runs. |
+| `manage_people` | Add people and give them roles. |
+| `manage_dashboards` | Register dashboards. |
+| `operate_schedules` | Pause and resume schedules. |
+| `manage_ontology` | Change the deployment's ontology. |
+| `manage_geospatial` | Choose the maps the deployment shows. |
+| `read_audit` | Read the audit log. |
+| `read_export_ledger` | Read the record of what left the deployment. |
+| `manage_models` | Choose the models and their keys. |
 
 **Someone with no role sees no datasets.** A person holding no role (or only a role this deployment
 does not know) is told no dataset's name or id anywhere: the list a new case chooses from and the
 datasets a case reads come back empty, and a model engine's reason for being unavailable names none,
-whatever unit or case level they have been given. Home shows them every place dimmed with the role each needs,
-and *No cases to show* when they hold no case. A single right given on its own counts as a role here.
-Set their roles first, or straight after their access, and they see what that role allows.
+whatever unit or case level they have been given. Home tells them "Your account opens no place yet.
+Ask an administrator to give you a role.", and *No cases to show* when they hold no case. A single
+right given on its own counts as a role here. Set their roles first, or straight after their access,
+and they see what that role allows.
 
 **The first administrator** (`admin`, on a deployment with no demo accounts) holds both the
 **Admin** and the **Analyst** roles from the start, whether or not demo packs are loaded. The Admin
@@ -1095,8 +1209,8 @@ People and roles.
 
 ### 9.3 Inviting someone
 
-**Invite** asks for a sign-in name, their name, optionally an email, a clearance, a unit, handling
-codes and roles. With a mail server configured and an email given, they get an email with a link to
+**Invite a person** asks for a sign-in name, their first and last name, optionally an email, a
+clearance, a unit, handling codes and, for each role, **Invite as ‹role›**. With a mail server configured and an email given, they get an email with a link to
 set their password. Otherwise you are shown a **one-time code** (sixteen letters in four groups) to
 give them in person; it is shown once, and at first sign-in they choose their own password.
 **Reset sign-in** works the same way.
@@ -1109,7 +1223,7 @@ page also offers *Reset your password*.
 
 ### 9.4 Monitoring: whom a hotlist's alerts reach
 
-Analysts work alerts in one queue, in the Glass's **Monitoring** place: the case's rule alerts reach
+Analysts work alerts in **Rules and Monitoring** (the alerts journey, coming, rewrites this section): the case's rule alerts reach
 every member of the case; a watched pattern's alerts reach its owner and the people of the owner's
 **unit** (the unit set on their account, section 9.3); a hotlist's alerts reach its owner, and the
 owner's unit too only when the hotlist is shared. Two settings in `osprey.yaml` decide hotlists:
@@ -1170,6 +1284,12 @@ refused, in words, and nothing loads. Add an entry with
 OspreyFlow's own (`packages/demo_fixtures/screening_lists/`, known by its fingerprint); a file cannot
 make itself synthetic by saying so.
 
+**Where lists live now.** Lists are imported and refreshed in the **Ingest Studio → 2 Sources**,
+under its screening lists (and, for `load_screening_lists`, from Rules and Monitoring), and each
+dataset subscribes to the lists its rules read. **The rest of this section was written for the Glass's
+former Monitoring → Lists**, which no longer exists: read it for what a list does, not where. It is
+being rewritten with the alerts journey (coming).
+
 **Subscribing.** In the Glass, open **Monitoring → Lists** (it needs the `load_screening_lists` right,
 which the administrator and data-engineer roles hold). Under **Subscribe to a list**, give the list a
 name, choose its connector, name its file inside the ingest folder (for example `lists/SDN.CSV`), and,
@@ -1225,7 +1345,7 @@ Analyst and the Admin roles** (or `deploy_rules` and `administer_system` granted
 Author of a case the rule is listed in (a whole-deployment rule is listed in every case). With one such person, a whole-deployment rule can be
 proposed but never run.
 
-**Approving influencers.** In **Monitoring → Connection strength**, a version waiting for a second
+**Approving influencers.** In the Glass's rail, **Connection strength**, a version waiting for a second
 person shows what it would put in force, who proposed it and why. Another holder of the right chooses
 **Approve version N**, or **Send it back** with words; its proposer sees the approval withheld and may
 withdraw it. Until a version is approved, the influencers shipped in the weights file are in force.
@@ -1236,8 +1356,7 @@ someone who should set influencers without the rest of a role.
 
 Every proposal, approval and rejection is in the case's rule audit, and every rule keeps its versions
 — who proposed each and who decided it. **After upgrading to this version**, a whole-deployment rule
-that was running waits for a second person's approval before it runs again; Monitoring → Rules lists
-it as waiting, "deployed before a second person's approval was needed".
+that was running waits for a second person's approval before it runs again, and is listed as waiting, "deployed before a second person's approval was needed".
 
 ### 9.7 Removing someone, and joining an organisation account
 
@@ -1257,6 +1376,104 @@ organisation lands in that account, with its roles, clearance and cases. Join on
 sure they are the same person: the organisation said only that its account carries the same
 address. Each account joins one organisation account; an account already joined, or one OspreyFlow
 itself uses, is not offered. Every removal and every join is in the audit log.
+
+### 9.8 Teams and leads
+
+A **team** is a set of people with a lead. Admin → Roles makes one from a role (**Team for**): a
+**Team name** and an optional **Team mailbox**, then **Make a team**. Its status line says who leads
+it, who covers and until when, and who is acting today. **Name** sets the lead and **Hand over** passes
+it on; under **Cover for** and **Cover's last day**, **Save cover** names someone to stand in while the
+lead is away, and **End cover** ends it. Only a member of the team may be its lead or cover, the lead
+cannot cover for themselves, a cover needs a last day (today or later), and a service account is never
+a lead or a cover. A team can answer for a dataset (section 9.10); its members do while they are in
+it, and not after. A rule's alerts can be routed to one team (**‹Team› only**, under the rule's *Alert
+goes to*): only its members and the Authors of the dataset's home case read them, enforced in the
+query, and the lead, or their cover while it lasts, gives each to a member (**Give to (a member of
+the team)**) or sets it aside with **Suppress until…**, up to 90 days ahead, when it stays open and
+counted. *Coming:* a case level given to a team.
+
+### 9.9 Disable, and what a person owns
+
+**Disable…** on a person's row first reads what they answer for and asks who takes each item: "‹name›
+answers for N things. Choose who takes each one: nothing is deleted, and every transfer is audited."
+Each item has its own **Transfer to…**; then **Transfer and disable**, or **Confirm disabling** when
+they own nothing (and **Cancel**). It lists:
+
+- the cases of which they are the only Author, a dataset's home case among them;
+- the teams they lead;
+- their hotlists, watches and saved patterns;
+- the typology rules they own;
+- their pipeline and screening-list schedules;
+- their views and boards, private or shared;
+- the link types they proposed that still wait for a decision;
+- their watches on items they drew.
+
+A transfer is refused, in words, when its recipient cannot take it: the person being disabled, a
+service account, someone disabled, someone of another unit, someone outside the team, someone without
+the right the item needs, someone who is not an Author of the case of a rule or pipeline schedule,
+someone without the level a view (Viewer) or a board, proposal or drawn item's watch (Editor) needs on
+its case, or someone not cleared to the item's marking: for a view or a board, the case's highest
+marking; for a proposal or a drawn item's watch, the dataset's highest (ADR-145 Amendment 9). People
+who are not cleared are left out of its **Transfer to…**. Items of another unit are left to that
+unit's administrator ("N transferred, and those stand; not disabled yet…"). You cannot disable your
+own account. **Enable** brings a disabled person back.
+
+The panel ends with what it does not list yet: "Not listed here yet: promotions waiting for review,
+reviews waiting on them." It never names or counts an item you may not see. When the person owns
+some, it says so: the transfers you choose go through and stand, but the person stays enabled ("…not
+disabled yet: they still own items you may not see…") until an administrator who may see those
+items, or an Author of their case, transfers them. It reads this from
+`GET /v1/admin/people/{user_id}/ownership` (`manage_people`).
+
+### 9.10 Datasets, their Authors and linked cases
+
+Admin → **Datasets** lists every dataset: its **Kind** (*Source*, loaded through the Ingest Studio;
+*Composite*, read from several sources; *Drawn*, made by a drawing), its **Unit**, the **Highest
+marking it may hold** (or the deployment's highest), its **Egress** (section 10) and its details:
+
+- **Promotion of drawn items**: *Author promotes*, or *Second person reviews*. It names who can approve,
+  says "No one can approve a promotion: none of its Authors holds Review promotions." when nobody can,
+  and warns when fewer than two people can ("one absence stops every promotion").
+- **Authors**: the people or team who answer for the dataset, who are its home case's Authors.
+  **Change owner of ‹dataset›** asks "Who answers for ‹dataset›?" and is audited. Before its first
+  *Make live* a dataset says "Not live yet: who answers for it is asked at its first Make live."
+- **Linked cases**: every case reading it, open or removed, with its analyst layer's items, links and
+  size (never the layer's contents), the home case tagged. For a removed case's layer, **Merge ‹case›
+  into the dataset (dry run)** and **Delete ‹case›'s layer (dry run)** say what each would do. After
+  the delete's dry run, **Delete ‹case›'s layer now** ("It cannot be undone.") deletes it: its items
+  are withdrawn and kept in the audit, and promoted items are not touched
+  (`POST /v1/admin/datasets/{dataset_id}/cases/{investigation_id}/delete`, `administer_system`, a
+  dataset of your own unit only). One of the dataset's Authors may also delete it in the Ingest
+  Studio's 4 Runs (developer guide, section 7.8). The merge is done only there, by one of the
+  dataset's Authors after their own dry run.
+
+**Who may be an owner.** Admin → System's **Dataset owners may be** is *People and teams* (the default),
+*People only* or *Teams only*. It governs every naming of a dataset's owners; a client who wants no
+person's name shown as an owner chooses teams only. A service account is never an owner.
+
+**A home case per dataset.** Every dataset has one home case, named for it and of its unit. It holds
+the dataset's own reports and its alerts that belong to no working case. It is made at a dataset's first *Make live*, which refuses to go live until someone
+answers for the dataset ("who answers for this dataset?"), and with a drawing made as a case of its
+own. For datasets that existed before, `python -m scripts.make_home_cases` gives each its home case,
+dry run first.
+
+### 9.11 Operations and Audit
+
+**Operations** (`operate_schedules`) has the schedules (pipeline, case, schedule, owner, next and last
+run; **Pause**, **Resume**, **Run now**, **Save schedule**) and **Promotions waiting for review**:
+the load, the dataset it goes into, who sent it, when, and how long it has waited. **Alert the
+reviewers and administrators after N days** (1 to 90) sets when a waiting promotion is overdue; an
+overdue one alerts the dataset's Authors who hold `review_promotions`, and administrators of its unit.
+A promotion is listed only to someone who may review it; with none, it says "No promotion you may see
+is waiting for review." Each overdue one raises its alert once, and its row reads "‹N› days, overdue".
+
+**Audit** (`read_audit`) reads the audit log. **Which entries** chooses the record (*Cases, people,
+datasets and loads*; the *Rule audit of one case*; or the *Engines' history*, which also needs
+`manage_models`), a kind (analyst assertions, loads and promotions, types, people and roles, datasets,
+reads and refusals), a person, a case, a dataset and a period; then **Show entries**. Each entry gives
+when, who, what, its kind, its case and its words. Entries about another unit's cases are not shown, and
+where your own read of a record would not show its words, the entry says "Withheld: your own read of
+this record would not show them".
 
 ## 10. Models
 
@@ -1346,6 +1563,45 @@ for, whether its key is present and whether it is under a privacy contract (with
 a notice that case content then leaves the deployment. `ospreyflow models` shows the same mark
 beside each provider ("privacy contract: yes (DPA 2026/07)" or "privacy contract: no"), and the
 guided install's Models screen shows it as the configuration holds it.
+
+### 10.1 Models in Admin
+
+Admin → **Models** (`manage_models`) does on screen what `ospreyflow models` does from the command
+line, which stays for headless use and recovery. **What the installer declared** says whether the
+deployment is local-only (`local_only` in `osprey.yaml`). **Engines** lists each engine, its jobs and
+models, whether it is under a privacy contract, its key, its limits and **Edit**, **Set limits**,
+**Enter key** or **Rotate key**, **Remove key**, **Test the connection** and **Remove**; **Add an
+engine** adds one. A key is **write-only**: its field says "not shown, never sent back", and the
+screen says only *Key set*, *No key*, or *Key lost: enter it again*. **Each job's default engine**
+sets the engine for extraction and Ask, image description, transcription and embeddings. **Limits**
+are requests a minute, tokens a minute and a token budget for a period, applied by the gateway on
+the engine's own key. **Usage** gives each engine's calls, failures and tokens by job, from the
+gateway's own records, never by person. Every change is in **History** and the audit log.
+
+## 10a. Maps
+
+Admin → **Maps** (`manage_geospatial`) holds the map providers, the local basemap and prefetched
+areas; `ospreyflow map list`, `map verify`, `map prefetch` and `map build` do the same from the command
+line (section 8).
+
+- **Providers**, tier 1 to 4, each with its attribution and licence, its key, its state, **Make the
+  default**, **Edit**, **Enter key** or **Rotate key**, **Remove key** and **Remove**; **Add a provider**
+  adds one. A key is kept the way a model key is: never shown back, and never given to the browser.
+  Where more than one provider is drawable, analysts choose between them with the map's **Basemap**
+  switch.
+- **The local basemap**: choose the **Region to build**, the **Unit the place names are held by**
+  (empty: your own) and **Build the basemap**; **Verify the providers** checks each one answers. The
+  build also makes the region's gazetteer dataset, held by that unit. A dataset takes a gazetteer of
+  its own unit (`PUT`, `DELETE /v1/datasets/{dataset_id}/gazetteers/{gazetteer_id}`, with `run_pipelines`):
+  its places are copied into the dataset, so a case still reads one dataset; removing it deletes
+  nothing ("…its places stay in this dataset as its own, and the map's place search no longer offers
+  them…"). On screen, the case's map shows **Gazetteers in this case's dataset** beside its place
+  search, each "added" or "not added", with **Add** and **Remove** for holders of `run_pipelines`; a
+  case reading a composite dataset or a drawing takes none.
+- **Prefetch areas**: areas whose tiles are fetched ahead of use, and **Fetch every area** by hand
+  only, every 6 hours, every day or every week.
+
+Changes are in **History** and the audit log.
 
 ## 11. Demo packs
 
@@ -1445,15 +1701,25 @@ database's `figures` table, beside `raised`, `open_by_age` and `outcome`:
 
 A typology rule is named by its typology, never by its own name, which an analyst writes and the
 feed does not carry. Every figure is counted as the dashboard's account may see it; a hotlist kept
-"only me" is counted for its owner alone, so never on a dashboard. No board ships as a file: build
-the monitoring board in Superset from the `figures` table, filtered on these sections — for
+"only me" is counted for its owner alone, so never on a dashboard.
+
+**In the Glass**, the rail's **Dashboards** draws an **Alert monitoring** board itself, first among the
+boards, from the same figures counted as the person reading it: raised each week and by rule, closed
+by outcome, time to close, hotlist matches and the team view. A Reports Viewer's *Open the dashboard*
+opens it filtered to an alert's rule and period. It needs
+no Superset set-up. For a board of your own in Superset, none ships as a file: build it from the `figures` table, filtered on these sections — for
 example a stacked bar of `raised_by_rule` by `week_start` and `label`, a bar of `closed` by
 `label`, a table of `time_to_close`, and a line of `hotlist_matches` — with a filter on
 `case_name`. Report sync fills it on its next pull; nothing else needs to change.
 
 ## 13. Backup and restore
 
-**Lite.** `ospreyflow backup` writes a set to `backups/<time>-<profile>-<commit>/`: the graph
+**Every install.** `ospreyflow backup` writes a set to `<backups folder>/<deployment>/<time>-<deployment>-<commit>/`.
+The backups folder is asked for at setup (`folders.backups` in the answers file, the **Backups
+folder** field on the guided page's Folders screen, or the install's prompt), offering
+`~/OspreyFlow/backups`, and is written to `osprey.yaml` as `components.storage.backups`.
+`<deployment>` is the `deployment.name` you gave (`--name`), or the profile (`local-lite`,
+`small`), so two deployments' sets never mix. The set holds the graph
 store, every PostgreSQL database (the identity provider's accounts as their own export), the
 analytics database, the object store (each object with its checksum), the configuration, and a
 manifest of checksums. Taken while the Conduit runs, the stores may be captured at slightly
@@ -1471,8 +1737,9 @@ authenticate to Keycloak: 500" (section 16).
 server's daily backup. `ospreyflow backup` refuses a deployment on a managed database, saying so;
 restore from the cloud's console.
 
-**Small on your own server.** As Lite, every store in the set, written to `server.backups`
-(section 5a.3), each set readable by its owner only; the certificate's key and `deployment.env` are
+**Small on your own server.** As every install: written to the backups folder
+(`folders.backups`, or `server.backups`, its older name, section 5a.3; giving both with different
+folders is refused), each set readable by its owner only; the certificate's key and `deployment.env` are
 never in it. Schedule it with a cron line, for example
 `0 2 * * * cd /opt/ospreyflow && ~/.local/bin/ospreyflow backup`. A person who signs in through the
 organisation's identity provider is restored still linked to it. OpenSearch is not in the set, as
@@ -1500,6 +1767,44 @@ so, so no half-written set is left beside the good ones. If it cannot remove all
 it could not remove, renames the set `<set>.incomplete` with a file `INCOMPLETE` in it, and
 `ospreyflow restore` refuses it; remove it as root (`sudo rm -rf <set>.incomplete`).
 
+**Where sets are, and cleaning them up.** A backup is never written inside the OspreyFlow
+folder (the checkout: the folder holding `OspreyFlow_Core`, and everything in it).
+`--out-root <folder>` writes a set elsewhere, but a folder inside the checkout is refused, and
+`ospreyflow doctor` fails if the backups folder is inside it. `/var/lib/osprey/backups`, the
+settings' placeholder, is refused at setup except on Small on your own server. A deployment
+installed by name cannot be called `local-lite`, `small` or `cluster`, or the checkout's own
+`deployment.name`, since the checkout's own deployment keeps its backups under that name. Give two
+checkouts on one machine different backups folders: both deployments are `local-lite`, so they would
+otherwise share a subfolder. An `osprey.yaml` from v0.4.x or earlier names no backups folder (or the
+placeholder `/var/lib/osprey/backups`), so its sets go to `~/OspreyFlow/backups/<deployment>/`,
+and the backup's first line says so. Name a folder as `components.storage.backups` to stop that
+line.
+
+Sets taken before this release may still be in the checkout's `backups/`, in a named
+deployment's `~/.ospreyflow/deployments/<name>/backups/`, or directly in a server's backups
+folder. `ospreyflow doctor` names each such folder, with the sets' total size and the one command
+that moves them (`mkdir -p <folder>/<deployment> && mv <sets> <folder>/<deployment>/`). It never
+moves or deletes a set itself. Until they are moved, `ospreyflow restore` with no set lists them
+beside the deployment's own sets, each with its move command, and `ospreyflow restore <set name>`
+still restores one, looking in the deployment's folder first. A set the doctor cannot read all of
+(a server's are the owner's only) is given as "at least" its size, and its move needs `sudo`.
+
+**A synced folder.** A set holds the deployment's data and any real-data exception it was given.
+`ospreyflow doctor` warns when the backups folder is under a folder a sync client copies: on
+macOS, `~/Library/CloudStorage` (Google Drive, OneDrive, Dropbox), `~/Library/Mobile Documents`
+(iCloud Drive), `~/Documents` or `~/Desktop` (which iCloud syncs when "Desktop & Documents" is
+on); and a `OneDrive` folder on any system (Windows, or a Windows home folder under WSL's `/mnt/c/`). It is a
+warning, not a refusal, because you may mean it. A folder reached through a link is judged by
+where the link points. `ospreyflow doctor --config <answers>` checks the answers' folder before
+the install.
+
+**Cleaning up.** Nothing removes old sets automatically. Each set is a folder named
+`<UTC time>-<deployment>-<commit>`, the commit in full, for example
+`20261109T020000Z-local-lite-3e5a1c2…` (40 characters). To remove one, delete its folder:
+`rm -rf ~/OspreyFlow/backups/local-lite/<set>`
+(on a server, as the account that runs the backup). Keep at least the newest set that
+`ospreyflow restore` accepts.
+
 **Once the object store holds files** (a demo pack or an upload has put some there), it is copied
 as the account that runs `ospreyflow backup`, so that account can remove its working copy. With
 v0.4.8 and earlier on Linux such a backup failed with "Permission denied" (section 16).
@@ -1524,7 +1829,7 @@ digest. Each release's notes are its section of `CHANGELOG.md`.
 | Lite, installed from a release tag | `ospreyflow update` (below) |
 | Lite, built from the checkout (`--build`, or a checkout on no release tag) | `git pull`, then `ospreyflow start --build`. `update` refuses this install, saying so |
 | Small | **Not yet by `update`**: its first step, the backup, refuses a deployment on a managed database (section 13). The cloud's own backups protect the data |
-| Small on your own server, installed from a release tag | `ospreyflow update`, as Lite: its backup is written to `server.backups` first |
+| Small on your own server, installed from a release tag | `ospreyflow update`, as Lite: its backup is written to `<server.backups>/<deployment>/` first |
 | Enterprise | Move the checkout to the release's tag and run the install again: the chart is upgraded in place, every password and account kept |
 
 **Checking for a newer release.** The deployment never calls out to look. Run
@@ -1686,7 +1991,7 @@ Made from the deployment's own schema. Settings marked *section* hold the settin
 | `components.storage.backups` | str | `/var/lib/osprey/backups` | Where backups are written. |
 | `components.storage.ingest` | str | `/var/lib/osprey/ingest` | The host folder of source files the Ingest Studio lists (read-only to it; uploads go to its uploaded/ folder). A relative path is read from the folder osprey.yaml is in. |
 | `components.storage.tiles` | str | `/var/lib/osprey/tiles` | The host folder a built basemap lives in. A relative path is read from the folder osprey.yaml is in. |
-| `components.source_path` | str or none | none | The owned services (workspace, api, ingest) are PULLED, by the digest recorded in versions.lock, from the registry reference harness/render.py's own service_images names. This is the operator path: the harness image itself carries no services/ or apps/workspace source, and round 05's own finding was that the documented one-command bootstrap could not Launch without it — a clean laptop has no checkout. Set to a checkout root containing services/api/Dockerfile, services/ingest/Dockerfile and apps/workspace/Dockerfile (this repository's own root, for a developer/CI run) to BUILD owned images from source instead. Declared and the Dockerfiles absent is refused by name (harness.render.MissingDockerfileError) — never silently treated as the pull path. |
+| `components.source_path` | str or none | none | The owned services (workspace, api, ingest) are PULLED, by the digest recorded in versions.lock, from the registry reference harness/render.py's own service_images names. This is the operator path: the harness image itself carries no services/ or apps/workspace source, and a review found that the documented one-command bootstrap could not Launch without it — a clean laptop has no checkout. Set to a checkout root containing services/api/Dockerfile, services/ingest/Dockerfile and apps/workspace/Dockerfile (this repository's own root, for a developer/CI run) to BUILD owned images from source instead. Declared and the Dockerfiles absent is refused by name (harness.render.MissingDockerfileError) — never silently treated as the pull path. |
 | `models` | section | — | The local models, and the client's own model providers (engines) if any are enabled. |
 | `models.local_only` | bool | true | No hosted fallback |
 | `models.hosted_fallback` | str or none | none | A provider name, never a credential. |
@@ -1762,6 +2067,7 @@ Made from the deployment's own schema. Settings marked *section* hold the settin
 | `map.providers.profile` | str or none | none | A ready-made provider (providers/<profile>.yaml) to use |
 | `map.providers.variables` | mapping | — | Values the profile's addresses are filled with |
 | `map.providers.credential` | str or none | none | The provider's key, as env:VARIABLE — a name, never the key itself |
+| `map.providers.credential_param` | str or none | none | WMTS: the query parameter the provider's key goes in |
 | `map.providers.proxy` | `required` \| `recommended` \| `none` | `none` | Whether tiles are fetched through the Conduit (which caches them and keeps the key on the server) rather than by the browser |
 | `map.providers.cache` | section or none | none | Keeping fetched tiles a while (online providers only). |
 | `map.providers.cache.ttl_days` | int | required | How long a fetched tile is kept, in days |
@@ -1777,6 +2083,9 @@ Made from the deployment's own schema. Settings marked *section* hold the settin
 | `monitoring` | section | — | Monitoring and alerts: whom a new hotlist's alerts reach, and who changes it. |
 | `monitoring.hotlist_audience` | `only_me` \| `team` | `only_me` | Whom a new hotlist's alerts reach: its owner alone (only_me), or also the owner's team, the people of the owner's organisational unit (team). Applies to hotlists made after it is set, never to an existing one. |
 | `monitoring.hotlist_audience_editable` | bool | true | Whether a hotlist's owner may choose its audience, when making it or later. When false, every new hotlist takes hotlist_audience and a change is refused. |
+| `connectors` | section | — | The Studio's SQL and API connectors: the private hosts an operator admits them to. |
+| `connectors.private_hosts` | list of str | — | The private hosts a SQL or API connection may reach: each a host name in full (nomis-replica.client.internal) or a network inside 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 or fc00::/7 (10.20.0.0/16) that a connection's host name resolves into. Everything else inside a network stays refused. Never admitted, whatever is listed: this machine, a cloud's metadata services (169.254.0.0/16, fd00:ec2::/32, 100.100.0.0/16), Docker's and the cluster's own names, and any address in the Conduit's own networks or the deployment's own services'. A host must still be on the egress allow-list. |
+| `connectors.secrets` | list of str | — | The name of each SQL or API connection's secret (NOMIS_REPLICA for OSPREY_CONNECTION_SECRET_NOMIS_REPLICA in deployment.env). Only the Conduit is given a declared secret, every other service having it blanked, and a connection whose secret is not declared reads nothing. |
 | `mail` | section or none | none | A mail server, for invitations and password resets by email. |
 | `mail.host` | str | required | The mail server's name |
 | `mail.port` | int | `587` | The mail server's port. |
@@ -1792,11 +2101,14 @@ Made from the deployment's own schema. Settings marked *section* hold the settin
 | `deployment` | section | — | Which deployment this is, on a machine that runs more than one. |
 | `deployment.name` | str or none | none | Names this deployment's Compose project, its volumes and its rendered folder, so a second deployment on the same machine shares none of them. |
 | `deployment.graph_port` | int or none | none | The port on this machine (127.0.0.1 only) the graph store's own tools reach it at. A deployment installed beside another with ospreyflow install --name is given one of its own, so the two share no port. |
+| `deployment.highest_marking` | str or none | none | The highest marking this deployment may hold: a load or an import marked above it is refused before anything is written, in words that say this limit and never the item's content. A demo pack that declares no highest marking is judged as the scheme's highest, so under a lower setting it is refused. One of the handling scheme's classifications. |
 | `appearance` | section | — | How every page looks: the deployment's brand, and what its page title names. |
 | `appearance.brand` | `ospreyflow` \| `govuk` | `ospreyflow` | The GOV.UK look, for a service on a gov.uk domain only. |
 | `appearance.service_name` | str or none | none | The service's name, in the page title. |
 | `appearance.organisation` | str or none | none | The organisation in the GOV.UK footer and the page title. |
 | `appearance.phase` | `alpha` \| `beta` \| `live` \| `none` | `none` | The phase banner shows at alpha or beta. |
+| `grading` | section | — | The scheme every drawn node and link is graded in (ADR-143 decision 11); changed only by `ospreyflow grading change`. |
+| `grading.scheme` | str | `5x5x5` | The scheme drawn items are graded in: 5x5x5; 3x5x2, whose handling code (P or C) is part of the grade and never merged with the marking; or the path of a scheme file (.yaml, beside this file unless absolute) naming its own scheme and each part's grades. |
 | `external` | section | — | What a cloud runs for the deployment instead of a container (Small). |
 | `external.postgres` | section or none | none | A cloud's managed PostgreSQL; its password arrives at install. |
 | `external.postgres.host` | str | required | The managed server's address |

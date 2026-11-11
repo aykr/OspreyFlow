@@ -18,7 +18,15 @@ from datetime import date, datetime
 from enum import StrEnum
 from typing import Annotated, Any, Final, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from schemas.sentences import RuleSentence, SentenceRuleParams
 
@@ -258,6 +266,149 @@ class SourceRef(BaseModel):
     document_id: DocumentId
     locator: str
     excerpt_hash: str
+    #: ADR-140 decision 11 (`source_refs` through staging; Amendment 11): the load that read the
+    #: row, set on an element a staged row made (a Join gives one ref per side), so `document_id`,
+    #: `locator` and `load_id` name the source row, which the load's `raw.parquet` resolves on the
+    #: server. No row key, raw or hashed, is ever carried here (rule 7: a key is low-entropy, so a
+    #: hash of it is reversible). `None` otherwise, and then left out of what is stored, so an
+    #: element written outside staging is stored exactly as before.
+    load_id: str | None = Field(default=None, title="SourceLoadId")
+
+    @model_serializer(mode="wrap")
+    def _leave_out_unset_load(self, handler: Any) -> dict[str, Any]:
+        data: dict[str, Any] = handler(self)
+        if data.get("load_id") is None:
+            data.pop("load_id", None)
+        return data
+
+
+# --- A drawn item's assertion (ADR-143 decision 4; `schemas/boards.py`) --------------------
+
+#: A grading scheme's name: one of `GRADING_PARTS`, or the name a scheme file gives its own
+#: (`grading.scheme`, ADR-143 decision 11 and Amendment 6).
+GradingScheme = Annotated[str, StringConstraints(pattern=r"^[0-9a-z][0-9a-z-]{0,39}$")]
+
+#: Each built-in scheme's three parts (decision 11): the source's reliability, the intelligence's
+#: assessment and the handling code. Under 3x5x2 the handling code (P or C) is part of the grade and
+#: is never merged with the protective marking. The one list of the built-in schemes' names.
+GRADING_PARTS: dict[str, tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = {
+    "5x5x5": (("A", "B", "C", "D", "E"), ("1", "2", "3", "4", "5"), ("1", "2", "3", "4", "5")),
+    "3x5x2": (("A", "B", "C"), ("1", "2", "3", "4", "5"), ("P", "C")),
+}
+BUILT_IN_GRADING_SCHEMES: tuple[str, ...] = tuple(GRADING_PARTS)
+
+
+class Grading(BaseModel):
+    """A grade in one scheme, kept with its scheme so a later change of scheme (L3.7) keeps the
+    original beside the new one (C13).
+
+    A grade of a built-in scheme is checked against its parts here. A grade of a scheme file's
+    scheme (Amendment 6) is checked where a grade enters, against the deployment's scheme: the
+    board routes and the grading change. A stored one is read as stored, since an original may be of
+    a scheme the deployment no longer has."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Titled, so the generated TypeScript's aliases never shadow `Handling` or `Source`.
+    scheme: GradingScheme = Field(default="5x5x5", title="GradingSchemeName")
+    source: str = Field(min_length=1, max_length=16, title="GradeSource")
+    intelligence: str = Field(min_length=1, max_length=16, title="GradeIntelligence")
+    handling: str = Field(min_length=1, max_length=16, title="GradeHandling")
+
+    @model_validator(mode="after")
+    def _in_its_scheme(self) -> Grading:
+        if self.scheme in GRADING_PARTS:
+            GradingSchemeAnswer.of(self.scheme).check(self)
+        return self
+
+
+_GRADE = re.compile(r"[A-Za-z0-9-]{1,16}")
+
+
+class GradingSchemeAnswer(BaseModel):
+    """A grading scheme and each of its parts' grades: `GET /v1/grading-scheme`'s answer (for
+    Admin's read-only display and the boards' grade fields), and the shape of a scheme file
+    (`grading.scheme` naming a YAML file, ADR-143 decision 11 and Amendment 6). A scheme file may
+    not take a built-in scheme's name."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scheme: GradingScheme = Field(title="GradingSchemeName")
+    source: list[str] = Field(min_length=1, max_length=12, title="GradeSources")
+    intelligence: list[str] = Field(min_length=1, max_length=12, title="GradeIntelligences")
+    handling: list[str] = Field(min_length=1, max_length=12, title="GradeHandlings")
+
+    @model_validator(mode="after")
+    def _a_scheme(self) -> GradingSchemeAnswer:
+        for part in ("source", "intelligence", "handling"):
+            grades = getattr(self, part)
+            # Letters, digits and hyphens only: a grade is written into `deployment.env`, which
+            # Compose also reads for interpolation (`$`, ` #` and quotes would change it).
+            if any(not _GRADE.fullmatch(g) for g in grades):
+                raise ValueError(f"{part}: each grade is 1 to 16 letters, digits or hyphens")
+            if len(set(grades)) != len(grades):
+                raise ValueError(f"{part}: a grade is given twice")
+        if self.scheme in GRADING_PARTS and self.parts() != GRADING_PARTS[self.scheme]:
+            raise ValueError(
+                f"{self.scheme} is a built-in scheme: a scheme file gives a name of its own"
+            )
+        return self
+
+    def parts(self) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+        return tuple(self.source), tuple(self.intelligence), tuple(self.handling)
+
+    def check(self, grading: Grading) -> None:
+        """Refuses a grade that is not of this scheme, naming the part and the grade."""
+        if grading.scheme != self.scheme:
+            raise ValueError(f"a grade in {grading.scheme} is not a grade of {self.scheme}")
+        for part, grades in zip(("source", "intelligence", "handling"), self.parts(), strict=True):
+            if getattr(grading, part) not in grades:
+                given = getattr(grading, part)
+                raise ValueError(f"{part} {given!r} is not a grade of {self.scheme}")
+
+    @classmethod
+    def of(cls, scheme: str) -> GradingSchemeAnswer:
+        """A built-in scheme."""
+        sources, intelligence, handling = GRADING_PARTS[scheme]
+        return cls.model_construct(
+            scheme=scheme,
+            source=list(sources),
+            intelligence=list(intelligence),
+            handling=list(handling),
+        )
+
+
+class DrawnAssertion(BaseModel):
+    """ADR-143 decision 4: on the provenance of every drawn node and link. A drawn item is asserted
+    by its author, not model-derived: rule 5's `inferred` is for the matches it raises, not for
+    it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provenance_class: Literal["analyst_drawn"] = "analyst_drawn"
+    #: The board's own id for the item, kept when the item is edited.
+    item_id: str = Field(title="DrawnItemId")
+    asserted_by: PrincipalId
+    board_id: str = Field(title="DrawnBoardId")
+    case_id: str = Field(title="DrawnCaseId")
+    #: What the analyst calls it ("Unknown male “Tall”"): a type of the model may declare no name.
+    label: str = Field(min_length=1, max_length=200, title="DrawnLabel")
+    grading: Grading
+    #: ADR-143 decision 11 (C13; L3.7): the grade, in its scheme, this item had before the
+    #: deployment's grading scheme was first changed, kept beside `grading` for good. `None` for
+    #: an item whose grade no change has rewritten.
+    original_grading: Grading | None = Field(default=None, title="DrawnOriginalGrading")
+    #: Free text, a document the case already holds, or both; never neither.
+    source_note: str | None = Field(default=None, max_length=2000, title="DrawnSourceNote")
+    source_document: DocumentId | None = None
+    #: An icon chosen as a display setting only (C17 c): not evidence.
+    icon: str | None = Field(default=None, title="DrawnIcon")
+
+    @model_validator(mode="after")
+    def _has_a_source(self) -> DrawnAssertion:
+        if not (self.source_note and self.source_note.strip()) and not self.source_document:
+            raise ValueError("a drawn item needs a source note, a document of the case, or both")
+        return self
 
 
 class Provenance(BaseModel):
@@ -272,6 +423,25 @@ class Provenance(BaseModel):
     first_seen: datetime
     last_confirmed: datetime | None = None
     confirmed_by: PrincipalId | None = None
+    #: ADR-143 decision 4: set on a node or link drawn on a board (the provenance class
+    #: `analyst_drawn`), and kept for good, promoted or not. `None` for everything else, and then
+    #: left out of what is stored, so an element not drawn is stored exactly as before.
+    drawn: DrawnAssertion | None = None
+    #: ADR-147 Amendment 2 (the owner's ruling 6): set on a case's own copy of a gazetteer's place,
+    #: naming the gazetteer dataset it was copied from (`gazetteer-osm-<region>`). Kept for good,
+    #: through every later write (`merge.merge_provenance`), since it is what withholds the place's
+    #: source identifiers from every request reader and keeps them from being matched (decision
+    #: 3b). `None` for everything else, and then left out of what is stored.
+    gazetteer: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _leave_out_undrawn(self, handler: Any) -> dict[str, Any]:
+        data: dict[str, Any] = handler(self)
+        if data.get("drawn") is None:
+            data.pop("drawn", None)
+        if data.get("gazetteer") is None:
+            data.pop("gazetteer", None)
+        return data
 
     @model_validator(mode="after")
     def _invariants(self) -> Provenance:
@@ -327,9 +497,16 @@ class AuditStub(BaseModel):
     #: A universal axis, not principal-dependent: a reverted element is
     #: invisible to every read, any clearance, the same way a `SECRET`
     #: record is invisible to an unauthorised one — `services/ingest/load_revert.py`
-    #: is the only writer, via `GraphPort.revert_elements`
+    #: writes it via `GraphPort.revert_elements`, as does a drawn merge's
+    #: operator revert for its own copies and links (ADR-143 Amendment 7)
     #: (Phase 2; `01_DOMAIN_MODEL.md` §2.4).
     reverted: bool = False
+    #: ADR-110 Amendment 6 point 3: the full-snapshot refresh (its `load_id`) that withdrew this
+    #: element because the only row that made it was dropped. Set with `reverted` by
+    #: `GraphPort.withdraw_elements`, so every read leaves it out; cleared by `restore_withdrawn`
+    #: (that load reverted), by the revert of the load that made it, and by a fresh create.
+    #: Distinct from `superseded_by`, which names a successor.
+    withdrawn_by_load: str | None = None
 
 
 # --- The node and edge records (01_DOMAIN_MODEL.md §2-3) ----------------
@@ -521,7 +698,7 @@ class PathRequest(BaseModel):
     source: NodeId
     target: NodeId
     #: `le=8` — a real, small margin over `01_DOMAIN_MODEL.md` §6.3's own domain-modelled default
-    #: of 6, not a multiplier: a `repeat().until()` traversal's cost scales with branching factor
+    #: of 6, not a multiplier: a `repeat().until()` traversal's cost scales with its fan-out
     #: raised to `max_hops`, not linearly, so this is a disclosed, reasoned-but-unmeasured ceiling
     #: (Phase 7 Stage 5) in the same spirit as `01_DOMAIN_MODEL.md` §8.2's `supersede_node` figure
     #: and ADR-025's `LOCK_TTL_SECONDS` — a real number retires the guess; none exists yet.
@@ -687,11 +864,9 @@ class Alert(BaseModel):
     investigation_scope`. Threaded from `ChangeStreamEntry.investigation_id`, itself threaded from
     whichever producer route was investigation-scoped at the point the triggering write happened
     (ingest); `None` for a producer that genuinely has no single investigation in scope (the
-    corpus-wide resolution trigger). B14's "jump" branches a new investigation from this field via
-    `InvestigationStore.create(principal, branched_from=...)` — the identical mechanism
-    `branch_investigation` already uses, not new investigation-linking infrastructure. `None` here
-    means the jump starts an unbranched investigation instead of one carrying that link, disclosed
-    to the analyst rather than silently omitted."""
+    corpus-wide resolution trigger). B14's "jump" opens a case of the jumper's own from the
+    alert; since L3.2 that case records no case it came from (ADR-144 Amendment 1), and the jump's
+    audit row names this one."""
 
     id: str
     rule_id: str
@@ -739,6 +914,16 @@ class Alert(BaseModel):
     #: second person may read). A typology alert's team is the case's members, not a unit, and it
     #: carries `None` here.
     team: str | None = None
+    #: ADR-146 decision 8: the named team a rule's alert goes to (a team's role id, ADR-112
+    #: Amendment 5): only the team's members, and the Authors of the home case of the alert's
+    #: dataset, may read it (a rule 3 read, in the queue's query). `None` for every other alert.
+    routed_team: str | None = None
+    #: ADR-146 Amendment 1: *Suppress until…*, by the team's lead or cover: the last day it is
+    #: suppressed (inclusive, at most 90 days ahead), the reason and who set it. It ends by itself:
+    #: after that day it reads as never suppressed. A suppressed alert stays open and counted open.
+    suppressed_until: date | None = None
+    suppress_reason: str | None = None
+    suppressed_by: str | None = None
 
 
 #: ADR-126 decision 1: the domain packs a case can carry, defined once here. `ontology.packs`
@@ -763,7 +948,7 @@ class Hotlist(BaseModel):
     (`06_DECISIONS.md` ADR-038's option (c), recorded there as not selected, not built here).
 
     `status` (Stage 6c): `06_DECISIONS.md` ADR-036's own "the monitor stops" requirement, extended
-    here — see `WatchStatus`'s own docstring. The investigation a jumped-to alert branches into
+    here — see `WatchStatus`'s own docstring. The case a jump from an alert is told of
     comes from `Alert.investigation_id` (the *triggering* event's own investigation, threaded
     through `ChangeStreamEntry`), not from this row — a hotlist is not investigation-scoped and
     outlives any one investigation it happened to be set from."""
@@ -793,6 +978,10 @@ class Hotlist(BaseModel):
     audience: HotlistAudience = "only_me"
 
 
+#: ADR-146 decision 4: how often a saved pattern runs on its own, beside every load.
+MonitorCadence = Literal["daily", "weekly", "never"]
+
+
 class Monitor(BaseModel):
     """A saved pattern being watched — `02_GLASS_FRONTEND.md` §3.3: "A saved visual query run...
     against new data." Phase 7 Stage 6b/6c. References a `SavedPattern` by `pattern_id`, never
@@ -820,6 +1009,30 @@ class Monitor(BaseModel):
     #: ADR-099 Amendment 3: the dataset of the case it was made in; read only in a case reading
     #: it. `None` for one made before, until `stamp_datasets` places it.
     dataset_id: str | None = None
+    #: ADR-146 decision 4 (G16): a saved pattern is also run on its own schedule, daily by default,
+    #: set per watch, at a whole hour in Europe/London, as its owner resolved afresh; `never` runs
+    #: it only as data loads.
+    every: MonitorCadence = "daily"
+    hour: int = Field(default=6, ge=0, le=23)
+    #: 1 (Monday) to 7 (Sunday), for a weekly schedule only.
+    weekday: int | None = Field(default=None, ge=1, le=7)
+
+
+class MonitorScheduleInput(BaseModel):
+    """A watch's schedule (ADR-146 decision 4, G16): every day, every week on one day, or never
+    (as data loads only), at a whole hour."""
+
+    every: MonitorCadence = "daily"
+    hour: int = Field(default=6, ge=0, le=23)
+    weekday: int | None = Field(default=None, ge=1, le=7)
+
+    @model_validator(mode="after")
+    def _a_day_for_a_week(self) -> MonitorScheduleInput:
+        if self.every == "weekly" and self.weekday is None:
+            raise ValueError("a weekly schedule names the day of the week it runs on")
+        if self.every != "weekly" and self.weekday is not None:
+            raise ValueError("only a weekly schedule names a day of the week")
+        return self
 
 
 # --- Typology rules (06_DECISIONS.md ADR-109) ---------------------------------
@@ -844,10 +1057,12 @@ TypologyName = Literal[
 #: the load (a hit loads with its alert; a failure holds the rows); `post_commit` runs on the
 #: change stream after the load commits, best-effort.
 #: ADR-133 stage (d): a rule written as a sentence may also run on a schedule, never at a load.
-RuleTrigger = Literal["pre_commit", "post_commit", "schedule"]
+#: ADR-146 decision 3 (*When*, L2.11): or when a screening list it reads refreshes.
+RuleTrigger = Literal["pre_commit", "post_commit", "schedule", "list_refresh"]
 #: ADR-133 decision 7, stage (d): a whole-deployment rule is `pending` until a second person
-#: approves it, and runs only once `active`.
-RuleStatus = Literal["pending", "active", "retired"]
+#: approves it, and runs only once `active`. ADR-146 decision 3 (L2.11): a rule saved and never yet
+#: made live is a `draft`, and never runs.
+RuleStatus = Literal["draft", "pending", "active", "retired"]
 #: What a change to a rule did: deployed it, changed it, or retired it (decision 7's maker–checker).
 RuleChangeAction = Literal["deploy", "change", "retire"]
 #: ADR-133 decision 7, stage (d): `closing` is a high-severity alert someone has proposed to close,
@@ -872,7 +1087,10 @@ CLOSING_REASONS: dict[str, str] = {
 #: `Alert.rule_id`'s prefix (`typology:`, `hotlist:`, `monitor:`); a scheduled run's notice is none
 #: of these and is never queued.
 AlertSeverity = Literal["low", "medium", "high"]
-AlertKind = Literal["typology", "hotlist", "monitor"]
+#: ADR-146 decision 1 adds `analyst`: raised by hand (*Raise an alert…*, R4), `rule_id`
+#: `analyst:case:<id>` or `analyst:dataset:<id>`. `drawn_watch` (L3.6, ADR-143 Amendment 2
+#: decision 8): a watch set by drawing, `rule_id` `drawn_watch:<watch id>`, its owner's in its case.
+AlertKind = Literal["typology", "hotlist", "monitor", "analyst", "drawn_watch"]
 #: ADR-133 ruling 3: whom a hotlist's alerts reach — its owner alone, or its owner's team too.
 HotlistAudience = Literal["only_me", "team"]
 #: Who may see a queued alert, in words the Glass shows: the case's members (a typology alert), the
@@ -1041,6 +1259,10 @@ class TypologyRuleInput(BaseModel):
     params: TypologyParams
     trigger: RuleTrigger = "post_commit"
     budget_ms: int = Field(default=5000, ge=100, le=60000)
+    #: ADR-146 Amendment 6 decision 12: a pattern or template rule (`POST …/rules`) raises alerts
+    #: for its author alone, never the case's queue or a team; a case-wide rule is written in the
+    #: rule editor, drafted, tested and made live. A sentence's own scope says this for a sentence.
+    just_me: bool = False
 
     @model_validator(mode="after")
     def _a_drawn_pattern_runs_after_commit(self) -> TypologyRuleInput:
@@ -1087,6 +1309,12 @@ class TypologyRule(TypologyRuleInput):
     pending_action: RuleChangeAction | None = None
     pending_by: str | None = None
     pending_version: int | None = None
+    #: ADR-146 decision 3: the change waiting is a tested draft asked to go live under its
+    #: dataset's second-person policy, which another Author with `deploy_rules` decides, not the
+    #: administrator.
+    pending_make_live: bool = False
+    #: Who asked for that draft to go live (never offered its approval).
+    pending_asked_by: str | None = None
     #: ADR-106: `pending_by`'s display name, resolved when the rules list is served and never
     #: stored (step 9d finding 1: the waiting change named its proposer by an identity-provider id).
     pending_by_name: str | None = None
@@ -1178,6 +1406,48 @@ class LabelledWeekCount(BaseModel):
     count: int = Field(ge=0)
 
 
+#: The four age bands of `open_by_age` and `time_to_close` (`services/api/reports.py` `AGE_LABELS`),
+#: closed so the feed can carry no other words in their place.
+AgeBand = Literal["under a day", "1 to 7 days", "7 to 30 days", "over 30 days"]
+
+
+class AgeCount(BaseModel):
+    """How many alerts of one rule group are open in one age band (ADR-146 decision 9: the
+    *Alerts* panel's open by source and age). `label` and `typology` are `LabelledWeekCount`'s;
+    `age` is one of the `open_by_age` bands. Never a rule's own name or an alert's words."""
+
+    label: str
+    typology: str = ""
+    age: AgeBand
+    count: int = Field(ge=0)
+
+
+class TeamCount(BaseModel):
+    """The team view of one rule group (ADR-145 Amendment 4 decision 9): its alerts still in the
+    queue with no one on them, those claimed by the reader, those open longer than seven days, and
+    those closed in the period, of which closed as not of interest (False positive or No further
+    action). Counted as the reader, from the same queue as every other figure."""
+
+    label: str
+    typology: str = ""
+    unassigned: int = Field(default=0, ge=0)
+    mine: int = Field(default=0, ge=0)
+    older_than_week: int = Field(default=0, ge=0)
+    closed: int = Field(default=0, ge=0)
+    not_of_interest: int = Field(default=0, ge=0)
+
+
+class DrawingFigures(BaseModel):
+    """A case's drawing figures (ADR-145 Amendment 4 decision 8): items drawn on its boards,
+    promoted into the dataset, awaiting review, and withdrawn. Served once drawing boards and
+    promotions are built (L3.3, L3.4); until then `ReportFigures.drawing` is `None`."""
+
+    drawn: int = Field(ge=0)
+    promoted: int = Field(ge=0)
+    awaiting_review: int = Field(ge=0)
+    withdrawn: int = Field(ge=0)
+
+
 class MonitoringFigures(BaseModel):
     """The monitoring dashboard's figures (ADR-134 decision 2): every kind of alert the one queue
     holds for the reader — typology, hotlist and monitor — counted as them, per case. A hotlist
@@ -1188,6 +1458,11 @@ class MonitoringFigures(BaseModel):
     #: Alerts closed in the period, by how long they took, in the `open_by_age` bands.
     time_to_close: list[ReportCount] = Field(default_factory=list)
     hotlist_matches: list[LabelledWeekCount] = Field(default_factory=list)
+    #: ADR-146 decision 9: alerts still in the queue (open, claimed or closing) by rule group and
+    #: age band.
+    open_by_source: list[AgeCount] = Field(default_factory=list)
+    #: ADR-145 Amendment 4 decision 9: the *Alert monitoring* board's team view, by rule group.
+    team: list[TeamCount] = Field(default_factory=list)
 
 
 class HeldFigures(BaseModel):
@@ -1275,6 +1550,9 @@ class ReportFigures(BaseModel):
     kyc: KycFigures | None = None
     #: Set when the case's packs are anything other than exactly `[fibo]`.
     pole: PoleFigures | None = None
+    #: ADR-145 Amendment 4 decision 8: `None` until drawing boards and promotions are built (L3.4);
+    #: the Figures tab draws no Drawing panel while it is.
+    drawing: DrawingFigures | None = None
 
 
 ReportOption = Literal["shorter_period", "fewer_typologies"]
@@ -1316,6 +1594,12 @@ class QueuedAlert(BaseModel):
     #: ADR-106 Amendment 1, as `AlertExplanation.assignee_name`: the display name of
     #: `alert.assignee`, resolved for the rows served, never stored (step 9e).
     assignee_name: str | None = None
+    #: ADR-146 decision 8: the display name of the team a routed alert goes to.
+    team_name: str | None = None
+    #: ADR-146 Amendment 1: suppressed today (`alert.suppressed_until` not passed). Still open.
+    suppressed: bool = False
+    #: ADR-146 Amendment 1, the lead's tools: the reader acts as lead of the alert's team today.
+    lead: bool = False
 
 
 class ExplainedTransaction(BaseModel):
@@ -1328,6 +1612,42 @@ class ExplainedTransaction(BaseModel):
     target_id: NodeId
     occurred_at: datetime
     amount: float | None = None
+
+
+class AlertHotlist(BaseModel):
+    """ADR-130 decision 1: the hotlist a `hotlist:` alert came from, read at display time and only
+    for the hotlist's owner. The identifier is as typed (else as stored)."""
+
+    identifier: str
+    kept_as_written: bool
+    review_date: date
+
+
+class FiredFile(BaseModel):
+    """One source file of a matched node: its name (the final path segment of the document id; two
+    loads' `calls.csv` are two entries), and what is cited in it. `row` is the single row (its
+    offset under the header, counted from 0; the Glass shows it counted from 1, ADR-131) when
+    exactly one `row N` is cited and nothing else; otherwise `rows` counts the distinct `row N`
+    locators and `records` the distinct locators of any other form (ADR-130 Amendment 1)."""
+
+    name: str
+    row: int | None = None
+    rows: int | None = None
+    records: int | None = None
+
+
+class FiredOn(BaseModel):
+    """ADR-130 decision 1: what a matched node is, and where it was read from. `files` are in the
+    order of first appearance, at most five; `more_files` counts the rest.
+
+    ADR-130 Amendment 1: when the node belongs to a dataset the reader's case does not read, its
+    sources are not said at all: `sources_withheld` is true, `files` is empty and `more_files` 0."""
+
+    type: str
+    label: str
+    files: list[FiredFile]
+    more_files: int
+    sources_withheld: bool = False
 
 
 class AlertExplanation(BaseModel):
@@ -1353,6 +1673,35 @@ class AlertExplanation(BaseModel):
     #: ADR-106 Amendment 1: the display name of `alert.assignee`, resolved the same way (step 9e:
     #: "Claimed by" named the assignee by an identity-provider id).
     assignee_name: str | None = None
+    #: ADR-146 decision 1: *what fired it* (the identifier, the file, the row) on every watch
+    #: alert, as the inbox said it before the inbox went (ADR-130 decision 1): the hotlist's entry,
+    #: to its owner alone, and each matched node's sources, read as the reader.
+    hotlist: AlertHotlist | None = None
+    fired_on: list[FiredOn] | None = None
+    team_name: str | None = None
+    suppressed: bool = False
+    lead: bool = False
+
+
+class AlertAtAddress(BaseModel):
+    """An alert opened at its own address, `/alerts/<id>` (ADR-146 decision 6): the case it is
+    worked in and its explanation, as `explain_alert` gives it in that case. Answered only where the
+    reader may open that case and see the alert whole; otherwise exactly as for an alert that does
+    not exist (404 `alert_not_found`, rule 3)."""
+
+    investigation_id: str
+    explanation: AlertExplanation
+
+
+class AlertQueueCounts(BaseModel):
+    """A case's alert queue as counts alone (ADR-146 Amendment 2 point 3): what Home shows a reader
+    of the queue whom Rules and Monitoring is not offered to (the Data Engineer), who is given no
+    alert's title, words or id. Counted as the queue is, so an alert any of whose evidence is hidden
+    from the reader is not counted (rule 3)."""
+
+    open: int
+    claimed: int
+    closing: int
 
 
 class AlertDispositionInput(BaseModel):
@@ -1391,6 +1740,124 @@ class AlertAssignee(BaseModel):
 
     id: str
     name: str | None = None
+
+
+#: ADR-146 Amendment 1: a suppression ends at most this many days ahead.
+SUPPRESS_DAYS_MAX: Final = 90
+
+
+class AlertSuppressInput(BaseModel):
+    """*Suppress until…* (ADR-146 Amendment 1): a reason and the last day, at most 90 days ahead
+    (checked at the route against today). Only the team's lead, or its cover while the cover lasts,
+    may suppress one of the team's alerts."""
+
+    until: date
+    reason: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("reason")
+    @classmethod
+    def _a_reason_in_words(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("suppressing an alert needs a reason")
+        return value.strip()
+
+
+#: ADR-146 decision 7: where an analyst's alert goes: the case, or the case's dataset.
+RaisedTo = Literal["case", "dataset"]
+
+
+class RaiseAlertInput(BaseModel):
+    """*Raise an alert…* (ADR-146 decision 7, R4): a title, a severity, a reason and where it goes,
+    with its evidence: the items and the query or question that found them. Refused at the route to
+    a case or dataset the raiser may not write, and a dataset alert citing an item that is not the
+    dataset's own (a drawn item, which only its case can see)."""
+
+    title: str = Field(min_length=1, max_length=200)
+    severity: AlertSeverity = "medium"
+    reason: str = Field(min_length=1, max_length=2000)
+    to: RaisedTo = "case"
+    #: The dataset, for an alert raised to the dataset: one the case reads.
+    dataset_id: str | None = None
+    node_ids: list[NodeId] = Field(min_length=1, max_length=200)
+    edge_ids: list[EdgeId] = Field(default_factory=list, max_length=400)
+    #: What found them, in words: the query or the question.
+    found_by: str | None = Field(default=None, max_length=500)
+
+    @field_validator("title", "reason")
+    @classmethod
+    def _words(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("an alert needs a title and a reason in words")
+        return value.strip()
+
+    @model_validator(mode="after")
+    def _a_dataset_for_a_dataset_alert(self) -> RaiseAlertInput:
+        if self.to == "dataset" and self.dataset_id is None:
+            raise ValueError("an alert raised to the dataset names the dataset")
+        if self.to == "case" and self.dataset_id is not None:
+            raise ValueError("an alert raised to the case names no dataset")
+        return self
+
+
+AlertSourceKind = Literal["rule", "hotlist", "watched_pattern"]
+
+
+class SuppressedAlert(BaseModel):
+    alert_id: str
+    until: date
+    reason: str
+    by: str
+    #: ADR-106: who suppressed it, by name, resolved at read time for the rows served; never stored.
+    by_name: str | None = None
+
+
+class AlertSource(BaseModel):
+    """One row of *What raises alerts* (ADR-146 decision 5): a rule or a watch, whoever made it.
+    Its counts are the reader's queue's, so an alert they may not see is not counted (rule 7)."""
+
+    id: str
+    #: The `rule_id` its alerts carry, which the queue's rows name.
+    rule_id: str
+    name: str
+    source: Literal["rule", "watch"]
+    kind: AlertSourceKind
+    maker: str
+    maker_name: str | None = None
+    dataset_id: str | None = None
+    #: A person's id, or a team's id for a rule routed to a team.
+    owner: str
+    #: ADR-106: the owner by name, resolved at read time for the rows served (a team's display
+    #: name for a routed rule); never stored. The Glass shows this, never `owner`.
+    owner_name: str | None = None
+    state: Literal["draft", "live", "stopped"]
+    expires_on: date | None = None
+    last_fired_at: datetime | None = None
+    alerts_30_days: int = 0
+    #: The share of its closed alerts closed as not of interest (false positive), 0 to 1, or
+    #: `None` when none is closed.
+    not_of_interest: float | None = None
+    #: ADR-146 Amendment 1: the alerts of this rule or watch suppressed today, beside it.
+    suppressed: list[SuppressedAlert] = Field(default_factory=list)
+
+
+class AlertSources(BaseModel):
+    sources: list[AlertSource]
+
+
+class AlertTeam(BaseModel):
+    """A team a rule's alerts may go to (ADR-146 decision 8), and for its lead today the members
+    of it who hold the case, whom its alerts may be given to (Amendment 1)."""
+
+    role_id: str
+    display_name: str
+    lead: bool = False
+    members: list[str] = Field(default_factory=list)
+    #: ADR-106: the members by name (id -> name), resolved at read time for the members served
+    #: (the lead's own team alone); never stored. The Glass shows these, an id only where unnamed.
+    member_names: dict[str, str] = Field(default_factory=dict)
+    #: ADR-146 decision 3: how many of the team hold this case, for the editor's "Its alerts will
+    #: appear in Alerts, seen by the 6 members of …" said before saving. People, never data.
+    member_count: int = Field(default=0, ge=0)
 
 
 class HotlistAudienceInput(BaseModel):
@@ -1626,6 +2093,9 @@ ALL_MODELS: tuple[type[BaseModel], ...] = (
     SchemaReport,
     Handling,
     SourceRef,
+    Grading,
+    GradingSchemeAnswer,
+    DrawnAssertion,
     Provenance,
     ResolutionState,
     AuditStub,
@@ -1690,6 +2160,18 @@ ALL_MODELS: tuple[type[BaseModel], ...] = (
     NeighbourhoodRisk,
     ExplainedTransaction,
     AlertExplanation,
+    AlertAtAddress,
+    AlertQueueCounts,
+    AlertSuppressInput,
+    AlertTeam,
+    RaiseAlertInput,
+    AlertSource,
+    AlertSources,
+    SuppressedAlert,
+    MonitorScheduleInput,
+    AlertHotlist,
+    FiredOn,
+    FiredFile,
     AlertDispositionInput,
     HeldRowDecision,
     Judgement,

@@ -29,6 +29,7 @@ import type {
   LoadChecksView,
   PipelineGraph,
   DomainPackEntry,
+  StagingPreview,
 } from "../../../../packages/schemas/generated";
 
 export interface HandlingCode {
@@ -274,21 +275,25 @@ export class ProfileError extends Error {
 
 /** The sentence a refusal carries: `detail`, or `message` (the ADR-127 refusals — a changed
  * `deduplicate`, a run already in progress — say theirs in `message`), else `fallback`. */
-function causeOf(body: { detail?: unknown; message?: unknown }, fallback: string): string {
+function causeOf(body: { detail?: unknown; message?: unknown; problems?: unknown }, fallback: string): string {
   if (typeof body.detail === "string" && body.detail) return body.detail;
+  // ADR-112 Amendment 8: a refusal of an expert step says why in `problems`.
+  if (Array.isArray(body.problems) && typeof body.problems[0] === "string") return body.problems.join(" ");
   if (typeof body.message === "string" && body.message) return body.message;
   return fallback;
 }
 
 async function parseCodedErrorOrThrow<T>(response: Response, action: string): Promise<T> {
   if (!response.ok) {
-    let body: { error?: unknown; detail?: unknown; message?: unknown } = {};
+    let body: { error?: unknown; detail?: unknown; message?: unknown; problems?: unknown } = {};
     try {
       body = await response.json();
     } catch {
       // Not a JSON error body — fall through with the generic detail below.
     }
-    const code = typeof body.error === "string" ? body.error : "unknown_error";
+    // A right the route needs comes back inside `detail` (`require_right`'s 403), not at the top.
+    const nested = typeof body.detail === "object" && body.detail !== null ? (body.detail as { error?: unknown }).error : undefined;
+    const code = typeof body.error === "string" ? body.error : typeof nested === "string" ? nested : "unknown_error";
     throw new ProfileError(code, causeOf(body, `${action}: ${response.status}`));
   }
   return (await response.json()) as T;
@@ -425,6 +430,22 @@ export async function runVerify(
     headers: authHeaders(bearerToken),
   });
   return parseCodedErrorOrThrow(response, "POST /v1/ingest/recipes/{id}/verify");
+}
+
+/** Phase 6's graph *Preview* of a Map or Load step (ADR-140 Amendment 8 point 2): the dry run Test
+ * runs, marking nothing, so it never counts as Test and never satisfies Deploy. Same refusals as
+ * `runVerify` (the right `verify_pipelines`, editor level, the same coded errors). */
+export async function previewGraph(
+  apiBaseUrl: string,
+  bearerToken: string,
+  investigationId: string,
+  recipeId: string,
+): Promise<VerifyReport> {
+  const response = await fetch(`${studioCase(apiBaseUrl, investigationId)}/ingest/recipes/${recipeId}/preview-graph`, {
+    method: "POST",
+    headers: authHeaders(bearerToken),
+  });
+  return parseCodedErrorOrThrow(response, "POST /v1/ingest/recipes/{id}/preview-graph");
 }
 
 // --- Checks on load (ADR-133 decision 6, stage (d); 09_INGEST_STUDIO.md §5a) ---------------------
@@ -597,13 +618,90 @@ export async function savePipeline(
       body: JSON.stringify(pipeline),
     },
   );
-  if (response.status === 422) {
-    const body = (await response.json()) as { error?: string; problems?: string[] };
-    if (body.error === "pipeline_invalid") {
+  return pipelineSaveOutcome(response, "PUT /v1/ingest/recipes/{id}/pipeline");
+}
+
+/** The save's refusals in words: the gate's (422 `pipeline_invalid`), or an expert step changed
+ * without `write_sql_transforms` (403, ADR-140 decision 3). */
+async function pipelineSaveOutcome(response: Response, what: string): Promise<PipelineSaveOutcome> {
+  if (response.status === 422 || response.status === 403) {
+    const body = (await response.json().catch(() => ({}))) as { error?: string; problems?: string[] };
+    if (body.error === "pipeline_invalid" || (body.error === "right_required" && body.problems)) {
       return { kind: "invalid", problems: body.problems ?? [] };
     }
+    throw new Error(`${what} failed: ${response.status}`);
   }
-  return { kind: "saved", draft: await parseOrThrow(response, "PUT /v1/ingest/recipes/{id}/pipeline") };
+  return { kind: "saved", draft: await parseOrThrow(response, what) };
+}
+
+/** *Show YAML* (ADR-140 decision 3): the pipeline as the Conduit writes it. */
+export async function fetchPipelineYaml(
+  apiBaseUrl: string,
+  bearerToken: string,
+  investigationId: string,
+  recipeId: string,
+): Promise<string> {
+  const response = await fetch(`${studioCase(apiBaseUrl, investigationId)}/ingest/recipes/${recipeId}/pipeline/yaml`, {
+    headers: authHeaders(bearerToken),
+  });
+  const body = await parseOrThrow<{ text: string }>(response, "GET /v1/ingest/recipes/{id}/pipeline/yaml");
+  return body.text;
+}
+
+/** Expert mode's YAML save, through the canvas's own gates. */
+export async function savePipelineYaml(
+  apiBaseUrl: string,
+  bearerToken: string,
+  investigationId: string,
+  recipeId: string,
+  text: string,
+): Promise<PipelineSaveOutcome> {
+  const response = await fetch(`${studioCase(apiBaseUrl, investigationId)}/ingest/recipes/${recipeId}/pipeline/yaml`, {
+    method: "PUT",
+    headers: { ...authHeaders(bearerToken), "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  return pipelineSaveOutcome(response, "PUT /v1/ingest/recipes/{id}/pipeline/yaml");
+}
+
+/** A SQL step's *Check SQL* (ADR-140 decision 12): the sandbox gate's words; nothing runs. */
+export async function checkSql(
+  apiBaseUrl: string,
+  bearerToken: string,
+  investigationId: string,
+  recipeId: string,
+  pipeline: PipelineGraph,
+  step: string,
+): Promise<string[]> {
+  const response = await fetch(`${studioCase(apiBaseUrl, investigationId)}/ingest/recipes/${recipeId}/sql-check`, {
+    method: "POST",
+    headers: { ...authHeaders(bearerToken), "Content-Type": "application/json" },
+    body: JSON.stringify({ pipeline, step }),
+  });
+  const body = await parseOrThrow<{ problems?: string[] }>(response, "POST /v1/ingest/recipes/{id}/sql-check");
+  return body.problems ?? [];
+}
+
+/** A staging step's drawer's live sample (ADR-140 Amendment 12): the steps up to `step` over the
+ * first ten rows of each source, of the pipeline the drawer holds, saved or not. Writes nothing.
+ * Its `problems` are the save gate's refusals, in the gate's own words. */
+export async function previewStaging(
+  apiBaseUrl: string,
+  bearerToken: string,
+  investigationId: string,
+  recipeId: string,
+  pipeline: PipelineGraph,
+  step: string,
+): Promise<StagingPreview> {
+  const response = await fetch(
+    `${studioCase(apiBaseUrl, investigationId)}/ingest/recipes/${recipeId}/staging-preview`,
+    {
+      method: "POST",
+      headers: { ...authHeaders(bearerToken), "Content-Type": "application/json" },
+      body: JSON.stringify({ pipeline, step }),
+    },
+  );
+  return parseCodedErrorOrThrow(response, "POST /v1/ingest/recipes/{id}/staging-preview");
 }
 
 export async function fetchDomainPacks(

@@ -45,6 +45,7 @@ import {
   type HandlingScheme,
   type IngestSourceListing,
 } from "./api";
+import { RightButton } from "./studio/rightsGate";
 
 export interface ConnectScreenProps {
   apiBaseUrl: string;
@@ -536,13 +537,14 @@ export function ConnectScreen({
                   if (file) void handleChosenFile(file);
                 }}
               />
-              <Button
+              <RightButton
+                right="add_ingest_files"
                 variant="primary"
                 disabled={uploading}
                 onClick={() => fileInput.current?.click()}
               >
                 {uploading ? "Uploading…" : "Choose file…"}
-              </Button>
+              </RightButton>
               <span style={{ color: "var(--text-tertiary)" }}>From your computer</span>
             </div>
             {uploadError ? (
@@ -756,7 +758,9 @@ export function ConnectScreen({
               {activeRecipeId ? "Save" : "Create draft"}
             </Button>
             {recipeId ? (
-              <Button onClick={() => onBack?.()}>Back to the pipeline</Button>
+              // Hosted in the pipeline's drawer there is no back (ADR-108 Amendment 6.1): the
+              // drawer's own Close goes back to the source node.
+              onBack && <Button onClick={onBack}>Back to the pipeline</Button>
             ) : (
               <Button
                 disabled={!lastSaved?.ready_for_profile}

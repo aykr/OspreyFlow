@@ -3,10 +3,11 @@
 import type { ReactElement, ReactNode } from "react";
 
 import { CasePicker } from "../investigation/CasePicker";
-import { startFor, type Rights, type StartPlace } from "../rights/visibility";
+import { startFor, startPlaces, type Rights, type StartPlace } from "../rights/visibility";
 import { AdminWithoutCase } from "./AdminWithoutCase";
-import { HomePage, type HomePerson } from "../home/HomePage";
+import { HomePage, type AlertJourneyStart, type HomePerson } from "../home/HomePage";
 import type { HomeSummary } from "../home/homeData";
+import { PlaceSwitcher } from "./PlaceSwitcher";
 import { StartBar } from "./StartPage";
 
 export type StartChoice = StartPlace | "start" | null;
@@ -36,6 +37,16 @@ export interface StartScreenInput {
   browseCases: () => void;
   /** The Studio on the open case. */
   openStudio: () => void;
+  /** Rules and Monitoring on the open case. */
+  openRules: () => void;
+  /** An alert at its address (ADR-146 decision 6). */
+  openAlert: (alertId: string) => void;
+  /** Opens a case on Rules and Monitoring (a reload, as every case switch is). */
+  openCaseOnRules: (id: string) => void;
+  /** The Reports Viewer's journey from an alert on Home (ADR-145 Amendment 4 decision 10). */
+  openAlertJourney?: (alert: AlertJourneyStart, to: "figures" | "board") => void;
+  /** Home's *What you can do, and what you answer for* (ADR-145 Amendment 4 decision 12, L2.7). */
+  answers?: ReactNode;
 }
 
 export function startScreen(input: StartScreenInput): ReactElement | null {
@@ -44,24 +55,42 @@ export function startScreen(input: StartScreenInput): ReactElement | null {
   if (!input.rightsSettled) {
     return <div style={{ padding: "var(--sp-24)", color: "var(--text-secondary)" }}>Loading…</div>;
   }
-  const where = investigationId ? startChoice : startFor(startChoice);
+  // ADR-145 N6: a place chosen or handed off (`?view=ingest|admin`) is drawn only if the person's
+  // rights open it, else Home — decided here, before anything of the place is drawn.
+  const chosen = investigationId ? startChoice : startFor(startChoice);
+  const where =
+    chosen === "glass" || chosen === "ingest" || chosen === "rules" || chosen === "admin"
+      ? startPlaces(rights).includes(chosen)
+        ? chosen
+        : "start"
+      : chosen;
+  // ADR-145 decision 1: Home's cards and the switcher go to a place the same way. With a case open
+  // behind, the Glass offers the cases with a way back to it, and the Studio opens on it; Admin needs
+  // no case either way.
+  const choose = (place: StartPlace) => {
+    if (!investigationId) return setStartChoice(place);
+    setStartChoice(place === "admin" ? "admin" : null);
+    if (place === "glass") input.browseCases();
+    if (place === "ingest") input.openStudio();
+    if (place === "rules") input.openRules();
+  };
+  const switcher = (current: StartPlace | null) => (
+    <PlaceSwitcher places={startPlaces(rights)} current={current} onChoose={choose} />
+  );
   if (where === "start") {
     return (
       <HomePage
         rights={rights ?? new Set()}
+        rightsUnread={rights === null}
         person={input.person}
         summary={input.summary}
         account={input.account}
         marking={input.marking}
         onOpenCase={(id, place) => input.openCase(id, place === "ingest" ? "ingest" : undefined)}
-        onChoose={(place) => {
-          if (!investigationId) return setStartChoice(place);
-          // A case is open behind Start: the Glass offers the cases with a way back to it, and the
-          // Studio opens on it; the Admin area needs no case either way.
-          setStartChoice(place === "admin" ? "admin" : null);
-          if (place === "glass") input.browseCases();
-          if (place === "ingest") input.openStudio();
-        }}
+        onOpenAlert={input.openAlert}
+        onAlertJourney={input.openAlertJourney}
+        onChoose={choose}
+        answers={input.answers}
       />
     );
   }
@@ -74,6 +103,7 @@ export function startScreen(input: StartScreenInput): ReactElement | null {
         account={input.account}
         marking={input.marking}
         onStart={() => setStartChoice("start")}
+        places={switcher("admin")}
       />
     );
   }
@@ -82,15 +112,15 @@ export function startScreen(input: StartScreenInput): ReactElement | null {
   const backToStart = () => setStartChoice("start");
   return (
     <>
-    <StartBar account={input.account} marking={input.marking} onStart={backToStart} />
+    <StartBar account={input.account} marking={input.marking} onStart={backToStart} places={switcher(where)} />
     <CasePicker
       apiBaseUrl={input.apiBaseUrl}
       bearerToken={input.bearerToken}
       lastCaseId={input.lastCaseId}
       isAdministrator={input.isAdministrator}
-      title={where === "ingest" ? "Choose the case to load into" : "Choose a case"}
+      title={where === "ingest" ? "Choose the case to load into" : where === "rules" ? "Choose the case whose alerts to work" : "Choose a case"}
       onStart={backToStart}
-      onOpen={(id) => input.openCase(id, where === "ingest" ? "ingest" : undefined)}
+      onOpen={(id) => (where === "rules" ? input.openCaseOnRules(id) : input.openCase(id, where === "ingest" ? "ingest" : undefined))}
     />
     </>
   );
