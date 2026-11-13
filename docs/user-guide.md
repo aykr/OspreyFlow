@@ -15,10 +15,12 @@ engineers, and the [architecture guide](architecture-guide.md), for how it is bu
 <!-- document-control:begin -->
 ## Document control
 
-**Version 1.47** · 2026-11-12 · For OspreyFlow v0.5.0 · Issued
+**Version 1.49** · 2026-11-13 · For OspreyFlow v0.5.0 · Issued
 
 | Version | Date | What changed |
 | --- | --- | --- |
+| 1.49 | 2026-11-13 | §5 and §6: the rail as the owner ruled (ADR-145 Amendment 12): Cases, Explore, *Ask & Chat* (Questions renamed) and Dashboards on the rail; *⋯ More* is *⋯ Explore Details*, holding History, Ownership and Connection strength; Help (and **?**) opens the keys, with the user guide's link, over any view, and closes again. PDF reprinted alone. |
+| 1.48 | 2026-11-13 | §3: Home's *What you can do, and what you answer for* is now *Your access and tasks*, across the page below the two columns (ADR-145 Amendment 11, the owner's ruling): *Waiting for you*, "Nothing is waiting for you.", *Your access to each case*, each line "Editor: Operation Ledger (synthetic demo)". |
 | 1.47 | 2026-11-12 | §3: Home's guides. *Read the user guide (PDF)* under the Glass's card, the developer guide under the Ingest Studio's and the administration guide under Admin's, each with its place's card alone, opened in a new tab or saved, as the version this deployment was built with (ADR-145 Amendment 10). PDF made by the orchestrator at merge. |
 | 1.46 | 2026-11-11 | The second look at 1.45. §7.10: lists are imported in the Ingest Studio by a data engineer, or anyone holding Load screening lists and Edit pipelines; who here sees a refresh's counts. Captions 23 and 26 say that their pictures still show the former Lists and Watches tabs, to be retaken |
 | 1.45 | 2026-11-11 | The review of 1.44, against the code. §7.6: *Make live*, *Approve* and *Reject* need Deploy rules and Rules and Monitoring itself, so an Analyst, not a Data Engineer; *Deploy the sentence* needs Deploy rules and Keep watches. §7.1, §7.2, §7.4, §7.9 and §7.10: a rule kept just for its author is listed as a *Watched pattern*, and a template or pattern rule kept so raises medium alerts whatever its template's severity, stated as a known issue. §7.4: *Retire*, *Use* and *Deploy* need Deploy rules. §7.10: the screening lists are shown read-only under *What raises alerts*, and imported, mapped and refreshed in the Ingest Studio's *2 Sources*. Captions 23, 24 and 26 recaptioned |
@@ -155,11 +157,12 @@ clearance and your roles, and then shows:
   made;
 - **Ways of working**: four short tips.
 
-Below them, **What you can do, and what you answer for** is worked out for you: **Places you can
-open**; **What you answer for** (each case you are an Author of, the datasets whose promotions you
-review, and proposed link types waiting for you, each with a *Why:* line), or "Nothing waits for
-you."; **Your level in each case**; and, folded, **What you can do, by place**, where each right has
-**Why can I do this?** ("Given by your Analyst role.").
+Below them, across the page, **Your access and tasks** is worked out for you: **Places you can
+open**; **Waiting for you** (each case you are an Author of, the datasets whose promotions you
+review, and proposed link types waiting for you, each with a *Why:* line), or "Nothing is waiting
+for you."; **Your access to each case**, one line a case ("Editor: Operation Ledger (synthetic
+demo)"); and, folded, **What you can do, by place**, where each right has **Why can I do this?**
+("Given by your Analyst role.").
 
 **Needs you**, in the top bar beside your account, appears when something waits for you: a promotion
 waiting past the days your administrator set (for one who may review it), and proposed link types to
@@ -274,7 +277,7 @@ added from outside, such as a VAST Challenge dataset, is a case of its own named
 | --- | --- |
 | **Top bar** | The place switcher, the case menu, search, the view switch (Graph and Map, with Matrix and Figures under **More views**), Export, and your account |
 | **Context banner** | Where you are: the Glass's **Case** and **Boards**, the case and the dataset it reads |
-| **Left rail** | Cases, Ownership, History, Explore, Questions, Dashboards and Connection strength, those your rights allow (some under **⋯ More**), and Help (**?**) |
+| **Left rail** | Cases, Explore, **Ask & Chat** and Dashboards, then **⋯ Explore Details** with History, Ownership and Connection strength, those your rights allow; and **Help** (**?**), which opens the keys and the user guide over any view and closes again with a second press or Esc |
 | **Canvas** | The graph, the map, the Matrix or the case's figures |
 | **Right column** | The Inspector, Metrics, the query builder and Find connections, stacked; **Full width** and **Hide** |
 | **Timeline** | Folded at the bottom until opened |
@@ -769,11 +772,11 @@ proposed, while a data engineer of the dataset decides it in the Ingest Studio's
 the draft domain model, or declined); the person who proposed it never decides it. Its links stay in
 the case's analyst layer.
 
-## 6. Questions to the model
+## 6. Ask & Chat: questions to the model
 
-![Questions: ask about the documents in this case](images/user/12-questions.png)
+![Ask & Chat (named Questions in this picture): ask about the documents in this case](images/user/12-questions.png)
 
-**Questions** asks the deployment's model about the documents in this case that you can see, and about
+**Ask & Chat** (on the rail; it was named *Questions*) asks the deployment's model about the documents in this case that you can see, and about
 **graph facts**. It answers from those only, citing each — **Draws on** opens a document. What it
 proposes, you **Accept** or **Reject**; an accepted proposal enters the graph as *inferred*.
 **Ask the model about these…** on a selection of documents starts a case of its own for them. Asking
@@ -1409,7 +1412,7 @@ recorded. Report packs export to PDF from the Packs and Published tabs.
 | --- | --- | --- |
 | Home | `G`, `I`, `R`, `A` | Open the Glass, the Ingest Studio, Rules and Monitoring or Admin, as your roles allow |
 | Anywhere | `/` | Search |
-| Anywhere | `?` | The welcome panel, with keys worth knowing |
+| Anywhere in the Glass | `?` | Opens or closes the welcome panel, with keys worth knowing and the user guide, over any view (as the rail's **Help** does) |
 | Canvas | Tab, Shift+Tab | Move into and out of the canvas |
 | Canvas | Arrows | Step to the next or previous neighbour; a screen reader hears its name, type and links |
 | Canvas | Ctrl/Cmd+Arrows | Step within the selection; with Shift, through every node |

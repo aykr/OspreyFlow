@@ -89,37 +89,41 @@ test("the marking strip and the top bar take 20 and 44 pixels, and the rail 48 w
 
 test("each rail entry is reached and pressed by keyboard", async ({ page }) => {
   await page.goto("/keyboard/top-bar-harness.html");
-  // ADR-145 Amendment 2 (variant B): the rail keeps Cases and Explore. Monitoring is no longer the
-  // Glass's at all: Rules and Monitoring is a place of its own (ADR-146 decision 2).
-  for (const name of ["Cases", "Explore"]) {
-    await page.getByRole("navigation", { name: "Workspace" }).getByRole("button", { name }).focus();
+  // ADR-145 Amendment 12: the rail keeps Cases, Explore, Ask & Chat (Questions renamed) and Dashboards.
+  // Monitoring is no longer the Glass's at all: Rules and Monitoring is a place of its own (ADR-146
+  // decision 2).
+  for (const name of ["Cases", "Explore", "Ask & Chat", "Dashboards"]) {
+    // Exact: "Explore" is also the start of "Explore Details" (ADR-145 Amendment 12).
+    await page.getByRole("navigation", { name: "Workspace" }).getByRole("button", { name, exact: true }).focus();
     await page.keyboard.press("Enter");
   }
-  expect(await page.evaluate(() => window.__TOPBAR__?.rail)).toEqual(["cases", "explore"]);
+  expect(await page.evaluate(() => window.__TOPBAR__?.rail)).toEqual(["cases", "explore", "questions", "dashboards"]);
   // Watches are with the rules in Rules and Monitoring (ADR-146 decision 4), not the rail.
   await expect(page.getByRole("navigation", { name: "Workspace" }).getByRole("button", { name: "Watches" })).toHaveCount(0);
   await expect(page.getByRole("navigation", { name: "Workspace" }).getByRole("button", { name: /Monitoring/ })).toHaveCount(0);
   registerCovered(REGISTRY, "rail-entries-by-keyboard");
 });
 
-// ADR-145 Amendment 2 (rule 13): each destination under the rail's ⋯ More, opened and chosen by
-// keyboard, and Escape closes the menu back onto ⋯.
-test("each destination under the rail's More is reached and chosen by keyboard", async ({ page }) => {
+// ADR-145 Amendment 12 (rule 13): each destination under the rail's ⋯ Explore Details, in its order,
+// opened and chosen by keyboard, and Escape closes the menu back onto it.
+test("each destination under the rail's Explore Details is reached and chosen by keyboard", async ({ page }) => {
   await page.goto("/keyboard/top-bar-harness.html");
   const rail = page.getByRole("navigation", { name: "Workspace" });
-  for (const name of ["Ownership", "History", "Questions", "Dashboards", "Connection strength"]) {
-    await rail.getByRole("button", { name: "More" }).focus();
+  for (const name of ["History", "Ownership", "Connection strength"]) {
+    await rail.getByRole("button", { name: "Explore Details" }).focus();
     await page.keyboard.press("Enter");
-    await rail.getByRole("group", { name: "More" }).getByRole("button", { name }).focus();
+    const menu = rail.getByRole("group", { name: "Explore Details" });
+    await expect(menu.getByRole("button")).toHaveText(["History", "Ownership", "Connection strength"]);
+    await menu.getByRole("button", { name }).focus();
     await page.keyboard.press("Enter");
-    await expect(rail.getByRole("group", { name: "More" })).toHaveCount(0);
+    await expect(rail.getByRole("group", { name: "Explore Details" })).toHaveCount(0);
   }
-  expect(await page.evaluate(() => window.__TOPBAR__?.rail)).toEqual(["ownership", "history", "questions", "dashboards", "strength"]);
-  await rail.getByRole("button", { name: "More" }).focus();
+  expect(await page.evaluate(() => window.__TOPBAR__?.rail)).toEqual(["history", "ownership", "strength"]);
+  await rail.getByRole("button", { name: "Explore Details" }).focus();
   await page.keyboard.press("Enter");
   await page.keyboard.press("Escape");
-  await expect(rail.getByRole("group", { name: "More" })).toHaveCount(0);
-  await expect(rail.getByRole("button", { name: "More" })).toBeFocused();
+  await expect(rail.getByRole("group", { name: "Explore Details" })).toHaveCount(0);
+  await expect(rail.getByRole("button", { name: "Explore Details" })).toBeFocused();
   registerCovered(REGISTRY, "rail-more-by-keyboard");
 });
 
@@ -160,19 +164,45 @@ test("the rail shows its names, and hides them again, by keyboard", async ({ pag
   const rail = page.getByRole("navigation", { name: "Workspace" });
   await rail.getByRole("button", { name: "Show names" }).focus();
   await page.keyboard.press("Enter");
-  await expect(rail.getByText("Explore")).toBeVisible();
+  await expect(rail.getByText("Explore", { exact: true })).toBeVisible();
   await expect(rail.getByRole("button", { name: "Hide names" })).toBeFocused();
   await page.keyboard.press("Enter");
-  await expect(rail.getByText("Explore")).toHaveCount(0);
+  await expect(rail.getByText("Explore", { exact: true })).toHaveCount(0);
   registerCovered(REGISTRY, "rail-shows-and-hides-names-by-keyboard");
 });
 
-// ADR-115 E6: Help at the rail's foot, by keyboard (it reopens the workspace's welcome panel).
-test("the rail's Help is reached and pressed by keyboard", async ({ page }) => {
+// ADR-115 E6 and ADR-145 Amendment 12 (rule 13): Help at the rail's foot, by keyboard, opens the keys
+// panel and a second press closes it; `?` does the same, and Esc closes it from inside; its user guide
+// link is reached by Tab and activated. (That it shows over every view of the real App is
+// `App.help.test.tsx`'s.)
+test("the rail's Help opens and closes the keys panel by keyboard, as ? and Esc do", async ({ page }) => {
   await page.goto("/keyboard/top-bar-harness.html");
-  await page.getByRole("navigation", { name: "Workspace" }).getByRole("button", { name: "Help" }).focus();
+  const help = page.getByRole("navigation", { name: "Workspace" }).getByRole("button", { name: "Help" });
+  const panel = page.getByRole("dialog", { name: "Welcome back" });
+  await help.focus();
   await page.keyboard.press("Enter");
-  expect(await page.evaluate(() => window.__TOPBAR__?.help)).toBe(1);
+  await expect(panel).toBeVisible();
+  await help.focus();
+  await page.keyboard.press("Enter");
+  await expect(panel).toHaveCount(0);
+  expect(await page.evaluate(() => window.__TOPBAR__?.help)).toBe(2);
+  // Opened by Help it takes focus, so Esc closes it straight away.
+  await help.focus();
+  await page.keyboard.press("Enter");
+  await expect(panel).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(panel).toHaveCount(0);
+  await page.locator("body").focus();
+  await page.keyboard.press("?");
+  await expect(panel).toBeVisible();
+  await page.keyboard.press("?");
+  await expect(panel).toHaveCount(0);
+  await page.keyboard.press("?");
+  await panel.getByRole("link", { name: "Read the user guide (PDF)" }).focus();
+  await page.keyboard.press("Enter");
+  expect(await page.evaluate(() => window.__TOPBAR__?.guide)).toBe(1);
+  await page.keyboard.press("Escape");
+  await expect(panel).toHaveCount(0);
   registerCovered(REGISTRY, "help-from-the-rail-by-keyboard");
 });
 
@@ -359,6 +389,86 @@ for (const brand of ["ospreyflow", "govuk"] as const) {
 }
 
 // ADR-132 Amendment 5 (4 November 2026): no service-name band, so the Glass follows the header.
+// ADR-132 Amendment 8 (the owner's ruling, 13 November 2026): under GOV.UK a workspace screen's top is
+// compact: a slim header (its places kept), the banner on one slim line (its words and landmark kept), and
+// the context bar's "You are in …" folded into the start of its own row (its region and name kept). The
+// OFFICIAL strip and the toolbar are untouched, and so are the dark and light looks and Home. Measured in
+// Chromium at 1440×1000 with the demonstration's banner words, as osprey-small shows them; at main 054f24b
+// the place's content started at 257 px under GOV.UK and at 130 in dark and light.
+const DEMO_WORDS = "Demonstration only: this is not a government service, and all data is synthetic.";
+// Whole pixels: a line box's height depends on the fonts' metrics, which differ by a fraction between hosts.
+const top = (page: import("@playwright/test").Page, selector: string) =>
+  page.locator(selector).first().evaluate((e) => { const b = e.getBoundingClientRect(); return { top: Math.round(b.top), height: Math.round(b.height), bottom: Math.round(b.bottom) }; });
+
+test("govuk: a case's workspace gains at least 100 px of height, the strip and toolbar untouched", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto("/keyboard/places-harness.html?banner=1&brand=govuk");
+  const content = await top(page, 'main[aria-label="Place content"]');
+  expect.soft(content.top, "the canvas starts at least 100 px higher than main's 257").toBeLessThanOrEqual(257 - 100);
+  expect.soft((await top(page, ".govuk-header")).height, "a slim header").toBeLessThanOrEqual(48);
+  await expect(page.locator(".govuk-header").getByRole("navigation", { name: "Places" })).toBeVisible();
+  const banner = page.getByRole("region", { name: "Service phase" });
+  await expect(banner).toHaveText(DEMO_WORDS);
+  expect.soft((await top(page, '[aria-label="Service phase"]')).height, "the banner on one slim line").toBeLessThanOrEqual(30);
+  expect.soft((await top(page, ".classification-strip")).height, "the marking strip untouched").toBe(20);
+  expect.soft((await top(page, ".top-bar")).height, "the toolbar untouched").toBe(44);
+});
+
+for (const place of ["glass", "ingest", "rules", "admin"] as const) {
+  test(`govuk: the context bar is one row, "You are in" at its start, its region and name kept (${place})`, async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.goto(`/keyboard/places-harness.html?banner=1&brand=govuk&place=${place}&rights=investigate,edit_pipelines,triage_alerts,read_alert_queue,manage_people`);
+    const name = { glass: "You are in the Glass", ingest: "You are in the Ingest Studio", rules: "You are in Rules and Monitoring", admin: "You are in Admin" }[place];
+    const region = page.getByRole("region", { name });
+    // Each claim judged on its own (rule 15), so each was shown red alone at 054f24b.
+    await expect.soft(region.getByRole("heading", { level: 2, name })).toBeVisible();
+    const bar = await region.evaluate((e) => e.getBoundingClientRect().height);
+    expect.soft(bar, "one row").toBeLessThanOrEqual(40);
+    const heading = region.getByRole("heading", { level: 2 });
+    const size = (e: Element) => getComputedStyle(e).fontSize;
+    const rowSize = await region.evaluate((e) => getComputedStyle(e.querySelector(".govuk-notification-banner__content") ?? e).fontSize);
+    expect.soft(await heading.evaluate(size), "the title at the row's size").toBe(rowSize);
+    if (place === "glass") {
+      const title = await heading.boundingBox();
+      const caseSection = await region.getByRole("button", { name: "Case", exact: true }).boundingBox();
+      expect.soft(Math.abs(title!.y + title!.height / 2 - (caseSection!.y + caseSection!.height / 2)), "on the same row as Case").toBeLessThan(6);
+      expect.soft(title!.x, "at the row's start").toBeLessThan(caseSection!.x);
+      expect.soft(await region.getByRole("button", { name: "Case", exact: true }).evaluate(size), "Case at the row's size").toBe(rowSize);
+    }
+  });
+}
+
+for (const theme of ["dark", "light"] as const) {
+  test(`ospreyflow ${theme}: a case's workspace top is as it was`, async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.goto("/keyboard/places-harness.html?banner=1");
+    if (theme === "light") await page.evaluate(() => document.documentElement.setAttribute("data-theme", "light"));
+    expect((await top(page, 'main[aria-label="Place content"]')).top).toBe(130);
+    expect((await top(page, '[aria-labelledby="context-banner-title"]')).height).toBe(41);
+  });
+}
+
+for (const [screen, harness] of [["Home", "start-harness.html"], ["the sign-in page", "sign-in-harness.html"]] as const) {
+  test(`govuk: ${screen} keeps the full header and banner`, async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.goto(`/keyboard/${harness}?brand=govuk`);
+    await expect(page.locator(".govuk-header")).toBeVisible();
+    expect.soft((await top(page, ".govuk-header")).height).toBe(61);
+    expect.soft((await top(page, '[aria-label="Service phase"]')).height).toBe(41);
+  });
+}
+
+// ADR-132 Amendment 8 (the owner's ruling, 13 November 2026): off gov.uk the header draws no crown, the word
+// mark and its link kept; on a gov.uk host the crown is drawn, as before.
+for (const [where, query, crown] of [["off gov.uk", "", 0], ["on gov.uk", "&host=demo.service.gov.uk", 1]] as const) {
+  test(`govuk ${where}: the header's crown ${crown ? "is drawn" : "is not drawn"}, the GOV.UK link kept`, async ({ page }) => {
+    await page.goto(`/keyboard/shell-harness.html?brand=govuk${query}`);
+    const header = page.locator(".govuk-header");
+    await expect(header.getByRole("link", { name: /GOV\.UK/ })).toBeVisible();
+    await expect(header.locator(".govuk-header__logotype g")).toHaveCount(crown);
+  });
+}
+
 test("govuk: the header, the Glass and the footer are reached by Tab in that order", async ({ page }) => {
   await page.goto("/keyboard/shell-harness.html?brand=govuk");
   await page.getByRole("link", { name: "Skip to main content" }).waitFor({ state: "attached" });

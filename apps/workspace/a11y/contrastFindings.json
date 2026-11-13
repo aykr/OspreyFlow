@@ -711,7 +711,7 @@
   "button[aria-label=\"More\"] > span": {
    "text": "⋯",
    "ratio": "unmeasurable",
-   "reason": "over or under div.govuk-notification-banner__content",
+   "reason": "over or under nav.left-rail",
    "own": 19.59,
    "owner": "shell"
   }
@@ -1041,18 +1041,18 @@
   }
  },
  "places-harness.html open=views (govuk)": {
-  ".context-banner__sep[aria-hidden=\"true\"]:nth-child(4)": {
+  ".context-banner__sep:nth-child(4)": {
    "text": "·",
    "ratio": "unmeasurable",
    "reason": "hidden at every point, under an opaque element over the words or clipped",
    "own": 19.59,
    "owner": "shell"
   },
-  "span:nth-child(5)": {
-   "text": "reads Prison intel",
+  ".govuk-notification-banner__content > .btn": {
+   "text": "Case: Kestrel",
    "ratio": "unmeasurable",
    "reason": "hidden at every point, under an opaque element over the words or clipped",
-   "own": 19.59,
+   "own": 18.34,
    "owner": "shell"
   }
  }

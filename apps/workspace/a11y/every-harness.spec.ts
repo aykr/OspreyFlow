@@ -70,11 +70,13 @@ const EXTRA_STATES: Record<string, string[]> = {
   ],
   // ADR-145 decision 2: the banner in the Studio, with its way back, and in Admin.
   // ADR-145 Amendment 2: Monitoring's badge (inside the GOV.UK notification banner under that
-  // brand), and the rail's ⋯ More and the top bar's More views drawn open.
+  // brand), and the rail's ⋯ Explore Details (ADR-145 Amendment 12) and the top bar's More views drawn
+  // open.
   // ADR-146 decision 2: Rules and Monitoring in the switcher with its count (inside the GOV.UK header
   // under that brand), and the place open, its banner a GOV.UK notification banner.
+  // ADR-132 Amendment 8: `banner=1` is the demonstration's deployment, the compact top under GOV.UK.
   "places-harness.html": [
-    "place=ingest", "place=admin", "badge=1", "open=more", "open=views",
+    "place=ingest", "place=admin", "badge=1", "open=more", "open=views", "banner=1", "banner=1&place=rules",
     "badge=1&rights=investigate,triage_alerts,read_alert_queue",
     "place=rules&rights=investigate,triage_alerts,read_alert_queue",
   ],
@@ -82,6 +84,8 @@ const EXTRA_STATES: Record<string, string[]> = {
   // monitoring board first on the Dashboards and as the journey opens it, a Reports Viewer's Home with
   // an alert's two ways on, and the Roles, teams and Authors page.
   "alert-figures-harness.html": ["from=alert", "board=1", "board=1&rule=hotlists&from=alert", "home=1", "help=1"],
+  // ADR-145 Amendment 11: Home's *Your access and tasks* where Home draws it, below the two columns.
+  "answers-harness.html": ["home=1"],
   // ADR-146 decisions 2 and 6: Rules and Monitoring at an alert's address, and at one the reader may
   // not see.
   "rules-place-harness.html": ["address=a1", "address=not-yours", "evidence=1"],
@@ -90,6 +94,8 @@ const EXTRA_STATES: Record<string, string[]> = {
   // ADR-145 Amendment 2: the column's fresh-page default, the Inspector alone open.
   "panel-frames-harness.html": ["defaults=1"],
   // ADR-132 Amendment 7: the deployment's own banner words, in the dark, light and GOV.UK scans.
+  // ADR-145 Amendment 12: the rail with Explore Details, and Help's keys panel open over it.
+  "top-bar-harness.html": ["help=1"],
   "shell-harness.html": ["banner=1", "banner=alone", "host=demo.service.gov.uk"],
   // L2.3 part 1: the case screen's lightening, each prototype variant (the default is variant a).
   "case-screen-options-harness.html": ["variant=today", "variant=b", "variant=c"],
@@ -358,6 +364,17 @@ test("the scan found the harness pages", () => {
   expect(pages.length).toBeGreaterThan(30);
 });
 
+// ADR-132 Amendment 8: target-size results, alone, for targets an open menu lies over in one drawn-open
+// state. axe's target-size counts a target a menu covers all but a sliver of as too small (it skips one
+// covered wholly); in the browser the menu is on top (`elementFromPoint` at every sampled point of its
+// items). GOV.UK's context row is one row under the top bar since Amendment 8, so *More views*, drawn open,
+// lies over its sections and leaves 4 px of *Boards (coming)* showing. Every other rule still runs on those
+// nodes, and each entry must still be reported, so it fails once the menu no longer lies over them. Keyed by
+// a scanned title; each value a class the dropped nodes' markup carries.
+const UNDER_AN_OPEN_OVERLAY: Record<string, readonly string[]> = {
+  "places-harness.html open=views (govuk)": ["context-banner__section"],
+};
+
 // Every look's title, as each test below is named, so a listed finding under a mistyped title fails.
 const TITLES = new Set<string>();
 
@@ -382,7 +399,19 @@ for (const name of pages) {
         let builder = new AxeBuilder({ page }).withTags(WCAG_TAGS);
         for (const selector of HARNESS_ONLY[name] ?? []) builder = builder.exclude(selector);
         const results = await builder.analyze();
-        expect(results.violations, JSON.stringify(results.violations, null, 2)).toEqual([]);
+        // Target-size alone, for the nodes an open menu lies over (UNDER_AN_OPEN_OVERLAY): dropped only when
+        // reported, and each listed class must be dropped at least once, so the entry cannot outlive it.
+        const overlaid = UNDER_AN_OPEN_OVERLAY[title] ?? [];
+        const dropped = new Set<string>();
+        const violations = results.violations
+          .map((v) => v.id !== "target-size" ? v : { ...v, nodes: v.nodes.filter((n) => {
+            const under = overlaid.find((c) => n.html.includes(`class="${c}`) || n.html.includes(` ${c}`));
+            if (under) dropped.add(under);
+            return !under;
+          }) })
+          .filter((v) => v.nodes.length > 0); // prettier-ignore
+        expect(overlaid.filter((c) => !dropped.has(c)), "listed under an open overlay but no longer reported: update UNDER_AN_OPEN_OVERLAY").toEqual([]);
+        expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
         // axe's undecided colour contrast, measured here (1.4.3): a shortfall or an unmeasurable
         // node fails, unless it is a listed finding carried by its owner, and a listed one that is
         // gone fails too, so the list never outlives what it excuses.
@@ -404,4 +433,8 @@ for (const name of pages) {
 
 test("every listed contrast finding names a look this file scans", () => {
   expect(Object.keys(CONTRAST_FINDINGS).filter((title) => !TITLES.has(title))).toEqual([]);
+});
+
+test("every node left out under an open overlay names a look this file scans", () => {
+  expect(Object.keys(UNDER_AN_OPEN_OVERLAY).filter((title) => !TITLES.has(title))).toEqual([]);
 });
