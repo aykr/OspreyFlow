@@ -63,6 +63,7 @@ from harness.images import (
     daemon_then_registry_digest_resolver,
     unresolved_digest_resolver,
 )
+from harness.laurium import laurium_env, laurium_services
 from harness.profiles import arcadedb_java_memory_opts, postgres_command, store_memory
 from harness.realm import CONDUIT_CLIENT_ID
 from harness.reporting import reporting_env, reporting_services
@@ -303,7 +304,11 @@ def provider_model_entries(config: OspreyConfig) -> list[dict[str, object]]:
         key = config.models.key_variable(provider.name)
         for model in dict.fromkeys(provider.roles.values()):
             name = f"{provider.name}/{model}"
-            params: dict[str, object] = {"model": name, "api_key": f"os.environ/{key}"}
+            params: dict[str, object] = {"model": provider.route(model)}
+            if not provider.keyless:  # ADR-135 Amendment 4: an IAM-role engine names no key
+                params["api_key"] = f"os.environ/{key}"
+            if provider.region:
+                params["aws_region_name"] = provider.region
             if provider.api_base:
                 params["api_base"] = provider.api_base
             entries.append({"model_name": name, "litellm_params": params})
@@ -312,7 +317,19 @@ def provider_model_entries(config: OspreyConfig) -> list[dict[str, object]]:
 
 def model_key_variables(config: OspreyConfig) -> dict[str, str]:
     """Each enabled provider's name and the `deployment.env` variable its key is kept in."""
-    return {p.name: config.models.key_variable(p.name) for p in config.models.enabled_providers}
+    # An engine signed in by the gateway's own IAM role has none (ADR-135 Amendment 4).
+    return {p.name: config.models.key_variable(p.name) for p in config.models.keyed_providers}
+
+
+def keyless_model_key_variables(config: OspreyConfig) -> dict[str, str]:
+    """The variable each IAM-role engine's key **would** be kept in (ADR-135 Amendment 4). It keeps
+    none, but one held under its name (an earlier engine of that name) stays in the deployment's
+    Secret until a move removes it, so the cluster's translation, which the `cloud-platform` render
+    reuses, blanks it in every workload that reads the Secret whole; the gateway reads none whole
+    and is never given it by name. Empty on every other profile, which takes no IAM-role engine
+    (Amendment 7 decision 1)."""
+    models = config.models
+    return {p.name: models.key_variable(p.name) for p in models.enabled_providers if p.keyless}
 
 
 def model_engines_env(config: OspreyConfig) -> list[str]:
@@ -335,6 +352,9 @@ def model_engines_env(config: OspreyConfig) -> list[str]:
             "contract_reference": p.contract_reference,
             # ADR-135 Amendment 2: the Conduit makes the gateway's entries, so it needs the base.
             "api_base": p.api_base,
+            # ADR-135 Amendment 4: what the engine is, how it signs in, and Bedrock's region;
+            # not written for a plain provider, so every other profile's line is as before.
+            **({} if p.plain else {"kind": p.kind, "auth": p.auth, "region": p.region}),
         }
         for p in models.enabled_providers
     ]
@@ -1205,12 +1225,19 @@ def compose_services(config: OspreyConfig, images: Sequence[ServiceImage]) -> di
             config, api_image=api.image, building=api.building, build_context=api.build_context
         )
     )
+    # ADR-135 Amendment 6 (P12 part 2): Laurium's service, when it is the extraction engine.
+    services.update(
+        laurium_services(
+            config, api_image=api.image, building=api.building, build_context=api.build_context
+        )
+    )
     _keys_for_the_gateway_alone(config, services)
     _connection_secrets_for_the_conduit_alone(config, services)
     _gateway_database(config, services)
     if "keycloak" in services and ("postgres" in services or config.external.postgres is not None):
         services["keycloak-db"] = _keycloak_database_step(config)
-    if config.external.postgres is not None:
+    if config.external.postgres is not None and "keycloak" in services:
+        # Not rendered on the cloud-platform profile, whose people sign in with Entra ID.
         services["keycloak"]["environment"]["KC_DB_URL"] = _keycloak_jdbc_url(config)
     _drop_absent_dependencies(services)
     _place_on_networks(config, services)
@@ -1621,6 +1648,7 @@ def _render_env(config: OspreyConfig) -> str:
     # key is here: only the gateway reads one, from the secrets apply writes.
     lines += model_engines_env(config)
     lines += reporting_env(config)
+    lines += laurium_env(config)
     # §2.5: "It never sees a secret. Credentials are entered as references." Nothing above is a
     # value; every one of these is a name, a path or a choice already written in osprey.yaml.
     return _comment_block(_BANNER, "#") + "\n".join(lines) + "\n"
@@ -1832,6 +1860,21 @@ def render(
         if build_context is None
         else service_images(config, build_context=build_context)
     )
+    if config.profile is Profile.CLOUD_PLATFORM:
+        # ADR-148: the chart's values into a namespace on a shared platform, and its Terraform,
+        # translated from the cluster's (`harness/cloud_platform/`).
+        from harness.cloud_platform import render_cloud_platform
+
+        return RenderResult(
+            profile=config.profile,
+            artefacts=render_cloud_platform(
+                config,
+                images,
+                resolver=resolver,
+                allow_unpinned=allow_unpinned,
+                resolved_source_label=resolved_source_label,
+            ),
+        )
     if config.profile is Profile.CLUSTER:
         # 05 §3b: the chart's values, translated from the same services (`harness/cluster.py`).
         from harness.cluster import render_cluster
@@ -1935,11 +1978,17 @@ SECRETS_FILE = "deployment.env"
 def write_private(path: Path, text: str) -> None:
     """`text` into `path`, readable and writable by its owner alone (`600`), whether the file is new
     or was looser before (ADR-137 decision 2: `deployment.env` had been written `644`, readable by
-    every account on the machine). The mode is set on the open file, before anything is written."""
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        os.fchmod(handle.fileno(), 0o600)
-        handle.write(text)
+    every account on the machine). The mode is set on the open file, before anything is written.
+
+    Whole or not at all (CARRIES, 10 November 2026): written to a `600` file beside `path`, flushed
+    to disk, given the old file's owner (so a run under sudo leaves it the operator's), and renamed
+    over it; a failure part way leaves the old file as it was and nothing beside it. Only for a file
+    a container reads when it is made (`deployment.env`, an `env_file`), never one it mounts: a
+    rename gives the file a new inode. A symlink stays a link, its target replaced
+    (`harness.atomic.replace_whole`, which every writer of `deployment.env` shares)."""
+    from harness.atomic import replace_whole
+
+    replace_whole(path, text.encode("utf-8"), mode=0o600)
 
 
 #: What a rendered file that holds no secret is written as, and a folder of them, whatever the
@@ -1972,16 +2021,47 @@ def make_shared_folder(path: Path, *, under: Path) -> None:
         folder.chmod(SHARED_FOLDER_MODE)
 
 
+#: What `write` wrote last into a deployment's folder, one path a line, so the next render removes
+#: what it no longer makes (a standard shape's `terraform/opensearch.tf` after a poc render), and
+#: never a file of anyone else's.
+RENDERED_MANIFEST = ".rendered"
+
+
+def _remove_what_is_no_longer_rendered(result: RenderResult, out_dir: Path) -> None:
+    manifest = out_dir / RENDERED_MANIFEST
+    if not manifest.is_file():
+        return
+    root = out_dir.resolve()
+    for name in manifest.read_text(encoding="utf-8").splitlines():
+        if not name or name in result.artefacts:
+            continue
+        stale = (out_dir / name).resolve()
+        if root in stale.parents and stale.is_file():
+            stale.unlink()
+            # Its folder too, once nothing is left in it (never the deployment's own folder).
+            folder = stale.parent
+            while folder != root and folder.is_dir() and not any(folder.iterdir()):
+                folder.rmdir()
+                folder = folder.parent
+
+
 def write(result: RenderResult, out_dir: Path) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
+    _remove_what_is_no_longer_rendered(result, out_dir)
     written = []
     for name, content in sorted(result.artefacts.items()):
         target = out_dir / name
+        # An artefact in a folder of its own (the cloud-platform profile's `terraform/`): the
+        # folder made, readable as the rest, before the file (a first render stopped without it).
+        make_shared_folder(target.parent, under=out_dir)
         if name == SECRETS_FILE:
             write_private(target, content)
         else:
             write_shared(target, content)
         written.append(target)
+    write_shared(
+        out_dir / RENDERED_MANIFEST, "".join(f"{name}\n" for name in sorted(result.artefacts))
+    )
     return written
 
 
@@ -2077,8 +2157,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.build:
         components = config.components.model_copy(update={"source_path": str(REPO_ROOT)})
         config = config.model_copy(update={"components": components})
-    result = render(config, allow_unpinned=args.allow_unpinned)
     out_dir = args.out_root / generated_folder(config)
+    resolver = None
+    if config.profile is Profile.CLOUD_PLATFORM:
+        # ADR-148 decision 8: theirs resolved even when unpinned (ours alone wait for the push),
+        # and each one the previous plan copied pinned by the digest it copied.
+        from harness.cloud_platform.carry import carried_resolver
+
+        resolver = carried_resolver(out_dir / "images.yaml", daemon_then_registry_digest_resolver)
+    result = render(config, resolver=resolver, allow_unpinned=args.allow_unpinned)
 
     if args.check:
         drifted = find_drift(result, out_dir)

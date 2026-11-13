@@ -58,7 +58,7 @@ const AUDIT_ENTRY = { recorded_at: "2026-11-08T09:00:00Z", who: "Demo Analyst",
 const AGEING = { alert_after_days: 3, promotions_recorded: false, waiting: [],
                  rules: [{ what: "A promotion waiting for review", after_days: 3, then: "After 3 days it is flagged overdue." }] };  // prettier-ignore
 
-async function serve(page: Page, opts: { owns?: boolean } = {}): Promise<string[]> {
+async function serve(page: Page, opts: { owns?: boolean; entra?: boolean } = {}): Promise<string[]> {
   const asked: string[] = [];
   let dashboards = [{ client_id: "osprey-dashboard-old", account_id: "sa-0", clearance: "OFFICIAL", org_unit: "verify" }];
   await page.route("**/*/v1/**", async (route) => {
@@ -78,6 +78,12 @@ async function serve(page: Page, opts: { owns?: boolean } = {}): Promise<string[
                          people: ["Demo Analyst", "Zed Reviewer"] });  // prettier-ignore
     }
     if (path === "operations/ageing") return json(200, AGEING);
+    // ADR-148 Amendment 8: how people sign in; Entra ID adds a person by object id.
+    if (path === "sign-in") return json(200, { kind: opts.entra ? "entra" : "keycloak" });
+    if (path === "people/by-object-id" && request.method() === "POST") {
+      const sent = request.postDataJSON() as { object_id: string };
+      return json(201, { ...PERSON, id: sent.object_id, username: sent.object_id, name: sent.object_id, roles: [] });
+    }
     if (path === "settings/promotion-alert-days" && request.method() === "PUT") return json(200, request.postDataJSON());
     if (path === "people" && request.method() === "POST") {
       const sent = request.postDataJSON() as { username: string };
@@ -386,6 +392,17 @@ test("a person is invited by keyboard and their one-time code is shown", async (
   registerCovered(REGISTRY, "invite-a-person-by-keyboard");
 });
 
+// ADR-148 Amendment 8: on Entra ID sign-in a person is added by object id, by keyboard alone.
+test("a person is added by Entra object id by keyboard", async ({ page }) => {
+  const asked = await serve(page, { entra: true });
+  await page.goto("/keyboard/admin-harness.html?rights=manage_people");
+  await page.getByLabel("Entra object id").fill("50000000-0000-4000-8000-000000000002");
+  await press(page, "Add");
+  await expect(page.getByText("50000000-0000-4000-8000-000000000002 was added with no roles.", { exact: false })).toBeVisible();
+  expect(asked).toContain("POST people/by-object-id");
+  registerCovered(REGISTRY, "add-a-person-by-object-id-by-keyboard");
+});
+
 test("a person's access is edited by keyboard", async ({ page }) => {
   const asked = await serve(page);
   await page.goto("/keyboard/admin-harness.html?rights=manage_people");
@@ -558,6 +575,50 @@ test("a SQL and a JSON connection are named with their fields by keyboard", asyn
     { kind: "json", name: "Exports (synthetic)", datasets: ["enron"], settings: { kind: "json" } },
   ]); // prettier-ignore
   registerCovered(REGISTRY, "name-a-json-connection-by-keyboard");
+});
+
+// L1.9 (ADR-148; rule 13): an Amazon S3 bucket and Amazon Athena named with their fields by keyboard,
+// the cloud role's words read with the region, and no field a key or a secret could be typed into.
+test("an S3 and an Athena connection are named with their fields by keyboard", async ({ page }) => {
+  await serve(page);
+  const sent = sentTo(page, "POST", "/v1/admin/connections");
+  await page.goto("/keyboard/admin-harness.html?rights=administer_system");
+  await open(page, "Connections");
+  const type = async (name: string, text: string, clear = false) => {
+    await page.getByRole("textbox", { name, exact: true }).focus();
+    if (clear) await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.type(text);
+  };
+  await page.getByLabel("Kind").selectOption("s3");
+  await expect(page.getByRole("textbox", { name: /secret|key|password|token/i })).toHaveCount(0);
+  await type("Connection name", "Client exports (synthetic)");
+  await page.getByRole("checkbox", { name: "Enron corpus" }).focus();
+  await page.keyboard.press("Space");
+  await expect(page.getByRole("textbox", { name: "Region", exact: true })).toHaveAccessibleDescription(/never with a key/);
+  await type("Bucket", "synthetic-exports");
+  await type("Folder sources may read under (empty for the whole bucket)", "client-a/");
+  await press(page, "Name the connection");
+  await expect(page.getByText("Named Client exports (synthetic).")).toBeVisible();
+  registerCovered(REGISTRY, "name-an-s3-connection-by-keyboard");
+  await page.getByLabel("Kind").selectOption("athena");
+  await expect(page.getByRole("textbox", { name: /secret|key|password|token/i })).toHaveCount(0);
+  await type("Connection name", "Client Athena (synthetic)");
+  await page.getByRole("checkbox", { name: "Enron corpus" }).focus();
+  await page.keyboard.press("Space");
+  await type("Databases a source may read (comma-separated)", "visits");
+  // The catalog, by keyboard too (09 §2; the orchestrator's review of L1.9, round 1, item 8).
+  await expect(page.getByRole("textbox", { name: "Catalog", exact: true })).toHaveValue("AwsDataCatalog");
+  await type("Catalog", "client_catalog", true);
+  await press(page, "Name the connection");
+  await expect(page.getByText("Named Client Athena (synthetic).")).toBeVisible();
+  expect(sent).toEqual([
+    { kind: "s3", name: "Client exports (synthetic)", datasets: ["enron"],
+      settings: { kind: "s3", region: "eu-west-2", bucket: "synthetic-exports", prefix: "client-a/" } },
+    { kind: "athena", name: "Client Athena (synthetic)", datasets: ["enron"],
+      settings: { kind: "athena", region: "eu-west-2", workgroup: "primary", catalog: "client_catalog",
+                  databases: ["visits"] } },
+  ]); // prettier-ignore
+  registerCovered(REGISTRY, "name-an-athena-connection-by-keyboard");
 });
 
 // L2.7 (ADR-145 decision 12, ADR-143 Amendment 6; rule 13): the grading scheme read, and its change

@@ -8,6 +8,11 @@
 # and the analyst notices nothing" — nothing in this image or its startup
 # sequence holds session state; every request re-derives what it needs
 # from ArcadeDB, Valkey and Postgres.
+#
+# ADR-148 decision 12: `--build-arg CONDUIT_JAVA=omitted` builds it without the Java runtime below,
+# for the `cloud-platform` profile (`ospreyflow images push` passes it); BuildKit then never pulls
+# the stage (the legacy builder builds every stage). Every other build takes the default, `included`.
+ARG CONDUIT_JAVA=included
 FROM python:3.12-slim AS builder
 
 RUN pip install --no-cache-dir uv==0.5.14
@@ -51,22 +56,38 @@ RUN jlink \
       --strip-debug --no-man-pages --no-header-files --compress=zip-6 \
       --output /opt/jre
 
-FROM python:3.12-slim
+# The runtime, and what declares it, only in the build that carries it (ADR-148 decision 12): the
+# image's base is one of these two, chosen by the build argument, so an image built with
+# `CONDUIT_JAVA=omitted` has no /opt/java, no JAVA_HOME and no Java on its path, is not labelled with
+# Java's licence or version, and (under BuildKit) never pulls the stage above; neither `make
+# licence-check` nor a reader of the image's labels is told it carries a runtime it does not (the
+# independent review of P7, item 9).
+FROM python:3.12-slim AS runtime-included
+COPY --from=java /opt/jre /opt/java
+LABEL org.ospreyflow.runtime.java.included="included"
+LABEL org.ospreyflow.runtime.java.licence="GPL-2.0-only WITH Classpath-exception-2.0"
+LABEL org.ospreyflow.runtime.java.version="21.0.13+9"
+# On the path the Conduit's `shutil.which("java")` reads (`map_admin.MapAdmin.basemap`).
+ENV PATH="/opt/java/bin:${PATH}" \
+    JAVA_HOME="/opt/java"
+
+FROM python:3.12-slim AS runtime-omitted
+LABEL org.ospreyflow.runtime.java.included="omitted"
+
+FROM runtime-${CONDUIT_JAVA}
 
 # Base-image OS packages lag the upstream image's own last-published point
 # release; picking up current Debian security patches at build time is
 # what keeps `trivy image` (below) a real gate rather than permanently red
-# on packages this service does not touch.
+# on packages this service does not touch. In the final stage
+# (`tests/test_images_built_fresh.py`), before the code's layers, so a code
+# change does not repeat it.
 RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 
 # No `git`: publishing commits a recipe in-process with dulwich (Apache-2.0), so nothing this image
 # carries execs the binary, which is GPL-2.0-only (the owner's ruling of 9 November 2026; ADR-140
 # Amendment 17). `tests/test_connectors_are_carried_into_the_image.py` fails if `git` is installed
 # again, and `make licence-check` names it as an offender.
-
-COPY --from=java /opt/jre /opt/java
-LABEL org.ospreyflow.runtime.java.licence="GPL-2.0-only WITH Classpath-exception-2.0"
-LABEL org.ospreyflow.runtime.java.version="21.0.13+9"
 
 RUN useradd --create-home --uid 10001 osprey
 WORKDIR /app
@@ -77,8 +98,7 @@ COPY --from=builder /app/scripts ./scripts
 COPY --from=builder /app/connectors ./connectors
 COPY --from=builder /app/recipes ./recipes
 
-ENV PATH="/app/.venv/bin:/opt/java/bin:${PATH}" \
-    JAVA_HOME="/opt/java" \
+ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONPATH="/app:/app/packages" \
     PYTHONUNBUFFERED=1 \
     HOME="/app"
@@ -107,6 +127,20 @@ RUN mkdir -p /run/osprey/model-settings && chown osprey:osprey /run/osprey/model
 # ADR-147 decision 1: the maps file's and the map key file's folder, made the same way.
 RUN mkdir -p /run/osprey/map-settings && chown osprey:osprey /run/osprey/map-settings \
     && chmod 700 /run/osprey/map-settings
+
+# ADR-145 Amendment 10: the guides Home links, served by `GET /v1/guides/{guide}` (`guides.py`) to
+# whoever's rights open the guide's place: the deployment's own PDFs, the version this image was
+# built with, and the manifest that records it. Not the architecture guide, which is not served.
+# After the `chown -R` above, so the files are not written twice into the image's layers (about
+# 12.6 MB, root-owned and 0444 whatever the checkout's modes, so the Conduit's user can always
+# read them).
+# `tests/services/api/test_guides.py` holds this line to the three files and the folder `guides.py`
+# reads.
+# The folder is made first (755): `COPY --chmod` gives a folder it creates the files' mode too, and a
+# 0444 folder cannot be entered by the Conduit's user, so the route would answer 503 (found by the guides'
+# image check on the test server, 12 November 2026: `ls: cannot access '/app/docs/pdf': Permission denied`).
+RUN mkdir -p /app/docs/pdf
+COPY --chmod=0444 docs/pdf/user-guide.pdf docs/pdf/developer-guide.pdf docs/pdf/administration-guide.pdf docs/pdf/manifest.json ./docs/pdf/
 
 USER 10001:10001
 EXPOSE 8000

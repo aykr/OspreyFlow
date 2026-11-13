@@ -104,6 +104,8 @@ if (serving === "people") {
               { kind: "team_lead", id: "r1", label: "Lead of the team Intel" },
               { kind: "typology_rule", id: "t1", label: "The rule Structuring, whose runs act as them" }] },
     "/v1/handling-scheme": { classification: ["OFFICIAL", "SECRET"], handling_codes: { P: {} } },
+    // ADR-148 Amendment 8: `show=entra`, People on Entra ID sign-in (its words, Add by object id).
+    "/v1/admin/sign-in": { kind: show === "entra" ? "entra" : "keycloak" },
     // L2.5b: `show=withheld`, the person also owns items this administrator may not see.
     "/v1/admin/people/u1/ownership": { person: "u1", items: [], counts: {}, withheld: show === "withheld",
       not_yet_listed: [] },
@@ -159,6 +161,11 @@ if (serving === "policies" || serving === "connections") {
       { id: "files", kind: "files", name: "Files: the ingest root", created_by: "system", created_at: "2026-11-01T00:00:00Z" },
       { id: "c-api", kind: "api", name: "Telco lookup (synthetic)", created_by: "admin-1", created_at: "2026-11-05T00:00:00Z",
         datasets: ["ds-a"], settings: { kind: "api", base_url: "https://telco.example", auth: "bearer", secret: "TELCO", pagination: "none" } },
+      // L1.9: an S3 bucket and Athena, each read as the deployment's own cloud role (no secret's name).
+      { id: "c-s3", kind: "s3", name: "Client exports (synthetic)", created_by: "admin-1", created_at: "2026-11-11T00:00:00Z",
+        datasets: ["ds-a"], settings: { kind: "s3", region: "eu-west-2", bucket: "synthetic-exports", prefix: "client-a/" } },
+      { id: "c-athena", kind: "athena", name: "Client Athena (synthetic)", created_by: "admin-1", created_at: "2026-11-11T00:00:00Z",
+        datasets: ["ds-a"], settings: { kind: "athena", region: "eu-west-2", workgroup: "primary", databases: ["visits"] } },
     ],
     "/v1/admin/datasets": [{ id: "ds-a", name: "Prison records", owning_unit: "u", egress: "none", kind: "source",
                              promotion_policy: "author_promotes" }],
@@ -224,12 +231,13 @@ if (serving === "audit" && show === "rules") {
   }
   await pressWhenDrawn("Show entries");
 }
-if (serving === "connections" && show === "sql") {
+// `show=sql`, `show=s3` or `show=athena` (L1.9) draws that kind's fields.
+if (serving === "connections" && (show === "sql" || show === "s3" || show === "athena")) {
   for (let i = 0; i < 60 && !document.querySelector("table[aria-label='Connections of this deployment']"); i++)
     await new Promise((resolve) => setTimeout(resolve, 50));
   const kind = [...document.querySelectorAll<HTMLSelectElement>("select")].find((el) => [...el.options].some((o) => o.value === "sql"));
   if (kind) {
-    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")!.set!.call(kind, "sql");
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")!.set!.call(kind, show);
     kind.dispatchEvent(new Event("change", { bubbles: true }));
   }
 }

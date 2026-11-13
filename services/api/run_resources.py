@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import cast
 
 from services.api.list_connector import ParquetListRows, PostgresListStore
+from services.api.sources import PostgresSourceStore
 from services.api.target_models import PostgresTargetModelStore, core_types_of
 from services.ingest.staging import ObjectStorageConfig
 from valkey.asyncio import Valkey
@@ -38,6 +39,7 @@ from ports.analytics import AnalyticsPort
 from ports.compute import ComputePort
 from ports.graph import GraphPort
 from ports.media import MediaStore
+from principal_auth import ClaimMapping
 from schemas.domain import OntologySchema
 
 from . import rule_editor
@@ -50,6 +52,7 @@ from .cache import CachedQuery
 from .config import ApiConfig
 from .dataset_scope import DatasetStampingGraph, stamping
 from .datasets import PostgresDatasetStore
+from .entra_people import EntraPeopleStore, open_people_store
 from .explore import EXPLORE_TTL_SECONDS
 from .held_rows import HeldRowStore
 from .hotlists import HotlistStore
@@ -110,6 +113,9 @@ class RunResources:
     staging_storage: ObjectStorageConfig
     #: ADR-140 Amendment 13: deployment-wide lists and subscriptions, which a staged run reads.
     list_store: PostgresListStore
+    #: ADR-140 Amendment 19: the registered sources, whose declared default markings a staged run's
+    #: unmarked tables carry before a join.
+    sources: PostgresSourceStore
     explore_cache: CachedQuery
     analytics: AnalyticsPort
     close_analytics: Close
@@ -125,6 +131,8 @@ class RunResources:
     #: L3.6: the drawn watches a load is run against (ADR-143 Amendment 2 decision 8).
     board_items: PostgresBoardItemStore
     recipe_repo_root: Path = RECIPES_REPO_ROOT
+    #: ADR-148 Amendment 8: on Entra ID sign-in, the people store the resolver reads roles from.
+    people_store: EntraPeopleStore | None = None
 
     @property
     def watch_reach(self) -> DatasetReach:
@@ -186,6 +194,7 @@ class RunResources:
             target_models=self.target_models,
             staging_storage=self.staging_storage,
             list_store=self.list_store,
+            sources=self.sources,
             rule_lists=self.rule_lists,
             rule_reach=self.rule_reach,
             watch_reach=self.watch_reach,
@@ -215,8 +224,11 @@ class RunResources:
         await self.investigations.close()
         await self.target_models.close()
         await self.list_store.close()
+        await self.sources.close()
         await self.board_items.close()
         await self.principal_resolver.aclose()
+        if self.people_store is not None:
+            await self.people_store.close()
         await self.close_analytics()
 
 
@@ -267,6 +279,7 @@ async def build_run_resources(config: ApiConfig) -> RunResources:
     )
     staging_storage = ObjectStorageConfig.from_env()
     list_store = await PostgresListStore.connect(config.postgres.dsn)
+    sources = await PostgresSourceStore.connect(config.postgres.dsn)
     # L3.6: a command-line load runs the drawn watches on its dataset, as the Conduit's do.
     board_items = await PostgresBoardItemStore.connect(config.postgres.dsn)
     # ADR-099 Amendment 6: no write names a dataset the registry does not hold.
@@ -299,7 +312,12 @@ async def build_run_resources(config: ApiConfig) -> RunResources:
     # client, no lifecycle to close.
     compute: ComputePort = ComputeRustworkxAdapter()
     jobs = JobQueue(valkey)
-    principal_resolver = PrincipalResolver(config)
+    # ADR-148 Amendment 8: the deployment's claim mapping; on Entra ID, roles from the people store.
+    claim_mapping = ClaimMapping.from_env()
+    people_store = await open_people_store(config.postgres.dsn, claim_mapping, audit)
+    principal_resolver = PrincipalResolver(
+        config, claim_mapping=claim_mapping, role_source=people_store
+    )
 
     return RunResources(
         config=config,
@@ -326,6 +344,7 @@ async def build_run_resources(config: ApiConfig) -> RunResources:
         target_models=target_models,
         staging_storage=staging_storage,
         list_store=list_store,
+        sources=sources,
         explore_cache=explore_cache,
         analytics=analytics,
         close_analytics=close_analytics,
@@ -336,5 +355,6 @@ async def build_run_resources(config: ApiConfig) -> RunResources:
         compute=compute,
         jobs=jobs,
         principal_resolver=principal_resolver,
+        people_store=people_store,
         board_items=board_items,
     )

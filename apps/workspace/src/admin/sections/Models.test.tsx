@@ -49,6 +49,14 @@ function stub(answers: (path: string, init?: RequestInit) => Answer | undefined)
 }
 
 describe("Models", () => {
+  it("marks an engine the render did not make, in the Conduit's words (ADR-135 Amendment 8)", async () => {
+    const words = "not made by the render: Declare it in osprey.yaml, re-render, and have the platform team apply the Terraform";
+    const UNMADE = { ...VIEW, engines: [{ ...VIEW.engines[0], not_made: words }] };
+    stub((path) => (path === "/v1/admin/models" ? { status: 200, body: UNMADE } : undefined));
+    render(<Models api={{ apiBaseUrl: "http://api", bearerToken: "t" }} />);
+    expect((await screen.findByRole("note")).textContent).toBe(words);
+  });
+
   it("sends the key once, clears the field, and never shows it again", async () => {
     const sent = stub((path, init) =>
       path === "/v1/admin/models/engines/gemini/key" && init?.method === "PUT" ? { status: 200, body: SET } : undefined,
@@ -113,10 +121,119 @@ describe("Models", () => {
     expect(JSON.parse(sent.find((s) => s.path === "/v1/admin/models/defaults")!.body)).toEqual({ defaults: { extraction: "gemini" } });
   });
 
+  // ADR-135 Amendment 4: the client's own AI gateway and Bedrock in London by the gateway's own IAM role.
+  const BEDROCK = { name: "bedrock", label: "Bedrock (London)", kind: "bedrock", auth: "iam_role", region: "eu-west-2", roles: { extraction: "anthropic.claude-3-haiku" }, api_base: null, privacy_contract: false, contract_reference: null };
+  // ADR-135 Amendment 7 decision 1: the two kinds are the cloud-platform profile's alone, as the view says.
+  const CLOUD = { ...VIEW, engine_kinds: ["provider", "gateway", "bedrock"] };
+  const BY_ROLE = { ...CLOUD, engines: [{ provider: BEDROCK, key_state: "iam_role", key_set_at: null, key_set_by: null, default_for: [] }] };
+  const onCloud = (path: string) => (path === "/v1/admin/models" ? { status: 200, body: CLOUD } : undefined);
+  const providers = () => Array.from((screen.getByLabelText("Provider") as HTMLSelectElement).options).map((o) => o.value);
+
+  it("offers no kind of engine off the cloud-platform profile, and bedrock as a provider by its key, as before", async () => {
+    const sent = stub(() => undefined);
+    render(<Models api={{ apiBaseUrl: "http://api", bearerToken: "t" }} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Add an engine" }));
+    expect(screen.queryByLabelText("Kind of engine")).toBeNull();
+    expect(providers()).toContain("bedrock");
+    fireEvent.change(screen.getByLabelText("Provider"), { target: { value: "bedrock" } });
+    fireEvent.change(screen.getByLabelText(/Extraction and Ask: the provider/), { target: { value: "anthropic.claude-3-haiku" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add the engine" }));
+    await waitFor(() => expect(sent.some((s) => s.method === "POST" && s.path === "/v1/admin/models/engines")).toBe(true));
+    const added = JSON.parse(sent.find((s) => s.method === "POST")!.body);
+    expect(added.provider.name).toBe("bedrock");
+    expect(Object.keys(added.provider)).not.toContain("kind");
+    expect(Object.keys(added.provider)).not.toContain("auth");
+  });
+
+  it("on the cloud-platform profile offers Bedrock as its own kind, not as a provider by a key", async () => {
+    stub(onCloud);
+    render(<Models api={{ apiBaseUrl: "http://api", bearerToken: "t" }} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Add an engine" }));
+    expect(screen.getByLabelText("Kind of engine")).toBeTruthy();
+    expect(providers()).not.toContain("bedrock");
+  });
+
+  it("adds Bedrock in London by the gateway's own IAM role, with no address and no key asked for", async () => {
+    const sent = stub((path, init) =>
+      path === "/v1/admin/models/engines" && init?.method === "POST" ? { status: 200, body: BY_ROLE } : onCloud(path),
+    );
+    render(<Models api={{ apiBaseUrl: "http://api", bearerToken: "t" }} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Add an engine" }));
+    fireEvent.change(screen.getByLabelText("Kind of engine"), { target: { value: "bedrock" } });
+    expect(screen.queryByLabelText(/^Address/)).toBeNull();
+    expect(screen.getByText(/gateway's own IAM role in London \(eu-west-2\); no key is kept/)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText(/Extraction and Ask: the provider/), { target: { value: "anthropic.claude-3-haiku" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add the engine" }));
+    await screen.findByText(/signs in by the gateway's own IAM role: no key is needed/);
+    const added = JSON.parse(sent.find((s) => s.method === "POST" && s.path === "/v1/admin/models/engines")!.body);
+    expect(added.provider).toMatchObject({ name: "bedrock", kind: "bedrock", auth: "iam_role", api_base: null });
+  });
+
+  it("offers no key field or key action for an engine signed in by the IAM role", async () => {
+    stub((path) => (path === "/v1/admin/models" ? { status: 200, body: BY_ROLE } : undefined));
+    render(<Models api={{ apiBaseUrl: "http://api", bearerToken: "t" }} />);
+    expect(await screen.findByText("IAM role: no key kept")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /key for Bedrock/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Test the connection to Bedrock (London)" })).toBeTruthy();
+  });
+
+  it("adds the organisation's own gateway at its address, by a token (the IAM role held, Q1)", async () => {
+    const sent = stub(onCloud);
+    render(<Models api={{ apiBaseUrl: "http://api", bearerToken: "t" }} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Add an engine" }));
+    fireEvent.change(screen.getByLabelText("Kind of engine"), { target: { value: "gateway" } });
+    fireEvent.change(screen.getByLabelText("Engine name"), { target: { value: "acme_ai" } });
+    fireEvent.change(screen.getByLabelText(/^Address/), { target: { value: "https://ai.example/v1" } });
+    expect(screen.getByText(/Signs in by a token/)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText(/Extraction and Ask: the provider/), { target: { value: "gpt-4o-mini" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add the engine" }));
+    await waitFor(() => expect(sent.some((s) => s.method === "POST" && s.path === "/v1/admin/models/engines")).toBe(true));
+    const added = JSON.parse(sent.find((s) => s.method === "POST")!.body);
+    expect(added.provider).toMatchObject({ name: "acme_ai", kind: "gateway", auth: "key", api_base: "https://ai.example/v1" });
+    await screen.findByText(/acme_ai is added. Enter its key next/);
+  });
+
+  it("keeps an engine's kind fixed when it is edited", async () => {
+    stub((path) => (path === "/v1/admin/models" ? { status: 200, body: BY_ROLE } : undefined));
+    render(<Models api={{ apiBaseUrl: "http://api", bearerToken: "t" }} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Bedrock (London)" }));
+    const kind = screen.getByLabelText("Kind of engine") as HTMLInputElement;
+    expect(kind.tagName).toBe("INPUT");
+    expect(kind.readOnly).toBe(true);
+  });
+
   it("offers no engine to add on a local-only deployment, and says why", async () => {
     stub((path) => (path === "/v1/admin/models" ? { status: 200, body: { ...VIEW, engines: [], local_only: true } } : undefined));
     render(<Models api={{ apiBaseUrl: "http://api", bearerToken: "t" }} />);
     expect(await screen.findByText(/This deployment is local only/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Add an engine" })).toBeNull();
+  });
+});
+
+// ADR-135 Amendment 5 decision 2 and Amendment 9 (P12 part 2): the extraction engine is chosen at
+// set-up and shown here read-only on the cloud-platform profile (the one that offers Laurium), with
+// how it is changed there (Amendment 8's words); nothing on the page changes it.
+describe("Models' extraction engine", () => {
+  const CLOUD = { engine_kinds: ["provider", "gateway", "bedrock"] };
+  it.each([
+    ["laurium", "Laurium"],
+    ["deep_read", "OspreyFlow Deep read"],
+  ])("names %s as chosen at set-up, with how to change it, and offers no control for it", async (engine, name) => {
+    stub((path) => (path === "/v1/admin/models" ? { status: 200, body: { ...VIEW, ...CLOUD, extraction_engine: engine } } : undefined));
+    render(<Models api={{ apiBaseUrl: "http://api", bearerToken: "t" }} />);
+    const said = await screen.findByText(new RegExp(`Extraction engine: ${name}`));
+    expect(said.textContent).toContain(
+      "chosen at set-up: change it in osprey.yaml, re-render, and have the platform team apply it.",
+    );
+    expect(screen.queryByRole("combobox", { name: /extraction engine/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /extraction engine/i })).toBeNull();
+    expect(screen.queryByRole("radio", { name: /laurium|deep read/i })).toBeNull();
+  });
+
+  it("says nothing of it on a profile that offers no Laurium", async () => {
+    stub((path) => (path === "/v1/admin/models" ? { status: 200, body: { ...VIEW, extraction_engine: "deep_read" } } : undefined));
+    render(<Models api={{ apiBaseUrl: "http://api", bearerToken: "t" }} />);
+    await screen.findByText(/Settings come from/);
+    expect(screen.queryByText(/Extraction engine:/)).toBeNull();
   });
 });

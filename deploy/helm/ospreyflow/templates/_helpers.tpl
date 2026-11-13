@@ -25,8 +25,11 @@ app.kubernetes.io/instance: {{ .root.Release.Name }}
   envFrom:
     - configMapRef:
         name: ospreyflow-env
+    {{- /* ADR-148 Amendment 5 point 22: a workload that reads no secret whole gets the settings alone. */}}
+    {{- if not .w.noSecret }}
     - secretRef:
         name: {{ .root.Values.secrets.name }}
+    {{- end }}
   {{- end }}
   {{- if or .w.env .w.jgroups }}
   env:
@@ -37,6 +40,12 @@ app.kubernetes.io/instance: {{ .root.Release.Name }}
         secretKeyRef:
           name: {{ $.root.Values.secrets.name }}
           key: {{ .secret }}
+      {{- else if hasKey . "secretKeyRef" }}
+      # ADR-148 decision 4: a managed store's detail, from the secret the platform's Terraform wrote.
+      valueFrom:
+        secretKeyRef:
+          name: {{ .secretKeyRef.name }}
+          key: {{ .secretKeyRef.key }}
       {{- else if hasKey . "config" }}
       valueFrom:
         configMapKeyRef:
@@ -55,6 +64,20 @@ app.kubernetes.io/instance: {{ .root.Release.Name }}
     - name: JAVA_OPTS_APPEND
       value: {{ printf "-Djgroups.dns.query=%s-headless.%s.svc.cluster.local" .w.name .root.Release.Namespace | quote }}
     {{- end }}
+  {{- end }}
+  {{- if .root.Values.podSecurity }}
+  # ADR-148 decision 3: no privilege, and none to gain.
+  securityContext:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    privileged: false
+    capabilities:
+      drop: ["ALL"]
+  {{- end }}
+  {{- with .w.resources }}
+  # ADR-148 decision 5: what it asks of the node and may use, so a namespace's LimitRange never
+  # caps it by default.
+  resources: {{ toJson . }}
   {{- end }}
   {{- with .w.ports }}
   ports:
@@ -87,7 +110,7 @@ app.kubernetes.io/instance: {{ .root.Release.Name }}
       readOnly: true
     {{- end }}
     {{- range .w.shared }}
-    - name: shared
+    - name: {{ if .claim }}{{ printf "claim-%s" .claim }}{{ else }}shared{{ end }}
       mountPath: {{ .mountPath }}
       subPath: {{ .subPath }}
       readOnly: {{ .readOnly }}
@@ -108,6 +131,10 @@ app.kubernetes.io/instance: {{ .root.Release.Name }}
 {{- $w := .w -}}
 {{- $shared := .w.shared -}}
 {{- range .w.initContainers }}{{ if .shared }}{{ $shared = true }}{{ end }}{{ end -}}
+{{- /* ADR-148 Amendment 5: a shared folder mounted from a claim of its own (`claim`). */}}
+{{- $claims := dict -}}
+{{- range .w.shared }}{{ with .claim }}{{ $_ := set $claims . true }}{{ end }}{{ end -}}
+{{- range .w.initContainers }}{{ range .shared }}{{ with .claim }}{{ $_ := set $claims . true }}{{ end }}{{ end }}{{ end -}}
 {{- if or .w.files .w.fileDirs $shared .w.scratch }}
 volumes:
   {{- if .w.files }}
@@ -126,6 +153,11 @@ volumes:
     persistentVolumeClaim:
       claimName: ospreyflow-shared
   {{- end }}
+  {{- range $claim, $_ := $claims }}
+  - name: {{ printf "claim-%s" $claim }}
+    persistentVolumeClaim:
+      claimName: {{ printf "ospreyflow-%s" $claim }}
+  {{- end }}
   {{- range $i, $s := .w.scratch }}
   - name: {{ printf "scratch-%d" $i }}
     emptyDir: {}
@@ -138,10 +170,47 @@ volumes:
 {{- with .root.Values.imagePullSecrets }}
 imagePullSecrets: {{ toJson . }}
 {{- end }}
+{{- with .root.Values.podSecurity }}
+# ADR-148 decision 3: one numeric non-root user, and the claims given to its group.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: {{ .user }}
+  runAsGroup: {{ .group }}
+  fsGroup: {{ .group }}
+  # Given to the group once, not walked again at every start: a store's claim holds millions of
+  # files, and a recursive change on each restart can outlast its readiness (and its grace period).
+  fsGroupChangePolicy: OnRootMismatch
+  {{- with $.w.supplementalGroups }}
+  supplementalGroups: {{ toJson . }}
+  {{- end }}
+  seccompProfile:
+    type: RuntimeDefault
+{{- else }}
 {{- with .w.runAs }}
 securityContext:
   runAsUser: {{ .user }}
   runAsGroup: {{ .group }}
+{{- end }}
+{{- end }}
+{{- with .w.serviceAccountName }}
+serviceAccountName: {{ . }}
+{{- end }}
+{{- if hasKey .w "automountToken" }}
+automountServiceAccountToken: {{ .w.automountToken }}
+{{- end }}
+{{- with .w.terminationGracePeriodSeconds }}
+terminationGracePeriodSeconds: {{ . }}
+{{- end }}
+{{- if .w.sharedAffinity }}
+# Until P8 (ADR-148 decision 6): the shared folders are one ReadWriteOnce claim, so every pod that
+# mounts it runs on the node that holds it.
+affinity:
+  podAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            ospreyflow.io/shared: "true"
+        topologyKey: kubernetes.io/hostname
 {{- end }}
 {{- with .w.nodeSelector }}
 nodeSelector: {{ toJson . }}

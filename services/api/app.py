@@ -85,7 +85,7 @@ from services.extract.writer import (
 from services.ingest.ceiling import AboveTheDeploymentCeiling, DeploymentCeiling
 from services.ingest.connectors import reads as connector_reads_module
 from services.ingest.connectors.geo.site_grid import site_grid_rows
-from services.ingest.connectors.reads import ConnectorRefused
+from services.ingest.connectors.reads import ConnectorRefused, ReadOverCap
 from services.ingest.engine import RowKeyDefinitionChanged, RowKeyRunInProgress, run_recipe
 from services.ingest.pipeline import (
     expert_steps_changed,
@@ -139,10 +139,17 @@ from ports.graph import GraphPort
 from ports.media import MediaStore
 from ports.model import ModelPort
 from ports.recognise import RecogniserRefusedError, RecogniserUnavailableError
-from principal_auth import PrincipalRevoked
+from principal_auth import (
+    ROLE_LOOKUP_TIMEOUT_SECONDS,
+    PrincipalLookupUnavailable,
+    PrincipalRevoked,
+    SigningKeysUnavailable,
+    in_keys_thread,
+)
 from rule_standards import StoredRuleFiles, rule_files
 from schemas.admin import (
     AccessInput,
+    AddPersonInput,
     AdminDataset,
     AdminDatasetAuthors,
     AdminDatasetCases,
@@ -185,6 +192,7 @@ from schemas.admin import (
     RolesInput,
     ScheduleRunView,
     SignInDelivery,
+    SignInKind,
     SystemStatus,
     Team,
     TeamCoverInput,
@@ -452,6 +460,7 @@ from schemas.rights import (
     CUSTOM_ROLE_PREFIX,
     ROLE_RIGHTS,
     SUPER_USER_PRESET,
+    MeResponse,
     Right,
     RightsResponse,
     rights_for,
@@ -481,6 +490,7 @@ from schemas.sources import (
     GovernanceEdited,
     PauseRefreshInput,
     RegisterSourceInput,
+    SourceDefaultMarkingInput,
     SourceGovernanceInput,
     SourceLineage,
     SourceRefresh,
@@ -521,6 +531,7 @@ from . import compute_routes as compute_routes_module
 from . import connections as connections_module
 from . import dossier as dossier_module
 from . import drawn_merge as drawn_merge_module
+from . import guides as guide_files
 from . import kyc as kyc_module
 from . import map_admin as map_admin_module
 from . import model_admin as model_admin_module
@@ -690,6 +701,7 @@ from .entity_pictures import (
     PictureNotFoundError,
     PictureSetResponse,
 )
+from .entra_people import STALE_ACCESS_WORDS, EntraPeopleAdmin, access_current
 from .event_scope import own_events_only
 from .explore import (
     ExploreService,
@@ -732,6 +744,7 @@ from .identity_admin import (
     DashboardExistsError,
     IdentityAdmin,
     IdentityAdminRefused,
+    PeopleDirectory,
     PersonActionRefused,
     PersonExistsError,
     UnknownRoleError,
@@ -762,6 +775,7 @@ from .kyc_expiries import KycExpiryStore
 from .kyc_sweep import SweepReport
 from .kyc_sweep import run_daily as run_daily_kyc_sweep
 from .kyc_sweep import sweep as kyc_sweep
+from .laurium_start import close_laurium, laurium_in_the_conduit, routed_model
 from .link_changes import (
     ChangeNotMadeError,
     InvalidChangeError,
@@ -996,12 +1010,12 @@ from .sites import ControlPointQuad, Site, SiteNotFoundError, SiteStore
 from .source_refresh import StoredSourceWatches
 from .sources import (
     InMemorySourceStore,
-    PostgresSourceStore,
     SecretInUseError,
     SourceAlreadyRegisteredError,
     SourceNotFoundError,
     SourceStore,
     UnknownConnectionError,
+    default_marking_problems,
 )
 from .strength_influencers import (
     InfluencerChangeRefused,
@@ -1050,6 +1064,7 @@ from .studio_recipes import (
     reconcile_recipe_pins,
 )
 from .studio_release import (
+    DraftHeld,
     apply_import,
     bundle_from_text,
     deployment_secrets,
@@ -1060,6 +1075,7 @@ from .studio_release import (
 from .studio_staging import (
     StagedTestInputs,
     dataset_reference_lists,
+    declared_markings,
     draft_marked,
     pipeline_from_yaml,
     pipeline_yaml,
@@ -1220,8 +1236,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     trend_store = await TrendStore.connect(config.postgres.dsn)
     pack_store = await PackStore.connect(config.postgres.dsn)
     studio_recipes = await StudioRecipeStore.connect(config.postgres.dsn)
-    # ADR-140 Amendment 4: connections and the sources registered on them.
-    source_store = await PostgresSourceStore.connect(config.postgres.dsn)
+    # ADR-140 Amendment 4: connections and the sources registered on them, opened with the run's
+    # resources, which a staged run reads each source's declared default marking through
+    # (ADR-140 Amendment 19; one pool).
+    source_store = resources.sources
     # ADR-140 Amendment 13: deployment-wide screening lists and each dataset's subscriptions,
     # opened with the run's resources, which a staged run reads them through (one pool).
     list_store = resources.list_store
@@ -1245,11 +1263,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # client's provider sees only material whose handling code the deployment declared sendable
     # and whose every dataset allows that provider, and an engine an analyst names is used only
     # when it is enabled and has a key.
-    model: ModelPort = RoutedModel(
+    # ADR-135 Amendments 6 and 9 (P12 part 2): `extract` by Laurium's service for the review
+    # queue's document extraction when the deployment chose it (`OSPREY_EXTRACTION_ENGINE`),
+    # every other call the gateway's; inside the routes, so each keeps its engine's key and the
+    # egress rules (`services.api.laurium_start.routed_model`).
+    model: ModelPort = routed_model(
         ModelLiteLLMAdapter(litellm_client, embed_model=models.embedding),
         routes=routes_from_env(models, os.environ),
         # ADR-136: and only from datasets whose egress allows the engine.
         egress=datasets_store,
+        environ=os.environ,
+        master=LiteLLMConfig.from_env().api_key,
     )
     # `spec/09_INGEST_STUDIO.md` §6's reverse index: "an ontology edit flags
     # every recipe that depends on the changed version". This deployment's
@@ -1319,7 +1343,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.recipe_runs = recipe_runs
     app.state.run_quotas = run_quotas
     # ADR-141 decision 10: a service identity's sign-in, for the run API alone.
-    app.state.service_identities = ServiceIdentityVerifier(config)
+    app.state.service_identities = ServiceIdentityVerifier(
+        config,
+        claim_mapping=resources.principal_resolver.claim_mapping,
+        # One set of keys for both paths: the same OIDC_JWKS_URL (ADR-148 Amendment 8).
+        # A resolver double without keys of its own leaves the verifier its own set.
+        signing_keys=getattr(resources.principal_resolver, "signing_keys", None),
+    )
     # The external runs going on in the background, held so none is collected mid-run.
     app.state.external_runs = set()
     app.state.judgements_store = judgements_store
@@ -1453,6 +1483,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await model_admin.start()
     if routed is not None:
         routed.follow(model_admin.routes)
+    # ADR-135 Amendment 6 decision 8: Laurium's own key, the deployment's extraction model alone,
+    # any older one (a master key since rotated) deleted; tried again in the background until held,
+    # never stopping the Conduit, Laurium's calls refused until then (`laurium_start`).
+    laurium_key_start = await laurium_in_the_conduit(
+        model, gateway_http, gateway_config.api_key, [models.extraction]
+    )
     app.state.model_admin = model_admin
     app.state.recipes_repo_root = resources.recipe_repo_root
     app.state.handling_scheme = handling_scheme
@@ -1499,10 +1535,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ADR-114 Amendment 5: invitations by the identity provider's own email when the deployment has
     # a mail server (rendered from the install answers), else by a one-time code.
     # ADR-112 Amendment 3 (b): the organisation's sign-in, whose refused arrivals can be joined.
-    app.state.identity_admin = IdentityAdmin(
-        config,
-        by_email=os.environ.get("OSPREY_SIGN_IN_EMAIL", "").lower() == "true",
-        organisation=os.environ.get("OSPREY_ORGANISATION_SIGN_IN") or None,
+    # ADR-148 Amendment 8: on Entra ID sign-in, Admin › People writes the deployment's own store,
+    # which an open delta socket also asks before each message (`_socket_standing`).
+    app.state.people_store = resources.people_store
+    app.state.identity_admin = (
+        EntraPeopleAdmin(resources.people_store)
+        if resources.people_store is not None
+        else IdentityAdmin(
+            config,
+            by_email=os.environ.get("OSPREY_SIGN_IN_EMAIL", "").lower() == "true",
+            organisation=os.environ.get("OSPREY_ORGANISATION_SIGN_IN") or None,
+        )
     )
     # ADR-111 Amendment 3: Superset dashboards inside the Glass; None when not configured.
     superset_settings = SupersetSettings.from_env()
@@ -1598,7 +1641,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # A closed store must not outlive the app: a request's custom roles are read through it.
         app.state.custom_roles = None
         await history.close()
-        await source_store.close()
+        # Closed with the run's resources; a closed store must not outlive the app.
+        app.state.sources = None
         # Closed with the run's resources; a closed store must not outlive the app.
         app.state.list_store = None
         await case_view_store.close()
@@ -1634,6 +1678,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # one left here would fail them; without it they judge with the weights file's influencers.
         app.state.strength_influencers = None
         await litellm_client.aclose()
+        if laurium_key_start is not None:
+            await laurium_key_start.stop()
+        await close_laurium(model)
         app.state.model_admin = None
         await model_admin.close()
         await model_admin_audit.close()
@@ -1996,7 +2043,7 @@ def get_judgements_store(request: Request) -> JudgementStore:
     return request.app.state.judgements_store  # type: ignore[no-any-return]
 
 
-def get_identity_admin(request: Request) -> IdentityAdmin:
+def get_identity_admin(request: Request) -> PeopleDirectory:
     return request.app.state.identity_admin  # type: ignore[no-any-return]
 
 
@@ -2076,9 +2123,31 @@ async def get_principal(
     role checks included, so no request reads unlimited (`dataset_scope.py`)."""
     resolver: PrincipalResolver = request.app.state.principal_resolver
     try:
-        identity = resolver.resolve(credentials.credentials)
+        identity = await resolver.resolve_principal(credentials.credentials)
     except PrincipalResolutionError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
+    except SigningKeysUnavailable as exc:
+        # ADR-148 Amendment 8: the identity provider's keys could not be read; said so, never as a
+        # rejected token.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "identity_provider_unavailable",
+                "message": "sign-in is unavailable: the identity provider could not be reached. "
+                "Try again shortly.",
+            },
+        ) from exc
+    except PrincipalLookupUnavailable as exc:
+        # ADR-148 Amendment 8: the person's stored roles could not be read; never a principal
+        # without them.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "people_store_unavailable",
+                "message": "sign-in is unavailable: this deployment could not read your roles. "
+                "Try again shortly.",
+            },
+        ) from exc
     # The token's own roles, kept apart for what must read a custom role's rights afresh later
     # (the delta socket's ticket, `issue_ws_ticket`).
     request.state.token_roles = list(identity.roles)
@@ -2192,15 +2261,19 @@ def get_run_quotas(request: Request) -> QuotaStore | None:
 RunQuotasDep = Annotated[QuotaStore | None, Depends(get_run_quotas)]
 
 
-def get_service_identity(
+async def get_service_identity(
     request: Request,
     credentials: Annotated[HTTPAuthorizationCredentials, Depends(bearer_scheme)],
 ) -> str:
     """The run API's caller (ADR-141 decision 10): the client a service identity's token names,
-    or 401 in words. Never a `Principal`: a service identity reads nothing as itself."""
+    or 401 in words. Never a `Principal`: a service identity reads nothing as itself. Its keys are
+    read in the keys' own threads, bounded in total, as a person's are (ADR-148 Amendment 8; never
+    anyio's shared pool, with no bound of its own)."""
     verifier: ServiceIdentityVerifier = request.app.state.service_identities
     try:
-        return verifier.client_of(credentials.credentials)
+        return await in_keys_thread(verifier.client_of, credentials.credentials)
+    except SigningKeysUnavailable as unavailable:
+        raise HTTPException(status_code=503, detail=str(unavailable)) from unavailable
     except ServiceIdentityRefused as refused:
         raise HTTPException(status_code=refused.status, detail=str(refused)) from refused
 
@@ -2211,7 +2284,7 @@ ServiceIdentityDep = Annotated[str, Depends(get_service_identity)]
 RecipeRunsDep = Annotated[RecipeRunStore, Depends(get_recipe_runs)]
 JudgementsStoreDep = Annotated[JudgementStore, Depends(get_judgements_store)]
 PrincipalNamesDep = Annotated[PrincipalNameDirectory, Depends(get_principal_names)]
-IdentityAdminDep = Annotated[IdentityAdmin, Depends(get_identity_admin)]
+IdentityAdminDep = Annotated[PeopleDirectory, Depends(get_identity_admin)]
 
 
 def get_custom_roles(request: Request) -> CustomRoleStore:
@@ -5579,6 +5652,8 @@ async def run_extraction_route(
         extraction_model=body.model,
         # ADR-136: text extracted in a case is of the case's datasets.
         datasets=principal.datasets,
+        # ADR-135 Amendment 9: the review queue's extraction, the one call Laurium serves.
+        laurium_may_read=True,
     )
     await audit.record(
         principal=principal,
@@ -11418,11 +11493,14 @@ async def import_dataset_release(
     handling_scheme: HandlingSchemeDep,
     ontology: OntologyDep,
     dry_run: bool = False,
+    replace_own_draft: str | None = None,
 ) -> ReleaseImportPlan:
     """*Import* and `ospreyflow release import [--dry-run]`: the bundle read and checked, every
     pipeline judged by the canvas's own gates, then (unless `dry_run`) everything written as a
     draft. A bundle that cannot be read, or any refusal, writes nothing (422, the plan's words).
-    Nothing goes live: *Make live* stays a person's audited step."""
+    Nothing goes live: *Make live* stays a person's audited step. An in-progress draft of the
+    model is never replaced silently: another person's is refused, naming them, and the importer's
+    own only with `replace_own_draft` (CARRIES row 90)."""
     try:
         bundle = bundle_from_text(body.files)
     except BundleRefused as refused:
@@ -11432,6 +11510,11 @@ async def import_dataset_release(
                 mode="json"
             ),
         )
+    # The confirmation names the version of the importer's own draft it was given for (the
+    # orchestrator's review, item 5); anything else (a bare `true`, say) confirms nothing.
+    confirmed = (
+        int(replace_own_draft) if replace_own_draft and replace_own_draft.isdigit() else None
+    )
     planned = await plan_import(
         bundle,
         dataset_id=dataset_id,
@@ -11444,6 +11527,7 @@ async def import_dataset_release(
         sources=sources,
         scheme=handling_scheme,
         ontology=ontology,
+        replace_own_draft=confirmed,
     )
     plan = planned.plan
     if plan.refused:
@@ -11458,15 +11542,24 @@ async def import_dataset_release(
             result_cardinality=len(plan.items),
         )
         return plan
-    made = await apply_import(
-        bundle,
-        planned,
-        dataset_id=dataset_id,
-        principal=principal,
-        models=models,
-        recipes=studio_recipes,
-        rows_kept=rows_kept,
-    )
+    try:
+        made, replaced = await apply_import(
+            bundle,
+            planned,
+            dataset_id=dataset_id,
+            principal=principal,
+            models=models,
+            recipes=studio_recipes,
+            rows_kept=rows_kept,
+            replace_own_draft=confirmed,
+        )
+    except DraftHeld as held:
+        refused_now = plan.model_copy(
+            update={"items": [], "refused": held.problems, "replaces_own_draft": held.own}
+        )
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=422, content=refused_now.model_dump(mode="json")
+        )
     await audit.record(
         principal=principal,
         action="import_dataset_release",
@@ -11475,6 +11568,9 @@ async def import_dataset_release(
             "release": bundle.manifest.metadata.name,
             "version": bundle.manifest.metadata.version,
             "pipelines": made,
+            # CARRIES row 90: the importer's own in-progress draft replaced, by their confirmation,
+            # as the write found it (the lane review, item 3).
+            "replaced_own_draft": replaced,
         },
         result_cardinality=len(plan.items),
     )
@@ -11606,6 +11702,12 @@ READ_REFUSED_FOR_AUTHORS = (
 )
 
 
+READ_OVER_CAP_FOR_AUTHORS = (
+    "The read was refused whole: it holds more than one read may take (500,000 rows, 256 MiB, or "
+    "1,000 pages or objects). Nothing was written, and nothing was cut short."
+)
+
+
 def _no_such_connection() -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
@@ -11614,8 +11716,16 @@ def _no_such_connection() -> HTTPException:
 
 
 def _connector_refused(refused: ConnectorRefused, principal: Principal) -> HTTPException:
-    """A refused connector read: its own words for an administrator, fixed words for anyone else."""
+    """A refused connector read: its own words for an administrator, fixed words for anyone else.
+    A read past a cap has its own type, `read_over_cap` (rule 2's typed refusal; L1.9), and words
+    that say so, the caps being the deployment's, not the connection's settings."""
     administrator = Right.ADMINISTER_SYSTEM in rights_for(principal.roles)
+    if isinstance(refused, ReadOverCap):
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "read_over_cap",
+                    "detail": str(refused) if administrator else READ_OVER_CAP_FOR_AUTHORS},
+        )  # fmt: skip
     return HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         detail={"error": "read_refused",
@@ -11825,7 +11935,13 @@ async def get_dataset_source_lineage(
 
 @app.patch(
     "/v1/datasets/{dataset_id}/sources/{source_id}/governance",
-    dependencies=[Depends(require_right(Right.EDIT_PIPELINES)), NoLoadingAComposite],
+    dependencies=[
+        Depends(require_right(Right.EDIT_PIPELINES)),
+        # The answer is the whole source, its default marking included, so the edit needs what
+        # reading it needs (rule 4; the orchestrator's review of the carries step, item 2).
+        Depends(require_right(Right.ADD_INGEST_FILES)),
+        NoLoadingAComposite,
+    ],
 )
 async def edit_dataset_source_governance(
     dataset_id: StudioDatasetDep,
@@ -11861,6 +11977,76 @@ async def edit_dataset_source_governance(
             "handling_after": edited.handling,
             "legal_basis_before": before.legal_basis,
             "legal_basis_after": edited.legal_basis,
+            "pipelines_needing_attention": len(flagged),
+            "drafts_following": len(followed),
+        },
+        result_cardinality=1,
+    )
+    return GovernanceEdited(source=edited, needs_attention=flagged)
+
+
+@app.put(
+    "/v1/datasets/{dataset_id}/sources/{source_id}/default-marking",
+    dependencies=[
+        Depends(require_right(Right.PUBLISH_PIPELINES)),
+        # The answer is the whole source, so the write needs what reading it needs (rule 4; the
+        # lane review, item 2): Add ingest files and the source author's Edit pipelines.
+        Depends(require_right(Right.ADD_INGEST_FILES)),
+        Depends(require_studio_role(StudioRole.SOURCE_AUTHOR)),
+        NoLoadingAComposite,
+    ],
+)
+async def set_dataset_source_default_marking(
+    dataset_id: StudioDatasetDep,
+    source_id: str,
+    body: SourceDefaultMarkingInput,
+    principal: Annotated[Principal, Depends(require_studio_role(StudioRole.SOURCE_APPROVER))],
+    sources: SourcesDep,
+    studio_recipes: StudioRecipesDep,
+    audit: AuditDep,
+    handling_scheme: HandlingSchemeDep,
+) -> GovernanceEdited:
+    """Studio › Sources › *Default marking* (ADR-140 Amendment 19): a source approver declares,
+    changes or clears the classification an unmarked table of this source carries before a join.
+    Refused in words (422 `default_marking_refused`) outside the scheme, above the approver's
+    clearance or the deployment's highest marking, or below the source's own marking. Audited
+    with who, when, from and to; a new version of the source, so each deployed pipeline reading
+    it needs attention, as after any governance edit (ADR-140 Amendment 4)."""
+    before = await _source_of(sources, dataset_id, source_id)
+    marking = body.default_marking.strip() if body.default_marking else None
+    problems = default_marking_problems(
+        before, marking, principal, handling_scheme, DeploymentCeiling.from_env(handling_scheme)
+    )
+    if problems:
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=422, content={"error": "default_marking_refused", "problems": problems}
+        )
+    if marking == before.default_marking:
+        # No change writes nothing: no version, audit, flag or draft following (the orchestrator's
+        # review, item 4).
+        return GovernanceEdited(source=before, needs_attention=[])
+    previous, edited = await sources.set_default_marking(dataset_id, source_id, marking, principal)
+    flagged = await studio_recipes.flag_for_source(
+        dataset_id, edited.location, SOURCE_GOVERNANCE_CHANGED
+    )
+    # Each draft reading it is tested again (the lane review, item 7): its handling is unchanged,
+    # so following only clears its Test, as after a governance edit.
+    followed = await studio_recipes.follow_source(
+        dataset_id, edited.location, edited.handling, edited.legal_basis
+    )
+    await audit.record(
+        principal=principal,
+        action="set_dataset_source_default_marking",
+        resolved_query={
+            "dataset_id": dataset_id,
+            "source_id": source_id,
+            "version": edited.version,
+            # What this write replaced, as the store's update read it under the row's lock.
+            "default_marking_before": previous,
+            "default_marking_after": edited.default_marking,
+            "set_at": edited.default_marking_set_at.isoformat()
+            if edited.default_marking_set_at
+            else None,
             "pipelines_needing_attention": len(flagged),
             "drafts_following": len(followed),
         },
@@ -12592,6 +12778,7 @@ async def preview_studio_recipe_staging(
     staging_storage: StagingStorageDep,
     body: StagingPreviewInput,
     list_store: ListStoreDep,
+    sources: SourcesDep,
 ) -> StagingPreview:
     """A staging step's drawer's live sample (ADR-140 Amendment 12, Q4 (a)): the steps up to one,
     over the first ten rows of each source, read as Map's sample is read (`edit_pipelines`, the
@@ -12622,6 +12809,7 @@ async def preview_studio_recipe_staging(
             models, recipe.dataset_id, staging_storage, lists=list_store
         ),
         storage=staging_storage,
+        declared=await declared_markings(sources, recipe.dataset_id, scheme),
     )
     await audit.record(
         principal=principal,
@@ -12685,6 +12873,7 @@ async def _studio_dry_run(
     models: TargetModelStore,
     staging_storage: ObjectStorageConfig,
     list_store: ListStore | None = None,
+    sources: SourceStore | None = None,
 ) -> tuple[VerifyReport, list[Any]]:
     """The dry run Test and Preview share (§5; ADR-140 decision 14): the report, and the files it
     read with their hashes. It writes nothing; what Test records afterwards is Test's alone."""
@@ -12729,6 +12918,8 @@ async def _studio_dry_run(
                 models, recipe.dataset_id, staging_storage, lists=list_store
             ),
             storage=staging_storage,
+            # ADR-140 Amendment 19: Test reads the sources' declared default markings as the run.
+            declared=await declared_markings(sources, recipe.dataset_id, scheme),
         ),
     )
     return report, checked
@@ -12760,6 +12951,7 @@ async def verify_studio_recipe(
     staging_storage: StagingStorageDep,
     influencers_store: OptionalStrengthInfluencersDep = None,
     list_store: ListStoreDep = None,  # type: ignore[assignment]
+    sources: SourcesDep = None,  # type: ignore[assignment]
 ) -> VerifyReport:
     """§5: the dry run. No persistent write of any kind happens here — no
     Parquet staging, no `GraphPort` write, no transaction — but an
@@ -12776,7 +12968,7 @@ async def verify_studio_recipe(
         analytics=analytics, principal_resolver=principal_resolver, patterns_store=patterns_store,
         hotlists_store=hotlists_store, screening_lists=screening_lists, compute=compute,
         repo_root=repo_root, influencers_store=influencers_store, models=models,
-        staging_storage=staging_storage, list_store=list_store,
+        staging_storage=staging_storage, list_store=list_store, sources=sources,
     )  # fmt: skip
     # §5: "Verify must pass before publish" — recorded here, against a
     # *completed* run (rejections included, per §5's own "a run with
@@ -12820,6 +13012,7 @@ async def preview_studio_recipe_graph(
     staging_storage: StagingStorageDep,
     influencers_store: OptionalStrengthInfluencersDep = None,
     list_store: ListStoreDep = None,  # type: ignore[assignment]
+    sources: SourcesDep = None,  # type: ignore[assignment]
 ) -> VerifyReport:
     """Phase 6's *Preview* of a Map or Load step (ADR-140 decision 14; ADR-140 Amendment 8 point 2):
     the same dry run Test runs, under the same right and level and the person's own principal, but
@@ -12833,7 +13026,7 @@ async def preview_studio_recipe_graph(
         analytics=analytics, principal_resolver=principal_resolver, patterns_store=patterns_store,
         hotlists_store=hotlists_store, screening_lists=screening_lists, compute=compute,
         repo_root=repo_root, influencers_store=influencers_store, models=models,
-        staging_storage=staging_storage, list_store=list_store,
+        staging_storage=staging_storage, list_store=list_store, sources=sources,
     )  # fmt: skip
     await audit.record(
         principal=principal,
@@ -13255,6 +13448,7 @@ async def run_studio_recipe(
     models: TargetModelsDep = None,  # type: ignore[assignment]
     staging_storage: StagingStorageDep = None,  # type: ignore[assignment]
     list_store: ListStoreDep = None,  # type: ignore[assignment]
+    sources: SourcesDep = None,  # type: ignore[assignment]
     rule_lists: RuleListsDep = None,  # type: ignore[assignment]
     rule_reach: RuleReachDep = None,  # type: ignore[assignment]
     run_quotas: RunQuotasDep = None,
@@ -13345,6 +13539,7 @@ async def run_studio_recipe(
             target_models=models,
             staging_storage=staging_storage,
             list_store=list_store,
+            sources=sources,
             rule_lists=rule_lists,
             rule_reach=rule_reach,
             watch_reach=watch_reach,
@@ -16388,7 +16583,9 @@ async def make_team_route(
     return team.model_copy(update={"members": [TeamMember(id=p.id, name=p.name) for p in holders]})
 
 
-async def _member_of(identity_admin: IdentityAdmin, role_id: str, account: str) -> PersonAccount:
+async def _member_of(
+    identity_admin: PeopleDirectory, role_id: str, account: str
+) -> PersonAccount:
     """`account` as one of the team's members, or a refusal in words: only a member, never a
     service account, may be lead or cover (ADR-112 Amendment 5 decisions 4 and 5)."""
     people = {p.id: p for p in await identity_admin.list_people()}
@@ -16555,6 +16752,16 @@ async def name_an_author_route(
     grantee = _grantee(account_id)
     await _may_hold_a_level(request, grantee, AccessLevel.AUTHOR, principal_names)
     named = people.get(grantee)
+    if named is not None and not access_current(named):
+        # ADR-148 Amendment 8: a unit read from Entra ID over a day ago is not trusted to place
+        # them in the case's unit (the orchestrator's second review, note 13; as a transfer).
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "access_out_of_date",
+                "message": f"{named.name}: {STALE_ACCESS_WORDS}",
+            },
+        )
     if named is not None and named.org_unit != case.owning_unit:
         raise HTTPException(
             status_code=409,
@@ -16715,6 +16922,39 @@ async def invite_person_route(
                                        "org_unit": body.org_unit, "delivery": made.delivery},
                        result_cardinality=1)  # fmt: skip
     return made
+
+
+@app.get("/v1/admin/sign-in", dependencies=[Depends(require_right(Right.MANAGE_PEOPLE))])
+async def sign_in_kind_route(identity_admin: IdentityAdminDep) -> SignInKind:
+    """ADR-148 Amendment 8: how people sign in here, so Admin › People offers invite (Keycloak) or
+    add by object id (Entra ID). Behind `manage_people`, as People is."""
+    return SignInKind(kind="entra" if isinstance(identity_admin, EntraPeopleAdmin) else "keycloak")
+
+
+@app.post(
+    "/v1/admin/people/by-object-id",
+    status_code=201,
+    dependencies=[Depends(require_right(Right.MANAGE_PEOPLE))],
+)
+async def add_person_by_object_id_route(
+    body: AddPersonInput,
+    principal: PrincipalDep,
+    identity_admin: IdentityAdminDep,
+    audit: AuditDep,
+) -> PersonAccount:
+    """ADR-148 Amendment 8: on Entra ID sign-in, a person added by their Entra object id ahead of
+    their first sign-in, with no roles, so roles can be given before they arrive. Elsewhere people
+    are invited, and this is refused (409)."""
+    if not isinstance(identity_admin, EntraPeopleAdmin):
+        raise PersonActionRefused(
+            "not_entra",
+            "People are invited on this deployment; adding by Entra object id is for Entra ID "
+            "sign-in only.",
+        )
+    person = await identity_admin.add_person(body.object_id, by=principal.id)
+    await audit.record(principal=principal, action="add_person_by_object_id",
+                       resolved_query={"user_id": person.id}, result_cardinality=1)  # fmt: skip
+    return person
 
 
 @app.put(
@@ -18859,7 +19099,7 @@ async def _pack_refused(request: Request, exc: PackItemRefused) -> JSONResponse:
 async def _openable_dashboards(
     principal: Principal,
     embedder: SupersetEmbedder | None,
-    identity_admin: IdentityAdmin,
+    identity_admin: PeopleDirectory,
     investigations: InvestigationStore,
     handling_scheme: HandlingScheme,
 ) -> list[EmbeddableDashboard]:
@@ -18977,11 +19217,70 @@ async def _dashboard_exists(request: Request, exc: DashboardExistsError) -> JSON
     )
 
 
+@app.get("/v1/me")
+async def me_route(principal: PrincipalDep) -> MeResponse:
+    """ADR-148 Amendment 8: the signed-in person's own principal, as `principal_auth` resolved it,
+    which the Glass shows and gates its places on, never a claim of the token (on Entra ID a token's
+    `roles` are app roles, not ours). Their own fields only: no other person's, and no count."""
+    return MeResponse(
+        id=principal.id,
+        clearance=principal.clearance,
+        org_unit=principal.org_unit,
+        roles=list(principal.roles),
+        receivable_handling_codes=list(principal.receivable_handling_codes),
+    )
+
+
 @app.get("/v1/me/rights")
 async def my_rights_route(principal: PrincipalDep) -> RightsResponse:
     """ADR-112: what the signed-in person may do, so the Glass and the Studio leave out what they
     would only refuse. Not a gate — every route still checks its own right."""
     return RightsResponse(rights=sorted(rights_for(principal.roles)))
+
+
+async def require_guide_place(guide: str, principal: PrincipalDep) -> guide_files.Guide:
+    """ADR-145 Amendment 10: the guide's place's gate, asked before the route touches any file. A
+    name that is not one of the three guides is 404 `no_such_guide`; a principal whose rights do
+    not open the guide's place (the switcher's test: one of its rights, every right it needs) is
+    403 `place_required`, which names the place, its rights and its needs, in words. The place
+    follows the guide's name, so it is not a static `required_place`: `test_guides.py` asks every
+    role and single right of it instead (`test_place_routes.py` reads static checks only)."""
+    known = guide_files.GUIDES.get(guide)
+    if known is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=guide_files.unknown(guide)
+        )
+    if not guide_files.opens_place(known.place, principal.roles):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=guide_files.refusal(known)
+        )
+    return known
+
+
+@app.get("/v1/guides/{guide}", response_class=FileResponse)
+async def read_guide_route(
+    known: Annotated[guide_files.Guide, Depends(require_guide_place)],
+) -> Response:
+    """ADR-145 Amendment 10: a guide's PDF, the deployment's own, to a principal whose rights open
+    the place it belongs to (`require_guide_place`): the user guide with the Glass, the developer
+    guide with the Ingest Studio, the administration guide with Admin. It names no single right,
+    because a place opens on any one of several. Home's link is a convenience, never the gate."""
+    folder = guide_files.guides_dir()
+    path = folder / known.pdf
+    if not path.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=guide_files.not_carried(known)
+        )
+    headers = {"Cache-Control": "private, no-store"}
+    if (version := guide_files.version(known, folder)) is not None:
+        headers["X-Guide-Version"] = version
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+        filename=f"ospreyflow-{known.pdf}",
+        content_disposition_type="inline",
+        headers=headers,
+    )
 
 
 @app.get("/v1/me/needs-you")
@@ -18993,6 +19292,7 @@ async def my_needs_you_route(
     datasets: DatasetsDep,
     link_types: LinkTypesDep,
     scheme: HandlingSchemeDep,
+    alerts_store: AlertsStoreDep,
 ) -> NeedsYou:
     """The reader's *Needs you* (ADR-145 decision 11, A2; L2.7; `needs_you.py` says what each
     half reads). It names no right because each half is gated by what it lists, as the reader. The
@@ -19038,7 +19338,14 @@ async def my_needs_you_route(
         proposals = await needs_you_module.proposals_to_decide(
             [d for d in reached if d in held], names, link_types.open_proposal_count, words
         )
-    return NeedsYou(promotions_overdue=overdue, proposals=proposals)
+    # ADR-110 Amendment 19: the reader's own scheduled loads' notices, read by owner in the query.
+    notices, notices_total = await needs_you_module.schedule_notices_for(
+        principal, alerts_store, now
+    )
+    return NeedsYou(
+        promotions_overdue=overdue, proposals=proposals,
+        schedule_notices=notices, schedule_notices_total=notices_total,
+    )  # fmt: skip
 
 
 # --- Admin › Models (ADR-135 Amendment 2, ADR-112 Amendment 7) ----------------------------------
@@ -20021,7 +20328,7 @@ async def _authenticate_websocket(websocket: WebSocket) -> Principal:
     if header.lower().startswith("bearer "):
         token = header[len("bearer ") :]
         resolver: PrincipalResolver = websocket.app.state.principal_resolver
-        return resolver.resolve(token)
+        return await resolver.resolve_principal(token)
 
     ticket = websocket.query_params.get("ticket", "")
     if not ticket:
@@ -20033,22 +20340,48 @@ async def _authenticate_websocket(websocket: WebSocket) -> Principal:
     return principal
 
 
+async def _socket_standing(app_: Any, raw: Principal) -> int | None:
+    """ADR-148 Amendment 8: on Entra ID sign-in, whether the socket's principal still stands as
+    the people store has them now, since a socket (or a ticket minted before a change) outlives the
+    request that resolved it. `None` when it stands (or on Keycloak, with no store); the close code
+    otherwise: 1008 for a person disabled, gone or whose roles changed (they sign in again, and the
+    one construction path builds their principal afresh), 1013 when the store cannot answer, never
+    a socket left open on a read that failed."""
+    store = getattr(app_.state, "people_store", None)
+    if store is None:
+        return None
+    try:
+        stored = await asyncio.wait_for(store.standing(raw.id), timeout=ROLE_LOOKUP_TIMEOUT_SECONDS)
+    except Exception:  # noqa: BLE001 - every failure of the read closes the socket
+        return status.WS_1013_TRY_AGAIN_LATER
+    if stored is None or stored.disabled:
+        return status.WS_1008_POLICY_VIOLATION
+    if list(dict.fromkeys(stored.roles)) != list(raw.roles):
+        return status.WS_1008_POLICY_VIOLATION
+    return None
+
+
 def _admission(
     app_: Any, raw: Principal, investigation_id: str
-) -> Callable[[], Awaitable[Principal | None]]:
+) -> Callable[[], Awaitable[Principal | int]]:
     """ADR-145 Amendment 5 ("never cached"): an open socket's principal, read afresh at each
     message: its custom roles' rights as they are now (`with_custom_roles`, the bearer and the
-    ticket alike), and its case level as it is now (a grant or a team's grant taken away). `None`
-    once the reader no longer holds a level, and the socket is closed."""
+    ticket alike), and its case level as it is now (a grant or a team's grant taken away). Once it
+    no longer stands, the code the socket is closed with: 1013 when the people store cannot answer
+    (try again later), 1008 otherwise (ADR-148 Amendment 8 point 1)."""
 
-    async def admitted() -> Principal | None:
+    async def admitted() -> Principal | int:
+        # ADR-148 Amendment 8: a person disabled, or whose roles changed, since the socket opened;
+        # or the store not answering, which is 1013, never 1008.
+        if (refused := await _socket_standing(app_, raw)) is not None:
+            return refused
         principal = await with_custom_roles(app_, raw)
         try:
             await app_.state.investigations.get_authorized(
                 investigation_id, principal, need=AccessLevel.VIEWER
             )
         except (InvestigationNotFoundError, InsufficientAccessError):
-            return None
+            return status.WS_1008_POLICY_VIOLATION
         return principal
 
     return admitted
@@ -20071,8 +20404,8 @@ class _SocketState:
     buffering: bool = False
     buffer: list[str] = field(default_factory=list)
     overflowed: bool = False
-    #: ADR-145 Amendment 5: asked before each message is acted on; `None` closes the socket.
-    admitted: Callable[[], Awaitable[Principal | None]] | None = None
+    #: ADR-145 Amendment 5: asked before each message is acted on; a close code closes the socket.
+    admitted: Callable[[], Awaitable[Principal | int]] | None = None
 
 
 async def _send_all(
@@ -20127,8 +20460,8 @@ async def _forward_notifications(
     async for message in pubsub.listen():
         if message["type"] != "message":
             continue
-        if state.admitted is not None and await state.admitted() is None:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        if state.admitted is not None and isinstance(refused := await state.admitted(), int):
+            await websocket.close(code=refused)
             return
         if state.stuck:
             # The reader was told their view is over the cap and is sent nothing more until a
@@ -20231,8 +20564,8 @@ async def _handle_resync_requests(
     state = state or _SocketState()
     while True:
         payload = await websocket.receive_json()
-        if state.admitted is not None and await state.admitted() is None:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        if state.admitted is not None and isinstance(refused := await state.admitted(), int):
+            await websocket.close(code=refused)
             return
         last_ack = payload.get("last_acknowledged_seq")
         if last_ack is None:
@@ -20260,6 +20593,13 @@ async def stream(websocket: WebSocket, investigation_id: str) -> None:
         raw = await _authenticate_websocket(websocket)
     except PrincipalResolutionError:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    except PrincipalLookupUnavailable:
+        await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
+        return
+    # ADR-148 Amendment 8: a ticket minted before a disable or a change of roles stands no longer.
+    if (refused := await _socket_standing(websocket.app, raw)) is not None:
+        await websocket.close(code=refused)
         return
     # One person, one principal: the bearer's and the ticket's alike have their custom roles' rights
     # read now, as `get_principal` does (ADR-145 Amendment 5).

@@ -31,7 +31,7 @@ from __future__ import annotations
 import re
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 import yaml
@@ -48,7 +48,16 @@ from pydantic import (
 
 from schemas.domain import BUILT_IN_GRADING_SCHEMES, GradingSchemeAnswer
 from schemas.mapconfig import MapConfig
-from schemas.sources import SECRET_NAME, private_host_entry
+from schemas.sources import (
+    ATHENA_NAME,
+    AWS_REGION,
+    S3_BUCKET,
+    S3_FOLDER,
+    S3_LOCATION,
+    SECRET_NAME,
+    no_climbing,
+    private_host_entry,
+)
 
 #: The Lite address (`06_DECISIONS.md` ADR-114 Amendment 4): the front proxy on port 80 of this
 #: machine, the Glass at this name, the identity provider at `id.` and the dashboards at `bi.`.
@@ -63,6 +72,10 @@ class Profile(StrEnum):
     LOCAL_LITE = "local-lite"
     SMALL = "small"
     CLUSTER = "cluster"
+    #: ADR-148 decision 1: values for the chart into a namespace on a shared platform someone else
+    #: runs, and that namespace's Terraform; no cluster, no VPC, none of the stores the platform
+    #: manages.
+    CLOUD_PLATFORM = "cloud-platform"
 
 
 class GraphStore(StrEnum):
@@ -261,17 +274,54 @@ MAX_CONTRACT_REFERENCE = 200
 _KEY_PREFIXES = ("sk-", "AIza")
 
 
+#: A JSON Web Token, the shape most gateways issue their tokens in: three base64url parts joined by
+#: dots, the first two starting `eyJ` (`{"` encoded). Its dots hid it from the unbroken-run check
+#: (the orchestrator's review of P11, round 2, item b).
+#: Its header may carry `=` padding, and a JWE (encrypted, five parts) has a second part that is not
+#: `eyJ`; a dot may arrive percent-encoded (`%2E`).
+_DOT = r"=*(?:\.|%2[eE])"
+_B64 = r"[A-Za-z0-9_\-]"
+_JWT = re.compile(rf"eyJ{_B64}{{8,}}{_DOT}{_B64}{{8,}}=*(?:{_DOT}{_B64}*=*)+")
+
+
 def _looks_like_a_key(text: str) -> bool:
-    """A key's shape: a known key prefix, or one unbroken run of 24 or more letters, digits, `-`
-    and `_` mixing letters and digits. A reference in words (`DPA-2026-0001, signed 3 March`) has
-    spaces or is short."""
-    if any(word.startswith(_KEY_PREFIXES) for word in text.split()):
+    """A key's shape: a known key prefix, a JWT anywhere in it, or one unbroken run of 24 or more
+    letters, digits, `-` and `_` mixing letters and digits. A reference in words
+    (`DPA-2026-0001, signed 3 March`) has spaces or is short."""
+    if any(word.startswith(_KEY_PREFIXES) for word in text.split()) or _JWT.search(text):
         return True
     return bool(
         re.fullmatch(r"[A-Za-z0-9_\-]{24,}", text)
         and re.search(r"[A-Za-z]", text)
         and re.search(r"[0-9]", text)
     )
+
+
+#: ADR-135 Amendment 4: what an engine is. `provider`, a hosted provider LiteLLM knows by name (as
+#: before); `gateway`, the client's own OpenAI-compatible AI gateway at its address; `bedrock`,
+#: Amazon Bedrock in the client's London region.
+EngineKind = Literal["provider", "gateway", "bedrock"]
+#: How an engine signs in: `key`, a key (a gateway's token) entered write-only in *Admin › Models*
+#: and kept by the model gateway alone; `iam_role`, an IAM role held by the gateway's pod through
+#: its service account, so **no key is stored anywhere**. (The cloud-platform render gives the
+#: gateway's pod its own account and role in P11 part 2; until then it has none.)
+EngineAuth = Literal["key", "iam_role"]
+#: ADR-135 Amendment 4 (b): Bedrock in the client's London region, and nowhere else.
+BEDROCK_REGION = "eu-west-2"
+#: ADR-135 Amendment 7 decision 1: Amendment 4's engine kinds and their rules are the
+#: `cloud-platform` profile's (ADR-148) alone. On every other profile an engine is a provider by its
+#: name and key, exactly as before Amendment 4 (an engine named `bedrock` included). Named by value:
+#: the profile's own `Profile` member is P7's.
+MODEL_ROUTE_PROFILE = "cloud-platform"
+MODEL_ROUTE_PROFILES: frozenset[str] = frozenset({MODEL_ROUTE_PROFILE})
+#: The validation context's key naming the profile whose engine rules a translated configuration
+#: was already held to (`harness.cloud_platform._as_cluster`).
+ENGINES_AS = "engines_as"
+#: ADR-135 Amendment 7 decision 2: a Bedrock model is named by its own id (`anthropic.…`). An
+#: inference profile's id puts a geography before it (`eu.`, `us.`, `apac.`, `global.`, …) and may
+#: send the call outside London; AWS's own guide says not to rely on the prefix alone to tell where
+#: it goes, so any id with a part before the provider's is refused, and so is an ARN.
+_BEDROCK_MODEL_ID = re.compile(r"[a-z0-9-]+\.[^.\s:]+(:[^.\s]+)?")
 
 
 class ModelProviderConfig(BaseModel):
@@ -309,6 +359,23 @@ class ModelProviderConfig(BaseModel):
         default=None,
         description="ADR-136: the agreement's reference, in words (for example DPA 2026/07); "
         "never a secret. Shown beside the mark.",
+    )
+    kind: EngineKind = Field(
+        default="provider",
+        description="ADR-135 Amendments 4 and 7: provider (a hosted provider LiteLLM knows by "
+        "name), or at profile: cloud-platform only, gateway (the client's own OpenAI-compatible "
+        "AI gateway, at api_base) or bedrock (Amazon Bedrock in London). Default: provider.",
+    )
+    auth: EngineAuth | None = Field(
+        default=None,
+        description="ADR-135 Amendments 4 and 7: key (entered in Admin › Models, kept by the "
+        "model gateway alone), or at profile: cloud-platform only, iam_role (the gateway's own "
+        "IAM role: no key is stored). Default: iam_role for bedrock, else key.",
+    )
+    region: str | None = Field(
+        default=None,
+        description="Bedrock's region (profile: cloud-platform): eu-west-2 (London) only, and "
+        "the default for bedrock.",
     )
 
     @field_validator("name")
@@ -380,6 +447,179 @@ class ModelProviderConfig(BaseModel):
             self.label = PROVIDER_LABELS.get(self.name, self.name.replace("_", " ").title())
         return self
 
+    @model_validator(mode="after")
+    def _signs_in_as_its_kind_does(self) -> ModelProviderConfig:
+        """ADR-135 Amendment 4's defaults, on any profile: Bedrock signs in by the gateway's own IAM
+        role in London, any other kind by its key. **What each profile allows is not decided
+        here** but by `engine_refusal`, which every reader of an engine calls with the
+        deployment's profile (ADR-135 Amendment 7 decision 1)."""
+        if self.auth is None:
+            self.auth = "iam_role" if self.kind == "bedrock" else "key"
+        if self.kind == "bedrock" and self.region is None:
+            self.region = BEDROCK_REGION
+        return self
+
+    @property
+    def plain(self) -> bool:
+        """A provider by its key with no region: the only engine there was before Amendment 4, and
+        the only one any profile but `cloud-platform` takes."""
+        return self.kind == "provider" and self.auth == "key" and self.region is None
+
+    @property
+    def keyless(self) -> bool:
+        """True where the engine signs in by the gateway's own IAM role: no key is stored for it."""
+        return self.auth == "iam_role"
+
+    def route(self, model: str) -> str:
+        """LiteLLM's `model` for one of this engine's models: the client's gateway through the
+        OpenAI-compatible route, Bedrock through its own, any other provider by its name."""
+        prefix = {"gateway": "openai", "bedrock": "bedrock"}.get(self.kind, self.name)
+        return f"{prefix}/{model}"
+
+
+def engine_kinds_offered(profile: str) -> list[EngineKind]:
+    """The kinds of engine *Admin › Models* offers on `profile` (ADR-135 Amendment 7 decision 1)."""
+    if profile in MODEL_ROUTE_PROFILES:
+        return ["provider", "gateway", "bedrock"]
+    return ["provider"]
+
+
+def _address_refusal(address: str) -> str | None:
+    """ADR-135 Amendment 7 decision 3: an address is an address alone. A key pasted into it, before
+    the host (`https://<key>@host`) or after it (`?api-key=<key>`, `#…`), would be kept in the
+    models file, the gateway's entries and the audit, and shown in *Admin › Models*."""
+    parts = urlsplit(address)
+    if "@" in parts.netloc:
+        return (
+            "the address carries a name or key before its host (https://…@…); give the address "
+            "alone, and the key or token with Enter key"
+        )
+    if parts.query or parts.fragment or "?" in address or "#" in address:
+        return (
+            "the address carries a query or fragment (?… or #…), where a key is often pasted; "
+            "give the address alone, and the key or token with Enter key"
+        )
+    if any(_a_key_in_the_path(segment) for segment in parts.path.split("/")):
+        return (
+            "the address's path carries what looks like a key or token (https://…/<key>); give "
+            "the address alone, and the key or token with Enter key"
+        )
+    return None
+
+
+def _label_looks_like_a_key(text: str) -> bool:
+    """A label or contract reference shaped like a key, or holding one among its words: each word
+    checked as a whole one is (my own lane review of round 2, item 6; the reference too since P11
+    part 2, on cloud-platform alone, by `engine_refusal`)."""
+    return _looks_like_a_key(text) or any(
+        _looks_like_a_key(word.strip(".,;:()'\"")) for word in text.split()
+    )
+
+
+def _a_key_in_the_path(segment: str) -> bool:
+    """A path segment shaped like a key: a key prefix, a JWT, or 24 or more characters mixing upper
+    case, lower case and digits. A deployment's name in a path (`my-deployment-2024-08-06`,
+    `gpt-4o-mini-2024-07-18`) is lower case, so is taken (the orchestrator's round 2, item d)."""
+    if segment.startswith(_KEY_PREFIXES) or _JWT.search(segment):
+        return True
+    # One unhyphenated run of 24 or more letters and digits in one case, mixing letters and digits
+    # (a hex subscription key in either case, a base32 secret): a deployment's name is hyphenated
+    # words (my own lane review of round 2, item 5; upper case since P11 part 2).
+    if (
+        re.fullmatch(r"[a-z0-9]{24,}|[A-Z0-9]{24,}", segment)
+        and re.search(r"[A-Za-z]", segment)
+        and re.search(r"[0-9]", segment)
+    ):
+        return True
+    return bool(
+        len(segment) >= 24
+        and re.search(r"[A-Z]", segment)
+        and re.search(r"[a-z]", segment)
+        and re.search(r"[0-9]", segment)
+    )
+
+
+def engine_refusal(provider: ModelProviderConfig, profile: str) -> str | None:
+    """What `profile` refuses in `provider`, in fixed words that name a field and never quote a
+    value, or None (ADR-135 Amendment 7). Called by every reader of an engine with the deployment's
+    profile: `OspreyConfig` (`osprey.yaml`), the Conduit's start (`Installed.from_env`), the models
+    file (`ModelSettingsFile.load`) and each change in *Admin › Models* (`ModelAdmin._validated`).
+
+    **Off `cloud-platform`**, an engine is a provider by its key, as before Amendment 4: an engine
+    named `bedrock` is LiteLLM's Bedrock provider by its key there, as it always was (ADR-135
+    decision 1). **On `cloud-platform`**, Amendment 4's rules: Bedrock by the gateway's own IAM role
+    in London, by a model's own id; the client's gateway at its address alone, by a token; no
+    engine named `bedrock` but Bedrock; no label shaped like a key."""
+    if profile not in MODEL_ROUTE_PROFILES:
+        if provider.plain:
+            return None
+        return (
+            "your organisation's AI gateway, Amazon Bedrock in London and signing in by the "
+            f"gateway's own IAM role are for profile: {MODEL_ROUTE_PROFILE} (ADR-135 Amendment 4); "
+            "on this deployment an engine is a provider, reached by its name and its key"
+        )
+    if provider.contract_reference and _label_looks_like_a_key(provider.contract_reference):
+        # Word by word on this profile alone (the orchestrator's ruling on P11 part 2, round 1):
+        # every other profile reads a reference exactly as before Amendment 4.
+        return (
+            "the contract reference holds what looks like a key among its words; it is shown to "
+            "analysts, so give the agreement's name or number in words, and the key or token with "
+            "Enter key"
+        )
+    if provider.label and _label_looks_like_a_key(provider.label):
+        return (
+            "the label looks like a key; it is shown to analysts, so give the engine's name in "
+            "words, and the key or token with Enter key"
+        )
+    if provider.api_base is not None and (refused := _address_refusal(provider.api_base)):
+        return refused
+    if provider.kind == "bedrock":
+        if provider.auth != "iam_role":
+            return (
+                "Bedrock is reached by the gateway's own IAM role, so no key is kept for it; "
+                "choose the IAM role"
+            )
+        if provider.api_base is not None:
+            return (
+                "Bedrock is reached at its own London address; an engine of this kind takes no "
+                "address"
+            )
+        if provider.region != BEDROCK_REGION:
+            return f"Bedrock is used in London only ({BEDROCK_REGION}); no other region is allowed"
+        for role, model in provider.roles.items():
+            if not _BEDROCK_MODEL_ID.fullmatch(model):
+                return (
+                    f"Bedrock is used in London only: the {role} model is not a model's own id "
+                    "(such as anthropic.…). A cross-region inference profile's id (eu.…, us.…, "
+                    "apac.…, global.…) or an ARN may send the call outside London"
+                )
+        return None
+    if provider.name == "bedrock":
+        # LiteLLM routes a provider by its name, so a `bedrock` provider would reach Bedrock by a
+        # stored key and in no fixed region: on this profile Bedrock is reached only as its kind.
+        return (
+            "bedrock is reached only as Amazon Bedrock in London, by the gateway's own IAM role; "
+            "choose that kind of engine"
+        )
+    if provider.region is not None:
+        return "only a Bedrock engine takes a region"
+    if provider.kind == "gateway" and provider.api_base is None:
+        return "your organisation's AI gateway needs its address (https://…)"
+    if provider.kind == "gateway" and provider.auth == "iam_role":
+        # Held (platform-b server log, Q1): LiteLLM's OpenAI-compatible route sends no request
+        # without a token, and how the client's gateway takes the namespace's identity is not yet
+        # known. Refused rather than offered to analysts and failing every call.
+        return (
+            "your organisation's AI gateway signs in by a token for now: signing in by an IAM "
+            "role waits for your gateway's owners to say how it accepts one"
+        )
+    if provider.kind == "provider" and provider.auth == "iam_role":
+        return (
+            "only Bedrock signs in by the gateway's own IAM role (your organisation's AI gateway, "
+            "by a token for now); a provider signs in by its key"
+        )
+    return None
+
 
 def provider_key_variable(provider: str, *, single: bool = False) -> str:
     """`OSPREY_MODEL_KEY_<NAME>`; `OSPREY_MODEL_PROVIDER_KEY` for the single `models.provider`."""
@@ -441,12 +681,30 @@ class ModelsConfig(BaseModel):
         default="all-minilm:22m-l6-v2-fp16",
         description="ADR-095: the local model that turns text into vectors.",
     )
+    #: ADR-135 Amendments 5 and 6 (P12 part 2): which engine runs `ModelPort.extract`. Deep read is
+    #: the LiteLLM adapter; Laurium is its own service, rendered only when chosen, on
+    #: `cloud-platform` alone (`OspreyConfig._extraction_engine_suits_the_profile`). Left unset,
+    #: the profile's preset (Amendment 5 decision 2; Amendment 9): `laurium` on `cloud-platform`,
+    #: `deep_read` on every other. Stored as written (unset stays unset, so a dump round-trips); the
+    #: effective engine is read from `OspreyConfig.extraction_engine`.
+    extraction_engine: Literal["deep_read", "laurium"] | None = Field(
+        default=None,
+        description="ADR-135 Amendments 5 and 6: deep_read or, at profile: cloud-platform only, "
+        "laurium (its own service, every call through the gateway). Left unset: laurium on "
+        "cloud-platform (its preset), deep_read on every other profile.",
+    )
 
     @property
     def enabled_providers(self) -> list[ModelProviderConfig]:
         """ADR-135: every enabled provider — `providers`, or the single `provider` as a one-entry
         list."""
         return [self.provider] if self.provider is not None else list(self.providers)
+
+    @property
+    def keyed_providers(self) -> list[ModelProviderConfig]:
+        """The enabled providers that sign in by a key: an engine signed in by the gateway's own IAM
+        role (ADR-135 Amendment 4) has no key variable, is asked for no key and keeps none."""
+        return [p for p in self.enabled_providers if not p.keyless]
 
     def key_variable(self, provider: str) -> str:
         """Where a provider's key is kept in `deployment.env` (ADR-135 decision 2):
@@ -680,6 +938,393 @@ class ClusterConfig(BaseModel):
         return self
 
 
+_KUBE_NAME = r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+
+#: ADR-148 decision 7: the widest network an egress allowance may name, by IP version. **IPv4
+#: /16** is the largest block AWS gives a VPC, so no one AWS service's network, and no platform's
+#: shared VPC (the client's is a /16), is wider; **IPv6 /48** is one site's allocation (RFC 6177).
+#: Anything wider, the default routes above all, opens the namespace's egress to far more than
+#: one host, which one setting must never do.
+EGRESS_WIDEST_PREFIX = {4: 16, 6: 48}
+
+
+def too_wide_for_egress(net: str) -> str | None:
+    """Why `net` may not be an egress allowance (a default route, or wider than
+    `EGRESS_WIDEST_PREFIX`), or None. `net` must already be a network."""
+    import ipaddress
+
+    network = ipaddress.ip_network(net, strict=False)
+    widest = EGRESS_WIDEST_PREFIX[network.version]
+    if network.prefixlen == 0:
+        return f"{net} is a default route: it would allow egress to every address"
+    if network.prefixlen < widest:
+        return (
+            f"{net} is wider than /{widest}, the widest network egress may be allowed to "
+            f"(IPv{network.version}); name the host's own, narrower networks"
+        )
+    return None
+
+
+def s3_location(location: str) -> tuple[str, str]:
+    """An `s3://` location's bucket and folder (the folder empty for the bucket's top)."""
+    bucket, _, folder = location.removeprefix("s3://").partition("/")
+    return bucket, folder
+
+
+def standard_partition(region: str) -> str:
+    """A declared source's region in AWS's standard partition: the role's statements are written for
+    `arn:aws:`, so a China (`cn-`) or GovCloud (`-gov-`) region is refused in words, never rendered
+    into ARNs that name another partition's resources wrongly."""
+    if region.startswith("cn-") or "-gov-" in region:
+        raise ValueError(
+            f"{region} is outside AWS's standard partition: a declared source's region is a "
+            "standard one (eu-west-2), since the role's statements name arn:aws: resources"
+        )
+    return region
+
+
+class DeclaredS3Source(BaseModel):
+    """A bucket an S3 connection may read, under a folder (ADR-140 Amendment 21): a connection on it
+    names this region and a folder at or under this one."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    bucket: str = Field(pattern=S3_BUCKET, description="The bucket's own name (no dot)")
+    region: str = Field(pattern=AWS_REGION, description="The bucket's region (eu-west-2)")
+    prefix: str = Field(
+        default="",
+        max_length=1024,
+        pattern=S3_FOLDER,
+        description="Default: the bucket's top. The folder a connection may read at or under, "
+        "each name ending in / (exports/client-a/)",
+    )
+
+    @field_validator("prefix")
+    @classmethod
+    def _inside(cls, value: str) -> str:
+        return no_climbing(value)
+
+    @field_validator("region")
+    @classmethod
+    def _standard(cls, value: str) -> str:
+        return standard_partition(value)
+
+    def host(self) -> str:
+        return f"{self.bucket}.s3.{self.region}.amazonaws.com"
+
+
+class DeclaredAthenaSource(BaseModel):
+    """An Athena workgroup an Athena connection may use (ADR-140 Amendment 21), with the databases
+    it may read, where Athena writes its results, and where the tables' objects are (Athena reads
+    them as the namespace's role, so the role is given read there; the Conduit never reaches
+    them)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    workgroup: str = Field(pattern=ATHENA_NAME, description="The workgroup's name")
+    region: str = Field(pattern=AWS_REGION, description="The workgroup's region (eu-west-2)")
+    databases: list[Annotated[str, Field(pattern=r"^[a-z0-9_]{1,128}$")]] = Field(
+        min_length=1, description="The Glue databases a connection may read"
+    )
+    results_location: str = Field(
+        max_length=1024,
+        pattern=S3_LOCATION,
+        description="Where Athena writes each query's results (s3://bucket/folder/): the only "
+        "place a declared source gives the role a write. A folder, never a bucket's top",
+    )
+    table_locations: list[Annotated[str, Field(max_length=1024, pattern=S3_LOCATION)]] = Field(
+        description="Where the databases' tables keep their objects (s3://bucket/folder/), at "
+        "least one, read by Athena as the namespace's role: read-only, and never reached by the "
+        "Conduit",
+    )
+
+    @field_validator("results_location")
+    @classmethod
+    def _a_folder(cls, value: str) -> str:
+        if not s3_location(value)[1]:
+            raise ValueError(
+                "results_location names a folder (s3://bucket/athena-results/), never a bucket's "
+                "top: the role may write there alone"
+            )
+        no_climbing(s3_location(value)[1])
+        return value
+
+    @field_validator("table_locations")
+    @classmethod
+    def _tables_inside(cls, values: list[str]) -> list[str]:
+        if not values:
+            raise ValueError(
+                "table_locations names at least one s3://bucket/folder/: Athena reads a table's "
+                "objects as the namespace's role, so with none the role could read no table"
+            )
+        for value in values:
+            no_climbing(s3_location(value)[1])
+        return values
+
+    @field_validator("region")
+    @classmethod
+    def _standard(cls, value: str) -> str:
+        return standard_partition(value)
+
+    def host(self) -> str:
+        return f"athena.{self.region}.amazonaws.com"
+
+
+class ConnectorSources(BaseModel):
+    """The cloud sources a cloud-platform deployment may read (ADR-140 Amendment 21)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    s3: list[DeclaredS3Source] = Field(default_factory=list, description="The S3 buckets")
+    athena: list[DeclaredAthenaSource] = Field(
+        default_factory=list, description="The Athena workgroups"
+    )
+
+    def declared(self) -> bool:
+        return bool(self.s3 or self.athena)
+
+    def hosts(self) -> list[str]:
+        """Each declared source's one host, as a connection on it reaches it."""
+        return sorted({s.host() for s in self.s3} | {a.host() for a in self.athena})
+
+
+_ENTRA_ID = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+
+
+class EntraSignInConfig(BaseModel):
+    """ADR-148 decision 9 and Amendment 8: how this deployment's people sign in with Entra ID, and
+    where `principal_auth` finds each of clearance, unit and handling codes in their token (a claim,
+    or a table from Entra group to value; `principal_auth.ClaimMapping` checks the shape at render).
+    Roles are not here: they are kept in Admin › People, the first administrators named below."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str = Field(pattern=_ENTRA_ID, description="The client's Entra tenant id")
+    client_id: str = Field(
+        pattern=_ENTRA_ID, description="The Glass's own app registration (application id)"
+    )
+    api_client_id: str = Field(
+        pattern=_ENTRA_ID,
+        description="This API's app registration (application id): the token's audience",
+    )
+    api_id_uri: str | None = Field(
+        default=None,
+        pattern=r"^api://\S+$",
+        description="Default: api://<api_client_id>. The API's application id URI, which the "
+        "Glass's scope names",
+    )
+    token_version: Literal["2.0", "1.0"] = Field(
+        default="2.0",
+        description="Default: 2.0. The access token version the API's registration is issued "
+        "(accessTokenAcceptedVersion): the issuer and audience the Conduit checks follow it",
+    )
+    scope: str = Field(
+        default="access_as_user",
+        pattern=r"^[A-Za-z0-9._-]+$",
+        description="Default: access_as_user. The delegated scope the Glass asks the API for",
+    )
+    clearance: dict[str, Any] = Field(
+        description="Where clearance comes from: {claim: <name>} or {groups: {<group id>: <value>}}"
+    )
+    org_unit: dict[str, Any] = Field(
+        description="Where the organisational unit comes from: {claim: ...} or {groups: {...}}"
+    )
+    handling_codes: dict[str, Any] = Field(
+        description="Where the handling codes come from: {claim: ...} or {groups: {<id>: [codes]}}"
+    )
+    groups_claim: str = Field(
+        default="groups",
+        min_length=1,
+        description="Default: groups. The token claim listing the person's Entra group ids, "
+        "which a {groups: ...} table above is read from",
+    )
+    first_administrators: list[str] = Field(
+        description="The people given the Admin role at install, by Entra object id (at least one)"
+    )
+    claims_mapping_policy: bool = Field(
+        default=False,
+        description="Default: false. Whether a claims-mapping policy signs the API's tokens with "
+        "its own key (the keys are then read with ?appid=<api_client_id>)",
+    )
+
+    @field_validator("first_administrators")
+    @classmethod
+    def _someone(cls, oids: list[str]) -> list[str]:
+        if not oids:
+            raise ValueError(
+                "names no first administrator: name at least one person by Entra object id "
+                "(an empty list is never everyone)"
+            )
+        if bad := [o for o in oids if not re.match(_ENTRA_ID, o)]:
+            raise ValueError(f"not an Entra object id (lower case): {bad[0]!r}")
+        return list(dict.fromkeys(oids))
+
+    @property
+    def issuer(self) -> str:
+        if self.token_version == "1.0":
+            return f"https://sts.windows.net/{self.tenant_id}/"
+        return f"https://login.microsoftonline.com/{self.tenant_id}/v2.0"
+
+    @property
+    def id_uri(self) -> str:
+        return self.api_id_uri or f"api://{self.api_client_id}"
+
+    @property
+    def audience(self) -> str:
+        # Unmeasured: as Microsoft documents v1.0 and v2.0 tokens' `aud`; one real token from the
+        # client's tenant settles it (ADR-148 Amendment 8; CARRIES).
+        return self.id_uri if self.token_version == "1.0" else self.api_client_id
+
+    @property
+    def jwks_url(self) -> str:
+        path = "discovery/keys" if self.token_version == "1.0" else "discovery/v2.0/keys"
+        url = f"https://login.microsoftonline.com/{self.tenant_id}/{path}"
+        return f"{url}?appid={self.api_client_id}" if self.claims_mapping_policy else url
+
+    def claim_mapping(self) -> dict[str, Any]:
+        """The `OSPREY_CLAIM_MAPPING` the Conduit reads (`principal_auth.ClaimMapping`)."""
+        return {
+            "tenant_id": self.tenant_id,
+            "client_id": self.client_id,
+            "api_client_id": self.api_client_id,
+            "scope": self.scope,
+            "clearance": self.clearance,
+            "org_unit": self.org_unit,
+            "handling_codes": self.handling_codes,
+            "groups_claim": self.groups_claim,
+        }
+
+
+class CloudPlatformConfig(BaseModel):
+    """ADR-148: only meaningful at `profile: cloud-platform`. What is this deployment's own (its
+    namespace, its environment, its registry, who may reach it, where its enabled hosts are); what
+    is the platform's (ingress class and annotations, storage class, egress policy kind, its
+    secrets' names) is in the platform's settings file, `harness/cloud_platform/platforms/
+    <platform>.yaml`, so another shared platform is a new file, not a new profile."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    platform: str = Field(
+        default="client",
+        pattern=r"^[a-z][a-z0-9-]*$",
+        description="Default: client. The platform's settings file, by name",
+    )
+    namespace: str | None = Field(
+        default=None,
+        pattern=_KUBE_NAME,
+        description="The namespace the platform's team created for the deployment (required)",
+    )
+    environment: Literal["development", "production"] = Field(
+        default="development",
+        description="Default: development — one copy of each store; production runs the "
+        "cluster's copies (ArcadeDB 3, ClickHouse 2, Keeper 3)",
+    )
+    shape: Literal["standard", "poc"] = Field(
+        default="standard",
+        description="Default: standard — the stores as the environment sets them. poc: the "
+        "proof-of-concept shape (ADR-148 Amendment 5), a development namespace's only: one "
+        "ArcadeDB and one ClickHouse running its own Keeper, no disruption budgets, and the "
+        "Ingest root on a claim of its own",
+    )
+    registry: str | None = Field(
+        default=None,
+        pattern=r"^[a-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)*$",
+        description="Where every image is pulled from (required): the namespace's ECR, as "
+        "`ospreyflow images push --registry` copied them there",
+    )
+    allow_from: list[str] = Field(
+        default_factory=list,
+        description="The networks (CIDR) the platform's ingress admits; empty: every address",
+    )
+    egress_nets: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="For each host the namespace reaches (a model provider, a proxied map "
+        "provider, the mail server, a connector host, S3 and STS "
+        "unless the platform's settings name theirs), the networks (CIDR) its traffic is allowed "
+        "to; a host with none is refused at render. No network wider than /16 (IPv4) or /48 "
+        "(IPv6), and never a default route",
+    )
+    tls_secret: str | None = Field(
+        default=None,
+        pattern=_KUBE_NAME,
+        description="Default: none — the platform's own certificate. The Kubernetes Secret "
+        "holding the certificate for the deployment's name (the Glass's: the profile renders no "
+        "sign-in or reporting name), where the platform's wildcard does not cover it",
+    )
+    claims: EntraSignInConfig | None = Field(
+        default=None,
+        description="How people sign in, with Entra ID (required at render): the tenant, the "
+        "Glass's and the API's app registrations, where each claim comes from and the first "
+        "administrators",
+    )
+    connector_hosts: list[str] = Field(
+        default_factory=list,
+        description="The hosts a SQL or API connection may reach, each as host or host:port (a "
+        "name, not an IPv6 literal), with its networks in egress_nets under the host alone. The "
+        "namespace's egress allows each host on its ports; the Conduit's own allow-list "
+        "(OSPREY_CONNECTOR_EGRESS) holds the hosts alone, so a connection to a listed host on a "
+        "port not listed here passes the Conduit and times out at the egress. A bare host is "
+        "reached on 443 (an API connection over HTTPS); a SQL connection needs its database's port "
+        "here (db.example.org:5432). A host given twice with two ports is reached on both",
+    )
+
+    connector_sources: ConnectorSources = Field(
+        default_factory=lambda: ConnectorSources(),
+        description="The S3 buckets and Athena workgroups an S3 or Athena connection may read "
+        "(ADR-140 Amendment 21). Each becomes the Conduit's own egress row on 443 and an entry on "
+        "its allow-list, and the namespace's IAM role gains read-only statements scoped to it. "
+        "Admin › Connections refuses an S3 or Athena connection not declared here; declare it, "
+        "re-render and run helm upgrade (and apply the Terraform)",
+    )
+
+    @field_validator("connector_hosts")
+    @classmethod
+    def _connector_ports(cls, hosts: list[str]) -> list[str]:
+        for entry in hosts:
+            connector_address(entry)  # refused in words when its port is not a port
+        return hosts
+
+    @model_validator(mode="after")
+    def _networks_are_networks(self) -> CloudPlatformConfig:
+        import ipaddress
+
+        for net in [*self.allow_from, *(n for nets in self.egress_nets.values() for n in nets)]:
+            try:
+                ipaddress.ip_network(net)
+            except ValueError:
+                raise ValueError(f"{net!r} is not a network (for example 192.0.2.0/24)") from None
+        if self.shape == "poc" and self.environment != "development":
+            raise ValueError(
+                "cloud_platform.shape: poc is a development namespace's (one copy of each store); "
+                "a production namespace takes the standard shape"
+            )
+        # ADR-148 decision 7: one setting must never open the namespace's egress.
+        for host, nets in self.egress_nets.items():
+            for net in nets:
+                if why := too_wide_for_egress(net):
+                    raise ValueError(f"cloud_platform.egress_nets[{host!r}]: {why}")
+        return self
+
+
+def connector_address(entry: str) -> tuple[str, int]:
+    """A `cloud_platform.connector_hosts` entry's host and port: `host:port`, or a bare host on 443
+    (ADR-148 Amendment 5 point 21). The port is digits alone, 1 to 65535."""
+    if entry.startswith("[") or entry.count(":") > 1:
+        raise ValueError(
+            f"cloud_platform.connector_hosts {entry!r}: an IPv6 address is not taken; name the "
+            "host by its name (db.example.org or db.example.org:5432)"
+        )
+    host, sep, port = entry.rpartition(":")
+    if not sep:
+        return entry, 443
+    if not host or not re.fullmatch(r"[0-9]{1,5}", port) or not 1 <= int(port) <= 65535:
+        raise ValueError(
+            f"cloud_platform.connector_hosts {entry!r}: a host, or host:port with a port from 1 "
+            "to 65535 in digits alone (db.example.org:5432)"
+        )
+    return host, int(port)
+
+
 class TlsFiles(BaseModel):
     """ADR-114 Amendment 33 decision 3: the organisation's own certificate for a Small on a server
     of its own. Paths on the server, absolute; the front proxy mounts the two files read-only and
@@ -769,6 +1414,19 @@ class NetworkConfig(BaseModel):
         description=(
             "Small on a server of your own, with network.tls only: the one address of the server "
             "the front proxy publishes on. Default: none — every interface."
+        ),
+    )
+    access_key: bool = Field(
+        default=False,
+        # Left out of every dump while false, so a deployment that does not ask renders byte for
+        # byte what it did (the cluster's and the cloud platform's values carry `osprey.yaml`).
+        exclude_if=lambda asks: asks is False,
+        description=(
+            "Small over https:// only: the front proxy asks every browser for a shared key (the "
+            "browser's own user name and key box) on all three names before anything loads, and "
+            "every answer says noindex. The key's bcrypt hash is set on the server by "
+            "`python -m harness.access_key set <the deployment's folder>`, never here. Default: "
+            "false (ADR-114 Amendment 41)."
         ),
     )
 
@@ -945,15 +1603,18 @@ class DeploymentConfig(BaseModel):
     )
 
     #: ADR-148 decision 10: the highest marking this deployment may hold. Checked against the
-    #: handling scheme the Conduit loads at render (`harness.site.highest_marking`).
+    #: handling scheme the Conduit loads at render (`harness.site.highest_marking`, which holds
+    #: each profile's own default, `PROFILE_CEILINGS`).
     highest_marking: str | None = Field(
         default=None,
         description=(
-            "Default: the handling scheme's highest. The highest marking this deployment may hold: "
+            "Default: OFFICIAL-SENSITIVE on the cloud-platform profile, else the handling "
+            "scheme's highest. The highest marking this deployment may hold: "
             "a load or an import marked above it is refused before anything is written, in words "
             "that say this limit and never the item's content. A demo pack that declares no "
             "highest marking is judged as the scheme's highest, so under a lower setting it is "
-            "refused. One of the handling scheme's classifications."
+            "refused. One of the handling scheme's classifications. Left unset, it is the "
+            "scheme's highest, or OFFICIAL-SENSITIVE on the cloud-platform profile."
         ),
     )
 
@@ -995,6 +1656,30 @@ class AppearanceConfig(BaseModel):
         default="none",
         description="Default: none. The phase banner shows at alpha or beta.",
     )
+    banner_text: str | None = Field(
+        default=None,
+        description=(
+            'Default: none. The banner\'s own words, in place of "This is a new service.", in '
+            "the Glass and on the sign-in page: after the phase's tag at alpha or beta, alone at "
+            "live or none. One line of at most 200 characters (ADR-132 Amendment 7)."
+        ),
+    )
+
+    @field_validator("banner_text")
+    @classmethod
+    def _one_line(cls, value: str | None) -> str | None:
+        one_line = "\n" not in value and "\r" not in value if value is not None else True
+        if value is not None and (not value.strip() or len(value) > 200 or not one_line):
+            raise ValueError("appearance.banner_text must be one line of at most 200 characters")
+        return value
+
+    def told(self) -> dict[str, object]:
+        """The section as the Glass and the sign-in page are told it: `banner_text` only when set,
+        so a deployment that names none renders byte for byte what it did (Amendment 7)."""
+        dumped = self.model_dump()
+        if self.banner_text is None:
+            del dumped["banner_text"]
+        return dumped
 
 
 class GradingConfig(BaseModel):
@@ -1263,6 +1948,9 @@ class OspreyConfig(BaseModel):
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     governance: GovernanceConfig = Field(default_factory=GovernanceConfig)
     cluster: ClusterConfig = Field(default_factory=ClusterConfig)
+    cloud_platform: CloudPlatformConfig | None = Field(
+        default=None, description="Default: none — only at profile: cloud-platform (ADR-148)"
+    )
     network: NetworkConfig = Field(default_factory=NetworkConfig)
     map: MapConfig | None = Field(default=None, description="Default: none declared")
     reporting: ReportingConfig = Field(default_factory=ReportingConfig)
@@ -1312,6 +2000,37 @@ class OspreyConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _a_cloud_platform_names_its_namespace_and_registry(self) -> OspreyConfig:
+        """ADR-148: the platform's settings belong to that profile alone; the platform's own
+        managed stores replace every one of ours, so `external:` names none (their details are
+        read from the platform's secrets, never written here)."""
+        given = self.cloud_platform
+        if self.profile is not Profile.CLOUD_PLATFORM:
+            if given is not None:
+                raise ValueError(
+                    "cloud_platform settings are declared but profile is "
+                    f"{self.profile.value!r}; they are only meaningful at profile: cloud-platform"
+                )
+            return self
+        missing = [
+            name
+            for name in ("namespace", "registry")
+            if given is None or getattr(given, name) is None
+        ]
+        if missing:
+            raise ValueError(
+                "a cloud-platform deployment names "
+                + " and ".join(f"cloud_platform.{name}" for name in missing)
+                + ": the platform's team creates the namespace and its registry"
+            )
+        if self.external.any:
+            raise ValueError(
+                "on a cloud platform its managed stores replace ours and their details come from "
+                "the platform's secrets; external: names none"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _a_cluster_runs_on_its_managed_services(self) -> OspreyConfig:
         """05 §3b: on Kubernetes the cloud runs PostgreSQL, Valkey and the object store, and a
         managed Valkey or search is for a cluster only (Small runs its own on the server)."""
@@ -1339,6 +2058,57 @@ class OspreyConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _engines_suit_the_profile(self, info: ValidationInfo) -> OspreyConfig:
+        """ADR-135 Amendment 7 decision 1: each engine as this profile allows (`engine_refusal`).
+        A cloud-platform deployment's cluster translation (`harness.cloud_platform._as_cluster`) is
+        validated as `profile: cluster`; its engines were already held to cloud-platform's rules,
+        and it says so by `ENGINES_AS` in the validation's context, so the render does not refuse
+        the engines it is rendering (the orchestrator's round 2, item a)."""
+        # Honoured only as `_as_cluster` uses it: cloud-platform's rules, for a cluster translation
+        # (my own lane review of round 2, note 11). Any other use is the profile's own rules.
+        engines_as = (info.context or {}).get(ENGINES_AS)
+        translated = engines_as == MODEL_ROUTE_PROFILE and self.profile is Profile.CLUSTER
+        profile = MODEL_ROUTE_PROFILE if translated else self.profile.value
+        for provider in self.models.enabled_providers:
+            if refused := engine_refusal(provider, profile):
+                raise ValueError(f"models.providers: {provider.name}: {refused}")
+        return self
+
+    #: Set while validating a cloud-platform deployment's cluster translation (`ENGINES_AS`), so the
+    #: translation reads cloud-platform's preset.
+    _engines_as_cloud_platform: bool = PrivateAttr(default=False)
+
+    @property
+    def extraction_engine(self) -> Literal["deep_read", "laurium"]:
+        """The engine `ModelPort.extract` runs on: as named, or the profile's preset (ADR-135
+        Amendment 5 decision 2, the owner's; Amendment 9): `laurium` on `cloud-platform` (and its
+        cluster translation), `deep_read` on every other profile."""
+        named = self.models.extraction_engine
+        if named is not None:
+            return named
+        cloud = self.profile is Profile.CLOUD_PLATFORM or self._engines_as_cloud_platform
+        return "laurium" if cloud else "deep_read"
+
+    @model_validator(mode="after")
+    def _extraction_engine_suits_the_profile(self, info: ValidationInfo) -> OspreyConfig:
+        """ADR-135 Amendments 5 and 6 (P12 part 2; the orchestrator's ruling of 11 November):
+        Laurium on `cloud-platform` alone, as the engine kinds are (`_engines_suit_the_profile`),
+        its cluster translation carried by `ENGINES_AS` alike."""
+        engines_as = (info.context or {}).get(ENGINES_AS)
+        translated = engines_as == MODEL_ROUTE_PROFILE and self.profile is Profile.CLUSTER
+        profile = MODEL_ROUTE_PROFILE if translated else self.profile.value
+        # Read, never written (the lane-reviewer's item 3): the preset is resolved by the
+        # `extraction_engine` property, so a dump of this configuration names only what was named.
+        self._engines_as_cloud_platform = translated
+        if self.models.extraction_engine == "laurium" and profile not in MODEL_ROUTE_PROFILES:
+            raise ValueError(
+                f"models.extraction_engine: laurium is for profile: {MODEL_ROUTE_PROFILE} "
+                f"(ADR-135 Amendment 6); this deployment is profile: {profile}. Name deep_read, "
+                "or leave it out."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _the_address_suits_the_profile(self) -> OspreyConfig:
         """S11 and O2 (GDS re-audit; the owner's ruling of 2 November 2026; `05_DEPLOYMENT.md`
         §7). Small and Enterprise are reached by other people over a network, so their address is
@@ -1347,12 +2117,20 @@ class OspreyConfig(BaseModel):
         page say why and what to write instead."""
         origin = self.network.public_origin
         if self.profile is not Profile.LOCAL_LITE and not origin.startswith("https://"):
-            name = "a Small" if self.profile is Profile.SMALL else "an Enterprise"
+            name = {
+                Profile.SMALL: "a Small",
+                Profile.CLOUD_PLATFORM: "a cloud platform",
+            }.get(self.profile, "an Enterprise")
+            front = (
+                "the platform's ingress serves its certificate"
+                if self.profile is Profile.CLOUD_PLATFORM
+                else "the front proxy obtains its certificate"
+            )
             raise ValueError(
                 f"network.public_origin {origin!r} is plain HTTP: {name} deployment's "
                 "network.public_origin must be an https:// address (for example "
-                "https://osprey.example.org), because other people reach it over a network and the "
-                "front proxy obtains its certificate. Plain HTTP is for Lite, on this computer only"
+                "https://osprey.example.org), because other people reach it over a network and "
+                f"{front}. Plain HTTP is for Lite, on this computer only"
             )
         host = (urlsplit(origin).hostname or "").rstrip(".").lower()
         if self.profile is Profile.LOCAL_LITE and (host == "gov.uk" or host.endswith(".gov.uk")):
@@ -1362,6 +2140,18 @@ class OspreyConfig(BaseModel):
                 "HTTPS: install it as Small or Enterprise (profile: small or cluster) with an "
                 "https:// address, or give Lite a localhost address such as "
                 "http://ospreyflow.localhost"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _the_shared_key_is_for_a_small_over_tls(self) -> OspreyConfig:
+        """ADR-114 Amendment 41: the shared key is asked by the Small's own front proxy. Only over
+        TLS, since a browser sends it again with every request: a Small's address is always an
+        https:// one (`_the_address_suits_the_profile`), and nothing else may ask."""
+        if self.network.access_key and self.profile is not Profile.SMALL:
+            raise ValueError(
+                "network.access_key is for Small, whose front proxy asks for it (profile: small), "
+                f"not profile: {self.profile.value}"
             )
         return self
 
@@ -1434,10 +2224,14 @@ class OspreyConfig(BaseModel):
         (ADR-114), so it is refused there in words. macOS and Windows, whose Docker Desktop gives a
         container no NVIDIA GPU, are refused by the doctor, which reads the machine."""
         if self.resources.gpu == "nvidia" and (
-            self.profile is Profile.CLUSTER or self.external.any
+            self.profile in (Profile.CLUSTER, Profile.CLOUD_PLATFORM) or self.external.any
         ):
             where = (
-                "Enterprise" if self.profile is Profile.CLUSTER else "a Small on managed services"
+                "Enterprise"
+                if self.profile is Profile.CLUSTER
+                else "a cloud platform (ADR-148 decision 11)"
+                if self.profile is Profile.CLOUD_PLATFORM
+                else "a Small on managed services"
             )
             raise ValueError(
                 "resources.gpu: nvidia is for Lite on a Linux computer or Small on a server of "

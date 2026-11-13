@@ -4,7 +4,7 @@ version = "0.0.0"
 requires-python = ">=3.12"
 dependencies = [
     "pyarrow>=25.0.1",
-    "pydantic>=2.9",
+    "pydantic>=2.12",  # Field(exclude_if=...) (ADR-114 Amendment 41)
     "pyyaml>=6.0",
     "jsonschema>=4.23",
     "python-ulid>=3.0",
@@ -57,6 +57,14 @@ dependencies = [
     # GPL-2.0-or-later`; taken under Apache-2.0, which the licence gate admits as the OR's allowed
     # alternative.
     "dulwich>=1.2.21",
+    # The Studio's Athena connector (L1.9; ADR-148): AWS's own client for Athena's API, its
+    # request signing and its credential chain (on the `cloud-platform` profile, the namespace's
+    # IAM role for service accounts), so nothing signs a request by hand. Apache-2.0. Until now in
+    # uv.lock only through the optional `extraction` extra (cloudpathlib's S3), so the lock is
+    # re-made at merge, or the Conduit's image (`uv sync --frozen`) would lack it. Its own
+    # dependencies: jmespath (MIT), python-dateutil and urllib3 (already here). S3 reads go through
+    # pyarrow's own filesystem.
+    "botocore>=1.43.114",
 ]
 
 [dependency-groups]
@@ -72,6 +80,7 @@ dev = [
     "types-defusedxml>=0.7",
     "types-networkx>=3.4",
     "pypdf>=6.20.1",
+    "pytest-xdist>=3.6",
 ]
 
 [tool.mypy]
@@ -88,6 +97,11 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "asyncpg.*"
+ignore_missing_imports = true
+
+# The Athena connector (L1.9): botocore ships no type stubs or py.typed marker.
+[[tool.mypy.overrides]]
+module = ["botocore", "botocore.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
@@ -123,6 +137,14 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = ["stanza.*", "transformers.*", "spacy.*"]
 ignore_missing_imports = true
+
+# Laurium and the libraries it brings (ADR-135 Amendment 6) are installed only in Laurium's own
+# Python 3.13 image, never in the Conduit's environment. Scoped to the one module that imports them,
+# Laurium's service app: `ignore_missing_imports` would match the imported names (`openai.*`)
+# wherever they were imported, so the error codes are turned off in the importing module instead.
+[[tool.mypy.overrides]]
+module = ["services.laurium.app"]
+disable_error_code = ["import-not-found", "import-untyped"]
 
 [tool.ruff]
 target-version = "py312"

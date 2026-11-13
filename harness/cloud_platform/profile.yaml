@@ -1,0 +1,162 @@
+# The `cloud-platform` profile's extension points (spec/06_DECISIONS.md ADR-148, Amendment 1
+# item 11): what a later step adds to the profile is a row here, not an edit to
+# `harness/cloud_platform/__init__.py`. Read and checked by `harness.cloud_platform.settings.
+# load_profile`; a row it cannot read is refused in words at render. What a *platform* fixes
+# (its ingress class, its storage class, its managed networks) is its own file under
+# `platforms/`, not this one.
+
+# What the Ingress serves (decision 2), by `harness.site.sites`' names: the site's attribute, the
+# workload behind it and the workload's port. A door whose workload is not rendered is left out.
+doors:
+  - {site: glass, workload: workspace, port: 8080}
+  - {site: dashboards, workload: superset, port: 8088}
+
+# An image built for any user in group 0 (OpenShift's convention) that writes into its own folders
+# at start: its pod adds group 0 as a supplementary group, its user staying 10001 and non-root.
+# None since P10 part 2: Keycloak, the one there was, is not rendered (people sign in with Entra
+# ID). `make cp-policy-check` holds its own list (`GROUP_ZERO_ALLOWED`), so a row added here alone
+# is refused there.
+group_zero: []
+
+# How each image of ours is built (decision 8): its Dockerfile and context, from OspreyFlow_Core,
+# and its build arguments. The Conduit without Java on this profile (decision 12). An image of
+# ours the render meets with no row here is refused in words.
+ours:
+  workspace: {dockerfile: apps/workspace/Dockerfile, context: .}
+  api: {dockerfile: services/api/Dockerfile, context: ., build_args: {CONDUIT_JAVA: omitted}}
+  ner: {dockerfile: services/ner/Dockerfile, context: .}
+  worker: {dockerfile: services/worker/Dockerfile, context: .}
+  report-sync: {dockerfile: services/report_sync/Dockerfile, context: .}
+  superset: {dockerfile: deploy/superset/Dockerfile, context: deploy/superset}
+  # ADR-135 Amendment 6: built from its own folder alone, only when Laurium is chosen.
+  laurium: {dockerfile: services/laurium/Dockerfile, context: services/laurium}
+
+# The hosts the namespace reaches (decision 7), each allowed by its networks
+# (`cloud_platform.egress_nets`, or the platform's `egress.service_nets`) or the render is refused.
+egress:
+  # On every render: the bucket (S3) and IRSA's role (STS). `{region}` is the platform's.
+  always: ["s3.{region}.amazonaws.com", "sts.{region}.amazonaws.com"]
+  # Entra ID's sign-in host, whose keys the Conduit reads to verify every token (P10 part 2): the
+  # Conduit's alone.
+  sign_in: ["login.microsoftonline.com"]
+  # A model engine that names no `api_base` is reached at its provider's own host.
+  engine_hosts:
+    openai: api.openai.com
+    anthropic: api.anthropic.com
+    gemini: generativelanguage.googleapis.com
+  # An engine of a kind that names no address, by its kind whatever its name; `{region}` is the
+  # engine's own (ADR-135 Amendment 4: Bedrock in London only).
+  engine_kind_hosts:
+    bedrock: "bedrock-runtime.{region}.amazonaws.com"
+  # ADR-148 Amendment 5 point 21: egress is each workload's own, one Calico policy a workload; DNS
+  # is every pod's, and anything not named here is denied. Who reaches each kind of host: S3 and STS
+  # (`always`) the bucket role's pods (IRSA), a model engine the gateway alone, a proxied map source
+  # the Conduit, Entra ID's sign-in host the Conduit (P10 part 2), a connector host and a declared S3
+  # or Athena source (`connector_sources`) the Conduit alone: no other pod reads a connection
+  # (ADR-140 Amendment 21; the worker's jobs read none); nothing reaches the mail server since P10
+  # part 2 (Keycloak sent its sign-in mail).
+  # STS alone: the gateway signs Bedrock's calls by its own role (P11 part 2) and never reaches S3.
+  identity: ["sts.{region}.amazonaws.com"]
+  # No KMS: S3 calls it on the backups' behalf (SSE-KMS), so none of P9's pods reaches it.
+  # The pods rendered outside the workloads that have rows by their own pods' names: P9's backup
+  # and restore (ADR-148 Amendment 7). A row whose pod is not rendered selects nothing.
+  others: [backup, backup-claims, restore, restore-claims]
+  reach:
+    identity: [litellm]
+    sign_in: [api]
+    # ClickHouse too: its BACKUP TO S3 runs as its own backup role (ADR-148 Amendment 7, P9), as do
+    # P9's backup and restore pods.
+    always: [api, worker, report-sync, clickhouse, backup, backup-claims, restore, restore-claims]
+    engines: [litellm]
+    maps: [api]
+    mail: []
+    connectors: [api]
+    sources: [api]
+  # The managed stores' networks (RDS, ElastiCache): the pods that read a store's details.
+  managed: [api, worker, report-sync, superset, litellm]
+  # Their ports: RDS's PostgreSQL and ElastiCache's (the Terraform's own); the OpenSearch domain's
+  # 443 is added when the deployment searches with it.
+  managed_ports: [5432, 6379]
+  # Which of the namespace's own workloads each one calls, from the addresses its environment names
+  # (the Glass the Conduit; the Conduit its stores, the identity provider, the gateway, the
+  # recogniser and the dashboards; a store its own replicas). A workload not rendered is left out.
+  paths:
+    workspace: [api]
+    api: [arcadedb, clickhouse, litellm, ner, superset, laurium]
+    worker: [arcadedb, clickhouse, ner]
+    report-sync: [api]
+    arcadedb: [arcadedb]
+    clickhouse: [clickhouse, clickhouse-keeper]
+    clickhouse-keeper: [clickhouse-keeper]
+    # Laurium (ADR-135 Amendment 9), rendered only when it is the extraction engine: the gateway alone.
+    laurium: [litellm]
+    # P9's backup and restore pods (ADR-148 Amendment 7), by their own pods' names, each reaching
+    # what its commands call: the backup ArcadeDB's backup and ClickHouse's BACKUP; the restore
+    # ClickHouse's RESTORE alone (ArcadeDB's is from the zip on the Job's own claim, no call). Both
+    # restores ask the cluster's API whether the writers have stopped (`kube-api`, the `kubernetes`
+    # Service), as no other workload may. The claims' runs call none of ours (a claim is a mount);
+    # the backup's reaches S3 and STS alone (`reach.always`).
+    backup: [arcadedb, clickhouse]
+    restore: [kube-api, clickhouse]
+    restore-claims: [kube-api]
+
+# Decision 5 and the platform's quotas: what each container asks for and may use. A namespace on a
+# shared platform may carry a LimitRange, whose defaults are given to exactly the containers that
+# name none: every container here names its requests and its memory limit, so none takes the
+# LimitRange's memory default. CPU is requested, not limited, in the standard shape (a CPU limit
+# throttles a store's compaction and the Conduit's bursts): so a LimitRange's default CPU limit
+# *is* given to each container, and a ResourceQuota on `limits.cpu` refuses its pods outright
+# (ADR-148 Amendment 5; the poc shape names its own below, and the platform team is asked which).
+# **Proposals, not measurements**: no load has been run on the platform (P7a measures them).
+resources:
+  default: {cpu: 100m, memory: 256Mi, memory_limit: 512Mi}  # init containers, and any not named
+  workspace: {cpu: 100m, memory: 128Mi, memory_limit: 256Mi}
+  api: {cpu: 500m, memory: 2Gi, memory_limit: 4Gi}
+  worker: {cpu: 500m, memory: 2Gi, memory_limit: 4Gi}
+  report-sync: {cpu: 100m, memory: 256Mi, memory_limit: 512Mi}
+  ner: {cpu: 250m, memory: 1Gi, memory_limit: 2Gi}
+  superset: {cpu: 250m, memory: 1Gi, memory_limit: 2Gi}
+  litellm: {cpu: 250m, memory: 512Mi, memory_limit: 1Gi}
+  # Laurium 0.6.0, LangChain and spaCy's small English model in one process (ADR-135 Amendment 6).
+  laurium: {cpu: 250m, memory: 1Gi, memory_limit: 2Gi}
+  # Requested at its limit: the store is the last thing a node under pressure should evict.
+  arcadedb: {cpu: "1", memory: 12Gi, memory_limit: 12Gi}
+  clickhouse: {cpu: "1", memory: 8Gi, memory_limit: 8Gi}
+  clickhouse-keeper: {cpu: 100m, memory: 512Mi, memory_limit: 512Mi}
+
+# ArcadeDB's heap, set from its container's memory limit (`-Xmx`, whole GiB, rounded down), so the
+# JVM never grows past what the kubelet allows it: the rest of the limit is the JVM's own (its
+# metaspace, threads and direct buffers). Its readiness cannot see a heap OOM (harness.profiles),
+# so it exits on one.
+arcadedb_heap_fraction: 0.75
+
+# Our Secret (ADR-148 Amendment 5 point 22): read whole (`envFrom`) by the Conduit, the workers and
+# the report sync alone, which read the stores' passwords and the gateway's keys. Superset is given
+# the keys it reads by name (its own key, its sign-in client's secret, the embedding's, the report
+# mart reader's password); the Glass and the recogniser read no secret and get the ConfigMap alone.
+secrets:
+  whole: [api, worker, report-sync]
+  named:
+    superset: [SUPERSET_SECRET_KEY, SUPERSET_OIDC_CLIENT_SECRET, SUPERSET_GUEST_TOKEN_SECRET,
+               SUPERSET_EMBEDDER_PASSWORD, REPORT_MART_READER_PASSWORD]
+
+# The proof-of-concept shape (`cloud_platform.shape: poc`, ADR-148 Amendment 5): the folders that
+# leave the shared claim for a claim of their own. The Ingest root (uploads and the drop folder),
+# so uploads cannot fill the disk the settings files and the recipes are on; removed by name at
+# decommission. The size is a proposal, unmeasured.
+poc:
+  claims:
+    - {name: ingest, folder: ingest, size: 100Gi}
+  # A CPU limit on every container (the standard shape requests CPU and limits none): a namespace's
+  # LimitRange gives its default CPU limit to exactly the containers that name none, and a
+  # ResourceQuota on `limits.cpu` refuses a pod with none, so a namespace whose LimitRange and quota
+  # the platform team has not yet named takes these. Proposals, unmeasured; each at least its
+  # container's request (checked at render).
+  cpu_limits:
+    default: 500m
+    workspace: 500m
+    api: "2"
+    worker: "2"
+    ner: "1"
+    arcadedb: "2"
+    clickhouse: "2"

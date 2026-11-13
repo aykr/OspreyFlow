@@ -20,6 +20,7 @@ import { expect, test } from "@playwright/test";
 import { readdirSync, readFileSync } from "node:fs";
 
 import { checkUndecidedContrast, type ListedFindings } from "./undecidedContrast";
+import { readFindings } from "../src/color/textContrast";
 
 const KEYBOARD = new URL("../keyboard/", import.meta.url);
 const WCAG_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"];
@@ -38,9 +39,16 @@ const EXTRA_STATES: Record<string, string[]> = {
   // ADR-135 Amendment 2: Admin › Models with an engine being added, a key being entered, and a
   // local-only deployment (platform lane P1); Amendment 3: an engine's limits being set, the usage's
   // own days drawn, and the gateway not giving its usage (P2; the usage table is on every other state).
-  "models-harness.html": ["open=add", "open=key", "local=1", "open=limits", "usage=chosen", "usage=fail"],
+  // ADR-135 Amendments 4 and 7 (P11 part 1): on the cloud-platform profile (`cloud=1`, the only one offering
+  // the two kinds), Bedrock chosen in the add form beside an IAM-role engine's row, and the organisation's own
+  // gateway chosen.
+  "models-harness.html": ["open=add", "open=key", "local=1", "open=limits", "usage=chosen", "usage=fail",
+                          "open=add&kind=bedrock&iam=1&cloud=1", "open=add&kind=gateway&cloud=1",
+                          // ADR-135 Amendment 9: the extraction engine Laurium, shown read-only.
+                          "cloud=1&engine=laurium"],  // prettier-ignore
   // ADR-146 decisions 2 and 6: Home with Rules and Monitoring's card and an alert's row.
-  "start-harness.html": ["rights=investigate", "figures=1&rights=investigate,triage_alerts,read_alert_queue"],
+  // ADR-145 Amendment 10: the administration guide refused, its words under its link.
+  "start-harness.html": ["rights=investigate", "figures=1&rights=investigate,triage_alerts,read_alert_queue", "guide=refused"],
   // ADR-147: Admin › Maps with a provider being added, a key being entered and an area being added
   // (platform lane P3), and with the basemap built, the glyphs installed and an area run.
   "maps-harness.html": ["open=add", "open=key", "open=area", "built=1"],
@@ -81,6 +89,8 @@ const EXTRA_STATES: Record<string, string[]> = {
   "rule-standards-harness.html": ["open=1", "open=1&file=other"],
   // ADR-145 Amendment 2: the column's fresh-page default, the Inspector alone open.
   "panel-frames-harness.html": ["defaults=1"],
+  // ADR-132 Amendment 7: the deployment's own banner words, in the dark, light and GOV.UK scans.
+  "shell-harness.html": ["banner=1", "banner=alone", "host=demo.service.gov.uk"],
   // L2.3 part 1: the case screen's lightening, each prototype variant (the default is variant a).
   "case-screen-options-harness.html": ["variant=today", "variant=b", "variant=c"],
   // ADR-144 (L3.2b): case views as another member sees them, the Save as a view form, and the banner
@@ -204,6 +214,8 @@ const EXTRA_STATES: Record<string, string[]> = {
     // The lane review of L1.6: the wizard's read step for each kind of connection.
     "view=wizard&serve=1&connection=c-sql&step=1", "view=wizard&serve=1&connection=c-api&step=1",
     "view=wizard&serve=1&connection=c-json&step=1",
+    // L1.9 (ADR-148): the read step over an S3 bucket and over Athena.
+    "view=wizard&serve=1&connection=c-s3&step=1", "view=wizard&serve=1&connection=c-athena&step=1",
     // ADR-145 Amendment 4 decision 12 (L1.8): the lists and a source's page to someone holding no Studio
     // right, each action described by why and who can.
     "serve=1&rights=none", "view=source&serve=1&rights=none",
@@ -245,7 +257,8 @@ const EXTRA_STATES: Record<string, string[]> = {
   // every section in the side list, a coming placeholder open.
   // L2.7 (ADR-145 decision 11): Needs you drawn open, its entries and their tips; the Studio with
   // two proposed link types, its Model tab's count and the reminder above the other tabs.
-  "needs-you-harness.html": ["open=1"],
+  // ADR-110 Amendment 19: the reader's own scheduled loads' notices, and the line saying how many more.
+  "needs-you-harness.html": ["open=1", "open=1&notices=1"],
   "admin-harness.html": [
     "open=connections&rights=administer_system",
     "rights=manage_people,manage_dashboards,operate_schedules,administer_system,manage_ontology,read_audit&open=Uploads%20(coming)",
@@ -261,6 +274,8 @@ const EXTRA_STATES: Record<string, string[]> = {
     // transfers, and Roles: the lists, a role's form, a team with its lead and cover.
     "rights=manage_people&serve=people",
     "rights=manage_people&serve=people&show=disable",
+    // ADR-148 Amendment 8: People on Entra ID sign-in, its words and Add by object id.
+    "rights=manage_people&serve=people&show=entra",
     "rights=manage_people&serve=people&open=Roles",
     "rights=manage_people&serve=people&open=Roles&show=role-form",
     "rights=manage_people&serve=people&open=Roles&show=team",
@@ -277,6 +292,9 @@ const EXTRA_STATES: Record<string, string[]> = {
     // listed and the form's SQL fields drawn.
     "rights=administer_system&serve=policies&open=Grading%20scheme",
     "rights=administer_system&serve=connections&open=Connections&show=sql",
+    // L1.9 (ADR-148): the S3 and Athena forms, their cloud role's words, and their rows in the table.
+    "rights=administer_system&serve=connections&open=Connections&show=s3",
+    "rights=administer_system&serve=connections&open=Connections&show=athena",
   ],
 };
 
@@ -287,11 +305,10 @@ const EXTRA_STATES: Record<string, string[]> = {
 // too). Fixed ones come off; a new one is never added to make a run green. The owners, by page:
 // the map's attribution chip over the map's canvas (platform); the case screen's variant b ⋯ and
 // places' open More views under GOV.UK (shell); the boards' handles and labels where a link line or
-// another item lies at them (case); Show as BPMN's words on the drawing's task box, in its dialog and
-// in the rule editor (rules-b, L2.11a's own); Home's key cap at `opacity: 0.8` (home).
-const CONTRAST_FINDINGS = JSON.parse(
-  readFileSync(new URL("./contrastFindings.json", import.meta.url), "utf8"),
-) as Record<string, ListedFindings>;
+// another item lies at them (case); Home's key cap at `opacity: 0.8` (home). Show as BPMN's words, once listed, measure on their task box since T3b.
+const CONTRAST_FINDINGS: Record<string, ListedFindings> = readFindings(
+  JSON.parse(readFileSync(new URL("./contrastFindings.json", import.meta.url), "utf8")),
+);
 
 const pages = readdirSync(KEYBOARD).filter((name) => name.endsWith(".html")).sort();
 

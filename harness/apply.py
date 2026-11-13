@@ -60,7 +60,14 @@ import yaml
 from pydantic import ValidationError
 
 from demo_fixtures.datasets import domains_for
-from harness import ingest_uploads, model_downloads, store_volumes, tls_check
+from harness import (
+    access_key,
+    compose_env,
+    ingest_uploads,
+    model_downloads,
+    store_volumes,
+    tls_check,
+)
 from harness.keycloak_admin import (
     grant_service_account_roles,
     set_demo_admin_password,
@@ -97,6 +104,7 @@ from harness.site import (
     TLS_FINGERPRINT_FILE,
     answer_localhost_with_loopback,
     answer_the_deployment_here,
+    carry_the_pass,
     sites,
 )
 from schemas.deployment import OspreyConfig, Profile, generated_folder
@@ -119,12 +127,34 @@ class ApplyFailed(RuntimeError):
         super().__init__(f"{stage}: {detail}")
 
 
+def _carry_the_key(stage: Path, out_dir: Path, config: OspreyConfig) -> None:
+    """ADR-114 Amendment 41: the shared key, newly set or in place, carried into the stage for
+    preflight and the move, the proxy's account's; a folder in its place refused in words."""
+    try:
+        access_key.carry_into(stage, out_dir, access_key.proxy_owner(config))
+    except access_key.KeyRefused as refused:
+        raise ApplyFailed("access-key", str(refused)) from None
+
+
 def move_into_place(stage: Path, out_dir: Path) -> None:
     """The staged files copied over the deployment's folder, which keeps its own mode: `copytree`
     also copies the stage folder's mode onto it, so a named deployment's folder, made `700` by the
-    command because it holds `deployment.env` (ADR-138), became `755` (found at step 11b)."""
+    command because it holds `deployment.env` (ADR-138), became `755` (found at step 11b).
+
+    **`deployment.env` is replaced whole, last** (`harness.atomic.replace_whole`): `copytree`
+    truncates and rewrites each file it copies, so a crash or a full disk part way would have torn
+    the live secrets (the lane review of the carries). Every other file is copied as before: a file
+    a container mounts on its own must keep its inode."""
+    from harness.atomic import replace_whole
+
     mode = out_dir.stat().st_mode & 0o777 if out_dir.is_dir() else None
-    shutil.copytree(stage, out_dir, dirs_exist_ok=True)
+    secrets = stage / "deployment.env"
+    shutil.copytree(
+        stage, out_dir, dirs_exist_ok=True,
+        ignore=lambda folder, _names: ["deployment.env"] if Path(folder) == stage else [],
+    )  # fmt: skip
+    if secrets.is_file():
+        replace_whole(out_dir / "deployment.env", secrets.read_bytes(), mode=0o600)
     if mode is not None:
         out_dir.chmod(mode)
 
@@ -231,7 +261,8 @@ def provider_secret_lines(
     held = _env_pairs(previous)
     in_gateway = held.get(KEYS_IN_GATEWAY) == "yes"
     lines: list[str] = [f"{KEYS_IN_GATEWAY}=yes\n"] if in_gateway else []
-    for provider in config.models.enabled_providers:
+    # An engine signed in by the gateway's own IAM role keeps no key (ADR-135 Amendment 4).
+    for provider in config.models.keyed_providers:
         variable = config.models.key_variable(provider.name)
         key = environ.get(variable, "") or held.get(variable, "")
         if not key and in_gateway:
@@ -810,7 +841,16 @@ def preflight(context: PreflightContext) -> None:
 def own_published_ports(compose_file: Path) -> set[int]:
     """The host ports the deployment's own running containers publish, as Compose itself reports
     them (`ps --format json`, each container's `Publishers`). Empty when nothing of it runs, or
-    when Docker cannot be asked — then every port is checked as on a first install."""
+    when Docker cannot be asked — then every port is checked as on a first install.
+
+    **A compose file Compose cannot read** (a required value `deployment.env` does not hold: the
+    v0.5.0 upgrade rehearsal's lockout) is not asked: Docker itself is, by the project's label
+    (`docker ps`), which needs no compose file. Apply then goes on and renders the file again, which
+    keeps or mints every value it needs: it is the way out of the lockout (ADR-114 Amendment 39
+    decision 1), so it never refuses here (the lane review of the carries, items 2 and 3)."""
+    missing = compose_env.unset_required(compose_file.parent)
+    if missing:
+        return _ports_by_label(compose_env.project(compose_file.parent))
     try:
         out = _run(_compose(compose_file) + ["ps", "--format", "json"], stage="preflight")
     except ApplyFailed:
@@ -831,6 +871,21 @@ def own_published_ports(compose_file: Path) -> set[int]:
             if port:
                 found.add(port)
     return found
+
+
+def _ports_by_label(project: str) -> set[int]:
+    """The host ports a compose project's running containers publish, asked of Docker by the
+    project's label (`docker ps`, each container's `Ports`: `0.0.0.0:8090->8090/tcp, …`). Empty
+    when Docker cannot be asked."""
+    try:
+        out = _run(
+            ["docker", "ps", "--filter", f"label=com.docker.compose.project={project}",
+             "--format", "{{.Ports}}"],
+            stage="preflight",
+        )  # fmt: skip
+    except ApplyFailed:
+        return set()
+    return {int(port) for port in re.findall(r":(\d+)->", out)}
 
 
 def _services(folder: Path) -> dict[str, Any]:
@@ -959,7 +1014,7 @@ def _keys_for_new_providers(
     # ADR-135 Amendment 2: once keys live in the gateway, one is set in Admin › Models or with
     # `ospreyflow models key`; apply takes one only from the terminal, and never asks.
     in_gateway = held.get(KEYS_IN_GATEWAY) == "yes"
-    for provider in config.models.enabled_providers:
+    for provider in config.models.keyed_providers:  # none for an IAM-role engine (ADR-135 Am 4)
         variable = config.models.key_variable(provider.name)
         terminal = f"OSPREY_MODEL_KEY_{provider.name.upper()}"
         if held.get(variable):
@@ -1129,6 +1184,8 @@ def reapply(
             environ={**_held_as_environ(held), **environ, **keys},
         )
         _keep_the_version(stage, out_dir, held)
+        # ADR-114 Amendment 41: the shared key, newly set or in place, moved with the rest.
+        _carry_the_key(stage, out_dir, config)
         preflight(
             PreflightContext(
                 config=config, out_dir=stage, own_ports=frozenset(own_published_ports(compose_file))
@@ -1153,6 +1210,7 @@ def reapply(
         # `copytree` copies each file's mode with it, so `deployment.env` arrives `600` (ADR-137
         # decision 2) over a file that was looser.
         move_into_place(stage, out_dir)
+        access_key.settle(out_dir, access_key.proxy_owner(config))
     finally:
         shutil.rmtree(stage, ignore_errors=True)
     # Whether or not anything restarts: a deployment installed before the upload folder was made the
@@ -1533,6 +1591,7 @@ def main(
     # and a server's own names, with its own certificate trusted, before the organisation's DNS.
     answer_localhost_with_loopback()
     answer_the_deployment_here(config)
+    carry_the_pass(config, out_dir)
     if args.keycloak_url is None:
         args.keycloak_url = sites(config).identity
 
@@ -1556,6 +1615,8 @@ def main(
             environ=environ,
         )
         rendered, env_path = staged.rendered, out_dir / SECRETS_FILE
+        # ADR-114 Amendment 41: the shared key, newly set or in place, moved with the rest.
+        _carry_the_key(stage, out_dir, config)
         secret, admin_password = staged.client_secret, staged.admin_password
         demo_analyst_password = staged.demo_analyst_password
         demo_admin_password = staged.demo_admin_password
@@ -1568,6 +1629,7 @@ def main(
             # ADR-114 Amendment 35 point 7: held, so a refused move of the stores puts them back.
             held = store_volumes.FilesHeld(out_dir)
             move_into_place(stage, out_dir)
+            access_key.settle(out_dir, access_key.proxy_owner(config))
         finally:
             shutil.rmtree(stage, ignore_errors=True)
         result.record("preflight", "all checks pass or skip")

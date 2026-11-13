@@ -894,6 +894,9 @@ export const MODELS_ACTIONS = defineActionRegistry("MODELS_ACTIONS", [
   // ADR-135 Amendment 3: an engine's limits and the gateway's usage.
   "set-a-model-engines-limits-by-keyboard",
   "choose-the-model-usage-period-by-keyboard",
+  // ADR-135 Amendment 4 (P11 part 1): the two engine kinds of the cloud-platform profile.
+  "add-bedrock-by-iam-role-by-keyboard",
+  "add-the-organisations-gateway-by-keyboard",
 ] as const);
 
 // ADR-147: Admin › Maps (platform lane P3).
@@ -932,6 +935,8 @@ export const ADMIN_ACTIONS = defineActionRegistry("ADMIN_ACTIONS", [
   "ask-the-system-again-by-keyboard",
   // ADR-114 Amendment 5 (B4c): people.
   "invite-a-person-by-keyboard",
+  // ADR-148 Amendment 8: on Entra ID sign-in, a person added by object id.
+  "add-a-person-by-object-id-by-keyboard",
   "edit-a-persons-access-by-keyboard",
   "disable-and-enable-a-person-by-keyboard",
   "reset-a-persons-sign-in-by-keyboard",
@@ -989,6 +994,9 @@ export const ADMIN_ACTIONS = defineActionRegistry("ADMIN_ACTIONS", [
   "name-a-sql-connection-by-keyboard",
   "name-a-json-connection-by-keyboard",
   "test-a-connection-by-keyboard",
+  // L1.9 (ADR-148): an Amazon S3 bucket and Amazon Athena, each with no field for a key.
+  "name-an-s3-connection-by-keyboard",
+  "name-an-athena-connection-by-keyboard",
   "copy-the-grading-change-command-by-keyboard",
   "read-a-roles-tip-by-keyboard",
   "read-a-teams-lead-tip-by-keyboard",
@@ -1032,6 +1040,8 @@ export const INGEST_STUDIO_ACTIONS = defineActionRegistry("INGEST_STUDIO_ACTIONS
   // ADR-140 Amendment 4: registered sources.
   "register-a-source-by-keyboard",
   "edit-a-sources-governance-by-keyboard",
+  // ADR-140 Amendment 19 (studio carries): a source's declared default marking.
+  "declare-a-sources-default-marking-by-keyboard",
   "re-profile-a-source-and-open-it-in-a-pipeline-by-keyboard",
   "use-a-registered-source-in-a-pipeline-by-keyboard",
   // ADR-140 Amendment 6: phase 3's exit, a file registered and used in a new pipeline, no marking asked.
@@ -1087,6 +1097,8 @@ export const INGEST_STUDIO_ACTIONS = defineActionRegistry("INGEST_STUDIO_ACTIONS
   // ADR-140 Amendment 9 decision 4 (L1.7): Studio › Releases.
   "export-a-release-by-keyboard",
   "check-and-import-a-release-by-keyboard",
+  // CARRIES row 90 (studio carries): the importer's own model draft replaced only once confirmed.
+  "replace-own-draft-on-import-by-keyboard",
   // ADR-141 decisions 6, 9 and 11 (L1.7): the Runs tab's external orchestration.
   "hand-a-pipeline-to-an-orchestrator-by-keyboard",
   "read-a-pipelines-airflow-dag-by-keyboard",
@@ -1107,6 +1119,9 @@ export const START_ACTIONS = defineActionRegistry("START_ACTIONS", [
   "return-to-start-from-the-mark-by-keyboard",
   // ADR-115 E3: Home's G, I and A.
   "open-a-place-from-home-with-its-key",
+  // ADR-145 Amendment 10: the guide under each card, opened in a new tab, and a refusal said in words.
+  "read-a-place-s-guide-from-home-by-keyboard",
+  "read-why-a-guide-was-refused-on-home-by-keyboard",
 ] as const);
 
 // ADR-115 E6: the workspace's welcome panel.
@@ -1258,10 +1273,20 @@ export const SOURCES_CONNECTORS_ACTIONS = defineActionRegistry("SOURCES_CONNECTO
   "register-a-source-through-a-json-connection-by-keyboard",
   "unsubscribe-a-dataset-from-a-screening-list-by-keyboard",
   "refresh-a-screening-list-by-hand-only-by-keyboard",
+  // L1.9 (ADR-148): an S3 folder and format, Athena's table and a named query.
+  "register-a-source-through-an-s3-connection-by-keyboard",
+  "register-a-source-through-an-athena-table-by-keyboard",
+  "register-a-source-through-an-athena-named-query-by-keyboard",
 ] as const);
 
 // ADR-145 Amendment 4 decision 12 (L1.8): the Studio's who-can tips and its door to the help page.
 export const STUDIO_TIPS_ACTIONS = defineActionRegistry("STUDIO_TIPS_ACTIONS", [
   "reach-a-refused-studio-actions-tip-by-keyboard",
   "open-roles-teams-and-authors-from-the-studio-by-keyboard",
+] as const);
+
+// ADR-148 Amendment 8 (P10 part 2): the top bar when the Conduit cannot say who the person is.
+export const ACCOUNT_UNREAD_ACTIONS = defineActionRegistry("ACCOUNT_UNREAD_ACTIONS", [
+  "try-reading-the-account-again-by-keyboard",
+  "sign-out-with-no-account-read-by-keyboard",
 ] as const);

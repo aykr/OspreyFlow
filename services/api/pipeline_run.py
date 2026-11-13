@@ -52,6 +52,7 @@ from services.api.review import (
 from services.api.rule_evaluation import RuleGate
 from services.api.run_source import branch_location as _branch_location
 from services.api.run_source import pipeline_of, topological
+from services.api.sources import SourceStore
 from services.api.studio_publish import (
     LoadSink,
     after_the_load,
@@ -61,6 +62,7 @@ from services.api.studio_publish import (
 )
 from services.api.studio_staging import (
     dataset_reference_lists,
+    declared_markings,
     row_reader,
     source_tables,
     subscribed_in,
@@ -70,7 +72,11 @@ from services.extract.candidates import ExtractionCandidate
 from services.extract.recognised import recognised_candidates
 from services.extract.writer import write_candidate
 from services.geocoder.match import match_place_mention
-from services.ingest.ceiling import DeploymentCeiling, refuse_fixed_markings_above_the_ceiling
+from services.ingest.ceiling import (
+    AboveTheDeploymentCeiling,
+    DeploymentCeiling,
+    refuse_fixed_markings_above_the_ceiling,
+)
 from services.ingest.engine import distinct_markings
 from services.ingest.geometries import POINT_GEOMETRY_VERSION
 from services.ingest.metering import StagingMeter
@@ -82,7 +88,11 @@ from services.ingest.pipeline import (
 )
 from services.ingest.recipe_rules import RecipeRuleError
 from services.ingest.reference_list_import import lists_for_run
-from services.ingest.staged_run import finish_staged_report, prepare_staged_load
+from services.ingest.staged_run import (
+    finish_staged_report,
+    prepare_staged_load,
+    remove_step_tables_on,
+)
 from services.ingest.staging import ObjectStorageConfig
 from services.ingest.staging_catalogue import StagingError
 from services.ingest.watermark import RefreshRead
@@ -521,6 +531,7 @@ async def _run_staged_branch(
     storage: ObjectStorageConfig,
     meter: StagingMeter | None,
     list_store: ListStore | None = None,
+    source_store: SourceStore | None = None,
 ) -> BranchRunReport:
     """A staged pipeline's one load (ADR-140 Amendment 12): every source node's whole file read
     by a load of its own (`<load_id>:<node id>`), new for each run, so no two runs share a raw
@@ -537,10 +548,13 @@ async def _run_staged_branch(
     # before the step tables are written; `run_recipe` judges every row again before its own writes.
     refuse_fixed_markings_above_the_ceiling(recipe, DeploymentCeiling.from_env())
     references = await dataset_reference_lists(models, draft.dataset_id, storage, lists=list_store)
+    # ADR-140 Amendment 19: each source's declared default marking, read for this run.
+    declared = await declared_markings(source_store, draft.dataset_id, scheme)
     try:
         read = await asyncio.to_thread(
-            source_tables, draft, pipeline, load_id=load_id, location=source_location
-        )
+            source_tables, draft, pipeline, load_id=load_id, location=source_location,
+            declared=declared,
+        )  # fmt: skip
         lists = await asyncio.to_thread(
             lists_for_run,
             recipe.staging,
@@ -563,21 +577,27 @@ async def _run_staged_branch(
         )
     except StagingError as refused:
         raise RecipeRuleError(refused.problems) from refused
-    branch, events, held = await load_with_rules(
-        recipe,
-        prepared.rows,
-        principal,
-        graph=graph,
-        ontology=ontology,
-        load_id=load_id,
-        investigation_scope=investigation_scope,
-        source=prepared.table.name,
-        media=media,
-        rules=rules,
-        scheme=scheme,
-        sink=sink,
-        staged=prepared,
-    )
+    try:
+        branch, events, held = await load_with_rules(
+            recipe,
+            prepared.rows,
+            principal,
+            graph=graph,
+            ontology=ontology,
+            load_id=load_id,
+            investigation_scope=investigation_scope,
+            source=prepared.table.name,
+            media=media,
+            rules=rules,
+            scheme=scheme,
+            sink=sink,
+            staged=prepared,
+        )
+    except AboveTheDeploymentCeiling as refused:
+        # ADR-148 Amendment 3 point 2: a marking a column sets is judged by `run_recipe`, after the
+        # step tables were written; a load its row check refuses leaves none of them behind.
+        await remove_step_tables_on(refused, prepared, storage)
+        raise
     finish_staged_report(branch, prepared)
     if meter is not None:
         meter.add(prepared.rows_staged, prepared.parquet_bytes)
@@ -624,6 +644,7 @@ async def run_published_pipeline(
     staging_storage: ObjectStorageConfig | None = None,
     staging_meter: StagingMeter | None = None,
     list_store: ListStore | None = None,
+    source_store: SourceStore | None = None,
 ) -> PipelineRunReport:
     """The whole pipeline, in topological order: branches, then extracts, then enriches.
 
@@ -642,6 +663,10 @@ async def run_published_pipeline(
     carry its own — the same "today's fresh export" override `run_published_recipe` has, applied
     to the sources that read the draft's own recorded location. A source node carrying its own
     `source_location` in its config keeps it.
+
+    `source_store`: the dataset's registered sources, whose declared default markings an unmarked
+    table's rows carry before a join (ADR-140 Amendment 19). None: none is carried, so a Join of
+    an unmarked table to a marked one is refused (fail closed).
 
     `alerts`: the alerts' repoint journal, which each enrich stage's supersedes go through (ADR-109
     Amendment 11), whether or not the run has a rule gate."""
@@ -705,6 +730,7 @@ async def run_published_pipeline(
                 storage=staging_storage or ObjectStorageConfig.from_env(),
                 meter=staging_meter,
                 list_store=list_store,
+                source_store=source_store,
             )
         )
     for node in ordered:

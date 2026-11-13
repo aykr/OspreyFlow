@@ -4,7 +4,8 @@ each engine's limits and the usage the gateway recorded.
 
 **No model here has a field that can hold a key** except `KeyInput`, which the Conduit reads as a
 `SecretStr` and never returns. A key's record is when and by whom it was set; its state is "set",
-"none" or "lost" (the gateway no longer holds it, ADR-135 Amendment 2 decision 9).
+"none" or "lost" (the gateway no longer holds it, ADR-135 Amendment 2 decision 9), or "iam_role" for
+an engine that signs in by the gateway's own IAM role and keeps no key (ADR-135 Amendment 4).
 """
 
 from __future__ import annotations
@@ -14,9 +15,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
-from schemas.deployment import ModelProviderConfig
+from schemas.deployment import EngineKind, ModelProviderConfig
 
-KeyState = Literal["set", "none", "lost"]
+#: `iam_role`: the engine signs in by the gateway's own IAM role (ADR-135 Amendment 4), so it has no
+#: key to set, lose or remove.
+KeyState = Literal["set", "none", "lost", "iam_role"]
 ModelAdminAction = Literal[
     "engine_added",
     "engine_edited",
@@ -35,6 +38,11 @@ ConnectionOutcome = Literal[
     "gateway_token",
     "key_refused",
     "model_not_offered",
+    # ADR-135 Amendment 7 decision 5: Bedrock's model access not granted, its sign-in expired, and a
+    # client gateway's 4xx in a shape that is not OpenAI's.
+    "model_not_enabled",
+    "sign_in_expired",
+    "request_refused",
     "cooling_down",
     "rate_limited",
     "unreachable",
@@ -42,6 +50,8 @@ ConnectionOutcome = Literal[
 
 
 BudgetPeriod = Literal["day", "month"]
+#: What every profile but `cloud-platform` offers (ADR-135 Amendment 7 decision 1).
+_PROVIDER_ONLY: tuple[EngineKind, ...] = ("provider",)
 
 
 class EngineLimits(BaseModel):
@@ -75,6 +85,10 @@ class AdminEngine(BaseModel):
     #: The roles this engine is the default for.
     default_for: list[str] = Field(default_factory=list)
     limits: EngineLimits = Field(default_factory=EngineLimits)
+    #: On `cloud-platform`, an engine the render made no way out (or, for Bedrock, no role) for,
+    #: as a restored models file can hold: "not made by the render: <words>". Such an engine is
+    #: never written into the gateway nor offered to analysts (ADR-135 Amendment 8).
+    not_made: str | None = None
 
 
 class ModelsAdminView(BaseModel):
@@ -92,6 +106,12 @@ class ModelsAdminView(BaseModel):
     #: Where the settings come from: `osprey.yaml` until the first change here, then the
     #: models file.
     source: Literal["osprey.yaml", "models file"]
+    #: The kinds of engine this deployment's profile takes (ADR-135 Amendment 7 decision 1): a
+    #: provider alone, or on `cloud-platform` also the client's gateway and Bedrock in London.
+    engine_kinds: list[EngineKind] = Field(default_factory=lambda: list(_PROVIDER_ONLY))
+    #: ADR-135 Amendment 5 decision 2 and Amendment 9: the extraction engine the deployment was
+    #: rendered with, chosen at set-up (`osprey.yaml`), read-only here.
+    extraction_engine: Literal["deep_read", "laurium"] = "deep_read"
 
 
 class EngineInput(BaseModel):

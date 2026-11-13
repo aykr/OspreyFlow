@@ -1,0 +1,1161 @@
+"""`profile: cloud-platform` (`spec/06_DECISIONS.md` ADR-148): the chart's values for a namespace
+on a shared Kubernetes platform someone else runs, and the Terraform for that namespace's AWS
+resources, in the shape its environments repository takes, for a person to raise as a pull request.
+
+**Translated from the cluster's values, not written again**, as the cluster's are from compose
+(`harness/cluster.py`): every workload is the one a cluster runs, and this module changes only what
+the platform changes (ADR-148's decisions):
+
+- 1: no cluster and no VPC are made; the namespace exists. `deploy/generated/cloud-platform/` holds
+  `values.yaml`, `versions.lock` and `terraform/`.
+- 2: the platform's ingress is the front door; no Caddy, and no Service is a load balancer.
+- 3: every pod runs as 10001:10001, non-root, no privilege escalation, every capability dropped.
+- 4: RDS, ElastiCache, OpenSearch and S3 replace ours; each detail is read from the secret the
+  namespace's Terraform writes (the platform settings name them), never rendered into a file.
+- 5: ArcadeDB 3, ClickHouse 2, Keeper 3 in production, one of each in development, on the
+  platform's ReadWriteOnce class, each with a disruption budget allowing one copy down.
+- 7: the platform's Calico deny-egress policy, and an allow policy for the managed stores, the
+  cluster's DNS and each host an enabled feature reaches (by its declared networks).
+- 8: every image from the deployment's registry, by the digest it was copied with.
+- 11 (as far as this step needs it): no local model and no Whisper; the gateway always (P11 part 2),
+  its model hosts allowed out only while an engine is enabled.
+
+**The shared folders until P8** (the orchestrator's acceptance, 10 November 2026; ADR-148 decision 6
+and its open questions 1 and 2 move them to S3 and Postgres): one ReadWriteOnce claim holds them,
+and every pod that mounts it is placed on the node that holds it (a required pod affinity), so two
+Conduits still read one folder. It is not spread across nodes; P8 removes it (a CARRIES row).
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import re
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from harness.cloud_platform.settings import (
+    KUBE_API,
+    PlatformSettings,
+    ProfileSettings,
+    load_platform,
+    load_profile,
+)
+from harness.images import DigestResolver, ServiceImage
+from schemas.deployment import (
+    ENGINES_AS,
+    AnalyticsEngine,
+    CloudPlatformConfig,
+    GraphStore,
+    OspreyConfig,
+    Profile,
+    SearchBackend,
+    connector_address,
+)
+
+#: ADR-148 decision 3: the one numeric user every pod runs as.
+UID = 10001
+
+#: What a cluster runs that this profile does not: Caddy (decision 2), the local models (11), and
+#: Keycloak: people sign in with Entra ID directly (decision 9; Amendment 8).
+NOT_RENDERED = frozenset(
+    {"proxy", "ollama", "ollama-models", "whisper", "whisper-models", "keycloak"}
+)
+
+#: The realm's settings a cluster's Conduit reads, which Entra ID sign-in has no use for: the token
+#: exchange and the realm's users (owner resolution is unavailable on Entra; Admin › People keeps
+#: roles in the deployment's own store) and the realm's public address (Amendment 8).
+REALM_SETTINGS = frozenset(
+    {"OIDC_TOKEN_EXCHANGE_URL", "OIDC_TOKEN_EXCHANGE_CLIENT_ID", "OIDC_ADMIN_USERS_URL",
+     "OSPREY_IDENTITY_ORIGIN"}
+)  # fmt: skip
+#: Our Secret's keys only the realm, or the Conduit's exchange with it, reads.
+REALM_SECRETS = frozenset(
+    {"OSPREY_KEYCLOAK_ADMIN", "OSPREY_KEYCLOAK_ADMIN_PASSWORD", "OSPREY_KEYCLOAK_DB_PASSWORD",
+     "OIDC_TOKEN_EXCHANGE_CLIENT_SECRET"}
+)  # fmt: skip
+#: The realm's own files (its export and its login theme), which only Keycloak mounts.
+REALM_FILES = ("realm.json", "theme--")
+
+#: What reads the managed stores' details: only these are given them (a pod that reads the whole
+#: env, as the workspace's nginx does, is not handed the database's password for that).
+READERS = frozenset({"api", "worker", "report-sync", "superset"})
+
+#: Decision 5: one of each in development.
+DEVELOPMENT_REPLICAS = {
+    "workspace": 1, "api": 1, "report-sync": 1, "superset": 1, "worker": 1,
+    "arcadedb": 1, "clickhouse": 1, "clickhouse-keeper": 1,
+}  # fmt: skip
+
+#: The stores' writable folders that are not on a claim of their own: a folder of the pod's own
+#: (measured on the test server, `process/lanes/platform/gates/p7_uid_proof.sh`: as 10001 each
+#: image's own folder is not writable).
+SCRATCH: dict[str, list[str]] = {
+    "arcadedb": ["/home/arcadedb/log", "/home/arcadedb/backups", "/home/arcadedb/replication"],
+    "clickhouse": ["/var/log/clickhouse-server"],
+    # Keeper's start checks its data folder, its claim's parent, is its own (measured: refused).
+    "clickhouse-keeper": ["/var/log/clickhouse-keeper", "/var/lib/clickhouse"],
+}
+
+#: Decision 5: long enough for ArcadeDB to close its databases.
+GRACE_SECONDS = {"arcadedb": 120, "clickhouse": 60, "clickhouse-keeper": 30}
+
+#: The label every pod that mounts the shared folders carries, which their affinity follows.
+SHARED_LABEL = "ospreyflow.io/shared"
+
+#: The doors, the images of ours, group 0's workloads, the hosts every render reaches and each
+#: container's resources are data, in `profile.yaml` (`settings.load_profile`), so a later step
+#: adds a row there rather than editing this module (ADR-148 Amendment 1 item 11).
+
+CORE = Path(__file__).resolve().parents[2]
+#: Where the Ingress's settings are read from, so they follow their sources, never a copy of them:
+#: the Glass's own proxy's timeouts for the Conduit's routes (its WebSocket among them), and the
+#: Conduit's upload cap.
+WORKSPACE_NGINX = CORE / "apps" / "workspace" / "nginx.conf.template"
+CONDUIT_UPLOADS = CORE / "services" / "api" / "ingest_sources.py"
+#: The variable a deployment may set the upload cap by (`ingest_sources.max_upload_bytes`).
+UPLOAD_CAP_VARIABLE = "OSPREY_INGEST_MAX_UPLOAD_BYTES"
+
+_BANNER = (
+    "# Generated by harness.render from osprey.yaml (profile: cloud-platform) — do not edit by\n"
+    "# hand. helm install ospreyflow <chart> -n <namespace> -f values.yaml, into the namespace\n"
+    "# the platform's team created (ADR-148). No secret is here: the managed stores' details\n"
+    "# are read from the secrets the namespace's Terraform (terraform/) writes.\n"
+)
+
+
+class CloudPlatformNotRenderable(ValueError):
+    """The configuration asks for something the platform cannot run; the message says what."""
+
+
+def _cp(config: OspreyConfig) -> CloudPlatformConfig:
+    assert config.cloud_platform is not None  # the profile's validator requires it
+    return config.cloud_platform
+
+
+def _refuse(config: OspreyConfig) -> None:
+    if config.map is None:
+        raise CloudPlatformNotRenderable(
+            "the Conduit reads its basemaps from osprey.yaml's map: section at start and cannot "
+            "start without one, and this profile has no install to write it: declare map:"
+        )
+    if config.components.analytics_engine is not AnalyticsEngine.CLICKHOUSE:
+        raise CloudPlatformNotRenderable(
+            "a cloud platform's Conduits share ClickHouse (ADR-148 decision 5); set "
+            "components.analytics_engine: clickhouse"
+        )
+    if config.components.graph_store is not GraphStore.ARCADEDB:
+        raise CloudPlatformNotRenderable(
+            "a cloud platform runs ArcadeDB (ADR-148 decision 5); components.graph_store is "
+            f"{config.components.graph_store.value!r}"
+        )
+    cp = config.cloud_platform
+    if (
+        cp is not None
+        and cp.shape == "poc"
+        and config.components.search is SearchBackend.OPENSEARCH
+    ):
+        raise CloudPlatformNotRenderable(
+            "the poc shape makes no OpenSearch domain (ADR-148 Amendment 5), so its Conduit would "
+            "reach for one that is not there: set components.search: postgres-fulltext"
+        )
+    if config.components.source_path is not None:
+        raise CloudPlatformNotRenderable(
+            "a cloud platform pulls its images from its registry; components.source_path asks "
+            "to build them here"
+        )
+    if not config.network.public_origin.startswith("https://"):
+        raise CloudPlatformNotRenderable("a cloud platform is reached over HTTPS")
+    if config.reporting.sync or config.reporting.superset:
+        # The orchestrator's ruling (a), P10 part 2: both signed in through Keycloak, which this
+        # profile does not render; each gets Entra ID's sign-in in its own later step (CARRIES).
+        raise CloudPlatformNotRenderable(
+            "report sync and Superset are not on this profile yet: they signed in through "
+            "Keycloak, and people sign in with Entra ID here; their own step after P10 (reporting "
+            "on Entra ID) brings them. Set reporting.sync and reporting.superset to false"
+        )
+    claims = _cp(config).claims
+    if claims is None:
+        raise CloudPlatformNotRenderable(
+            "people sign in with Entra ID on this profile (ADR-148 decision 9): declare "
+            "cloud_platform.claims (the tenant, the Glass's and the API's app registrations, where "
+            "each claim comes from and the first administrators)"
+        )
+    from principal_auth import ClaimMapping
+
+    try:
+        ClaimMapping.model_validate(claims.claim_mapping())
+    except ValueError as error:
+        raise CloudPlatformNotRenderable(
+            f"cloud_platform.claims cannot be read as a claim mapping: {error}"
+        ) from None
+
+
+def entra_settings(config: OspreyConfig) -> dict[str, str]:
+    """What the Conduit, the workers and Superset read to sign people in with Entra ID (ADR-148
+    Amendment 8): the issuer, audience and keys of the API's tokens, the claim mapping
+    (`OSPREY_CLAIM_MAPPING`, `principal_auth.ClaimMapping`) and the first administrators."""
+    claims = _cp(config).claims
+    assert claims is not None  # `_refuse`
+    return {
+        "OSPREY_IDENTITY_PROVIDER": "entra",
+        "OIDC_ISSUER": claims.issuer,
+        "OIDC_AUDIENCE": claims.audience,
+        "OIDC_JWKS_URL": claims.jwks_url,
+        "OSPREY_CLAIM_MAPPING": json.dumps(claims.claim_mapping(), sort_keys=True),
+        "OSPREY_FIRST_ADMINISTRATORS": ",".join(claims.first_administrators),
+        "SUPERSET_SIGN_IN": "entra",
+    }
+
+
+#: Each variable a workload reads that a managed store's secret gives: (store, the secret's key).
+def managed_variables(config: OspreyConfig) -> dict[str, tuple[str, str]]:
+    variables = {
+        "POSTGRES_HOST": ("postgres", "host"),
+        "POSTGRES_PORT": ("postgres", "port"),
+        "POSTGRES_USER": ("postgres", "user"),
+        "OSPREY_POSTGRES_USER": ("postgres", "user"),
+        "POSTGRES_PASSWORD": ("postgres", "password"),
+        "OSPREY_POSTGRES_PASSWORD": ("postgres", "password"),
+        "POSTGRES_DB": ("postgres", "database"),
+        "OSPREY_POSTGRES_DB": ("postgres", "database"),
+        "VALKEY_HOST": ("redis", "host"),
+        "VALKEY_PORT": ("redis", "port"),
+        "VALKEY_PASSWORD": ("redis", "password"),
+        "MINIO_BUCKET_PREFIX": ("s3", "prefix"),
+    }
+    # The platform's OpenSearch (decision 4) is made by the namespace's Terraform and its address
+    # written to its secret, but no pod is given it: nothing in the Conduit reads an OpenSearch
+    # address yet (`services/api/search.py`: the index leg has not landed), and a pod naming a key
+    # fails
+    # to start without it. The index leg names its variable here when it lands.
+    return variables
+
+
+def person_given(config: OspreyConfig) -> set[str]:
+    """Our Secret's keys a person holds and gives (a model engine's, a connection's, the mail
+    server's password): the namespace's Terraform takes each as a sensitive variable."""
+    from harness.render import connection_secret_variables, model_key_variables
+
+    given = set(model_key_variables(config).values()) | set(connection_secret_variables(config))
+    if config.mail is not None and config.mail.username:
+        given.add("OSPREY_SMTP_PASSWORD")
+    return given
+
+
+@dataclass(frozen=True)
+class _InstallWrites:
+    settings: dict[str, str]  # to the ConfigMap
+    keys: list[str]  # our Secret's, each made by the Terraform or given by a person
+    defaults: dict[str, str]  # a key of our Secret with a fixed first value
+    copies: dict[str, str]  # a key of our Secret written from another's password
+
+
+def _what_the_install_writes(
+    config: OspreyConfig, as_cluster: OspreyConfig, managed: set[str]
+) -> _InstallWrites:
+    """What `ospreyflow install` writes into our Secret on a cluster (`harness.cluster_install`),
+    which the Conduit and the workers read by `envFrom`, split for a profile with no install: a
+    setting goes to the ConfigMap; a secret to our Secret's keys, the namespace's Terraform making
+    it (`random_password`) or a person giving it; and a password the install writes under two names
+    (two readers naming it differently) is written once and copied, so the two never disagree."""
+    from harness.apply import _SECRET_KEY
+    from harness.cluster_install import _derived, _minted
+
+    given = {variable: f"given:{variable}" for variable in person_given(config)}
+    given["OSPREY_POSTGRES_PASSWORD"] = "managed"  # the platform's secret gives it (`managed`)
+    minted, again = _minted(as_cluster, given), _minted(as_cluster, given)
+    derived = _derived(as_cluster, given, {})
+    settings = {
+        k: v for k, v in derived.items()
+        if k not in managed and k not in minted and not _SECRET_KEY.search(k)
+    }  # fmt: skip
+    secret = {
+        k: v for k, v in {**minted, **derived}.items() if k not in managed and k not in settings
+    }
+    keys = sorted(secret)
+    # A value the same on two mintings is a fixed first value (`REPORT_SYNC_DASHBOARDS=[]`), or a
+    # person's; any other is a fresh password, and two keys holding one are one password.
+    defaults = {k: minted[k] for k in keys if k in minted and again[k] == minted[k]}
+    defaults = {k: v for k, v in defaults.items() if k not in given}
+    copies: dict[str, str] = {}
+    first: dict[str, str] = {}
+    # Ours first (`OSPREY_*`, the name our pods give it), so the copy is the other reader's name.
+    for key in sorted(keys, key=lambda k: (not k.startswith("OSPREY_"), k)):
+        if key in defaults or key in given:
+            continue
+        original = first.setdefault(secret[key], key)
+        if original != key:
+            copies[key] = original
+    return _InstallWrites(settings, keys, defaults, copies)
+
+
+def bedrock_enabled(config: OspreyConfig) -> bool:
+    """Whether an enabled engine is Bedrock, signed by the gateway's own role (ADR-135 Am 4)."""
+    return any(p.kind == "bedrock" for p in config.models.enabled_providers)
+
+
+def gateway_account(platform: PlatformSettings) -> str:
+    """The gateway's own service account (`secrets.irsa.gateway_service_account`), refused in
+    words when the platform's settings name none and a Bedrock engine needs it."""
+    account = platform.secrets.irsa.gateway_service_account
+    if not account:
+        raise CloudPlatformNotRenderable(
+            "a Bedrock engine is enabled, and Bedrock's calls are signed by the gateway's own IAM "
+            "role, but the platform's settings name no secrets.irsa.gateway_service_account"
+        )
+    return account
+
+
+def _as_cluster(config: OspreyConfig, platform: PlatformSettings) -> OspreyConfig:
+    """The same deployment as a cluster would be configured, its managed stores named by the
+    variables their secrets give (`$(VAR)`, which Kubernetes expands in a container's env, command
+    and arguments), so the cluster's translation runs unchanged."""
+    raw = config.model_dump(mode="json", exclude_none=True)
+    raw.pop("cloud_platform", None)
+    raw["profile"] = Profile.CLUSTER.value
+    namespace = _cp(config).namespace
+    assert namespace is not None
+    storage = raw.setdefault("components", {}).setdefault("storage", {})
+    # On a cluster these are paths on the shared folders, never a product folder's.
+    storage["ingest"], storage["tiles"] = "/var/lib/osprey/ingest", "/var/lib/osprey/tiles"
+    raw["cluster"] = {
+        "namespace": namespace,
+        "storage_class": platform.storage.class_name,
+        "shared_storage_class": platform.storage.class_name,
+    }
+    raw["external"] = {
+        "postgres": {"host": "$(POSTGRES_HOST)", "sslmode": "require"},
+        "valkey": {"host": "$(VALKEY_HOST)", "tls": True},
+        "object_store": {
+            "endpoint": f"s3.{platform.aws_region}.amazonaws.com",
+            "region": platform.aws_region,
+            "credentials": "instance",
+            "bucket_prefix": f"{namespace}-",
+        },
+        **(
+            {"search": {"url": "$(OPENSEARCH_URL)"}}
+            if config.components.search is SearchBackend.OPENSEARCH
+            else {}
+        ),
+    }
+    # Its engines were held to cloud-platform's rules when `config` was validated; validated
+    # again as a cluster, they are held to those still (ADR-135 Amendment 7; P11).
+    return OspreyConfig.model_validate(raw, context={ENGINES_AS: Profile.CLOUD_PLATFORM.value})
+
+
+def _in_registry(image: str, registry: str) -> str:
+    """`image` (`[host/]path:tag@digest`) as the copy `ospreyflow images push` made of it."""
+    first, _, rest = image.partition("/")
+    path = rest if rest and ("." in first or ":" in first or first == "localhost") else image
+    return f"{registry}/{path}"
+
+
+class _Copies:
+    """Each image as the registry holds its copy, and the plan `ospreyflow images push` follows to
+    make the copies: ours built here and pushed, the third-party ones copied by their digest (so
+    the digest the values pin is the source's). Ours are pinned by the digest the registry gives
+    for its copy, once pushed; until then the render is unpinned, and refused unless asked."""
+
+    def __init__(
+        self,
+        registry: str,
+        ours_prefix: str,
+        resolver: DigestResolver,
+        profile: ProfileSettings | None = None,
+    ) -> None:
+        self.registry, self.ours_prefix, self.resolver = registry, ours_prefix, resolver
+        self.ours = (profile or load_profile()).ours
+        self.plan: dict[str, dict[str, Any]] = {}
+        self.unresolved: list[str] = []
+
+    def __call__(self, image: str) -> str:
+        # A reference given by its digest keeps it (`harness.cluster._Pins`).
+        reference, *digests = image.split("@")
+        digest = digests[0] if digests else ""
+        source = f"{reference}@{digest}" if digest else reference
+        target = _in_registry(reference, self.registry)
+        if not reference.rsplit("/", 1)[-1].count(":"):
+            if not digest:
+                raise CloudPlatformNotRenderable(
+                    f"the image {image!r} has neither a tag nor a digest, so no copy of it can "
+                    "be named"
+                )
+            target += ":sha256-" + digest.removeprefix("sha256:")[:12]  # a tag to push it under
+        entry: dict[str, Any] = {"source": source, "target": target}
+        if reference.startswith(self.ours_prefix + "/"):
+            name = reference.removeprefix(self.ours_prefix + "/").split(":")[0]
+            built = self.ours.get(name)
+            if built is None:
+                raise CloudPlatformNotRenderable(
+                    f"the image {reference!r} is one of ours, but the profile's settings "
+                    f"(harness/cloud_platform/profile.yaml, ours:) do not say how {name!r} is "
+                    "built, so `ospreyflow images push` could not make its copy: add its "
+                    "Dockerfile and context there"
+                )
+            entry = {"target": target, "dockerfile": built.dockerfile, "context": built.context,
+                     "build_args": dict(built.build_args)}  # fmt: skip
+            digest = self.resolver(target) or ""
+            if not digest:
+                self.unresolved.append(target)
+        held = self.plan.setdefault(target, entry)
+        if held.get("source") != entry.get("source"):
+            raise CloudPlatformNotRenderable(
+                f"two sources would be copied to {target}: {held.get('source')} and "
+                f"{entry.get('source')}; the values would pin a copy `images push` never made"
+            )
+        return f"{target.split(':sha256-')[0]}@{digest}" if digest else target
+
+
+def _grant_what_it_owns(container: dict[str, Any]) -> None:
+    """A managed Postgres gives the namespace's login no superuser (RDS), and PostgreSQL 16 lets a
+    login make a database owned by another role only if it may SET ROLE to it; a role it made is
+    one it administers, so it grants itself membership first. The step's SQL is the cluster's own
+    (`harness.render`), so the other profiles' renders are unchanged."""
+    args = container.get("args")
+    if not args:
+        return
+    container["args"] = [
+        re.sub(
+            r"(SELECT 'CREATE DATABASE (\w+) OWNER (\w+)')",
+            lambda m: f"GRANT {m.group(3)} TO CURRENT_USER;\n{m.group(1)}",
+            arg,
+        )
+        for arg in args
+    ]
+
+
+def _containers(workload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [workload, *workload.get("initContainers", [])]
+
+
+def _secret_ref(platform: PlatformSettings, store: str, key: str) -> dict[str, str]:
+    settings = getattr(platform.secrets, store)
+    return {"name": settings.name, "key": settings.keys[key]}
+
+
+def _read_from_the_platform(
+    container: dict[str, Any],
+    variables: dict[str, tuple[str, str]],
+    platform: PlatformSettings,
+    *,
+    reader: bool,
+) -> None:
+    """Every managed variable the container reads comes from the platform's secret: an entry that
+    named our Secret or the ConfigMap is pointed there, and a container that reads the whole env
+    (`envFrom`) is given each one by name, first, so a later `$(VAR)` finds it."""
+    env = list(container.get("env", []))
+    named = {e["name"] for e in env}
+    first: list[dict[str, Any]] = []
+    for entry in env:
+        source = entry.get("secret") or entry.get("config")
+        if source in variables:
+            entry.pop("secret", None)
+            entry.pop("config", None)
+            entry["secretKeyRef"] = _secret_ref(platform, *variables[source])
+    text = yaml.safe_dump(container)
+    for name, (store, key) in variables.items():
+        if name in named:
+            continue
+        if (reader and container.get("envFrom")) or f"$({name})" in text or f"$$({name})" in text:
+            first.append({"name": name, "secretKeyRef": _secret_ref(platform, store, key)})
+    # Kubernetes expands `$(VAR)` only for a variable defined earlier in the list.
+    defined = [e for e in env if "secretKeyRef" in e]
+    rest = [e for e in env if "secretKeyRef" not in e]
+    container["env"] = [*first, *defined, *rest]
+    for field in ("command", "args"):
+        if field in container:
+            container[field] = [
+                re.sub(r"\$\$\(({})\)".format("|".join(variables)), r"$(\1)", part)
+                for part in container[field]
+            ]
+
+
+def _address(address: str) -> tuple[str | None, int]:
+    """An address's host and port, in one parse: its own port, or its scheme's (80 for http, 443
+    otherwise). The one place a host and its port are read from an address (point 21)."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(re.sub(r"\{[^}]*\}", "x", address))
+    return parts.hostname, parts.port or (80 if parts.scheme == "http" else 443)
+
+
+def _host(address: str) -> str | None:
+    return _address(address)[0]
+
+
+def engine_address(
+    name: str, kind: str, api_base: str | None, region: str | None, profile: ProfileSettings
+) -> tuple[str | None, int]:
+    """The one host a model engine's calls reach, and its port: its address's, its kind's
+    (Bedrock's runtime in its region, `egress.engine_kind_hosts`), or its provider's own
+    (`egress.engine_hosts`), the last two on 443."""
+    if api_base:
+        return _address(api_base)
+    if kind in profile.egress.engine_kind_hosts:
+        # A kind that names no address (Bedrock): by its kind, its region's (P11).
+        return profile.egress.engine_kind_hosts[kind].format(region=region), 443
+    return profile.egress.engine_hosts.get(name), 443
+
+
+def engine_host(
+    name: str, kind: str, api_base: str | None, region: str | None, profile: ProfileSettings
+) -> str | None:
+    """The one host a model engine's calls reach (`engine_address`'s)."""
+    return engine_address(name, kind, api_base, region, profile)[0]
+
+
+def _engine_addresses(config: OspreyConfig, profile: ProfileSettings) -> list[tuple[str, int]]:
+    """Each enabled engine's host and port, refused in words when its host cannot be known."""
+    addresses = []
+    for provider in config.models.enabled_providers:
+        host, port = engine_address(
+            provider.name, provider.kind, provider.api_base, provider.region, profile
+        )
+        if host is None:
+            raise CloudPlatformNotRenderable(
+                f"the model engine {provider.name!r} names no api_base, so its traffic's host is "
+                "not known and cannot be allowed"
+            )
+        addresses.append((host, port))
+    return addresses
+
+
+def engine_hosts(config: OspreyConfig, profile: ProfileSettings) -> list[str]:
+    """Each enabled engine's host, refused in words when one cannot be known."""
+    return [host for host, _ in _engine_addresses(config, profile)]
+
+
+def _egress_hosts(
+    config: OspreyConfig, platform: PlatformSettings, profile: ProfileSettings
+) -> list[str]:
+    """Every host the namespace reaches, whoever reaches it (`_egress_hosts_by_kind`)."""
+    return sorted({h for hosts in _egress_hosts_by_kind(config, platform, profile).values()
+                   for h in hosts})  # fmt: skip
+
+
+def _egress_hosts_by_kind(
+    config: OspreyConfig, platform: PlatformSettings, profile: ProfileSettings
+) -> dict[str, list[str]]:
+    """Each kind's hosts (`_egress_addresses_by_kind`'s, without their ports)."""
+    return {kind: sorted({host for host, _ in addresses}) for kind, addresses
+            in _egress_addresses_by_kind(config, platform, profile).items()}  # fmt: skip
+
+
+def _host_ports(addresses: dict[str, list[tuple[str, int]]]) -> dict[str, list[int]]:
+    """Each host's ports, whichever kinds reach it: a host given twice with two ports has both."""
+    ports: dict[str, set[int]] = {}
+    for host, port in (a for kind in addresses.values() for a in kind):
+        ports.setdefault(host, set()).add(port)
+    return {host: sorted(held) for host, held in ports.items()}
+
+
+def _egress_addresses_by_kind(
+    config: OspreyConfig, platform: PlatformSettings, profile: ProfileSettings
+) -> dict[str, list[tuple[str, int]]]:
+    """Each host the namespace reaches: the profile's `egress.always` (S3, the bucket, and STS,
+    IRSA's role); a model engine's address, or its kind's host from `egress.engine_kind_hosts`
+    (Bedrock's runtime in its region), or its provider's own host from `egress.engine_hosts`,
+    and a proxied map provider's source (the settings ADR-135 Amendment 2 and ADR-147 gate); the
+    mail server; Entra ID's sign-in host (`egress.sign_in`, P10 part 2); and each connector host.
+    Each with its port (Amendment 5 point 21): an AWS service's 443, an address's own or its
+    scheme's, the mail server's `mail.port`, a connector host's `host:port` or 443."""
+    region = platform.aws_region
+    kinds: dict[str, list[tuple[str, int]]] = {
+        "always": [(host.format(region=region), 443) for host in profile.egress.always],
+        "identity": [(host.format(region=region), 443) for host in profile.egress.identity],
+        "sign_in": [(host, 443) for host in profile.egress.sign_in],
+        "engines": _engine_addresses(config, profile), "maps": [], "mail": [], "connectors": [],
+        # ADR-140 Amendment 21: each declared S3 bucket and Athena workgroup by its own host, on
+        # 443. Never a results or table location's bucket: Athena reaches those itself.
+        "sources": [(host, 443) for host in _cp(config).connector_sources.hosts()],
+    }  # fmt: skip
+    for map_provider in config.map.providers if config.map is not None else []:
+        if map_provider.proxy == "none":
+            continue  # fetched by the browser, never from the namespace
+        for address in (map_provider.source or "", map_provider.endpoint or ""):
+            if address.startswith(("http://", "https://")):
+                host, port = _address(address)
+                if host:
+                    kinds["maps"].append((host, port))
+    if config.mail is not None:
+        kinds["mail"].append((config.mail.host, config.mail.port))
+    kinds["connectors"] += [connector_address(e) for e in _cp(config).connector_hosts]
+    return {kind: sorted(set(addresses)) for kind, addresses in kinds.items()}
+
+
+def egress_policy(
+    config: OspreyConfig,
+    platform: PlatformSettings,
+    profile: ProfileSettings | None = None,
+    workloads: Sequence[dict[str, Any]] = (),
+    others: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Decision 7's policies' settings: the networks allowed out, each host's by name, from the
+    deployment's `egress_nets` or, for an AWS service, the platform's settings; and (Amendment 5
+    point 21) what each rendered workload alone may reach, from `profile.yaml`'s `egress`."""
+    profile = profile or load_profile()
+    given = {**platform.egress.service_nets, **_cp(config).egress_nets}
+    # Every pod that has a row: the workloads, and the pods rendered outside them (`others`: P9's
+    # backup and restore, by their pods' names), which admit nothing and reach what their rows give.
+    rows = [*workloads, *({"name": name} for name in others)]
+    addresses = _egress_addresses_by_kind(config, platform, profile)
+    by_kind = {kind: sorted({host for host, _ in held}) for kind, held in addresses.items()}
+    ports = _host_ports(addresses)
+    hosts = sorted(ports)
+    missing = [host for host in hosts if not given.get(host)]
+    if missing:
+        raise CloudPlatformNotRenderable(
+            "egress is denied by default on a cloud platform (ADR-148 decision 7); name the "
+            "networks of " + ", ".join(missing) + " under cloud_platform.egress_nets, or switch "
+            "the feature off"
+        )
+    return {
+        "kind": platform.egress.kind,
+        "dnsNamespace": platform.egress.dns_namespace,
+        "managedNets": list(platform.egress.managed_nets),
+        "managedPorts": _managed_ports(config, profile),
+        "hosts": [
+            {"host": host, "nets": list(given[host]), "ports": ports[host]} for host in hosts
+        ],  # fmt: skip
+        "workloads": _egress_by_workload(by_kind, profile, rows),
+    }
+
+
+def _bare_connector_hosts_note(config: OspreyConfig) -> str:
+    """The render's warning, in words, at the head of `values.yaml` on either shape (the poc's
+    INSTALL.md says it too): a connector host named without a port is reached on 443 alone."""
+    import textwrap
+
+    bare = [e for e in _cp(config).connector_hosts if ":" not in e]
+    if not bare:
+        return ""
+    words = (
+        f"Connector hosts reached on 443 only: {', '.join(bare)}, named in "
+        "cloud_platform.connector_hosts without a port. A SQL connection to one times out until "
+        f"its port is named there ({bare[0]}:5432) and the deployment is rendered again."
+    )
+    return "".join(f"# {line}\n" for line in textwrap.wrap(words, 96))
+
+
+def _managed_ports(config: OspreyConfig, profile: ProfileSettings) -> list[int]:
+    """The managed stores' ports (Amendment 5 point 21): RDS's and ElastiCache's, and the
+    OpenSearch domain's 443 when the deployment searches with OpenSearch."""
+    ports = set(profile.egress.managed_ports)
+    if config.components.search is SearchBackend.OPENSEARCH:
+        ports.add(443)
+    return sorted(ports)
+
+
+def _egress_by_workload(
+    by_kind: dict[str, list[str]], profile: ProfileSettings, workloads: Sequence[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Each rendered workload's own egress (Amendment 5 point 21): the namespace's workloads it
+    calls, on their Services' ports; whether it reaches the managed stores' networks; and the hosts
+    of each kind `egress.reach` gives it. A workload with none of these reaches DNS alone."""
+    ports = {w["name"]: [p["port"] for p in w.get("ports", [])] for w in workloads}
+    egress = profile.egress
+    out = []
+    for workload in workloads:
+        name = workload["name"]
+        to_pods = [
+            {"name": target, "ports": ports[target]}
+            for target in egress.paths.get(name, [])
+            if ports.get(target)
+        ]
+        to_api = KUBE_API in egress.paths.get(name, [])
+        hosts = sorted({h for kind, hs in by_kind.items() if name in egress.reach.get(kind, [])
+                        for h in hs})  # fmt: skip
+        # Amendment 5 point 23: who may reach it, from the same rows, so the two never drift.
+        callers = sorted(w["name"] for w in workloads if name in egress.paths.get(w["name"], []))
+        entry: dict[str, Any] = {"name": name}
+        if ports.get(name):
+            entry["ports"] = ports[name]
+        if callers:
+            entry["fromPods"] = callers
+        if to_pods:
+            entry["toPods"] = to_pods
+        if to_api:
+            entry["toKubeApi"] = True
+        if name in egress.managed:
+            entry["managed"] = True
+        if hosts:
+            entry["hosts"] = hosts
+        out.append(entry)
+    return out
+
+
+def _covered(host: str, wildcard: str) -> bool:
+    head, _, rest = host.partition(".")
+    return bool(head) and rest == wildcard.removeprefix("*.")
+
+
+_NGINX_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _nginx_seconds(path: Path, directive: str) -> int:
+    """`directive`'s time (`1h`, `90s`, `300`) in the Glass's own proxy's configuration, in
+    seconds, as the platform's ingress controller takes it. Refused in words if it is not there."""
+    found = re.search(rf"^\s*{directive}\s+(\d+)([smhd]?)\s*;", path.read_text(encoding="utf-8"),
+                      flags=re.MULTILINE)  # fmt: skip
+    if found is None:
+        raise CloudPlatformNotRenderable(
+            f"{path.name} sets no {directive}, which the platform's ingress must match for the "
+            "Glass's WebSocket to stay open: set it there"
+        )
+    return int(found.group(1)) * _NGINX_SECONDS[found.group(2) or "s"]
+
+
+def _constant_int(node: ast.expr) -> int:
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult | ast.Add | ast.Pow):
+        left, right = _constant_int(node.left), _constant_int(node.right)
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        return left + right if isinstance(node.op, ast.Add) else left**right
+    raise ValueError(ast.unparse(node))
+
+
+def upload_cap_bytes(environment: dict[str, Any], path: Path | None = None) -> int:
+    """The Conduit's upload cap: the deployment's own setting if it gives one, else the Conduit's
+    default (`_DEFAULT_MAX_UPLOAD_BYTES` in `ingest_sources.py`, read from its source). The setting
+    is read as the Conduit's `max_upload_bytes` reads it: a value that is not a whole number above
+    0 is the default (and never `0m`, which nginx reads as no limit at all)."""
+    try:
+        given = int(str(environment.get(UPLOAD_CAP_VARIABLE, "")))  # text, as the Conduit reads it
+    except ValueError:
+        given = 0
+    if given > 0:
+        return given
+    path = path or CONDUIT_UPLOADS
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "_DEFAULT_MAX_UPLOAD_BYTES" for t in node.targets
+        ):
+            try:
+                return _constant_int(node.value)
+            except ValueError:
+                break
+    raise CloudPlatformNotRenderable(
+        f"{path.name}'s _DEFAULT_MAX_UPLOAD_BYTES is not a number this render can read, so the "
+        "platform's ingress cannot be given the Conduit's upload cap"
+    )
+
+
+def _nginx_size(size: int) -> str:
+    mib = 1024 * 1024
+    return f"{size // mib}m" if size % mib == 0 else str(size)
+
+
+def _ingress(
+    config: OspreyConfig,
+    platform: PlatformSettings,
+    names: set[str],
+    profile: ProfileSettings,
+    environment: dict[str, Any],
+) -> dict[str, Any]:
+    from harness.site import sites
+
+    where = sites(config)
+    annotations = dict(platform.ingress.annotations)
+    if _cp(config).allow_from:
+        annotations[platform.ingress.allow_list_annotation] = ",".join(_cp(config).allow_from)
+    # The Glass holds its delta stream (a WebSocket) open as long as its own proxy lets it, and
+    # sends an upload as large as the Conduit takes: the platform's controller, in front of both,
+    # must not close the one sooner or refuse the other (its defaults are 60 s and 1 MiB).
+    nginx = "nginx.ingress.kubernetes.io/"
+    for directive in ("proxy_read_timeout", "proxy_send_timeout"):
+        seconds = _nginx_seconds(WORKSPACE_NGINX, directive)
+        annotations[nginx + directive.replace("_", "-")] = str(seconds)
+    annotations[nginx + "proxy-body-size"] = _nginx_size(upload_cap_bytes(environment))
+    rules = []
+    for door in profile.doors:
+        site, service, port = door.site, door.workload, door.port
+        if service in names:
+            host = getattr(where, site).removeprefix("https://").split("/")[0].split(":")[0]
+            paths = [{"path": "/", "service": service, "port": port}]
+            if site == "identity" and config.appearance.brand == "govuk":
+                # As Caddy does (`harness.site`; ADR-132 Amendment 2): the sign-in page's GOV.UK
+                # stylesheet and fonts from the Glass, on the sign-in page's own name.
+                paths.insert(0, {"path": "/assets/govuk", "service": "workspace", "port": 8080})
+            rules.append({"host": host, "service": service, "port": port, "paths": paths})
+    tls_secret = _cp(config).tls_secret
+    wildcard = platform.ingress.wildcard
+    if wildcard and not tls_secret:
+        uncovered = [r["host"] for r in rules if not _covered(r["host"], wildcard)]
+        if uncovered:
+            raise CloudPlatformNotRenderable(
+                f"the platform's certificate covers {wildcard}, one name deep, and not "
+                + ", ".join(uncovered)
+                + ": name a certificate that does under cloud_platform.tls_secret"
+            )
+    return {
+        "enabled": True,
+        "className": platform.ingress.class_name,
+        "annotations": annotations,
+        "rules": rules,
+        "controllerNamespace": platform.ingress.controller_namespace,
+        **({"tlsSecret": tls_secret} if tls_secret else {}),
+    }
+
+
+_BINARY = {"Ki": 1024, "Mi": 1024**2, "Gi": 1024**3, "Ti": 1024**4}
+
+
+def _bytes(quantity: str) -> int:
+    number, unit = re.fullmatch(r"([0-9.]+)([KMGT]i)?", quantity).groups()  # type: ignore[union-attr]
+    return int(float(number) * _BINARY.get(unit or "", 1))
+
+
+def _resources(profile: ProfileSettings, name: str) -> dict[str, Any]:
+    given = profile.resources.get(name) or profile.resources["default"]
+    return {
+        "requests": {"cpu": given.cpu, "memory": given.memory},
+        "limits": {"memory": given.memory_limit},
+    }
+
+
+def arcadedb_heap_gib_from_limit(profile: ProfileSettings) -> int:
+    """ArcadeDB's `-Xmx`, whole GiB, from its container's memory limit (not from a profile's floor,
+    as `harness.profiles.arcadedb_heap_gib` reads it for the other profiles)."""
+    limit = _bytes(_resources(profile, "arcadedb")["limits"]["memory"])
+    heap = int(limit * profile.arcadedb_heap_fraction // 1024**3)
+    if heap < 1:
+        raise CloudPlatformNotRenderable(
+            "ArcadeDB's memory limit leaves it less than 1 GiB of heap: raise resources.arcadedb "
+            "in the profile's settings"
+        )
+    return heap
+
+
+def _heap_from_the_limit(pod: dict[str, Any], profile: ProfileSettings) -> None:
+    from harness.profiles import ARCADEDB_INITIAL_HEAP_GIB
+
+    heap = arcadedb_heap_gib_from_limit(profile)
+    opts = f"-Xms{min(ARCADEDB_INITIAL_HEAP_GIB, heap)}G -Xmx{heap}G -XX:+ExitOnOutOfMemoryError"
+    pod["env"] = [
+        {"name": e["name"], "value": opts} if e["name"] == "ARCADEDB_OPTS_MEMORY" else e
+        for e in pod.get("env", [])
+    ]
+    if not any(e["name"] == "ARCADEDB_OPTS_MEMORY" for e in pod["env"]):
+        pod["env"].append({"name": "ARCADEDB_OPTS_MEMORY", "value": opts})
+
+
+def _as_written(config: OspreyConfig) -> dict[str, Any]:
+    """The deployment's own configuration for the values' copy, its shape left out at its default
+    (ADR-148 Amendment 5): the copy is in the ConfigMap whose checksum restarts every pod when it
+    changes, so a deployment rendered before the shape existed reads the same after it."""
+    raw = config.model_dump(mode="json", exclude_none=True)
+    cloud = raw.get("cloud_platform") or {}
+    if cloud.get("shape") == "standard":
+        del cloud["shape"]
+    return raw
+
+
+def _without(lock: str, services: set[str]) -> str:
+    """The lock without the entries of `services` (the poc shape's Keeper, which no pod runs), its
+    header and every other entry as written."""
+    if not services:
+        return lock
+    head, _, body = lock.partition("images:\n")
+    entries = re.split(r"(?m)^(?=- service: )", body)
+    kept = [e for e in entries if not any(e.startswith(f"- service: {s}\n") for s in services)]
+    return head + "images:\n" + "".join(kept)
+
+
+def embedded_keeper_clickhouse_config() -> str:
+    """The poc shape's ClickHouse (ADR-148 Amendment 5): the cluster's configuration for one server
+    (`harness.cluster.clickhouse_config`), its Keeper the server's own, a Raft of one whose log is
+    on the server's own claim, reached at 127.0.0.1. The cluster's Replicated database needs a
+    Keeper; here it runs inside the server rather than as a StatefulSet of its own."""
+    from harness.cluster import CLAIMS, clickhouse_config
+
+    data = next(path for name, path, _ in CLAIMS["clickhouse"] if name == "data")
+    one = clickhouse_config(1, 1).replace(
+        "<host>clickhouse-keeper-0.clickhouse-keeper-headless</host>", "<host>127.0.0.1</host>"
+    )
+    keeper = f"""  <keeper_server>
+    <tcp_port>9181</tcp_port>
+    <server_id>1</server_id>
+    <log_storage_path>{data}/coordination/log</log_storage_path>
+    <snapshot_storage_path>{data}/coordination/snapshots</snapshot_storage_path>
+    <raft_configuration>
+      <server><id>1</id><hostname>127.0.0.1</hostname><port>9234</port></server>
+    </raft_configuration>
+  </keeper_server>
+"""
+    return one.replace("  <zookeeper>\n", keeper + "  <zookeeper>\n", 1)
+
+
+def _secrets_it_reads(pod: dict[str, Any], profile: ProfileSettings) -> None:
+    """Amendment 5 point 22: a workload that reads the settings whole (`envFrom`) but is not one of
+    `secrets.whole` gets the ConfigMap alone, and only the keys `secrets.named` gives it, each by
+    name, so the Glass and the recogniser never hold the stores' passwords or the gateway's keys."""
+    if not pod.get("envFrom") or pod["name"] in profile.secrets.whole:
+        return
+    pod["noSecret"] = True
+    named = profile.secrets.named.get(pod["name"], [])
+    kept = [e for e in pod.get("env", []) if e.get("value") != "" or "secret" in e]
+    pod["env"] = [*kept, *({"name": key, "secret": key} for key in named)]
+    if not pod["env"]:
+        pod.pop("env")
+
+
+def _millicores(quantity: str) -> float:
+    return float(quantity[:-1]) if quantity.endswith("m") else float(quantity) * 1000
+
+
+def _cpu_limit(container: dict[str, Any], profile: ProfileSettings, name: str) -> None:
+    """The poc shape names a CPU limit on every container (ADR-148 Amendment 5), never below the
+    CPU it requests."""
+    limit = profile.poc.cpu_limits.get(name) or profile.poc.cpu_limits["default"]
+    request = container["resources"]["requests"]["cpu"]
+    if _millicores(limit) < _millicores(request):
+        raise CloudPlatformNotRenderable(
+            f"{name}'s CPU limit {limit} is below its request {request}: raise poc.cpu_limits in "
+            "the profile's settings"
+        )
+    container["resources"]["limits"]["cpu"] = limit
+
+
+def _onto_own_claims(pod: dict[str, Any], profile: ProfileSettings) -> None:
+    """The poc shape (ADR-148 Amendment 5): a shared folder the profile gives a claim of its own
+    (`profile.yaml`'s `poc.claims`) is mounted from that claim, at the same folder on it, so the
+    claim's root, which holds the file system's lost+found, is never the folder itself."""
+    for container in [pod, *pod.get("initContainers", [])]:
+        for mount in container.get("shared") or []:
+            for claim in profile.poc.claims:
+                if mount["subPath"] == claim.folder or mount["subPath"].startswith(
+                    claim.folder + "/"
+                ):
+                    mount["claim"] = claim.name
+
+
+def render_cloud_platform(
+    config: OspreyConfig,
+    images: Sequence[ServiceImage],  # noqa: ARG001 — the cluster configuration's are rendered
+    *,
+    resolver: DigestResolver,
+    allow_unpinned: bool,
+    resolved_source_label: str,
+) -> dict[str, str]:
+    """`values.yaml`, `versions.lock` and `terraform/*.tf`."""
+    from harness.cloud_platform.terraform import render_terraform
+    from harness.cluster import render_cluster
+    from harness.render import service_images
+    from harness.site import highest_marking, render_glass_settings
+
+    _refuse(config)
+    platform = load_platform(_cp(config).platform)
+    profile = load_profile()
+    production = _cp(config).environment == "production"
+    poc = _cp(config).shape == "poc"
+    as_cluster = _as_cluster(config, platform)
+    # The images the cluster's configuration runs: none of the stores the platform manages. The
+    # gateway always (P11 part 2): an engine first added in Admin › Models then has one without a
+    # re-render, and the namespace reaches a model host only while an engine is enabled (egress).
+    images = [i for i in service_images(as_cluster) if i.service not in NOT_RENDERED]
+    rendered = render_cluster(
+        as_cluster,
+        images,
+        resolver=resolver,
+        allow_unpinned=allow_unpinned,
+        resolved_source_label=resolved_source_label,
+        replicas=None if production else DEVELOPMENT_REPLICAS,
+    )
+    values = yaml.safe_load(rendered["values.yaml"].split("\n", 3)[-1])
+    registry = _cp(config).registry
+    assert registry is not None
+    variables = managed_variables(config)
+    api_image = next(i.image for i in images if i.service == "api")
+    copies = _Copies(registry, api_image.rsplit("/", 1)[0], resolver, profile)
+
+    workloads = [
+        w for w in values["workloads"]
+        if w["name"] not in NOT_RENDERED and not (poc and w["name"] == "clickhouse-keeper")
+    ]  # fmt: skip
+    jobs = [j for j in values["jobs"] if j["name"] not in NOT_RENDERED]
+    for pod in [*workloads, *jobs]:
+        pod.pop("runAs", None)  # decision 3: every pod is 10001's (the chart's podSecurity)
+        pod["initContainers"] = list(pod.get("initContainers", []))
+        if not pod["initContainers"]:
+            pod.pop("initContainers")
+        for container in _containers(pod):
+            _grant_what_it_owns(container)
+            container["image"] = copies(container["image"])
+            _read_from_the_platform(container, variables, platform, reader=pod["name"] in READERS)
+            # The pod's own container by its workload's name; an init container takes the default.
+            container["resources"] = _resources(
+                profile, pod["name"] if container is pod else container["name"]
+            )
+        if pod["name"] == "arcadedb":
+            _heap_from_the_limit(pod, profile)
+        if pod["name"] in SCRATCH:
+            pod["scratch"] = [
+                *pod.get("scratch", []), *({"mountPath": p} for p in SCRATCH[pod["name"]])
+            ]  # fmt: skip
+        if pod["name"] in profile.group_zero:
+            pod["supplementalGroups"] = [0]
+        if pod["name"] in GRACE_SECONDS:
+            pod["terminationGracePeriodSeconds"] = GRACE_SECONDS[pod["name"]]
+        if pod.get("shared") or any(c.get("shared") for c in pod.get("initContainers", [])):
+            pod["sharedAffinity"] = True
+        if pod["name"] in ("api", "worker", "report-sync"):
+            pod["serviceAccountName"] = platform.secrets.irsa.service_account
+        if pod["name"] == "litellm" and bedrock_enabled(config):
+            # Bedrock's calls signed by the gateway's own role, Bedrock's invoke in London alone
+            # (P11 part 2, least privilege): never the namespace's, which holds the buckets.
+            pod["serviceAccountName"] = gateway_account(platform)
+        # Amendment 5 point 24: the service account's token is mounted only in a pod given an
+        # account of its own (IRSA's web identity); a pod calling no Kubernetes API holds none.
+        pod["automountToken"] = bool(pod.get("serviceAccountName"))
+        if pod.get("kind") == "StatefulSet" and not poc:
+            pod["disruptionBudget"] = {"maxUnavailable": 1}
+        _secrets_it_reads(pod, profile)
+        if poc:
+            _onto_own_claims(pod, profile)
+            for container in _containers(pod):
+                _cpu_limit(
+                    container, profile, pod["name"] if container is pod else container["name"]
+                )
+    names = {w["name"] for w in workloads}
+    if copies.unresolved and not allow_unpinned:
+        from harness.render import UnpinnedImagesError
+
+        raise UnpinnedImagesError(copies.unresolved)
+
+    environment = {
+        k: v
+        for k, v in values["environment"].items()
+        if k not in variables and k not in REALM_SETTINGS
+    }
+    # ArcadeDB's heap is its own container's, from its limit (above), never the cluster's
+    # machine-sized setting, which nothing else reads.
+    environment.pop("OSPREY_ARCADEDB_HEAP", None)
+    # Decision 12: no Java in this profile's Conduit; Admin › Maps' Build reads the profile and
+    # says where the basemap is built instead.
+    environment["OSPREY_PROFILE"] = Profile.CLOUD_PLATFORM.value
+    # What this render made for the model route, so Admin › Models refuses, in words, an engine
+    # whose host the egress does not allow or, for Bedrock, whose identity the render did not make
+    # (the orchestrator's ruling on P11 part 2, round 1): the hosts, the rules that place a new
+    # engine's host, and whether the gateway's own IAM role exists.
+    environment["OSPREY_MODEL_ROUTES_MADE"] = json.dumps(
+        {
+            "hosts": sorted(set(engine_hosts(config, profile))),
+            "provider_hosts": profile.egress.engine_hosts,
+            "kind_hosts": profile.egress.engine_kind_hosts,
+            "gateway_identity": bedrock_enabled(config),
+        },
+        sort_keys=True,
+    )
+    # Decision 10: the ceiling from its one source, for this deployment as it is (the cluster's
+    # translation above is another profile's, whose default is the scheme's highest).
+    environment["OSPREY_HIGHEST_MARKING"] = highest_marking(config)
+    # What the cluster's install writes into our Secret, and this profile has no install to write.
+    install = _what_the_install_writes(config, as_cluster, set(variables))
+    environment.update({k: v for k, v in install.settings.items() if k not in REALM_SETTINGS})
+    # Entra ID's, last, so nothing the cluster's realm wrote stands (ADR-148 Amendment 8).
+    environment.update(entra_settings(config))
+    sources = _cp(config).connector_sources
+    if _cp(config).connector_hosts or sources.declared():
+        # The Conduit's own allow-list, from the lists the egress policy allows (one list, both).
+        # Hosts alone: the Conduit's allow-list matches a host; the port is the egress policy's.
+        hosts = {connector_address(e)[0] for e in _cp(config).connector_hosts}
+        environment["OSPREY_CONNECTOR_EGRESS"] = ",".join(sorted(hosts | set(sources.hosts())))
+    if sources.declared():
+        # ADR-140 Amendment 21: what Admin › Connections is told the render made, so it refuses an
+        # S3 or Athena connection not declared, as Admin › Models refuses an engine (ADR-135 Am 8).
+        environment["OSPREY_CONNECTOR_SOURCES"] = json.dumps(
+            sources.model_dump(mode="json"), sort_keys=True
+        )
+    secrets = values["secrets"]
+    secrets["keys"] = sorted(
+        ({k for k in secrets["keys"] if k not in variables} | set(install.keys)) - REALM_SECRETS
+    )
+    secrets["defaults"] = {
+        k: v
+        for k, v in {
+            **{k: v for k, v in secrets["defaults"].items() if k not in variables},
+            **install.defaults,
+        }.items()
+        if k not in REALM_SECRETS
+    }
+    secrets["copies"] = {
+        k: v for k, v in sorted(install.copies.items()) if REALM_SECRETS.isdisjoint((k, v))
+    }
+    # The gateway's keys stay in our Secret with no engine enabled: the Conduit still names its
+    # master key (found on the kind cluster, where its pod could not start without it).
+
+    files = {
+        k: v
+        for k, v in values["files"].items()
+        if k != "Caddyfile" and not k.startswith(REALM_FILES)
+    }
+    storage: dict[str, Any] = {
+        "className": platform.storage.class_name,
+        "sharedClassName": platform.storage.class_name,
+        "sharedAccessMode": "ReadWriteOnce",
+        "sharedSize": values["storage"]["sharedSize"],
+    }
+    if poc:
+        # Amendment 5: the server runs its own Keeper, so no Keeper of its own is rendered.
+        files.pop("keeper.xml")
+        files["clickhouse.xml"] = embedded_keeper_clickhouse_config()
+        storage["claims"] = [{"name": c.name, "size": c.size} for c in profile.poc.claims]
+
+    out = {
+        "secrets": secrets,
+        "storage": storage,
+        "imagePullSecrets": [],
+        "podSecurity": {"user": UID, "group": UID},
+        "networkPolicy": {"openEgress": False},
+        # P9's backup and restore pods render beside the workloads; their rows by their names.
+        "egress": egress_policy(config, platform, profile, workloads, others=profile.egress.others),
+        "ingress": _ingress(config, platform, names, profile, environment),
+        "environment": environment,
+        "files": {
+            **files,
+            # The Glass signs in with Entra ID (Amendment 8): its deployment file says where.
+            "glass.json": render_glass_settings(config, entra=_cp(config).claims),
+            # The deployment's own configuration, as it was written, not the cluster's shape.
+            "osprey.yaml": yaml.safe_dump(_as_written(config), sort_keys=False),
+        },
+        "workloads": workloads,
+        "jobs": jobs,
+    }
+    # Decision 13 (ADR-148 Amendment 7, P9): the backups, added to these values, and its Terraform.
+    from harness.cloud_platform_backups import add_backups
+
+    backups_terraform = add_backups(config, platform, out)
+    artefacts = {
+        "values.yaml": _BANNER
+        + _bare_connector_hosts_note(config)
+        + yaml.safe_dump(out, sort_keys=False, default_flow_style=False, width=4096),
+        "versions.lock": _without(
+            rendered["versions.lock"], {"clickhouse-keeper"} if poc else set()
+        ),
+        "images.yaml": "# What `ospreyflow images push --registry` copies (ADR-148 decision 8).\n"
+        + yaml.safe_dump(
+            {"registry": registry, "images": [copies.plan[k] for k in sorted(copies.plan)]},
+            sort_keys=False,
+        ),
+    }
+    artefacts.update(
+        {
+            f"terraform/{name}": text
+            for name, text in render_terraform(config, platform, out).items()
+        }
+    )
+    artefacts.update(backups_terraform)
+    if poc:
+        # Amendment 5: the runbooks, for the client's team, with the deployment's own names.
+        from harness.cloud_platform.runbooks import render_decommission, render_install
+
+        artefacts["INSTALL.md"] = render_install(config, platform, out)
+        artefacts["DECOMMISSION.md"] = render_decommission(config, platform, out)
+    return artefacts

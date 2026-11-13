@@ -3,7 +3,7 @@
 /**
  * Default: local-lite. Which kind of deployment: one machine (local-lite), a cloud server on managed services or a server of your own with every store in a container (small), or a cluster.
  */
-export type Profile = "local-lite" | "small" | "cluster";
+export type Profile = "local-lite" | "small" | "cluster" | "cloud-platform";
 /**
  * Default: arcadedb. The graph store.
  */
@@ -77,6 +77,18 @@ export type PrivacyContract = boolean;
  */
 export type ContractReference = string | null;
 /**
+ * ADR-135 Amendments 4 and 7: provider (a hosted provider LiteLLM knows by name), or at profile: cloud-platform only, gateway (the client's own OpenAI-compatible AI gateway, at api_base) or bedrock (Amazon Bedrock in London). Default: provider.
+ */
+export type Kind = "provider" | "gateway" | "bedrock";
+/**
+ * ADR-135 Amendments 4 and 7: key (entered in Admin › Models, kept by the model gateway alone), or at profile: cloud-platform only, iam_role (the gateway's own IAM role: no key is stored). Default: iam_role for bedrock, else key.
+ */
+export type Auth = ("key" | "iam_role") | null;
+/**
+ * Bedrock's region (profile: cloud-platform): eu-west-2 (London) only, and the default for bedrock.
+ */
+export type Region = string | null;
+/**
  * ADR-135: the providers an administrator enables; each key is OSPREY_MODEL_KEY_<NAME>, entered at install or with `ospreyflow models key`.
  */
 export type Providers = ModelProviderConfig[];
@@ -96,6 +108,10 @@ export type Transcription = "Systran/faster-whisper-tiny.en";
  * ADR-095: the local model that turns text into vectors.
  */
 export type Embedding = "all-minilm:22m-l6-v2-fp16";
+/**
+ * ADR-135 Amendments 5 and 6: deep_read or, at profile: cloud-platform only, laurium (its own service, every call through the gateway). Left unset: laurium on cloud-platform (its preset), deep_read on every other profile.
+ */
+export type ExtractionEngine = ("deep_read" | "laurium") | null;
 /**
  * Default: keycloak. The identity provider people sign in through.
  */
@@ -162,6 +178,116 @@ export type StorageClass = string | null;
  */
 export type SharedStorageClass = string | null;
 /**
+ * Default: client. The platform's settings file, by name
+ */
+export type Platform = string;
+/**
+ * The namespace the platform's team created for the deployment (required)
+ */
+export type Namespace1 = string | null;
+/**
+ * Default: development — one copy of each store; production runs the cluster's copies (ArcadeDB 3, ClickHouse 2, Keeper 3)
+ */
+export type Environment = "development" | "production";
+/**
+ * Default: standard — the stores as the environment sets them. poc: the proof-of-concept shape (ADR-148 Amendment 5), a development namespace's only: one ArcadeDB and one ClickHouse running its own Keeper, no disruption budgets, and the Ingest root on a claim of its own
+ */
+export type Shape = "standard" | "poc";
+/**
+ * Where every image is pulled from (required): the namespace's ECR, as `ospreyflow images push --registry` copied them there
+ */
+export type Registry = string | null;
+/**
+ * The networks (CIDR) the platform's ingress admits; empty: every address
+ */
+export type AllowFrom = string[];
+/**
+ * Default: none — the platform's own certificate. The Kubernetes Secret holding the certificate for the deployment's name (the Glass's: the profile renders no sign-in or reporting name), where the platform's wildcard does not cover it
+ */
+export type TlsSecret = string | null;
+/**
+ * The client's Entra tenant id
+ */
+export type TenantId = string;
+/**
+ * The Glass's own app registration (application id)
+ */
+export type ClientId1 = string;
+/**
+ * This API's app registration (application id): the token's audience
+ */
+export type ApiClientId = string;
+/**
+ * Default: api://<api_client_id>. The API's application id URI, which the Glass's scope names
+ */
+export type ApiIdUri = string | null;
+/**
+ * Default: 2.0. The access token version the API's registration is issued (accessTokenAcceptedVersion): the issuer and audience the Conduit checks follow it
+ */
+export type TokenVersion = "2.0" | "1.0";
+/**
+ * Default: access_as_user. The delegated scope the Glass asks the API for
+ */
+export type Scope = string;
+/**
+ * Default: groups. The token claim listing the person's Entra group ids, which a {groups: ...} table above is read from
+ */
+export type GroupsClaim = string;
+/**
+ * The people given the Admin role at install, by Entra object id (at least one)
+ */
+export type FirstAdministrators = string[];
+/**
+ * Default: false. Whether a claims-mapping policy signs the API's tokens with its own key (the keys are then read with ?appid=<api_client_id>)
+ */
+export type ClaimsMappingPolicy = boolean;
+/**
+ * The hosts a SQL or API connection may reach, each as host or host:port (a name, not an IPv6 literal), with its networks in egress_nets under the host alone. The namespace's egress allows each host on its ports; the Conduit's own allow-list (OSPREY_CONNECTOR_EGRESS) holds the hosts alone, so a connection to a listed host on a port not listed here passes the Conduit and times out at the egress. A bare host is reached on 443 (an API connection over HTTPS); a SQL connection needs its database's port here (db.example.org:5432). A host given twice with two ports is reached on both
+ */
+export type ConnectorHosts = string[];
+/**
+ * The bucket's own name (no dot)
+ */
+export type Bucket = string;
+/**
+ * The bucket's region (eu-west-2)
+ */
+export type Region1 = string;
+/**
+ * Default: the bucket's top. The folder a connection may read at or under, each name ending in / (exports/client-a/)
+ */
+export type Prefix = string;
+/**
+ * The S3 buckets
+ */
+export type S3 = DeclaredS3Source[];
+/**
+ * The workgroup's name
+ */
+export type Workgroup = string;
+/**
+ * The workgroup's region (eu-west-2)
+ */
+export type Region2 = string;
+/**
+ * The Glue databases a connection may read
+ *
+ * @minItems 1
+ */
+export type Databases = [string, ...string[]];
+/**
+ * Where Athena writes each query's results (s3://bucket/folder/): the only place a declared source gives the role a write. A folder, never a bucket's top
+ */
+export type ResultsLocation = string;
+/**
+ * Where the databases' tables keep their objects (s3://bucket/folder/), at least one, read by Athena as the namespace's role: read-only, and never reached by the Conduit
+ */
+export type TableLocations = string[];
+/**
+ * The Athena workgroups
+ */
+export type Athena = DeclaredAthenaSource[];
+/**
  * Default: false. Publish the Conduit's own port on the host in addition to the workspace's. Not needed to use the deployment — the workspace proxies /v1 — and turning it on widens the exposed surface by a whole tier. For an operator debugging the Conduit directly, or a second client that is not the Glass.
  */
 export type ExposeConduit = boolean;
@@ -189,6 +315,10 @@ export type RedirectHttp = boolean;
  * Small on a server of your own, with network.tls only: the one address of the server the front proxy publishes on. Default: none — every interface.
  */
 export type ListenAddress = string | null;
+/**
+ * Small over https:// only: the front proxy asks every browser for a shared key (the browser's own user name and key box) on all three names before anything loads, and every answer says noindex. The key's bcrypt hash is set on the server by `python -m harness.access_key set <the deployment's folder>`, never here. Default: false (ADR-114 Amendment 41).
+ */
+export type AccessKey = boolean;
 /**
  * The provider the map opens on, by its id
  */
@@ -381,7 +511,7 @@ export type Name2 = string | null;
  */
 export type GraphPort = number | null;
 /**
- * Default: the handling scheme's highest. The highest marking this deployment may hold: a load or an import marked above it is refused before anything is written, in words that say this limit and never the item's content. A demo pack that declares no highest marking is judged as the scheme's highest, so under a lower setting it is refused. One of the handling scheme's classifications.
+ * Default: OFFICIAL-SENSITIVE on the cloud-platform profile, else the handling scheme's highest. The highest marking this deployment may hold: a load or an import marked above it is refused before anything is written, in words that say this limit and never the item's content. A demo pack that declares no highest marking is judged as the scheme's highest, so under a lower setting it is refused. One of the handling scheme's classifications. Left unset, it is the scheme's highest, or OFFICIAL-SENSITIVE on the cloud-platform profile.
  */
 export type HighestMarking = string | null;
 /**
@@ -400,6 +530,10 @@ export type Organisation = string | null;
  * Default: none. The phase banner shows at alpha or beta.
  */
 export type Phase = "alpha" | "beta" | "live" | "none";
+/**
+ * Default: none. The banner's own words, in place of "This is a new service.", in the Glass and on the sign-in page: after the phase's tag at alpha or beta, alone at live or none. One line of at most 200 characters (ADR-132 Amendment 7).
+ */
+export type BannerText = string | null;
 /**
  * Default: 5x5x5. The scheme drawn items are graded in: 5x5x5; 3x5x2, whose handling code (P or C) is part of the grade and never merged with the marking; or the path of a scheme file (.yaml, beside this file unless absolute) naming its own scheme and each part's grades.
  */
@@ -431,7 +565,7 @@ export type Endpoint1 = string;
 /**
  * The region the buckets live in
  */
-export type Region = string;
+export type Region3 = string;
 /**
  * Default: instance — the server's own cloud identity, no key anywhere; `keys` reads OSPREY_S3_ACCESS_KEY and OSPREY_S3_SECRET_KEY at apply.
  */
@@ -499,6 +633,10 @@ export interface OspreyConfig {
   models?: ModelsConfig;
   governance?: GovernanceConfig;
   cluster?: ClusterConfig;
+  /**
+   * Default: none — only at profile: cloud-platform (ADR-148)
+   */
+  cloud_platform?: CloudPlatformConfig | null;
   network?: NetworkConfig;
   /**
    * Default: none declared
@@ -564,6 +702,7 @@ export interface ModelsConfig {
   vision?: Vision;
   transcription?: Transcription;
   embedding?: Embedding;
+  extraction_engine?: ExtractionEngine;
 }
 /**
  * A client's own model provider (ADR-114 decision 11, Amendment 6 point 4; ADR-135), reached
@@ -579,6 +718,9 @@ export interface ModelProviderConfig {
   api_base?: ApiBase;
   privacy_contract?: PrivacyContract;
   contract_reference?: ContractReference;
+  kind?: Kind;
+  auth?: Auth;
+  region?: Region;
 }
 /**
  * The roles it takes, each with the provider's model for it
@@ -650,6 +792,102 @@ export interface ClusterHost {
   roles?: Roles1;
 }
 /**
+ * ADR-148: only meaningful at `profile: cloud-platform`. What is this deployment's own (its
+ * namespace, its environment, its registry, who may reach it, where its enabled hosts are); what
+ * is the platform's (ingress class and annotations, storage class, egress policy kind, its
+ * secrets' names) is in the platform's settings file, `harness/cloud_platform/platforms/
+ * <platform>.yaml`, so another shared platform is a new file, not a new profile.
+ */
+export interface CloudPlatformConfig {
+  platform?: Platform;
+  namespace?: Namespace1;
+  environment?: Environment;
+  shape?: Shape;
+  registry?: Registry;
+  allow_from?: AllowFrom;
+  egress_nets?: EgressNets;
+  tls_secret?: TlsSecret;
+  /**
+   * How people sign in, with Entra ID (required at render): the tenant, the Glass's and the API's app registrations, where each claim comes from and the first administrators
+   */
+  claims?: EntraSignInConfig | null;
+  connector_hosts?: ConnectorHosts;
+  connector_sources?: ConnectorSources;
+}
+/**
+ * For each host the namespace reaches (a model provider, a proxied map provider, the mail server, a connector host, S3 and STS unless the platform's settings name theirs), the networks (CIDR) its traffic is allowed to; a host with none is refused at render. No network wider than /16 (IPv4) or /48 (IPv6), and never a default route
+ */
+export interface EgressNets {
+  [k: string]: string[];
+}
+/**
+ * ADR-148 decision 9 and Amendment 8: how this deployment's people sign in with Entra ID, and
+ * where `principal_auth` finds each of clearance, unit and handling codes in their token (a claim,
+ * or a table from Entra group to value; `principal_auth.ClaimMapping` checks the shape at render).
+ * Roles are not here: they are kept in Admin › People, the first administrators named below.
+ */
+export interface EntraSignInConfig {
+  tenant_id: TenantId;
+  client_id: ClientId1;
+  api_client_id: ApiClientId;
+  api_id_uri?: ApiIdUri;
+  token_version?: TokenVersion;
+  scope?: Scope;
+  clearance: Clearance;
+  org_unit: OrgUnit;
+  handling_codes: HandlingCodes;
+  groups_claim?: GroupsClaim;
+  first_administrators: FirstAdministrators;
+  claims_mapping_policy?: ClaimsMappingPolicy;
+}
+/**
+ * Where clearance comes from: {claim: <name>} or {groups: {<group id>: <value>}}
+ */
+export interface Clearance {
+  [k: string]: unknown;
+}
+/**
+ * Where the organisational unit comes from: {claim: ...} or {groups: {...}}
+ */
+export interface OrgUnit {
+  [k: string]: unknown;
+}
+/**
+ * Where the handling codes come from: {claim: ...} or {groups: {<id>: [codes]}}
+ */
+export interface HandlingCodes {
+  [k: string]: unknown;
+}
+/**
+ * The S3 buckets and Athena workgroups an S3 or Athena connection may read (ADR-140 Amendment 21). Each becomes the Conduit's own egress row on 443 and an entry on its allow-list, and the namespace's IAM role gains read-only statements scoped to it. Admin › Connections refuses an S3 or Athena connection not declared here; declare it, re-render and run helm upgrade (and apply the Terraform)
+ */
+export interface ConnectorSources {
+  s3?: S3;
+  athena?: Athena;
+}
+/**
+ * A bucket an S3 connection may read, under a folder (ADR-140 Amendment 21): a connection on it
+ * names this region and a folder at or under this one.
+ */
+export interface DeclaredS3Source {
+  bucket: Bucket;
+  region: Region1;
+  prefix?: Prefix;
+}
+/**
+ * An Athena workgroup an Athena connection may use (ADR-140 Amendment 21), with the databases
+ * it may read, where Athena writes its results, and where the tables' objects are (Athena reads
+ * them as the namespace's role, so the role is given read there; the Conduit never reaches
+ * them).
+ */
+export interface DeclaredAthenaSource {
+  workgroup: Workgroup;
+  region: Region2;
+  databases: Databases;
+  results_location: ResultsLocation;
+  table_locations: TableLocations;
+}
+/**
  * What this deployment publishes to its host.
  *
  * `05_DEPLOYMENT.md` §7: "Every service on an internal network. Only the workspace and the
@@ -667,6 +905,7 @@ export interface NetworkConfig {
   tls?: TlsFiles | null;
   redirect_http?: RedirectHttp;
   listen_address?: ListenAddress;
+  access_key?: AccessKey;
 }
 /**
  * ADR-114 Amendment 33 decision 3: the organisation's own certificate for a Small on a server
@@ -814,6 +1053,7 @@ export interface AppearanceConfig {
   service_name?: ServiceName;
   organisation?: Organisation;
   phase?: Phase;
+  banner_text?: BannerText;
 }
 /**
  * The deployment's grading scheme (`06_DECISIONS.md` ADR-143 decision 11 and Amendment 6): the
@@ -851,7 +1091,7 @@ export interface ExternalPostgres {
  */
 export interface ExternalObjectStore {
   endpoint: Endpoint1;
-  region: Region;
+  region: Region3;
   credentials?: Credentials;
   bucket_prefix?: BucketPrefix;
 }
