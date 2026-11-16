@@ -31,9 +31,17 @@ from conduit_common.identity import new_id
 from conduit_common.valkey_compat import reply
 from ontology.handling import HandlingScheme, principal_may_view
 from principal_auth import (
+    ACCESS_OUT_OF_DATE_WORDS,
+    PEOPLE_SECTION,
+    RUN_AGAIN_WORDS,
+    OwnerNotHeld,
+    OwnerRecordUnavailable,
+    PrincipalAccessOutOfDate,
     PrincipalExchangeRefused,
     PrincipalExchangeUnavailable,
     PrincipalRevoked,
+    out_of_date_next,
+    out_of_date_words,
 )
 from schemas.domain import Alert, AlertMode, Principal
 from schemas.ingest import StudioRecipeDraft, StudioRecipeStatus
@@ -263,10 +271,27 @@ class _Refused(Exception):
     refusal that says nothing about the owner (Amendment 3), which never pauses the schedule. `kind`
     is what its owner is told (Amendment 19); the words here go to the ledger alone."""
 
-    def __init__(self, why: str, *, kind: NoticeKind, about_the_owner: bool = True) -> None:
+    def __init__(
+        self, why: str, *, kind: NoticeKind, about_the_owner: bool = True, asked_for: str = ""
+    ) -> None:
         super().__init__(why)
         self.about_the_owner = about_the_owner
         self.kind: NoticeKind = kind
+        #: For a run asked for by hand, the words that say what to do instead (Amendment 16).
+        self.asked_for = asked_for
+
+
+def _asked_for(refused: _Refused, recipe: StudioRecipeDraft) -> str:
+    """A refusal's words for a run asked for now (*Run now*, `ospreyflow run`): nothing runs again
+    by itself, so an out-of-date owner's says what to do (ADR-148 Amendment 16)."""
+    if refused.kind == "owner_out_of_date" and refused.asked_for:
+        return refused.asked_for
+    if refused.kind == "owner_out_of_date":
+        return (
+            f"the schedule's owner, {recipe.schedule_owner}, {ACCESS_OUT_OF_DATE_WORDS}: "
+            f"{RUN_AGAIN_WORDS}"
+        )
+    return str(refused)
 
 
 @dataclass
@@ -375,7 +400,8 @@ class ScheduleExecutor:
         if recipe.status is StudioRecipeStatus.FLAGGED:
             await self._not_run(
                 recipe, latest, "blocked",
-                "the ontology changed since this recipe was published; publish it again to run it",
+                "the ontology changed since this pipeline was published; publish it again to "
+                "run it",
             )  # fmt: skip
             return
         try:
@@ -391,7 +417,7 @@ class ScheduleExecutor:
         token = uuid4().hex
         if not await reply(self.valkey.set(lock, token, nx=True, ex=_LOCK_SECONDS)):
             await self._not_run(
-                recipe, latest, "skipped", "the previous run of this recipe was still going"
+                recipe, latest, "skipped", "the previous run of this pipeline was still going"
             )
             return
         try:
@@ -451,8 +477,8 @@ class ScheduleExecutor:
                 if recipe.dataset_id not in (owner.datasets or []):
                     # Rule 4: the folder is the dataset's, read only through a case that has it.
                     raise _Refused(
-                        f"the recipe's dataset, {recipe.dataset_id}, is no longer in the case the "
-                        "watch was set in",
+                        f"the pipeline's dataset, {recipe.dataset_id}, is no longer in the case "
+                        "the watch was set in",
                         kind="refused_reach",
                     )
             except _Refused as refused:
@@ -507,11 +533,11 @@ class ScheduleExecutor:
         try:
             owner, case = await self._owner(recipe)
         except _Refused as refused:
-            raise ScheduleRunRefused(str(refused)) from refused
+            raise ScheduleRunRefused(_asked_for(refused, recipe)) from refused
         lock = f"schedule:lock:{recipe.recipe_id}"
         token = uuid4().hex
         if not await reply(self.valkey.set(lock, token, nx=True, ex=_LOCK_SECONDS)):
-            raise ScheduleRunRefused("the previous run of this recipe is still going")
+            raise ScheduleRunRefused("the previous run of this pipeline is still going")
         try:
             return await self.run(owner, recipe, case, None)
         finally:
@@ -525,7 +551,7 @@ class ScheduleExecutor:
         try:
             owner, case = await self._owner(recipe)
         except _Refused as refused:
-            raise ScheduleRunRefused(str(refused)) from refused
+            raise ScheduleRunRefused(_asked_for(refused, recipe)) from refused
         if Right.RUN_PIPELINES not in rights_for(owner.roles):
             raise ScheduleRunRefused(
                 f"the pipeline's owner, {recipe.schedule_owner}, no longer holds the loader's "
@@ -619,11 +645,35 @@ class ScheduleExecutor:
             raise _Refused(
                 f"the schedule's owner, {owner_id}, can no longer sign in", kind="refused_rights"
             ) from error
+        except PrincipalAccessOutOfDate as error:
+            # ADR-148 Amendment 16: nothing decided about the owner, so never counted toward the
+            # three that pause; refused at each slot until they sign in, then run again.
+            why = out_of_date_words(error)
+            raise _Refused(
+                f"the schedule's owner, {owner_id}, {why}: {out_of_date_next(error)}",
+                kind="owner_out_of_date",
+                about_the_owner=False,
+                asked_for=f"the schedule's owner, {owner_id}, {why}: "
+                f"{out_of_date_next(error, by_hand=True)}",
+            ) from error
+        except OwnerRecordUnavailable as error:
+            raise _Refused(
+                f"the people store behind {PEOPLE_SECTION} could not be read to act as the "
+                "schedule's owner",
+                kind="failed",
+                about_the_owner=False,
+            ) from error
         except PrincipalExchangeUnavailable as error:
             raise _Refused(
                 "the identity provider could not be reached to act as the schedule's owner",
                 kind="sign_in_unavailable",
                 about_the_owner=False,
+            ) from error
+        except OwnerNotHeld as error:
+            # ADR-148 Amendment 16: a fact about the owner, counted; Entra itself was not asked.
+            raise _Refused(
+                f"the schedule's owner, {owner_id}, is not held in {PEOPLE_SECTION}",
+                kind="refused_rights",
             ) from error
         except PrincipalExchangeRefused as error:
             # The identity provider was reached and refused: an account it no longer knows, an

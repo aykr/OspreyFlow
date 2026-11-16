@@ -26,11 +26,11 @@ export function SelectionList({ nodes, onCentre, onRemove }: SelectionListProps)
               <button
                 type="button"
                 className="btn"
-                aria-label={`Centre on ${name}`}
+                aria-label={`Centre on ${name} · ${node.type}`} // its visible text whole (WCAG 2.5.3)
                 onClick={() => onCentre(node.id)}
                 style={{ flex: 1, textAlign: "left" }}
               >
-                <span className="value">{name}</span>
+                <span>{name}</span>
                 <span style={{ color: "var(--text-tertiary)" }}> · {node.type}</span>
               </button>
               <button

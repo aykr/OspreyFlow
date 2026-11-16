@@ -6,15 +6,72 @@
   padding: var(--sp-16); min-height: 0; flex: 1; overflow-y: auto;
   background: var(--surface-app); color: var(--text-primary);
 }
-.admin-place .admin-place__title { margin: 0; }
+/* Under GOV.UK, Admin is a page that scrolls (the owner's screenshot of Admin › System, 15 November 2026). The
+   page's footer follows the workspace there (ADR-132, `brand/BrandFrame.tsx`), so Admin scrolling in its own box
+   made two scrollers, and the side list and the section were cut at the footer's edge. Here the document is Admin's
+   one scroller: the place grows with its content, App's root (sized to the window by an inline height) grows to hold
+   it, and the footer follows. The side list stays in view as the section scrolls, never past the place's end. The
+   standard look, with no footer, keeps the place's own box; so does Admin drawn outside the page's frame
+   (`#main-content`, `brand/BrandFrame.tsx`), as a harness of the place alone draws it. `keyboard/admin-frame.spec.ts`
+   holds it. */
+[data-brand="govuk"] #main-content .admin-place { flex: none; overflow-y: visible; }
+[data-brand="govuk"] #main-content :has(> .admin-place) { height: auto !important; min-height: var(--workspace-height, 100vh); }
+/* Sticky alone: a scrolling box of its own would be a scroller no key reaches (axe's scrollable-region-focusable).
+   Only beside the section: at 640px and below the list stands above it, and pinned it would cover the section. */
+@media (min-width: 641px) {
+  /* Beneath the classification strip, pinned above it (20px, primitives.css's `.classification-strip`). */
+  [data-brand="govuk"] #main-content .admin-place .admin-nav { position: sticky; top: 20px; }
+}
+
+/* The page's one heading is the open section's (the GOV.UK pass, 14 Nov): "Admin" a caption over it,
+   the help page a link in the same row. Outside GOV.UK, the section heading keeps its old size. */
+.admin-place__title-row { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-16); flex-wrap: wrap; }
+.admin-place .admin-place__caption { margin: 0; }
+.admin-place .admin-place__help { background: none; border: 0; padding: 0; cursor: pointer; }
+.admin-place .admin-place__heading { margin: 0; }
+.admin-place h1.value.admin-place__heading { font-size: var(--fs-16); line-height: var(--lh-16); font-weight: 600; }
+
+/* A row's actions: a full-width row beneath the person, one primary then the rest as links, every look. */
+/* A person's row and its actions read as one item: no rule between them, little space. */
+.admin-place__section tr:has(+ .admin-row-actions-row) > td { border-bottom: 0; padding-bottom: var(--sp-2); }
+.admin-row-actions-row > td { padding-top: var(--sp-2); padding-bottom: var(--sp-8); }
+.admin-row-actions__line { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-4) var(--sp-16); }
+.admin-row-actions__more { display: contents; }
+.admin-row-actions__link {
+  font: inherit; color: var(--brass); background: none; border: 0; padding: 0; min-height: var(--h-control-24);
+  text-decoration: underline; cursor: pointer; white-space: nowrap;
+}
+.admin-row-actions__link:hover { color: var(--brass-hover); }
+.admin-row-actions__link[aria-expanded="true"] { font-weight: 700; }
+
+/* A person's name is words, in the page's own face; mono stays for identifiers (DESIGN.md §9). */
+.admin-person__name { font-family: var(--ui); font-weight: 700; }
+
+/* A case's name is a name, not an identifier (ADR-145 Amendment 16): the body face, as a person's is. */
+.admin-case__name { font-family: var(--ui); font-weight: 700; }
+
+/* A section not built yet is named, never a link, with a Coming tag. */
+.admin-nav__coming-item { display: block; padding: var(--sp-4) var(--sp-8); color: var(--text-secondary); }
+.admin-nav__coming.label { border: 1px solid var(--border); padding: 0 var(--sp-4); font-weight: 600; }
+.admin-nav__coming-what { display: block; font-size: var(--fs-12); line-height: var(--lh-12); color: var(--text-secondary); }
+
+/* Column headers on one line at desktop width; they may wrap on a narrower screen. */
+@media (min-width: 1020px) { .admin-place__section th { white-space: nowrap; } }
 .admin-place__body { display: flex; gap: var(--sp-24); align-items: flex-start; min-width: 0; }
 .admin-place__section { display: flex; flex-direction: column; gap: var(--sp-12); flex: 1; min-width: 0; }
-.admin-place__section > h3 { align-self: flex-start; }
-.admin-place__section > h3:focus { outline: none; }
-.admin-place__section > h3:focus-visible { outline: var(--focus-width) solid var(--focus); outline-offset: var(--focus-offset); }
+.admin-place__section > h1 { align-self: flex-start; }
+.admin-place__section > h1:focus { outline: none; }
+.admin-place__section > h1:focus-visible { outline: var(--focus-width) solid var(--focus); outline-offset: var(--focus-offset); }
 
 .admin-nav { flex: none; width: 220px; display: flex; flex-direction: column; gap: var(--sp-12); }
 .admin-nav .admin-nav__heading { margin: 0 0 var(--sp-4); }
+/* Beneath the section's h1, h2s and then h3s (ADR-145 Amendment 16): the side list's groups, and every section's
+   parts (People's, Models' and Maps', the others'), with Datasets' details and Operations' figures nesting h3s.
+   Drawn at the sizes main gave them as h3 to h5, below the h1, not at the browser's sizes; GOV.UK's scale remaps
+   them (19px and 16px under a 36px h1). GOV.UK's classes size the side list's own. */
+.admin-nav h2.label.admin-nav__heading { font-size: var(--fs-14); line-height: var(--lh-14); font-weight: 700; }
+.admin-place__section h2 { font-size: var(--fs-13); line-height: var(--lh-13); font-weight: 700; }
+.admin-place__section h3 { font-size: var(--fs-12); line-height: var(--lh-12); font-weight: 700; }
 .admin-nav__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
 .admin-nav__item { border-left: 4px solid transparent; }
 .admin-nav__item--current { border-left-color: var(--brass); background: var(--surface-raised); }
@@ -28,7 +85,7 @@
 
 /* GOV.UK's side navigation: links underlined, the open item's rule and background as GOV.UK draws it,
    the focus state GOV.UK's own (the yellow with its ink). */
-.admin-nav--govuk { width: 280px; }
+.admin-nav--govuk { width: 220px; }
 .admin-nav--govuk .admin-nav__item--current { background: var(--surface-sunken); }
 .admin-nav--govuk .admin-nav__link { text-decoration: underline; text-underline-offset: 0.1578em; }
 .admin-nav--govuk .admin-nav__item--current .admin-nav__link { text-decoration: none; }
@@ -43,3 +100,24 @@
   .admin-place__body { flex-direction: column; }
   .admin-nav { width: 100%; }
 }
+
+/* GOV.UK's scale for Admin's dense parts (the GOV.UK pass, 14 Nov): the side navigation, the tables and
+   their controls at the Design System's "s" size (16px, the --fs-12 slot on these pages); prose stays at
+   the 19px body. */
+[data-brand="govuk"] .admin-place :is(.admin-nav__link, .admin-nav__coming-item, .admin-nav__coming, .admin-nav__coming-what, .admin-place__help, .admin-place__section table, .admin-place__section .btn, .admin-place__section input, .admin-place__section select, .admin-row-actions__link) {
+  font-size: var(--fs-12); line-height: var(--lh-12);
+}
+
+/* Admin › System's words in the page's own face (the owner's screenshot, 15 November 2026): a part's name, the
+   version, the marking ceiling and the converted views are words to read. Mono stays for a value to copy, a model's
+   id in its table (tokens.css: "every identifier … is set in mono. Mono means: this is a value you can copy";
+   DESIGN.md §9 exception 3). */
+.admin-system__name, .admin-system__version, .admin-system__marking, .admin-system__converted {
+  font-family: var(--ui); font-weight: 600;
+}
+
+/* Admin's words in the page's own face (v0.6.0 #6; the owner's ruling, 15 November 2026): a role's label, a custom
+   role's name, a schedule's label, the tips' role labels and an organisation arrival's sign-in name are words to read,
+   as a person's name and a case's are above. Mono stays for a value to copy (tokens.css: "every identifier … is set
+   in mono"; DESIGN.md §9 exception 3), such as a run's time. `keyboard/admin-words-face.spec.ts` holds it. */
+.admin-words { font-family: var(--ui); }

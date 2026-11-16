@@ -36,6 +36,12 @@ const HARNESS_ONLY: Record<string, string[]> = {
 // Glass's, where it once drew the other two gated (the live audit of 1 November 2026 found their text
 // at 4.25:1); the state is kept so Home with a single card is scanned too.
 const EXTRA_STATES: Record<string, string[]> = {
+  // ADR-078 Amendment 1: the canvas's right-click menu open on one node (the selection's actions, its link
+  // types, its own) and on two (the selection's, the pair's), opened by the keyboard's own route.
+  "harness.html": ["menu=node", "menu=two"],
+  // v0.6.1 glass-rows (ADR-145 Amendment 19 decisions 5 and 6): strictness's slider open in the canvas toolbar; the
+  // toolbar hidden, the case line slim with Show toolbar; the Map's row with Hide toolbar.
+  "glass-toolbar-harness.html": ["open=strictness", "hidden=1", "view=map"],
   // ADR-135 Amendment 2: Admin › Models with an engine being added, a key being entered, and a
   // local-only deployment (platform lane P1); Amendment 3: an engine's limits being set, the usage's
   // own days drawn, and the gateway not giving its usage (P2; the usage table is on every other state).
@@ -70,13 +76,15 @@ const EXTRA_STATES: Record<string, string[]> = {
   ],
   // ADR-145 decision 2: the banner in the Studio, with its way back, and in Admin.
   // ADR-145 Amendment 2: Monitoring's badge (inside the GOV.UK notification banner under that
-  // brand), and the rail's ⋯ Explore Details (ADR-145 Amendment 12) and the top bar's More views drawn
-  // open.
+  // brand), and the top bar's More views drawn open; ADR-145 Amendment 15: the Explore panel from the rail, and the
+  // Cases panel from the case line's Views in this case, drawn open.
   // ADR-146 decision 2: Rules and Monitoring in the switcher with its count (inside the GOV.UK header
   // under that brand), and the place open, its banner a GOV.UK notification banner.
   // ADR-132 Amendment 8: `banner=1` is the demonstration's deployment, the compact top under GOV.UK.
+  // The page frame as main.tsx and App.tsx draw it, a drawer's long body and the start overlay open (15 Nov 2026).
+  "frame-harness.html": ["drawer=1", "overlay=1"],
   "places-harness.html": [
-    "place=ingest", "place=admin", "badge=1", "open=more", "open=views", "banner=1", "banner=1&place=rules",
+    "place=ingest", "place=admin", "badge=1", "open=explore", "open=cases", "open=views", "open=questions", "banner=1", "banner=1&place=rules",
     "badge=1&rights=investigate,triage_alerts,read_alert_queue",
     "place=rules&rights=investigate,triage_alerts,read_alert_queue",
   ],
@@ -86,6 +94,8 @@ const EXTRA_STATES: Record<string, string[]> = {
   "alert-figures-harness.html": ["from=alert", "board=1", "board=1&rule=hotlists&from=alert", "home=1", "help=1"],
   // ADR-145 Amendment 11: Home's *Your access and tasks* where Home draws it, below the two columns.
   "answers-harness.html": ["home=1"],
+  // ADR-098 Amendment 9: Whole case chosen, its search's fallback said, an answer with its sources.
+  "questions-harness.html": ["case=1", "history=1", "case=1&save=1"],
   // ADR-146 decisions 2 and 6: Rules and Monitoring at an alert's address, and at one the reader may
   // not see.
   "rules-place-harness.html": ["address=a1", "address=not-yours", "evidence=1"],
@@ -94,15 +104,18 @@ const EXTRA_STATES: Record<string, string[]> = {
   // ADR-145 Amendment 2: the column's fresh-page default, the Inspector alone open.
   "panel-frames-harness.html": ["defaults=1"],
   // ADR-132 Amendment 7: the deployment's own banner words, in the dark, light and GOV.UK scans.
-  // ADR-145 Amendment 12: the rail with Explore Details, and Help's keys panel open over it.
-  "top-bar-harness.html": ["help=1"],
-  "shell-harness.html": ["banner=1", "banner=alone", "host=demo.service.gov.uk"],
+  // ADR-145 Amendment 15: the rail of panel openers, and Help's keys panel open over it.
+  // ADR-145 Amendment 15: Build a report beside Reports, for a builder where Superset is deployed.
+  "top-bar-harness.html": ["help=1", "reports=1"],
+  "shell-harness.html": ["banner=1", "banner=alone", "host=demo.service.gov.uk", "drawer=1"],
   // L2.3 part 1: the case screen's lightening, each prototype variant (the default is variant a).
   "case-screen-options-harness.html": ["variant=today", "variant=b", "variant=c"],
   // ADR-144 (L3.2b): case views as another member sees them, the Save as a view form, and the banner
   // over an opened view.
   // ADR-144 Amendment 3: the graph's *Views ▾*, closed, open on the case's views, and open on none.
-  "views-harness.html": ["as=bob", "show=form", "show=lens", "show=merged", "show=merged&notes=open", "asking=delete", "show=menu", "show=menu&open=1", "show=menu&open=1&empty=1"],
+  // ADR-145 Amendment 15 Part A: the search results page open, with nothing found, on the fallback and refused.
+  "search-results-harness.html": ["open=1", "open=1&state=none", "open=1&state=limited", "open=1&state=refused"],
+  "views-harness.html": ["in=drawer", "in=drawer&asking=delete", "in=drawer&long=1", "as=bob", "show=form", "show=lens", "show=lens&details=open", "show=merged", "show=merged&notes=open", "asking=delete", "show=way-back"],
   // ADR-143 decisions 4 to 7 (L3.3): a board open with its drawn and loaded items, its inspector, its
   // item and link forms and the withdrawal's question; another member's read-only view; a blank board;
   // the boards list with a board from a view chosen, the edit form and an item's menu open, a drawing
@@ -176,6 +189,8 @@ const EXTRA_STATES: Record<string, string[]> = {
     // *What raises alerts*: the inventory (ADR-146 decision 5), the hotlists and the watched patterns
     // with their schedules (the alert inbox went in L2.10).
     "tab=watches",
+    // v0.6.0 #14: a stopped hotlist on *What raises alerts*, its reason under *Stopped*.
+    "tab=watches&stopped=1",
     "tab=rules&sentence=preview",
     // ADR-139 decision 8: a sentence on connection strength.
     "tab=rules&sentence=strength",
@@ -268,7 +283,14 @@ const EXTRA_STATES: Record<string, string[]> = {
   "needs-you-harness.html": ["open=1", "open=1&notices=1"],
   "admin-harness.html": [
     "open=connections&rights=administer_system",
-    "rights=manage_people,manage_dashboards,operate_schedules,administer_system,manage_ontology,read_audit&open=Uploads%20(coming)",
+    // Admin › System in the page's own frame, the owner's screenshot (15 November 2026).
+    "frame=1&serve=system&rights=administer_system&open=System",
+    // ADR-145 Amendment 16: Models and Maps, their parts h2s beneath the section's h1.
+    "rights=manage_models&serve=models&open=Models",
+    "rights=manage_geospatial&serve=maps&open=Maps",
+    // Every section in the side list, the coming ones named with their tag and what they will hold (the
+    // GOV.UK pass, 14 Nov: no longer opened as placeholders); People's rows with their actions beneath.
+    "rights=manage_people,manage_dashboards,operate_schedules,administer_system,manage_ontology,read_audit&serve=people",
     // L2.4 part 2: Datasets' details (policy with its warning, Authors, linked cases), Change
     // owner… open, a removed case's dry run shown, and System's Dataset owners may be.
     "rights=administer_system&serve=datasets&show=details",
@@ -302,6 +324,10 @@ const EXTRA_STATES: Record<string, string[]> = {
     // L1.9 (ADR-148): the S3 and Athena forms, their cloud role's words, and their rows in the table.
     "rights=administer_system&serve=connections&open=Connections&show=s3",
     "rights=administer_system&serve=connections&open=Connections&show=athena",
+    // The section headings step (ADR-145 Amendment 16): Dashboard identities' form and Demo packs' packs, each heading
+    // an h2 beneath the section's h1.
+    "rights=manage_dashboards,administer_system&serve=packs&open=Dashboard%20identities",
+    "rights=manage_dashboards,administer_system&serve=packs&open=Demo%20packs",
   ],
 };
 
@@ -310,9 +336,10 @@ const EXTRA_STATES: Record<string, string[]> = {
 // title and the node's selector, with the text it held and either the ratio it measured (a floor:
 // worse fails) or the exact reason it could not be measured and what its own surfaces gave (a floor
 // too). Fixed ones come off; a new one is never added to make a run green. The owners, by page:
-// the map's attribution chip over the map's canvas (platform); the case screen's variant b ⋯ and
+// the case screen's variant b ⋯ and
 // places' open More views under GOV.UK (shell); the boards' handles and labels where a link line or
 // another item lies at them (case); Home's key cap at `opacity: 0.8` (home). Show as BPMN's words, once listed, measure on their task box since T3b.
+// The map's attribution chip (platform) came off in v0.5.2: an opaque token surface (CARRIES 91).
 const CONTRAST_FINDINGS: Record<string, ListedFindings> = readFindings(
   JSON.parse(readFileSync(new URL("./contrastFindings.json", import.meta.url), "utf8")),
 );
@@ -369,8 +396,8 @@ test("the scan found the harness pages", () => {
 // state. axe's target-size counts a target a menu covers all but a sliver of as too small (it skips one
 // covered wholly); in the browser the menu is on top (`elementFromPoint` at every sampled point of its
 // items). GOV.UK's context row is one row under the top bar since Amendment 8, so *More views*, drawn open,
-// lay over its sections and left 4 px of *Boards (coming)* showing. Since ADR-145 Amendment 13 renamed them
-// *Graph · Drawing board* nothing is reported there, so the list is empty and kept for the next such state. Every other rule still runs on those
+// lay over its sections and left 4 px of *Boards (coming)* showing. The sections left the case line with ADR-145
+// Amendment 15, and nothing is reported there now, so the list is empty and kept for the next such state. Every other rule still runs on those
 // nodes, and each entry must still be reported, so it fails once the menu no longer lies over them. Keyed by
 // a scanned title; each value a class the dropped nodes' markup carries.
 const UNDER_AN_OPEN_OVERLAY: Record<string, readonly string[]> = {};
@@ -390,6 +417,14 @@ for (const name of pages) {
         await page.goto(`/keyboard/${name}${query ? `?${query}` : ""}`);
         await page.waitForLoadState("networkidle");
         await page.evaluate(() => document.fonts.ready);
+        // The menu open on what the state names: one node (headed with its name) or two ("2 selected").
+        if (state.startsWith("menu="))
+          await expect(page.locator(".radial-menu__list[role='menu']")).toHaveAttribute(
+            "aria-label",
+            state === "menu=two" ? "2 selected" : "n0",
+          );
+        // Ask & Chat's page open before the scan (ADR-145 Amendment 18): the harness presses the rail after it loads.
+        if (state === "open=questions") await expect(page.getByRole("region", { name: "Ask & Chat" })).toBeVisible();
         if (variant === "light") {
           await page.evaluate(() => document.documentElement.setAttribute("data-theme", "light"));
         }

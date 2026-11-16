@@ -3,7 +3,7 @@
 // provider directly. Shapes are the generated ones.
 import { rightName, rolesHolding, whyNotByRole, type Right } from "../help/roles";
 import type {
-  AccessInput,
+  PersonAccessInput,
   AdminPeopleRows,
   AuditSectionPage,
   ConnectionTest,
@@ -32,6 +32,7 @@ import type {
   ScheduleRunView,
   SignInDelivery,
   SignInKind,
+  GuestSignIn,
   SystemStatus,
 } from "../../../../packages/schemas/generated";
 
@@ -53,6 +54,12 @@ async function failure(response: Response): Promise<Error> {
   if (typeof detail === "object" && detail?.error === "handling_code_you_do_not_hold") {
     return new Error(`You cannot give a handling code you do not hold yourself (${(detail.codes ?? []).join(", ")}).`);
   }
+  // ADR-148 Amendment 15: the people store's own refusal of a setter it holds nothing for, or disabled.
+  if (typeof detail === "object" && detail?.error === "setter_cannot_set") {
+    return new Error("You cannot set anyone's access until your own is set here, and while your account is enabled.");
+  }
+  // ADR-148 Amendment 15: a person no longer recorded here (removed since People was read).
+  if (body.error === "no_such_person") return new Error("That person is no longer in People and roles here: refresh the list.");
   if (typeof detail === "object" && detail?.error === "cannot_disable_yourself") {
     return new Error("You cannot disable your own account.");
   }
@@ -122,9 +129,15 @@ export const invitePerson = (api: AdminApi, invite: InviteInput) =>
   call<SignInDelivery>(api, "people", { method: "POST", body: JSON.stringify(invite) });
 // ADR-148 Amendment 8: on Entra ID sign-in, Entra holds the accounts; a person is added by object id.
 export const signInKind = (api: AdminApi) => call<SignInKind>(api, "sign-in");
+// ADR-148 Amendment 17: whether guest (B2B) accounts are admitted, and switching it (manage_people).
+export const guestSignIn = (api: AdminApi) => call<GuestSignIn>(api, "sign-in/guests");
+export const setGuestSignIn = (api: AdminApi, admitted: boolean) =>
+  call<GuestSignIn>(api, "sign-in/guests", { method: "PUT", body: JSON.stringify({ admitted }) });
+// ADR-148 Amendment 10: Admin › Dashboards' own copy, behind manage_dashboards.
+export const dashboardsSignInKind = (api: AdminApi) => call<SignInKind>(api, "dashboards/sign-in");
 export const addPersonByObjectId = (api: AdminApi, objectId: string) =>
   call<PersonAccount>(api, "people/by-object-id", { method: "POST", body: JSON.stringify({ object_id: objectId }) });
-export const setAccess = (api: AdminApi, userId: string, access: AccessInput) =>
+export const setAccess = (api: AdminApi, userId: string, access: PersonAccessInput) =>
   call<PersonAccount>(api, person(userId, "access"), { method: "PUT", body: JSON.stringify(access) });
 export const disablePerson = (api: AdminApi, userId: string) =>
   call<PersonAccount>(api, person(userId, "disable"), { method: "POST" });
@@ -140,10 +153,11 @@ export const listArrivals = (api: AdminApi) => call<OrganisationArrival[]>(api, 
 export const linkOrganisation = (api: AdminApi, userId: string, subject: string) =>
   call<PersonAccount>(api, person(userId, "organisation-link"), { method: "POST", body: JSON.stringify({ subject }) });
 export const listDashboards = (api: AdminApi) => call<DashboardIdentity[]>(api, "dashboards");
-export const registerDashboard = (api: AdminApi, name: string, clearance: string, orgUnit: string) =>
+export const registerDashboard = (api: AdminApi, name: string, clearance: string, orgUnit: string, applicationId?: string) =>
   call<RegisteredDashboard>(api, "dashboards", {
     method: "POST",
-    body: JSON.stringify({ name, clearance, org_unit: orgUnit }),
+    // ADR-148 Amendment 10: on Entra ID, the dashboard's own app registration's application id.
+    body: JSON.stringify({ name, clearance, org_unit: orgUnit, ...(applicationId ? { application_id: applicationId } : {}) }),
   });
 export const removeDashboard = (api: AdminApi, clientId: string) =>
   call<void>(api, `dashboards/${encodeURIComponent(clientId)}`, { method: "DELETE" });

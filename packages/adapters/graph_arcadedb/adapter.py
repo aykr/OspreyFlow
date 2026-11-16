@@ -17,7 +17,6 @@ No read here counts what it left out: a figure for what the reader may not read 
 from __future__ import annotations
 
 import asyncio
-import re
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from datetime import datetime
 from typing import Any, Literal
@@ -51,6 +50,7 @@ from ports.graph import (
     SubgraphTooLarge,
     SuggestOptions,
 )
+from ports.index_feed import PendingIndex
 from schemas.compute import LinkStructure, StructureEdge, StructureNode
 from schemas.domain import (
     AuditStub,
@@ -92,6 +92,7 @@ from schemas.explore import (
     TypeCounts,
 )
 from schemas.ingest import LinkPriorState, stored_digest
+from schemas.mapconfig import GAZETTEER_ONLY_IDENTIFIERS
 from schemas.merge import merge_datasets, merge_interval, merge_properties, merge_provenance
 from schemas.strength import (
     SHARED_VALUE,
@@ -124,6 +125,7 @@ from .builders import (
     SuggestNodesBuilder,
     render_edges_among_gremlin,
     render_existing_ids_sql,
+    render_field_record_id_lookup_sql,
     render_get_edges_gremlin,
     render_get_nodes_gremlin,
     render_link_structure_gremlin,
@@ -142,6 +144,8 @@ from .gremlin_literals import (
     groovy_string_list_literal,
     groovy_string_literal,
 )
+from .lookup import RECORD_ID as _RECORD_ID
+from .lookup import unique_id_types, vertex_records
 from .naming import (
     logical_type_name,
     physical_edge_labels,
@@ -151,6 +155,7 @@ from .naming import (
 from .schema import apply_schema as _apply_schema_ddl
 from .schema import drop_schema as _drop_schema_ddl
 from .serialization import (
+    _indexed_property_names,
     edge_from_element_map,
     edge_write_to_properties,
     node_from_element_map,
@@ -179,7 +184,6 @@ _ID_CHUNK = 1000
 
 #: What ArcadeDB calls a record: `#<bucket>:<position>`. Checked before one is put in a Gremlin
 #: literal, though the store is what said it.
-_RECORD_ID = re.compile(r"^#\d+:\d+$")
 
 
 #: How many links `strip_provenance_references` reads at a time.
@@ -209,6 +213,15 @@ def _count(row: Any) -> int:
     if isinstance(row, dict):
         return int(row.get("result") or 0)
     return int(row or 0)
+
+
+def _same_as_ends(edges: Sequence[EdgeWrite]) -> list[NodeId]:
+    """Both ends of every `SAME_AS` among `edges`: a merge re-reads its nodes (ADR-150)."""
+    return [end for e in edges if e.type == "SAME_AS" for end in (e.source, e.target)]
+
+
+#: The search index feed's outbox (ADR-150 decision 1), a document type of its own.
+INDEX_PENDING = "IndexPending"
 
 
 def _id_chunks(ids: Sequence[str]) -> list[list[str]]:
@@ -286,17 +299,20 @@ class GraphArcadeDBAdapter:
         return self._schema
 
     async def _find_existing_node(
-        self, node_id: NodeId, *, session_id: TxId
+        self, node_id: NodeId, *, session_id: TxId, type_name: str | None = None
     ) -> dict[str, Any] | None:
         """Unfiltered by design — an internal lookup during a trusted write, the same as
-        `_node_type`'s and `supersede_node`'s own. A second `upsert_nodes` call for the same id
+        `supersede_node`'s own. A second `upsert_nodes` call for the same id
         (a re-ingested load; the same fixture seeded twice, `tests/conformance/graph_port/
         test_suite.py`'s own case for this) must find and update the existing node, never insert
         a duplicate that collides on the same declared `id` property."""
-        node_lit = groovy_string_literal(node_id)
-        results = await self._client.gremlin(
-            f'g.V().has("id",{node_lit}).elementMap()', session_id=session_id
+        found = await self._vertex_records(
+            [node_id], tx=session_id, types=None if type_name is None else [type_name]
         )
+        if node_id not in found:
+            return None
+        rid_lit = groovy_string_literal(found[node_id][0])
+        results = await self._client.gremlin(f"g.V({rid_lit}).elementMap()", session_id=session_id)
         return results[0] if results else None
 
     async def upsert_nodes(self, nodes: Sequence[NodeWrite], tx: TxId) -> list[NodeId]:
@@ -321,14 +337,45 @@ class GraphArcadeDBAdapter:
         """
         schema = self._require_schema()
         ids: list[NodeId] = []
+        # The call's ids resolved once, by SQL through every vertex type's unique `id` index
+        # (ADR-124 Amendment 18), not only the types written: an id another type already holds is
+        # refused below, never inserted beside it as a second vertex under one id (which no
+        # per-type unique index could refuse). An id written earlier in this call is resolved
+        # again, in its own type, since its record is new.
+        known = await self._vertex_records([write.id for write in nodes], tx=tx)
+        # Every write checked before the first is sent, so a refused call writes nothing: an id is
+        # written as the type the store holds it in, and as one type throughout the call. The
+        # refusal names neither type: the holder may be a node its writer cannot read (rule 3).
+        typed = {node_id: stored for node_id, (_rid, stored) in known.items()}
         for write in nodes:
             entity_type = schema.entity_type(write.type)
             if entity_type is None:
                 raise OntologyError(f"{write.type!r} is not a type in the active ontology")
             validate_properties(entity_type, write.properties)
-
+            wanted = physical_type_name(write.type)
+            if typed.setdefault(write.id, wanted) != wanted:
+                raise OntologyError(
+                    f"the id {write.id!r} is held by a node of another type: a node's type is not "
+                    "changed by a write, and one id is never two nodes. If a generator or pipeline "
+                    "moved this record to another type, give it an id of its own in that type "
+                    "(an id names one node for good, reverted or not)"
+                )
+        written: set[str] = set()
+        for write in nodes:
+            entity_type = schema.entity_type(write.type)
+            assert entity_type is not None  # checked above, before any write
             node_id = write.id
-            existing = await self._find_existing_node(node_id, session_id=tx)
+            if node_id in written:
+                existing = await self._find_existing_node(
+                    node_id, session_id=tx, type_name=physical_type_name(write.type)
+                )
+            elif node_id in known:
+                rid_lit = groovy_string_literal(known[node_id][0])
+                found = await self._client.gremlin(f"g.V({rid_lit}).elementMap()", session_id=tx)
+                existing = found[0] if found else None
+            else:
+                existing = None
+            written.add(node_id)
             # A reverted node is not merged into (ADR-127 Amendment 6): its body, marking and
             # datasets were taken back with its load, so none of them may carry into the write.
             # The write is a fresh create under the same id, which `UPDATE` below clears of
@@ -399,16 +446,8 @@ class GraphArcadeDBAdapter:
                     f"INSERT INTO {type_name} SET {set_clause}", params=props, session_id=tx
                 )
             ids.append(node_id)
+        await self._index_pending(ids, tx)  # ADR-150 decision 1: a load
         return ids
-
-    async def _node_type(self, node_id: NodeId, *, session_id: TxId) -> str | None:
-        node_lit = groovy_string_literal(node_id)
-        results = await self._client.gremlin(
-            f'g.V().has("id",{node_lit}).label()', session_id=session_id
-        )
-        if not results:
-            return None
-        return logical_type_name(results[0]["result"])
 
     async def _find_existing_edge(
         self,
@@ -419,6 +458,7 @@ class GraphArcadeDBAdapter:
         directed: bool,
         audience: Hashable,
         session_id: TxId,
+        source_rid: str | None = None,
     ) -> dict[str, Any] | None:
         """`01_DOMAIN_MODEL.md` §3: one summarised edge per pair per type.
         A second `upsert_edges` call for the same (type, source, target) —
@@ -440,13 +480,20 @@ class GraphArcadeDBAdapter:
         most one, since writes of one audience merge, but `supersede_edge` can put a replacement
         beside a live link of its audience, so the choice is deterministic: the higher revision,
         then the later creation, then the greater id, never whichever the store returns first."""
-        src_lit = groovy_string_literal(source)
+        if source_rid is None:
+            found = await self._vertex_records([source], tx=session_id)
+            if source not in found:
+                return None
+            source_rid = found[source][0]
+        src_lit = groovy_string_literal(source_rid)
         tgt_lit = groovy_string_literal(target)
         label_lit = groovy_string_literal(type_name)
         step = "outE" if directed else "bothE"
         other = "inV" if directed else "otherV"
+        # From the source's record id (ADR-124 Amendment 18); the target is matched among the
+        # source's own neighbours, which reads no other vertex.
         query = (
-            f'g.V().has("id",{src_lit}).{step}({label_lit}).has("reverted",false)'
+            f'g.V({src_lit}).{step}({label_lit}).has("reverted",false)'
             f'.hasNot("superseded_by").where({other}().has("id",{tgt_lit})).elementMap()'
         )
         results = await self._client.gremlin(query, session_id=session_id)
@@ -497,6 +544,7 @@ class GraphArcadeDBAdapter:
         *,
         session_id: TxId,
         corpus_total: int | None = None,
+        ends: Mapping[str, tuple[str, str]] | None = None,
     ) -> tuple[int, int, int]:
         """Occurrences-weighted degree of `source` and `target` and the
         corpus-wide total for this edge type, *before* this write's own
@@ -511,18 +559,22 @@ class GraphArcadeDBAdapter:
         asked: the total is a whole-corpus traversal, and `upsert_edges` reads it once per call and
         carries it forward rather than once per edge (ADR-056 Amendment 22)."""
         label_lit = groovy_string_literal(type_name)
-        src_lit = groovy_string_literal(source)
-        tgt_lit = groovy_string_literal(target)
-        source_degree = await self._sum_occurrences(
-            f'g.V().has("id",{src_lit}).bothE({label_lit}).has("reverted",false)'
-            '.hasNot("superseded_by").values("occurrences").sum()',
-            session_id,
-        )
-        target_degree = await self._sum_occurrences(
-            f'g.V().has("id",{tgt_lit}).bothE({label_lit}).has("reverted",false)'
-            '.hasNot("superseded_by").values("occurrences").sum()',
-            session_id,
-        )
+        if ends is None:
+            ends = await self._vertex_records([source, target], tx=session_id)
+
+        async def degree(node_id: NodeId) -> int:
+            if node_id not in ends:
+                return 0
+            rid_lit = groovy_string_literal(ends[node_id][0])
+            return await self._sum_occurrences(
+                f'g.V({rid_lit}).bothE({label_lit}).has("reverted",false)'
+                '.hasNot("superseded_by").values("occurrences").sum()',
+                session_id,
+            )
+
+        # Each end from its record id (ADR-124 Amendment 18), not a scan of the store by `id`.
+        source_degree = await degree(source)
+        target_degree = await degree(target)
         if corpus_total is not None:
             return source_degree, target_degree, corpus_total
         corpus_total = await self._sum_occurrences(
@@ -567,6 +619,9 @@ class GraphArcadeDBAdapter:
         # traversal, and the only change it can see during this call is the call's own writes
         # (ADR-056 Amendment 22). Never kept between calls, since anything may write or revert then.
         corpus_totals: dict[str, int] = {}
+        # Every end of the call's edges, by SQL through each vertex type's unique `id` index, once
+        # (ADR-124 Amendment 18): the store is never scanned by `id` once per edge.
+        ends = await self._edge_ends(edges, schema, tx=tx)
         for write in edges:
             edge_type = schema.edge_type(write.type)
             if edge_type is None:
@@ -578,8 +633,8 @@ class GraphArcadeDBAdapter:
                     "least one"
                 )
 
-            source_type = await self._node_type(write.source, session_id=tx)
-            target_type = await self._node_type(write.target, session_id=tx)
+            source_type = logical_type_name(ends[write.source][1]) if write.source in ends else None
+            target_type = logical_type_name(ends[write.target][1]) if write.target in ends else None
             if source_type is None:
                 raise OntologyError(f"edge source {write.source!r} does not exist")
             if target_type is None:
@@ -594,6 +649,7 @@ class GraphArcadeDBAdapter:
                 directed=edge_type.directed,
                 audience=audience_of(write.handling, write.datasets, self._scheme),
                 session_id=tx,
+                source_rid=ends[write.source][0],
             )
 
             if existing is not None:
@@ -645,6 +701,7 @@ class GraphArcadeDBAdapter:
                 now=now,
                 session_id=tx,
                 corpus_total=corpus_totals.get(type_name),
+                ends=ends,
             )
             # `corpus_total_occurrences` is the total with this write's delta in it, which is what
             # the store would answer for the next edge of this type once this one is written.
@@ -680,11 +737,17 @@ class GraphArcadeDBAdapter:
                 for key in props
             )
             if existing is not None:
-                edge_lit = groovy_string_literal(edge_id)
-                # ADR-110 Amendment 18: its own type alone, never another type holding the id.
+                # ADR-110 Amendment 18: its own type alone, never another type holding the id. The
+                # link a traversal reached (`_find_existing_edge`), from its source's record id
+                # through its own adjacency (ADR-124 Amendment 18): never by the type's `id` index,
+                # which may hold a stray second record of the link that no traversal reaches
+                # (ADR-056 Amendments 15, 16 and 19), where the merge would be written and read by
+                # nothing; and never by `g.E().hasLabel(…).has("id", …)`, which scans every edge.
+                step = "outE" if edge_type.directed else "bothE"
                 command = (
-                    f"g.E().hasLabel({groovy_string_literal(type_name)})"
-                    f'.has("id",{edge_lit}){property_steps}'
+                    f"g.V({groovy_string_literal(ends[write.source][0])})"
+                    f".{step}({groovy_string_literal(type_name)})"
+                    f'.has("id",{groovy_string_literal(edge_id)}){property_steps}'
                 )
                 await self._client.gremlin(command, params=bound_params, session_id=tx)
                 if merged_interval is not None and merged_interval.valid_to is None:
@@ -698,17 +761,21 @@ class GraphArcadeDBAdapter:
                         session_id=tx,
                     )
             else:
+                # From the ends' record ids (ADR-124 Amendment 18).
                 command = (
-                    f'g.V().has("id", src).as("__src")'
-                    f'.V().has("id", tgt)'
-                    f'.addE("{type_name}").from("__src"){property_steps}'
+                    f'g.V(src).as("__src").V(tgt).addE("{type_name}").from("__src"){property_steps}'
                 )
                 await self._client.gremlin(
                     command,
-                    params={"src": write.source, "tgt": write.target, **bound_params},
+                    params={
+                        "src": ends[write.source][0],
+                        "tgt": ends[write.target][0],
+                        **bound_params,
+                    },
                     session_id=tx,
                 )
             ids.append(edge_id)
+        await self._index_pending(_same_as_ends(edges), tx)  # ADR-150 decision 1: a merge
         return ids
 
     async def bulk_load_edges(
@@ -720,9 +787,14 @@ class GraphArcadeDBAdapter:
     ) -> BulkEdgeResult:
         """`ports.graph.BulkGraphLoader` (ADR-058): the contract is stated there, the logic is
         `bulk.BulkEdgeLoader`'s. No `TxId`: it commits in chunks of its own."""
-        return await self._bulk.load(
+        result = await self._bulk.load(
             self._require_schema(), edges, chunk_size=chunk_size, progress=progress
         )
+        # ADR-150 decision 1, a merge loaded in bulk: the chunks commit on their own, so the
+        # outbox is written after them; a merge changes no document, and the drift check finds a
+        # crash between the two.
+        await self._index_pending(_same_as_ends(edges), None)
+        return result
 
     async def _weigh_edge(
         self,
@@ -734,13 +806,19 @@ class GraphArcadeDBAdapter:
         now: datetime,
         session_id: TxId,
         corpus_total: int | None = None,
+        ends: Mapping[str, tuple[str, str]] | None = None,
     ) -> tuple[float, WeightComponents]:
         """`01_DOMAIN_MODEL.md` §6.1. `merged_occurrences` already reflects
         this write; the corpus-wide degree/total queries do not yet, since
         the store has not been updated at the point they run — so this
         write's own delta (`write.occurrences`) is added to each below."""
         source_degree, target_degree, corpus_total = await self._corpus_edge_stats(
-            type_name, write.source, write.target, session_id=session_id, corpus_total=corpus_total
+            type_name,
+            write.source,
+            write.target,
+            session_id=session_id,
+            corpus_total=corpus_total,
+            ends=ends,
         )
         delta = write.occurrences
         # A link from a node to itself is read back twice from that node (`bothE`), so the stored
@@ -787,16 +865,7 @@ class GraphArcadeDBAdapter:
         on `id` alone. Not this process's applied ontology: a link type another process created
         since (a proposal's own storage type) would be left out, and its links would read as
         absent. A type without that index is not asked, since asking would scan it."""
-        types = await self._client.sql("SELECT name, type, indexes FROM schema:types")
-        return [
-            t["name"]
-            for t in types
-            if t.get("type") == kind
-            and any(
-                i.get("unique") is True and i.get("properties") == ["id"]
-                for i in t.get("indexes") or []
-            )
-        ]
+        return await unique_id_types(self._client, kind)
 
     async def _record_ids(
         self, type_names: Sequence[str], ids: list[str], *, tx: TxId | None = None
@@ -821,6 +890,46 @@ class GraphArcadeDBAdapter:
                     raise ValueError(f"not an ArcadeDB record id: {rid!r}")
                 rids.append(rid)
         return rids
+
+    async def _vertex_records(
+        self,
+        node_ids: Sequence[NodeId],
+        *,
+        tx: TxId | None,
+        types: Sequence[str] | None = None,
+    ) -> dict[str, tuple[str, str]]:
+        """Each id's vertex as (record id, stored type), through the unique `id` index of each
+        vertex type in `types`, or of every one (`lookup.vertex_records`, ADR-124 Amendment 18):
+        the write path's lookups, never `g.V().has("id", …)`, which scanned every vertex once per
+        item."""
+        return await vertex_records(self._client, [str(i) for i in node_ids], tx=tx, types=types)
+
+    async def _edge_ends(
+        self, edges: Sequence[EdgeWrite], schema: OntologySchema, *, tx: TxId
+    ) -> dict[str, tuple[str, str]]:
+        """The ends of a call's edges, asked first of the types the ontology lets those edges join
+        (ADR-124 Amendment 18), so a call costs one query per type its links can reach rather than
+        one per type in the store. An end not found there is asked again of every type, so an end
+        of a type the link does not allow is still found, and refused for its type, not reported
+        missing; a type that joins anything (`*`) asks every type at once."""
+        ids = [i for write in edges for i in (write.source, write.target)]
+        joined: set[str] = set()
+        anything = False
+        for write in edges:
+            edge_type = schema.edge_type(write.type)
+            allowed = [] if edge_type is None else edge_type.from_types + edge_type.to_types
+            if edge_type is None or "*" in allowed:
+                anything = True
+                break
+            joined.update(physical_type_name(t) for t in allowed)
+        types: set[str] | None = None if anything else joined
+        ends = await self._vertex_records(
+            ids, tx=tx, types=None if types is None else sorted(types)
+        )
+        missing = [i for i in ids if i not in ends]
+        if missing and types is not None:
+            ends.update(await self._vertex_records(missing, tx=tx))
+        return ends
 
     async def get_nodes(self, node_ids: Sequence[NodeId], principal: Principal) -> list[Node]:
         found: dict[str, Node] = {}
@@ -928,9 +1037,61 @@ class GraphArcadeDBAdapter:
         identifier_fields = tuple(sorted(searchable_fields))
         if not identifier_fields:
             return []
-        builder = SearchNodesBuilder(identifier_fields, query, limit=limit)
-        results = await self._client.gremlin(builder.render_gremlin(self._access, principal))
-        return [node_from_element_map(r, principal) for r in results]
+        # ADR-124 Amendment 21: the candidates first, by SQL, then the match and the access step
+        # in a traversal from them alone. `g.V().or(...)` read the whole store for each search.
+        rids = await self._search_candidates(schema, identifier_fields, query, principal)
+        found: dict[str, dict[str, Any]] = {}
+        for chunk in _id_chunks(rids) or [[]]:
+            builder = SearchNodesBuilder(
+                identifier_fields, query, limit=limit, record_ids=tuple(chunk)
+            )
+            for row in await self._client.gremlin(builder.render_gremlin(self._access, principal)):
+                found.setdefault(str(row.get("id")), row)
+        return [node_from_element_map(r, principal) for r in list(found.values())[:limit]]
+
+    async def _search_candidates(
+        self,
+        schema: OntologySchema,
+        identifier_fields: tuple[str, ...],
+        query: str,
+        principal: Principal,
+    ) -> list[str]:
+        """`search_nodes`' candidates (ADR-124 Amendment 21): the record ids of every vertex that
+        could match, one SQL query per stored vertex type and searchable field that type keeps at
+        its top level (its identifiers and indexed properties, `_indexed_property_names`, which the
+        write flattens; any other property stays inside `properties`, where `has(field, value)`
+        never matched it), run together, the value bound. A field matched for no request reader
+        (`GAZETTEER_ONLY_IDENTIFIERS`, ADR-147 Amendment 3) is not asked for one. A type the store
+        does not hold (no unique `id` index, Amendment 2) is not asked. Nothing here is
+        access-filtered, and the traversal from these records applies the match again, so a
+        candidate the lookup over-finds is dropped there; the result is ordered, without repeats,
+        so the chunks, and the round trips, depend only on how many vertices hold the value."""
+        asked = set(identifier_fields)
+        if principal.datasets is not None:
+            asked -= set(GAZETTEER_ONLY_IDENTIFIERS)
+        stored = set(await self._types_with_unique_id("vertex"))
+        pairs = [
+            (physical_type_name(entity.name), name)
+            for entity in schema.entity_types
+            if physical_type_name(entity.name) in stored
+            for name in sorted(asked & _indexed_property_names(entity))
+        ]
+        found = await asyncio.gather(
+            *(
+                self._client.sql(
+                    render_field_record_id_lookup_sql(type_name, name), params={"value": query}
+                )
+                for type_name, name in pairs
+            )
+        )
+        rids: set[str] = set()
+        for rows in found:
+            for row in rows:
+                rid = row.get("rid")
+                if not isinstance(rid, str) or not _RECORD_ID.match(rid):
+                    raise ValueError(f"not an ArcadeDB record id: {rid!r}")
+                rids.add(rid)
+        return sorted(rids)
 
     async def suggest_locations(
         self, name: str, principal: Principal, *, limit: int = 20
@@ -1020,12 +1181,30 @@ class GraphArcadeDBAdapter:
         principal: Principal,
         edge_types: list[str] | None = None,
     ) -> list[Edge]:
-        if len(set(node_ids)) < 2:
+        """ADR-124 Amendment 20: each chunk of the ids is resolved to record ids through each vertex
+        type's unique `id` index (as `get_nodes` is), the links leaving those records are read with
+        the access step on both ends and the link, and a link is kept where its far end's id was
+        asked for. Each link is reached from its own source alone, and each source record is in one
+        chunk, so a link across two chunks is found once, with no merging by id: two links of
+        different types may hold one id, and both are listed, as before. Every chunk's query is
+        sent, so the round trips depend on how many ids were asked, never on which of them the
+        reader may see (rule 3)."""
+        if isinstance(node_ids, str):
+            raise TypeError("node_ids must be a sequence of ids, not a single string")
+        wanted = set(node_ids)
+        if len(wanted) < 2:
             return []
-        records = await self._client.gremlin(
-            render_edges_among_gremlin(sorted(set(node_ids)), self._access, principal, edge_types)
-        )
-        return [edge_from_element_map(r, principal) for r in records]
+        types = await self._types_with_unique_id("vertex")
+        found: list[Edge] = []
+        for chunk in _id_chunks(sorted(wanted)):
+            rids = await self._record_ids(types, chunk)
+            query = render_edges_among_gremlin(rids, self._access, principal, edge_types)
+            found += [
+                edge_from_element_map(row["e"], principal)
+                for row in await self._client.gremlin(query)
+                if row["t"] in wanted
+            ]
+        return found
 
     async def paths(self, req: PathRequest, principal: Principal) -> list[Path]:
         query = PathBuilder(req).render_gremlin(self._access, principal)
@@ -1734,6 +1913,74 @@ class GraphArcadeDBAdapter:
         self._schema = target
         return report
 
+    # --- the search index feed (ADR-150) --------------------------------------
+
+    async def _index_pending(self, node_ids: Sequence[NodeId], tx: TxId | None) -> None:
+        """Records `node_ids` in the outbox, in the write's own transaction (`tx`), so the write and
+        its record commit or roll back together. A node recorded twice is read twice; the indexer's
+        writes are idempotent."""
+        for chunk in _id_chunks([str(i) for i in node_ids]):
+            await self._client.sql(
+                f"INSERT INTO {INDEX_PENDING} CONTENT :rows",
+                params={"rows": [{"node_id": node_id} for node_id in chunk]},
+                session_id=tx,
+            )
+
+    async def pending_index(self, limit: int) -> list[PendingIndex]:
+        rows = await self._client.sql(
+            f"SELECT @rid AS ref, node_id FROM {INDEX_PENDING} ORDER BY @rid LIMIT :limit",
+            params={"limit": int(limit)},
+        )
+        return [PendingIndex(ref=str(r["ref"]), node_id=str(r["node_id"])) for r in rows]
+
+    async def clear_pending_index(self, refs: Sequence[str]) -> None:
+        for chunk in _id_chunks(list(refs)):
+            for ref in chunk:
+                if not _RECORD_ID.match(ref):
+                    raise ValueError(f"not an ArcadeDB record id: {ref!r}")
+            refs_literal = ", ".join(chunk)
+            await self._client.sql(f"DELETE FROM {INDEX_PENDING} WHERE @rid IN [{refs_literal}]")
+
+    async def nodes_for_index(self, node_ids: Sequence[NodeId]) -> dict[NodeId, Node | None]:
+        """`IndexFeedSource.nodes_for_index`: unfiltered by design, for the indexer alone (ADR-150
+        decision 2). No access step and no reader: the document carries the node's own marking and
+        the query side filters by it. A node not live (reverted, withdrawn, superseded) or absent is
+        None."""
+        found: dict[NodeId, Node | None] = {str(i): None for i in node_ids}
+        chunks = _id_chunks(list(found))
+        types = await self._types_with_unique_id("vertex") if chunks else []
+        for chunk in chunks:
+            rids = await self._record_ids(types, chunk)
+            if not rids:
+                continue
+            for record in await self._client.gremlin(
+                f"g.V({groovy_string_list_literal(rids)}).elementMap()"
+            ):
+                if record.get("reverted") is True or record.get("superseded_by"):
+                    continue
+                node = node_from_element_map(record)
+                found[node.id] = node
+        return found
+
+    async def live_node_ids(self, *, after: NodeId | None, limit: int) -> list[NodeId]:
+        """`IndexFeedSource.live_node_ids`: every live node's id after `after`, in id order, over
+        every vertex type, each through its own `id` index."""
+        types = await self._types_with_unique_id("vertex")
+        where = "(reverted IS NULL OR reverted = false) AND superseded_by IS NULL"
+        if after is not None:
+            where += " AND id > :cursor"
+        pages = await asyncio.gather(
+            *(
+                self._client.sql(
+                    f"SELECT id FROM `{groovy_identifier(t)}` WHERE {where} "
+                    "ORDER BY id LIMIT :limit",
+                    params={"cursor": after, "limit": int(limit)},
+                )
+                for t in types
+            )
+        )
+        return sorted(str(r["id"]) for rows in pages for r in rows)[:limit]
+
     # --- revert ------------------------------------------------------------
 
     async def revert_elements(
@@ -1760,6 +2007,9 @@ class GraphArcadeDBAdapter:
                 params={"ids": ids},
                 session_id=tx,
             )
+        await self._index_pending(  # ADR-150 decision 1: a deletion
+            [i for kind, _, ids in plan if kind == "node" for i in ids], tx
+        )
 
     async def withdraw_elements(
         self, node_ids: Sequence[NodeId], edge_ids: Sequence[EdgeId], load_id: str, tx: TxId
@@ -1777,6 +2027,7 @@ class GraphArcadeDBAdapter:
                 params={"ids": ids, "load": load_id},
                 session_id=tx,
             )
+        await self._index_pending(list(node_ids), tx)  # ADR-150 decision 1: a deletion
 
     async def promote_elements(
         self,
@@ -1823,6 +2074,7 @@ class GraphArcadeDBAdapter:
                 },
                 session_id=tx,
             )
+        await self._index_pending(list(node_ids), tx)  # ADR-150 decision 1: a promotion
 
     @staticmethod
     def _refuse_unless_all_live(wanted: int, live: int) -> None:
@@ -1848,12 +2100,12 @@ class GraphArcadeDBAdapter:
                         params={"id": row["id"], "datasets": kept},
                         session_id=tx,
                     )
+                if kind == "vertex":  # ADR-150 decision 1: a promotion taken back
+                    await self._index_pending([str(r["id"]) for r in found], tx)
                 counts[kind] += len(found)
         return PromotionReverted(nodes=counts["vertex"], edges=counts["edge"])
 
-    async def withdraw_layer(
-        self, dataset_id: str, withdrawal: str, tx: TxId
-    ) -> PromotionReverted:
+    async def withdraw_layer(self, dataset_id: str, withdrawal: str, tx: TxId) -> PromotionReverted:
         # By the `datasets BY ITEM` index, then only an element wholly the layer's: one promoted
         # from it holds the source too and is left (Amendment 2 decision 1).
         counts = {"vertex": 0, "edge": 0}
@@ -1874,6 +2126,8 @@ class GraphArcadeDBAdapter:
                         params={"ids": chunk, "w": withdrawal},
                         session_id=tx,
                     )
+                if kind == "vertex":  # ADR-150 decision 1: a deleted case layer
+                    await self._index_pending(ids, tx)
                 counts[kind] += len(ids)
         return PromotionReverted(nodes=counts["vertex"], edges=counts["edge"])
 
@@ -1895,6 +2149,7 @@ class GraphArcadeDBAdapter:
                     session_id=tx,
                 )
             nodes.extend(ids)
+        await self._index_pending(nodes, tx)  # ADR-150 decision 1: a deletion taken back
         edges: list[EdgeId] = []
         for type_name in await self._types_with_unique_id("edge"):
             name = groovy_identifier(type_name)
@@ -2273,7 +2528,7 @@ class GraphArcadeDBAdapter:
 
         node_lit = groovy_string_literal(node_id)
         # Unfiltered by design — an internal lookup during a trusted write,
-        # the same as `_node_type`'s, not a principal-scoped read. It must
+        # the same as the write path's lookups, not a principal-scoped read. It must
         # also find a node that is itself already superseded (the caller's
         # business whether that is sensible), so it never applies the
         # access filter's `hasNot("superseded_by")` step.
@@ -2324,6 +2579,7 @@ class GraphArcadeDBAdapter:
             tx=tx,
             on_link_cloned=on_link_cloned,
         )
+        await self._index_pending([node_id, new_node_id], tx)  # ADR-150 decision 1: a new version
         return new_node_id
 
     async def _repoint_incident_edges(
@@ -2582,7 +2838,8 @@ class GraphArcadeDBAdapter:
             params={"src": replacement.source, "tgt": replacement.target, **bound_params},
             session_id=tx,
         )
-
+        if "SAME_AS" in (replacement.type, old_type):  # ADR-150 decision 1: a merge changed
+            await self._index_pending([replacement.source, replacement.target], tx)
         return replacement_edge_id
 
 

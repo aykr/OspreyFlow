@@ -21,6 +21,7 @@ from typing import Any
 
 from harness.cloud_platform.connections import POSTGRES_MAX_CONNECTIONS
 from harness.cloud_platform.settings import PlatformSettings
+from harness.cloud_platform_backups import POINT_IN_TIME_DAYS
 from schemas.deployment import OspreyConfig, SearchBackend
 
 #: The buckets the services use (`packages/conduit_common/s3.py`'s `<prefix><name>`), as the
@@ -131,8 +132,11 @@ def render_terraform(
     nets = "[" + ", ".join(_q(n) for n in platform.egress.managed_nets) + "]"
     pg = secrets.postgres.keys
     files["rds.tf"] = _file(
-        "Decision 4: RDS PostgreSQL 16, the application's database (Keycloak's and the gateway's\n"
-        "are made on it at start, as on a cluster), encrypted, reached over TLS.",
+        "Decision 4: RDS PostgreSQL 16, the application's database `ospreyflow` (the report\n"
+        "mart a schema in it, osprey_reports, as on Small), encrypted, reached over TLS. The\n"
+        "gateway's `litellm` and, with Superset on, Superset's `superset` are made on it at\n"
+        "start by their own start-up, as on a cluster (ADR-148 Amendment 11): three databases\n"
+        "on the one instance.",
         [
             (
                 'resource "aws_db_subnet_group" "postgres"',
@@ -188,7 +192,10 @@ def render_terraform(
                     ("db_subnet_group_name", "aws_db_subnet_group.postgres.name"),
                     ("parameter_group_name", "aws_db_parameter_group.postgres.name"),
                     ("vpc_security_group_ids", "[aws_security_group.postgres.id]"),
-                    ("backup_retention_period", "7"),
+                    # The ADR-148 audit's ruling 3: point in time beyond the oldest set (35 days,
+                    # AWS's maximum; the sets expire a day sooner), so the stores and PostgreSQL
+                    # meet at any set's time.
+                    ("backup_retention_period", str(POINT_IN_TIME_DAYS)),
                     ("deletion_protection", "true" if production else "false"),
                     ("skip_final_snapshot", "false" if production else "true"),
                     (
@@ -265,12 +272,14 @@ def render_terraform(
             ),
         ],  # fmt: skip
     )
-    # ADR-148 Amendment 5: a poc shape naming OpenSearch is refused at render, so none is made.
+    # v0.5.2 step 3a (the owner, 13 November 2026): the poc shape's too, two data nodes.
     if config.components.search is SearchBackend.OPENSEARCH:
         files["opensearch.tf"] = _file(
             "Decision 4: the platform's OpenSearch 2.x, encrypted, HTTPS only, inside the VPC,\n"
-            "reached on 443 from the namespace's networks alone and answering the bucket role's\n"
-            "signed requests alone (no pod is given its address until the index leg lands).",
+            "reached on 443 from the namespace's networks alone and answering the namespace\n"
+            "role's SigV4-signed requests alone; no fine-grained access control, so no user or\n"
+            "password. Not backed up: the index is rebuilt from the graph (ADR-150), and goes\n"
+            "with the domain.",
             [
                 (
                     'resource "aws_security_group" "search"',
@@ -323,7 +332,10 @@ def render_terraform(
                             "cluster_config",
                             [
                                 ("instance_type", _q("t3.medium.search")),
-                                ("instance_count", "2" if production else "1"),
+                                # Two data nodes in two zones, in every shape (the owner, v0.5.2).
+                                ("instance_count", "2"),
+                                ("zone_awareness_enabled", "true"),
+                                ("zone_awareness_config", [("availability_zone_count", "2")]),
                             ],
                         ),
                         ("ebs_options", [("ebs_enabled", "true"), ("volume_size", "50")]),
@@ -339,7 +351,7 @@ def render_terraform(
                         (
                             "vpc_options",
                             [
-                                ("subnet_ids", "[var.subnet_ids[0]]"),
+                                ("subnet_ids", "[var.subnet_ids[0], var.subnet_ids[1]]"),
                                 ("security_group_ids", "[aws_security_group.search.id]"),
                             ],
                         ),

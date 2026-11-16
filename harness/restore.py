@@ -714,13 +714,30 @@ def restore_maps_file(compose_file: Path, maps_file: Path) -> None:
     entered for (`map_admin.address_of`)."""
     _run(
         _compose(compose_file)
-        + ["exec", "-T", "api", "sh", "-c",
-           "umask 077 && cat > /run/osprey/map-settings/.maps-restored.yaml"
-           " && mv -f /run/osprey/map-settings/.maps-restored.yaml"
-           " /run/osprey/map-settings/maps.yaml"],  # fmt: skip
+        + [
+            "exec",
+            "-T",
+            "api",
+            "sh",
+            "-c",
+            "umask 077 && cat > /run/osprey/map-settings/.maps-restored.yaml"
+            " && mv -f /run/osprey/map-settings/.maps-restored.yaml"
+            " /run/osprey/map-settings/maps.yaml",
+        ],  # fmt: skip
         item="maps",
         input=maps_file.read_text(encoding="utf-8"),
     )
+
+
+def rebuild_search_index(compose_file: Path) -> None:
+    """The search index rebuilt from the restored graph (ADR-114 Amendment 35 point 2; ADR-150
+    decision 4): a set carries no index, so a deployment with an OpenSearch gets its index back from
+    the graph, in the Conduit's own container. A deployment without one has nothing to rebuild."""
+    from harness import search_rebuild
+
+    if not search_rebuild.renders_opensearch(compose_file):
+        return
+    _run(search_rebuild.rebuild_argv(_compose(compose_file)), item="search index")
 
 
 def restore_models_file(compose_file: Path, models_file: Path) -> None:
@@ -792,6 +809,8 @@ def run_restore(
         restore_models_file(compose_file, models_file)
     for maps_file in by_item.get("maps", []):
         restore_maps_file(compose_file, maps_file)
+    # Last: the index is read from the graph and the texts, both restored above.
+    rebuild_search_index(compose_file)
     return plan
 
 

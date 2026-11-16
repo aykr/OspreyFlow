@@ -24,6 +24,8 @@
 //   (§5's own technique for the 50k/250k fixture), which is still not built
 //   and still unmeasured; past the cap the scatter stays as it is.
 import { DetailsToggle } from "../layout/PanelFrames";
+import { CanvasToolbarCompact, isCompactToolbar } from "./toolbarCompact";
+import { isToolbarKey } from "./toolbarVisibility";
 import { linkHoverText } from "./linkHover";
 import { nodeWithinReach } from "./nodeHitArea";
 import { createNodeBorderProgram } from "@sigma/node-border";
@@ -38,6 +40,7 @@ import {
   forwardRef,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -109,6 +112,7 @@ import {
 } from "./expansionGate";
 import { fetchWouldAdd } from "./expansionPreview";
 import { LargeExpansionPrompt } from "./LargeExpansionPrompt";
+import { CapRefusalPrompt } from "./CapRefusalPrompt";
 import { type CaseView, saveView } from "../views/viewsApi";
 import { SaveViewForm } from "../views/SaveViewForm";
 import { fetchFirstSeen } from "../analytics/api";
@@ -148,9 +152,10 @@ import {
   type Community,
 } from "./communities";
 import { linkCaption, linkTypeName } from "./linkLabel";
-import { SelectionBar } from "./SelectionBar";
+import { SelectionBar, type SelectionBarProps } from "./SelectionBar";
 import { AddFiles } from "../content/AddFiles";
 import { linkMenuItems, linkMenuTitle } from "./linkMenu";
+import { selectionMenuItems } from "./selectionActions";
 import { sameAsGroup } from "./linkCollapse";
 import { ReasonPrompt } from "./ReasonPrompt";
 import { withChunkedTextureRefresh } from "./chunkedTextureRefresh";
@@ -167,7 +172,7 @@ import { PathfinderOverlay } from "./PathfinderOverlay";
 import { PathfinderErrorOverlay } from "./PathfinderErrorOverlay";
 import { ActionErrorOverlay } from "./ActionErrorOverlay";
 import { describeEmptyExpansion } from "./expansionOutcome";
-import type { ClusterExplanation, ResolutionOutcome, WorkingSetDelta } from "../workingset/models";
+import { outcomeDeltas, type ClusterExplanation, type ExpansionOutcome, type LimitExceeded, type ResolutionOutcome, type WorkingSetDelta } from "../workingset/models";
 
 const NODE_PROGRAM = createNodeCompoundProgram<
   WorkingSetNodeAttributes,
@@ -261,11 +266,22 @@ export interface GlassCanvasProps {
    * links among, no paths or messages put on, no remove, no manual same-as or split. The selection
    * can still be saved as a view and asked about. */
   lens?: boolean;
-  /** ADR-144 Amendment 3: the case's *Views ▾*, drawn first in the toolbar's View group, beside *Clear
-   * view*. Absent (no case open): not drawn. */
-  viewsMenu?: ReactNode;
   /** ADR-115 E6: the case's latest history step and when, for the toolbar's note. */
   lastChange?: string | null;
+  /** v0.6.1 glass-rows A (ADR-145 Amendment 19 decision 5): drawn in the toolbar after Layout; App hands it
+   * the Match strictness control. A control here reads `CanvasToolbarCompact` for its shorter words. */
+  toolbarAfterLayout?: ReactNode;
+  /** v0.6.1 glass-rows C (ADR-145 Amendment 19 decision 6): drawn last in the toolbar, at its right end; App hands it
+   * *Hide toolbar*. */
+  toolbarEnd?: ReactNode;
+  /** Hides the toolbar: `hidden`, so out of the tab order and the accessibility tree, not only out of sight. */
+  toolbarHidden?: boolean;
+  /** The toolbar's id, which *Hide toolbar* and *Show toolbar* name in `aria-controls`. */
+  toolbarId?: string;
+  /** T on the canvas (the owner's ruling of 16 November 2026): App hides or shows the toolbar. */
+  onToolbarKey?: () => void;
+  /** Whether the toolbar is narrow (its words short), told to App for *Show toolbar*'s words (the owner's ruling 14). */
+  onToolbarCompactChange?: (compact: boolean) => void;
   /** The link now selected, or `null` when none is. Selecting a link clears the node selection,
    * and selecting a node clears the link, so the Inspector shows one thing at a time. */
   onEdgeSelect?: (edge: Edge | null) => void;
@@ -282,6 +298,12 @@ export interface GlassCanvasProps {
    * with the node's own id rather than owning any Dossier state itself; `App.tsx` owns `view`,
    * the same separation `onSelectionChange` already establishes. */
   onViewMessages?: (nodeId: string) => void;
+  /** An expansion the working set's cap refused (rule 2; spec/00 §4): the cap's *save_as_view*, a
+   * smaller view of the case saved and opened as the lens. Its refusal offers it only when given. */
+  onSaveSmallerView?: (refused: LimitExceeded, subject: string | undefined) => void;
+  /** The cap's *promote_to_batch* (ADR-151, case-b's): the refused expansion run on the server.
+   * Its refusal offers it only when given. */
+  onRunExpansionAsBatch?: (request: { nodeId: string; edgeType: string | null; depth: number; refused: LimitExceeded }) => void;
   /** Phase 7 Stage 3: the metrics panel's own community-detection result, already grouped into
    * hull polygons by `metrics/hulls.ts`'s pure `computeCommunityHulls` — `GlassCanvas` only
    * renders them (`CommunityHullOverlay`, a camera-tracked DOM overlay, ADR-002's "one honest
@@ -426,7 +448,21 @@ const LENS_MENU_ITEMS: ReadonlySet<string> = new Set([
   "view-messages",
   "expand-group",
   "save-selected-as-view",
+  // The selection's actions a view's bar offers too (ADR-078 Amendment 1): none changes the case.
+  "selection-ask",
+  "selection-undo-lit",
+  "selection-clear",
 ]);
+
+/** ADR-098 Amendment 8: the menu's heading over the per-type expansions (the bar keeps *Show links*
+ * for the links among the selection). */
+const EXPAND_BY_LINK_TYPE = "Expand by link type";
+
+/** The keys that open the canvas's menu on what has focus: `\` (spec 02 §6), the ContextMenu key and
+ * Shift+F10, as on any desktop (ADR-078 Amendment 1). */
+function opensMenu(e: { key: string; shiftKey: boolean }): boolean {
+  return e.key === "\\" || e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey);
+}
 
 /** What a link's menu offers in a view: folding, notes, hiding, history and the events read, each
  * changing nothing in the case's working set. */
@@ -440,7 +476,7 @@ const LENS_LINK_MENU_ITEMS: ReadonlySet<string> = new Set([
 ]);
 
 /** Said when something that would change the case's working set is asked for in a view. */
-const LENS_NOTICE = "This is a view: nothing in it changes the case. Go back to the case to change it.";
+const LENS_NOTICE = "This is a saved view: nothing in it changes the case. Go back to the whole case to change it.";
 
 /** The selected link: the brass the lasso already uses. */
 
@@ -462,11 +498,18 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       onViewSaved,
       onAskInView,
       lens = false,
-      viewsMenu,
       lastChange,
+      toolbarAfterLayout,
+      toolbarEnd,
+      toolbarHidden = false,
+      toolbarId,
+      onToolbarKey,
+      onToolbarCompactChange,
       onEdgeSelect,
       onFocusChange,
       onViewMessages,
+      onSaveSmallerView,
+      onRunExpansionAsBatch,
       communityHulls,
       onGroupedCountChange,
       judgementCounts,
@@ -482,6 +525,13 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
     ref,
   ) {
     const containerRef = useRef<HTMLDivElement>(null);
+    /** Sigma's own element, which React draws nothing into. `sigma.kill()` empties its container
+     * (`while (container.firstChild) container.removeChild(...)`), so it must never be the element
+     * React draws the toolbar, menus and selection bar into: under StrictMode, as the App is mounted
+     * (`main.tsx`), the effect's cleanup runs once on mount, emptied them out from under React, and
+     * the next one React inserted among them threw `insertBefore`, throwing away the whole tree
+     * (found live, 14 November 2026; `keyboard/canvas-strict-mode.spec.ts`). */
+    const sigmaContainerRef = useRef<HTMLDivElement>(null);
     const modifierListenersRef = useRef<(() => void) | null>(null);
     const resizeObserverRef = useRef<ResizeObserver | null>(null);
     const dimmedEdgeIdsRef = useRef<ReadonlySet<string>>(EMPTY_DIMMED_SET);
@@ -506,6 +556,11 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
     const [radialMenu, setRadialMenu] = useState<PendingRadialMenu | null>(
       null,
     );
+    // "7 types with no links", opened in place, for the menu it was opened in: a new menu starts folded.
+    const [unfoldedFor, setUnfoldedFor] = useState<PendingRadialMenu | null>(null);
+    // The selection bar's *Show links* stepper, held here so the menu's *Show links* looks as far (ADR-078 Am 1).
+    const [linksDegree, setLinksDegree] = useState(1);
+    const emptyTypesShown = unfoldedFor !== null && unfoldedFor === radialMenu;
     // **The radial menu's real cardinality, per edge type** — `08_ACCEPTANCE_SCENARIOS.md` A1:
     // "expansion previews its cardinality before running: the analyst is never surprised by ten
     // thousand nodes". Until round 12c this was hardcoded to 0 for every entry, so the menu read
@@ -575,6 +630,8 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
     };
     const arrangeNowRef = useRef<() => void>(() => undefined);
     const selectLinkRef = useRef<(edgeId: string | null) => void>(() => undefined);
+    // ADR-078 Amendment 1: a menu opened on an unselected item selects it first, so it is the selection's.
+    const selectForMenuRef = useRef<(nodeId: string) => void>(() => undefined);
     const requestExpansionRef = useRef<
       | ((
           nodeId: string,
@@ -595,6 +652,38 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
     const [suppressionMarks, setSuppressionMarks] = useState<
       Record<string, string>
     >({});
+    // v0.5.2 route row S7: the marks are read back from the case (`GET …/suppression-marks`, the nodes this reader
+    // may see on the canvas) when the canvas loads and again as nodes arrive, so a reload keeps them: a marked node
+    // offers *Remove suppression mark*, never the mark again over its reason. A read that fails changes nothing.
+    useEffect(() => {
+      if (!investigationId) return;
+      let live = true;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const read = async () => {
+        try {
+          const response = await fetch(
+            `${apiBaseUrl}/v1/investigations/${encodeURIComponent(investigationId)}/suppression-marks`,
+            { headers: { Authorization: `Bearer ${bearerToken}` } },
+          );
+          if (!response.ok) return;
+          const marks = (await response.json()) as { node_id: string; reason: string }[];
+          if (live && Array.isArray(marks)) setSuppressionMarks(Object.fromEntries(marks.map((m) => [m.node_id, m.reason])));
+        } catch {
+          // Unread: the marks already known stay as they are.
+        }
+      };
+      void read();
+      const again = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => void read(), 250);
+      };
+      graph.on("nodeAdded", again);
+      return () => {
+        live = false;
+        clearTimeout(timer);
+        graph.removeListener("nodeAdded", again);
+      };
+    }, [apiBaseUrl, bearerToken, investigationId, graph]);
     // A link selected by click or by keyboard. A ref as well, because the Sigma edge reducer
     // reads it when drawing.
     const [selectedEdge, setSelectedEdge] = useState<string | null>(() =>
@@ -623,6 +712,7 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       y: number;
       title: string;
       confirmLabel: string;
+      why?: string;
       run: (reason: string) => void;
     } | null>(null);
     // Nodes the analyst folded into one from a same-as link: a view only, like Communities, kept in
@@ -660,6 +750,17 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       wouldAdd: number | "unavailable";
       options: NarrowingOption[];
       depth: number;
+    } | null>(null);
+    // An expansion the working set's cap refused (rule 2): the typed `limit_exceeded` and the cap's
+    // choices, never "Expand failed" alone and never a part drawn.
+    const [capRefusal, setCapRefusal] = useState<{
+      nodeId: string;
+      edgeType: string | null;
+      x: number;
+      y: number;
+      depth: number;
+      refused: LimitExceeded;
+      options: NarrowingOption[];
     } | null>(null);
     // A failed `expandNode`/`manualAssertion`/`explainCluster` call — `ActionErrorOverlay`'s own
     // doc comment has the full reasoning for why these three share one generic overlay rather than
@@ -711,13 +812,26 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
     // drawn, not one row down (the owner, 14 October 2026: the legend covered its second row).
     const toolbarRef = useRef<HTMLDivElement | null>(null);
     const [toolbarHeight, setToolbarHeight] = useState<number | null>(null);
-    useEffect(() => {
+    // The owner's rulings 6 and 7 (16 November 2026): shorter words follow the toolbar's own width.
+    const [toolbarCompact, setToolbarCompact] = useState(false);
+    useEffect(() => onToolbarCompactChange?.(toolbarCompact), [toolbarCompact, onToolbarCompactChange]);
+    // A layout effect, so the toolbar's words are chosen before the first paint: GlassCanvas is drawn afresh whenever a
+    // saved view opens or closes, and a passive effect drew the whole words for a frame, wrapping a narrow toolbar
+    // (the lane-reviewer's item 9).
+    useLayoutEffect(() => {
       const bar = toolbarRef.current;
       if (!bar || typeof ResizeObserver !== "function") return;
-      const measure = () => setToolbarHeight(Math.ceil(bar.getBoundingClientRect().height) || null);
+      const measure = () => {
+        setToolbarHeight(Math.ceil(bar.getBoundingClientRect().height) || null);
+        // The toolbar spans the canvas, so its width is the canvas's, read there: a hidden toolbar measures 0 wide, and
+        // shown again it would first draw the whole words, wrap, then shorten, moving the drawing area twice.
+        const width = containerRef.current?.getBoundingClientRect().width ?? 0;
+        if (width > 0) setToolbarCompact(isCompactToolbar(width));
+      };
       measure();
       const observer = new ResizeObserver(measure);
       observer.observe(bar);
+      if (containerRef.current) observer.observe(containerRef.current);
       return () => observer.disconnect();
     }, []);
     const [gridOn, setGridOn] = useState<boolean>(() => {
@@ -964,6 +1078,9 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
     useEffect(() => {
       if (seenReprojectRef.current === lastReproject) return;
       seenReprojectRef.current = lastReproject;
+      // A reader's own clusters arriving with nodes (ADR-124 Amendment 19) are not a change of the
+      // resolution: what was folded stays folded.
+      if (lastReproject?.reason === "resolution_on_entry") return;
       if (manualGroups.length === 0) return;
       setManualGroups([]);
       const rect = containerRef.current?.getBoundingClientRect();
@@ -1266,6 +1383,9 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
     // node per cluster takes part and the others follow it afterwards.
     useEffect(() => {
       let timer: ReturnType<typeof setTimeout> | undefined;
+      // The move under way (Sigma's `animateNodes`), its targets and how to stop it.
+      let animating: Record<string, { x: number; y: number }> | null = null;
+      let stopAnimating: (() => void) | null = null;
       // ADR-060 Amendment 2. "added": nodes arrived (an expansion, a search result, a stream
       // delta) — the nodes already settled stay exactly where they are and the new ones settle
       // around them, and the camera is not touched, so the view never moves under the analyst's
@@ -1441,7 +1561,16 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
           }
           if (was.length > 0) setPreviousPositions(was);
           finish();
-        } else animateNodes(graph, targets, { duration: 420 }, finish);
+        } else {
+          // Sigma's animation reads `targets` afresh each frame: a node dropped while it runs is
+          // taken out of them (`onDropped` below), so no frame writes to a node no longer here.
+          animating = targets;
+          stopAnimating = animateNodes(graph, targets, { duration: 420 }, () => {
+            animating = null;
+            stopAnimating = null;
+            finish();
+          });
+        }
       };
       const schedule = () => {
         clearTimeout(timer);
@@ -1451,13 +1580,27 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
         clearTimeout(timer);
         run("arrange");
       };
+      // A remove delta (another reader's change, a withdrawal, a revert) can drop a node, or a
+      // snapshot clear them all, mid-animation: Sigma's next frame then wrote to a node no longer in
+      // the graph and threw, uncaught (`keyboard/canvas-remove-while-arranging.spec.ts`).
+      const onDropped = ({ key }: { key: string }) => {
+        if (animating) delete animating[key];
+      };
+      const onCleared = () => {
+        if (animating) for (const id of Object.keys(animating)) delete animating[id];
+      };
       graph.on("nodeAdded", schedule);
       graph.on("edgeAdded", schedule);
+      graph.on("nodeDropped", onDropped);
+      graph.on("cleared", onCleared);
       schedule();
       return () => {
         clearTimeout(timer);
+        stopAnimating?.();
         graph.removeListener("nodeAdded", schedule);
         graph.removeListener("edgeAdded", schedule);
+        graph.removeListener("nodeDropped", onDropped);
+        graph.removeListener("cleared", onCleared);
       };
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [graph]);
@@ -1506,7 +1649,7 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
     }, [dimmedNodeIds]);
 
     useEffect(() => {
-      if (!containerRef.current) return;
+      if (!containerRef.current || !sigmaContainerRef.current) return;
       // `Sigma`'s own constructor calls `refresh()` synchronously — which,
       // for a graph that already has nodes at mount time (a history
       // restore, an opened view, or this checkpoint's own perf-fixture harness —
@@ -1524,7 +1667,7 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       const sigma = new Sigma<
         WorkingSetNodeAttributes,
         WorkingSetEdgeAttributes
-      >(graph, containerRef.current, {
+      >(graph, sigmaContainerRef.current, {
         // The toolbar above and the selection bar below sit over the canvas: fitting with Sigma's
         // 30px framed the outermost nodes under them (found live, 11 October 2026).
         stagePadding: 80,
@@ -1883,6 +2026,7 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
         dragRef.current = null; // a menu is opening: nothing is being dragged
         setLinkMenu(null);
         setFocused(node);
+        selectForMenuRef.current(node);
         setRadialMenu(
           menuRequestForRightClick(event.original as MouseEvent, node),
         );
@@ -2143,6 +2287,12 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       // family: without Shift, cycle the selection; with it, cycle everything. The order is
       // `graph.nodes()`' own, which is insertion order and therefore stable within a session —
       // enough for "walk to the other one", which is all this is for.
+      // v0.6.1 glass-rows C: T hides or shows the toolbar, on the canvas alone (WCAG 2.1.4, active only on focus).
+      if (onToolbarKey && isToolbarKey(e)) {
+        e.preventDefault();
+        onToolbarKey();
+        return;
+      }
       if ((e.key === "f" || e.key === "F") && !e.ctrlKey && !e.metaKey && !e.altKey) {
         // ADR-097 step 2: F fits everything in view, as the zoom cluster's Fit does.
         e.preventDefault();
@@ -2273,7 +2423,7 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
           (rect?.left ?? 0) + 40,
           (rect?.top ?? 0) + 40,
         );
-      } else if (e.key === "\\" && selectedEdge !== null && graph.hasEdge(selectedEdge)) {
+      } else if (opensMenu(e) && selectedEdge !== null && graph.hasEdge(selectedEdge)) {
         // With a link selected (`L` steps through a node's links), `\` opens that link's menu in
         // the list layout, as a right-click on the link does (ADR-080; rule 13).
         e.preventDefault();
@@ -2285,10 +2435,11 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
           edgeId: selectedEdge,
           layout: "list",
         });
-      } else if (e.key === "\\" && focused) {
+      } else if (opensMenu(e) && focused) {
         e.preventDefault();
         const rect = containerRef.current?.getBoundingClientRect();
         setLinkMenu(null);
+        selectForMenu(focused);
         setRadialMenu({
           x: (rect?.left ?? 0) + 40,
           y: (rect?.top ?? 0) + 40,
@@ -2314,6 +2465,8 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       depth = 1,
     ): Promise<void> {
       if (refusedInLens()) return;
+      // A new expansion asked for: an earlier one's cap refusal no longer stands.
+      setCapRefusal(null);
       const ask = {
         apiBaseUrl,
         bearerToken,
@@ -2331,21 +2484,7 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
         await expandNode(nodeId, edgeType, x, y, depth);
         return;
       }
-      let options: NarrowingOption[] = [];
-      if (edgeType === null && graph.hasNode(nodeId)) {
-        const node = graph.getNodeAttribute(nodeId, "data");
-        const types = edgeTypesOfferedFor(edgeTypes, node.type);
-        const counts = await Promise.all(
-          types.map(
-            async (et) =>
-              [
-                et.name,
-                await fetchWouldAdd(fetch, { ...ask, edgeTypes: [et.name] }),
-              ] as const,
-          ),
-        );
-        options = narrowingOptions(Object.fromEntries(counts));
-      }
+      const options = edgeType === null ? await narrowingFor(nodeId, depth) : [];
       setPendingExpansion({
         nodeId,
         edgeType,
@@ -2357,6 +2496,19 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       });
     }
 
+    /** The relationship types to expand `nodeId` by instead, each with what it would add: the gate's
+     * and the cap refusal's narrowing (spec/00 §4's *filter*). */
+    async function narrowingFor(nodeId: string, depth: number): Promise<NarrowingOption[]> {
+      if (!graph.hasNode(nodeId)) return [];
+      const ask = { apiBaseUrl, bearerToken, investigationId, nodeId, currentOrder: graph.order, depth };
+      const node = graph.getNodeAttribute(nodeId, "data");
+      const types = edgeTypesOfferedFor(edgeTypes, node.type);
+      const counts = await Promise.all(
+        types.map(async (et) => [et.name, await fetchWouldAdd(fetch, { ...ask, edgeTypes: [et.name] })] as const),
+      );
+      return narrowingOptions(Object.fromEntries(counts));
+    }
+
     async function expandNode(
       nodeId: string,
       edgeType: string | null,
@@ -2365,6 +2517,10 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       depth = 1,
     ): Promise<void> {
       if (refusedInLens()) return;
+      // What the canvas holds as the expansion is asked for: the case's stream can draw the expansion's own
+      // add before its answer lands (the Conduit publishes as it answers), so "nothing new" is judged against
+      // this, never against the canvas as the answer finds it (found live, 14 November 2026).
+      const drawnBefore = { nodes: new Set(graph.nodes()), edges: new Set(graph.edges()) };
       let response: Response;
       try {
         response = await fetch(
@@ -2384,10 +2540,20 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
             }),
           },
         );
+        if (response.status === 409) {
+          // The working set's cap (rule 2): its typed `limit_exceeded`, said with the cap's own
+          // figure and choices (spec/00 §4), nothing added.
+          const body = (await response.json().catch(() => null)) as Partial<LimitExceeded> | null;
+          if (body?.error === "limit_exceeded" && typeof body.cap === "number" && typeof body.would_be === "number") {
+            const refused = body as LimitExceeded;
+            const options = edgeType === null ? await narrowingFor(nodeId, depth) : [];
+            // Gone while its choices were counted (removed, another case): nothing to offer them for.
+            if (!graph.hasNode(nodeId)) return;
+            setCapRefusal({ nodeId, edgeType, x, y, depth, refused, options });
+            return;
+          }
+        }
         if (!response.ok) {
-          // `limit_exceeded` (409, the working-set cap) included — no silent drop is allowed; the
-          // typed error surface itself, not a silent drop; the response body's own `options` (the
-          // three the cap offers) are not yet rendered here — flagged, not solved, by this fix.
           throw new Error(`Expand failed (${response.status}). Try again.`);
         }
       } catch (err) {
@@ -2407,12 +2573,13 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
         rootId: nodeId,
         nodeIds: (delta?.nodes ?? []).map((n) => n.id),
         edgeIds: (delta?.edges ?? []).map((e) => e.id),
-        hasNode: (id) => graph.hasNode(id),
-        hasEdge: (id) => graph.hasEdge(id),
+        hasNode: (id) => drawnBefore.nodes.has(id),
+        hasEdge: (id) => drawnBefore.edges.has(id),
         edgeType,
         edgeTypes: edgeTypesRef.current,
       });
-      store.getState().applyDelta(outcome.delta);
+      // The add, then the reader's own clusters at the case's τ (ADR-124 Amendment 19).
+      for (const delta of outcomeDeltas(outcome as ExpansionOutcome)) store.getState().applyDelta(delta);
       if (emptyNotice !== null) setActionError({ x, y, message: emptyNotice, tone: "notice" });
       // ADR-098: an expansion small enough brings the links among its nodes and the view; when
       // they would have passed the cap, none of them is added and the analyst is told.
@@ -2455,11 +2622,29 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
     // `/expand`'s own `ExpandBody` is — `ManualAssertionRequest` (`services/api/resolution.py`) is
     // the whole body, checked directly rather than assumed from `expandNode`'s own different shape.
     async function toggleSuppressionMark(nodeId: string): Promise<void> {
-      // A write, like `manualAssertion` — so a failure is surfaced rather than swallowed. An
-      // analyst who believes they have flagged a record for suppression, and has not, is exactly
-      // the dangerous silence that function's own comment describes.
-      const marked = Boolean(suppressionMarks[nodeId]);
-      const reason = marked ? "" : "Marked from the canvas";
+      // ADR-046 step 1, owner ruling R7: "a reversible mark with a reason". Marking asks why first (v0.5.2 route
+      // row S8: it recorded a fixed "Marked from the canvas" and asked for nothing), in the same box the link
+      // menu's writes ask in; removing asks nothing.
+      const anchor = radialMenu ?? { x: 0, y: 0 };
+      if (suppressionMarks[nodeId]) {
+        await writeSuppressionMark(nodeId, null, anchor);
+        return;
+      }
+      setReasonPrompt({
+        x: anchor.x,
+        y: anchor.y,
+        title: "Mark this record for suppression (hides nothing yet)",
+        confirmLabel: "Mark for suppression",
+        why: "Why should it be suppressed? (required, kept with the mark)",
+        run: (reason) => void writeSuppressionMark(nodeId, reason, anchor),
+      });
+    }
+
+    /** The mark written (`reason`) or removed (`null`). A write, like `manualAssertion`, so a failure is surfaced
+     * rather than swallowed: an analyst who believes they have flagged a record for suppression, and has not, is
+     * exactly the dangerous silence that function's own comment describes. */
+    async function writeSuppressionMark(nodeId: string, reason: string | null, anchor: { x: number; y: number }): Promise<void> {
+      const marked = reason === null;
       try {
         const response = await fetch(
           `${apiBaseUrl}/v1/investigations/${encodeURIComponent(investigationId)}/nodes/${nodeId}/suppression-mark`,
@@ -2486,7 +2671,6 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
           );
         }
       } catch (err) {
-        const anchor = radialMenu ?? { x: 0, y: 0 };
         setActionError({
           x: anchor.x,
           y: anchor.y,
@@ -2496,7 +2680,7 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       }
       setSuppressionMarks((current) => {
         const next = { ...current };
-        if (marked) delete next[nodeId];
+        if (reason === null) delete next[nodeId];
         else next[nodeId] = reason;
         return next;
       });
@@ -2661,8 +2845,8 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
             },
           );
           if (seedResponse.ok) {
-            const outcome = await seedResponse.json();
-            store.getState().applyDelta(outcome.delta);
+            // The add, then the reader's own clusters (ADR-124 Amendment 19).
+            for (const delta of outcomeDeltas((await seedResponse.json()) as ExpansionOutcome)) store.getState().applyDelta(delta);
           }
         }
       }
@@ -2703,6 +2887,8 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
     // fetched is a reason to say so, not a reason to block the expansion behind it.
     useEffect(() => {
       if (!radialMenu || !bearerToken) return;
+      // A menu on two or more selected shows no per-type entries (ADR-078 Amendment 1): nothing to count.
+      if (selected.size > 1 && selected.has(radialMenu.nodeId)) return;
       const nodeId = radialMenu.nodeId;
       if (!graph.hasNode(nodeId)) return;
       const node = graph.getNodeAttribute(nodeId, "data");
@@ -2739,17 +2925,12 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
                 }));
               return;
             }
-            const preview = (await response.json()) as {
-              candidate_node_count: number;
-            };
+            const preview = (await response.json()) as { link_count?: unknown };
             if (cancelled) return;
-            // `candidate_node_count` is the working set's size *after* this expansion, so the
-            // figure the analyst wants — how many this click would add — is the difference.
-            const wouldAdd = previewCountFrom(
-              { ok: true, candidateNodeCount: preview.candidate_node_count },
-              graph.order,
-            );
-            setPreviewCounts((prev) => ({ ...prev, [et.name]: wouldAdd }));
+            // ADR-098 Amendment 8: the links of this type the reader may see at the node, counted by
+            // the Conduit from the adapter's own access-filtered read (one already drawn counts).
+            const links = typeof preview.link_count === "number" ? preview.link_count : "unavailable";
+            setPreviewCounts((prev) => ({ ...prev, [et.name]: links }));
           } catch {
             // Said as "count unavailable", not left as `…` (which reads as still loading).
             // Deliberately not surfaced as an action error — a preview is an aid, and failing to
@@ -2773,25 +2954,49 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       investigationId,
       graph,
       edgeTypes,
+      selected,
     ]);
 
     function radialMenuItems(nodeId: string): RadialMenuItem[] {
       if (!graph.hasNode(nodeId)) return [];
       const node = graph.getNodeAttribute(nodeId, "data");
+      // ADR-078 Amendment 1: a menu on the selection offers what the bar offers, in its words; a
+      // right-click selects an unselected item first, so the menu is always the selection's.
+      const forSelection = selected.has(nodeId) ? selectionMenuItems(selectionBarProps) : [];
+      if (selected.has(nodeId) && selected.size > 2) return lensOnly(forSelection);
       const valid = edgeTypesOfferedFor(edgeTypes, node.type);
-      const items: RadialMenuItem[] = valid.map((et: EdgeTypeDef) => ({
+      const typed: RadialMenuItem[] = valid.map((et: EdgeTypeDef) => ({
         id: et.name,
         label: linkTypeName(et.name, edgeTypes),
-        group: "Show links",
-        // The real figure from `/expand/preview`, fetched by the effect below when this menu
-        // opened. `null` (still in flight, or the preview failed) renders as `…`, never as `0`:
-        // a confident zero on a node with eight associates is the exact fault this replaced.
+        group: EXPAND_BY_LINK_TYPE,
+        // The real figure from `/expand/preview` (`link_count`), fetched by the effect above when this
+        // menu opened. `null` (still in flight) renders as `…`, never as `0`; a failed call, as
+        // "count unavailable".
         count: previewCounts[et.name] ?? null,
         onSelect: () => {
           const anchor = radialMenu ?? { x: 0, y: 0 };
           void requestExpansion(nodeId, et.name, anchor.x, anchor.y);
         },
       }));
+      // The types known to have no links fold into one line, which opens the list in place. Only once
+      // every count has answered, so the list re-lays out once and not under the pointer as each
+      // arrives; a type awaited or unavailable is never folded.
+      const answered = typed.every((i) => i.count !== null);
+      const empty = answered ? typed.filter((i) => i.count === 0) : [];
+      const shownTypes = emptyTypesShown || !answered ? typed : typed.filter((i) => i.count !== 0);
+      const items: RadialMenuItem[] = [...forSelection];
+      if (selected.size <= 1) {
+        items.push(...shownTypes);
+        if (!emptyTypesShown && empty.length > 0)
+          items.push({
+            id: "types-with-no-links",
+            label: `${empty.length} ${empty.length === 1 ? "type" : "types"} with no links`,
+            count: undefined,
+            group: EXPAND_BY_LINK_TYPE,
+            keepsOpen: true,
+            onSelect: () => setUnfoldedFor(radialMenu),
+          });
+      }
 
       // B11: only offered on a *pair* — `selected` (the ring, closed over from this component's own
       // state) is what tells the menu a second node exists, since the menu is always opened on one
@@ -2900,11 +3105,12 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       // (ADR-092 decision 4; the owner, 6 October 2026: "the right click to give me an option to
       // see the content full screen").
       if (opensToRead(nodeId)) {
+        // At the head of the menu, before the selection's actions: the owner's ruling of 6 October 2026
+        // (ADR-092 decision 4), kept by ADR-078 Amendment 1. Its own entry, outside any group.
         items.unshift({
           id: "read-full-screen",
           label: "Read full screen",
           count: undefined,
-          group: "Actions",
           onSelect: () => onOpenDocumentRef.current?.(nodeId),
         });
       }
@@ -2939,18 +3145,8 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
         });
       }
 
-      // ADR-144 decision 4: a node that is part of the selection offers to save the whole selection
-      // as a view from its own menu, so the analyst need not find the button over the canvas.
-      // The count is the selection's, Group Nodes included (each stands for its members).
-      if (onViewSaved && selected.has(nodeId)) {
-        items.push({
-          id: "save-selected-as-view",
-          label: `Save selected (${selected.size}) as a view…`,
-          count: undefined,
-          group: "Actions",
-          onSelect: () => setSavingView(true),
-        });
-      }
+      // ADR-144 decision 4, Amendment 5: saving the selection as a view is the selection's own action,
+      // first in the menu in the bar's words (`selectionMenuItems`), not an entry of the item's.
 
       // **Owner ruling R7 (TENTATIVE, 27 September 2026) — step one of two.** Offered on every
       // node, not gated on a pair or a type: any record can be proposed for suppression.
@@ -2959,16 +3155,28 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       // and the item toggles, because R7's own word is "reversible".
       items.push({
         id: "mark-for-suppression",
+        // Its words say what it does today (the owner, 14 November 2026): it records a mark and a reason, and
+        // hides nothing yet; R7's second step, which hides, comes after v0.5.2.
         label: suppressionMarks[nodeId]
           ? "Remove suppression mark"
-          : "Mark for suppression",
+          : "Mark for suppression (hides nothing yet)",
         count: undefined,
         group: "Actions",
         onSelect: () => void toggleSuppressionMark(nodeId),
       });
 
-      // In a view (a read-only lens) only what changes nothing in the case's working set is offered:
-      // an allowlist, so an item added later is left out of a view until someone says it belongs.
+      // With two selected, the pair's own actions (Link to, Split from, Find paths to) and nothing
+      // else of the one item's: ADR-078 Amendment 1, an item's own actions for one item.
+      if (selected.size === 2) {
+        const pair = new Set(["manual-link", "manual-split", "find-paths"]);
+        return lensOnly(items.filter((i) => !i.group || i.group !== "Actions" || pair.has(i.id)));
+      }
+      return lensOnly(items);
+    }
+
+    // In a view (a read-only lens) only what changes nothing in the case's working set is offered:
+    // an allowlist, so an item added later is left out of a view until someone says it belongs.
+    function lensOnly(items: RadialMenuItem[]): RadialMenuItem[] {
       return lens ? items.filter((item) => LENS_MENU_ITEMS.has(item.id)) : items;
     }
 
@@ -3282,15 +3490,29 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       return true;
     }
 
-    // ADR-098 decision 4: the selection's Documents, Group Nodes' members included.
-    const selectedDocumentCount = (() => {
+    /** The bottom bar's top edge, which no menu opens over (ADR-078 Amendment 1); null with no bar. */
+    function barTop(): number | null {
+      const bar = containerRef.current?.querySelector<HTMLElement>(".selection-bar");
+      return bar ? bar.getBoundingClientRect().top : null;
+    }
+
+    function selectForMenu(nodeId: string): void {
+      if (selected.has(nodeId)) return;
+      setSelected(new Set([nodeId]));
+      onSelectionChange?.([nodeId]);
+    }
+    selectForMenuRef.current = selectForMenu;
+
+    // ADR-098 Amendment 7: the selection's items, Group Nodes' members included, for the name of
+    // the view *Ask the model about these* saves (a question needs no Document).
+    const selectedItemCount = (() => {
       let count = 0;
       for (const id of new Set(Array.from(selected).flatMap((s) => {
         const group = foldedViewRef.current?.groups.get(s);
         if (!group) return [s];
         return allGroups.find((c) => c.id === group.communityId)?.members ?? [];
       }))) {
-        if (graph.hasNode(id) && graph.getNodeAttribute(id, "data")?.type === "Document") count += 1;
+        if (graph.hasNode(id)) count += 1;
       }
       return count;
     })();
@@ -3301,14 +3523,42 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
     }
 
     async function askAboutSelected(): Promise<void> {
-      const n = selectedDocumentCount;
-      const saved = await saveSelection(`Questions on ${n} document${n === 1 ? "" : "s"}`);
+      const n = selectedItemCount;
+      const saved = await saveSelection(`Questions on ${n} item${n === 1 ? "" : "s"}`);
       if ("refusal" in saved) {
         sayOnCanvas(saved.refusal);
         return;
       }
       onAskInView?.(saved.view);
     }
+
+    // ADR-097 step 1, ADR-078 Amendment 1: what the bar offers for the selection, which its right-click
+    // menu offers too (`selectionMenuItems`), from this one object.
+    const selectionBarProps: SelectionBarProps = {
+      count: selected.size,
+      onExpand: lens
+        ? undefined
+        : () => {
+            const box = containerRef.current?.getBoundingClientRect();
+            const [x, y] = box ? [box.width / 2, box.height / 2] : [0, 0];
+            // One at a time, each through its own preview and the working set's cap (rule 2).
+            void (async () => {
+              for (const id of Array.from(selected)) await requestExpansion(id, null, x, y);
+            })();
+          },
+      onSaveView: onViewSaved ? () => setSavingView(true) : undefined,
+      onAsk: onAskInView ? () => void askAboutSelected() : undefined,
+      litNote: litStands && lit ? litNote(lit.window) : undefined,
+      onUndoLit: litStands ? undoSelectLit : undefined,
+      onLinksAmong: lens ? undefined : (degree) => void linksAmongOnCanvas(Array.from(selected), degree),
+      degree: linksDegree,
+      onDegreeChange: setLinksDegree,
+      onRemove: lens ? undefined : () => void removeNodeIds(Array.from(selected)),
+      onClear: () => {
+        setSelected(new Set());
+        onSelectionChange?.([]);
+      },
+    };
 
     return (
       <div
@@ -3318,6 +3568,13 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
         aria-describedby={canvasDescriptionId}
         tabIndex={0}
         onKeyDown={onKeyDown}
+        // The ContextMenu key and Shift+F10 open the canvas's own menu (`opensMenu`); the browser's is
+        // not opened over it. A right-click on a node is Sigma's, on its own inner container.
+        onContextMenu={(e) => {
+          // From the canvas or anything inside it (its menu, where focus is once open); Sigma's own
+          // right-click on a node is handled, and prevented, on its inner container.
+          if (e.target instanceof Node && containerRef.current?.contains(e.target)) e.preventDefault();
+        }}
         onFocus={(e) => {
           // The keyboard-only entry point, moved off Tab's own keydown (see `onKeyDown`'s own
           // comment on why) — reaching this container by any means (Tab, a click, `.focus()`)
@@ -3378,7 +3635,17 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
       >
         {/* ADR-097 step 2 (design review item 12): the canvas's tools, one docked row of labelled
             groups; Show is one segmented control. */}
-        <div role="toolbar" aria-label="Canvas tools" className="canvas-toolbar" ref={toolbarRef}>
+        {/* Sigma draws here and only here; React renders nothing inside it (see sigmaContainerRef). */}
+        <div ref={sigmaContainerRef} className="network-canvas__sigma" style={{ position: "absolute", inset: 0 }} />
+        <CanvasToolbarCompact.Provider value={toolbarCompact}>
+        <div
+          role="toolbar"
+          aria-label="Canvas tools"
+          id={toolbarId}
+          hidden={toolbarHidden}
+          className={toolbarCompact ? "canvas-toolbar canvas-toolbar--compact" : "canvas-toolbar"}
+          ref={toolbarRef}
+        >
           <div role="group" aria-label="Select" className="canvas-toolbar__group">
             <button
               type="button"
@@ -3391,7 +3658,8 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
             </button>
           </div>
           <div role="group" aria-label="Layout" className="canvas-toolbar__group">
-            <span className="canvas-toolbar__label" aria-hidden="true">Layout</span>
+            {/* Ruling 6: the caption is dropped on a narrow toolbar; the group keeps its name. */}
+            {!toolbarCompact && <span className="canvas-toolbar__label" aria-hidden="true">Layout</span>}
             <LayoutMenu
               mode={layoutMode}
               onChange={(mode) => {
@@ -3410,8 +3678,9 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
               onArrange={() => arrangeNowRef.current()}
             />
           </div>
+          {toolbarAfterLayout && <div className="canvas-toolbar__group">{toolbarAfterLayout}</div>}
           <div className="canvas-toolbar__group">
-            <span className="canvas-toolbar__label" aria-hidden="true">Show</span>
+            {!toolbarCompact && <span className="canvas-toolbar__label" aria-hidden="true">Show</span>}
             <div role="group" aria-label="Show" className="segmented canvas-toolbar__show">
               <CommunitiesToggle on={communitiesOn} onToggle={() => setCommunitiesOn((v) => !v)} />
               <button
@@ -3451,8 +3720,11 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
               onExpandAll={() => setCollapsed(new Set())}
             />
           </div>
+          {/* ADR-115 E6: what last changed in the case, hidden below 1100px (DESIGN.md §5a). v0.6.1 glass-rows (the
+              owner's ruling 1, the toolbar one row): it takes only the room the row has left, ellipsised, so it never
+              wraps the row; it was inside View, where its whole width pushed View to a second row. */}
+          {lastChange && <span className="canvas-toolbar__note canvas-toolbar__last-change" title={lastChange}>{lastChange}</span>}
           <div role="group" aria-label="View" className="canvas-toolbar__group canvas-toolbar__group--end">
-            {viewsMenu}
             <ViewActions
               nodeCount={graph.order}
               onClearAll={lens ? undefined : () => void removeNodeIds(graph.nodes())}
@@ -3463,12 +3735,12 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
               onAddFiles={bearerToken && investigationId && !lens ? () => setAddingFiles({}) : undefined}
               onLinksAmongAll={bearerToken && investigationId && !lens ? () => void linksAmongOnCanvas(null) : undefined}
             />
-            {/* ADR-115 E6: what last changed in the case, hidden below 1100px (DESIGN.md §5a). */}
-            {lastChange && <span className="canvas-toolbar__note canvas-toolbar__last-change">{lastChange}</span>}
             {/* ADR-115 E4: the right panel's toggle, docked or overlaid (DESIGN.md §5a). */}
             <DetailsToggle />
+            {toolbarEnd}
           </div>
         </div>
+        </CanvasToolbarCompact.Provider>
         {lassoActive && lassoPoints.length > 1 && (
           <svg
             style={{
@@ -3493,13 +3765,15 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
             y={radialMenu.y}
             layout={radialMenu.layout}
             title={
-              graph.hasNode(radialMenu.nodeId)
-                ? `${graph.getNodeAttribute(radialMenu.nodeId, "data").type}: ${nodeLabel(
-                    graph.getNodeAttribute(radialMenu.nodeId, "data"),
-                  )}`
-                : undefined
+              // ADR-078 Amendment 1: what the menu applies to, "2 selected" or the item's name.
+              selected.size > 1 && selected.has(radialMenu.nodeId)
+                ? `${selected.size.toLocaleString("en-GB")} selected`
+                : graph.hasNode(radialMenu.nodeId)
+                  ? nodeLabel(graph.getNodeAttribute(radialMenu.nodeId, "data"))
+                  : undefined
             }
             items={radialMenuItems(radialMenu.nodeId)}
+            keepAbove={barTop}
             onClose={() => setRadialMenu(null)}
           />
         )}
@@ -3515,6 +3789,7 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
               return linkMenuTitle(linkTypeName(edge.type, edgeTypesRef.current), end(edge.source), end(edge.target));
             })()}
             items={linkMenuEntries(linkMenu.edgeId, linkMenu.x, linkMenu.y)}
+            keepAbove={barTop}
             onClose={() => {
               setLinkMenu(null);
               returnFocusToCanvas();
@@ -3527,6 +3802,7 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
             y={reasonPrompt.y}
             title={reasonPrompt.title}
             confirmLabel={reasonPrompt.confirmLabel}
+            why={reasonPrompt.why}
             onSubmit={(reason) => {
               const run = reasonPrompt.run;
               setReasonPrompt(null);
@@ -3663,34 +3939,7 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
             : "Nothing selected. Arrow keys select nodes."}
         </span>
         {/* ADR-097 step 1: the selection's one count, and what can be done to all of it. */}
-        <SelectionBar
-          count={selected.size}
-          onExpand={
-            lens
-              ? undefined
-              : () => {
-                  const box = containerRef.current?.getBoundingClientRect();
-                  const [x, y] = box ? [box.width / 2, box.height / 2] : [0, 0];
-                  // One at a time, each through its own preview and the working set's cap (rule 2).
-                  void (async () => {
-                    for (const id of Array.from(selected)) await requestExpansion(id, null, x, y);
-                  })();
-                }
-          }
-          onSaveView={onViewSaved ? () => setSavingView(true) : undefined}
-          onAsk={onAskInView ? () => void askAboutSelected() : undefined}
-          documentCount={selectedDocumentCount}
-          litNote={
-            litStands && lit ? litNote(lit.window) : undefined
-          }
-          onUndoLit={litStands ? undoSelectLit : undefined}
-          onLinksAmong={lens ? undefined : (degree) => void linksAmongOnCanvas(Array.from(selected), degree)}
-          onRemove={lens ? undefined : () => void removeNodeIds(Array.from(selected))}
-          onClear={() => {
-            setSelected(new Set());
-            onSelectionChange?.([]);
-          }}
-        />
+        <SelectionBar {...selectionBarProps} />
         {savingView && selected.size > 0 && (
           <div className="save-view-anchor">
             <SaveViewForm
@@ -3723,7 +3972,13 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
           })()}
         <div
           className="canvas-corner"
-          style={toolbarHeight ? ({ "--canvas-toolbar-height": `${toolbarHeight}px` } as CSSProperties) : undefined}
+          style={
+            toolbarHidden
+              ? ({ "--canvas-toolbar-height": "0px" } as CSSProperties)
+              : toolbarHeight
+                ? ({ "--canvas-toolbar-height": `${toolbarHeight}px` } as CSSProperties)
+                : undefined
+          }
         >
           <CanvasLegend
             types={legendTypes}
@@ -3754,6 +4009,41 @@ export const GlassCanvas = forwardRef<GlassCanvasHandle, GlassCanvasProps>(
             message={actionError.message}
             tone={actionError.tone}
             onClose={dismissActionError}
+          />
+        )}
+        {capRefusal && graph.hasNode(capRefusal.nodeId) && (
+          <CapRefusalPrompt
+            x={capRefusal.x}
+            y={capRefusal.y}
+            refused={capRefusal.refused}
+            options={capRefusal.options}
+            subject={graph.hasNode(capRefusal.nodeId) ? nodeLabel(graph.getNodeAttribute(capRefusal.nodeId, "data")) : undefined}
+            edgeTypes={edgeTypesRef.current}
+            onChooseType={(edgeType) => {
+              const { nodeId, x, y, depth } = capRefusal;
+              setCapRefusal(null);
+              // The node removed since the refusal: expanding it would draw its neighbours back.
+              if (graph.hasNode(nodeId)) void expandNode(nodeId, edgeType, x, y, depth);
+            }}
+            onSaveSmallerView={
+              onSaveSmallerView
+                ? () => {
+                    const { nodeId, refused } = capRefusal;
+                    setCapRefusal(null);
+                    onSaveSmallerView(refused, graph.hasNode(nodeId) ? nodeLabel(graph.getNodeAttribute(nodeId, "data")) : undefined);
+                  }
+                : undefined
+            }
+            onRunAsBatch={
+              onRunExpansionAsBatch
+                ? () => {
+                    const { nodeId, edgeType, depth, refused } = capRefusal;
+                    setCapRefusal(null);
+                    if (graph.hasNode(nodeId)) onRunExpansionAsBatch({ nodeId, edgeType, depth, refused });
+                  }
+                : undefined
+            }
+            onCancel={() => setCapRefusal(null)}
           />
         )}
         {pendingExpansion && (

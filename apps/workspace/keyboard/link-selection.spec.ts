@@ -60,8 +60,8 @@ test("the buttons over the canvas can be clicked with the mouse", async ({ page 
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ seq: 9 }) });
   });
 
-  await page.getByRole("button", { name: "Clear view" }).click({ timeout: 3000 });
-  await expect(page.getByRole("alertdialog", { name: "Clear the view" })).toBeVisible();
+  await page.getByRole("button", { name: "Clear the graph" }).click({ timeout: 3000 });
+  await expect(page.getByRole("alertdialog", { name: "Clear the graph" })).toBeVisible();
   await page.getByRole("button", { name: /^Clear all/ }).click({ timeout: 3000 });
   await expect.poll(() => removed?.node_ids.length).toBe(6);
 
@@ -77,7 +77,7 @@ test("the large-expansion prompt's buttons can be clicked with the mouse", async
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ candidate_node_count: 1200, candidate_edge_count: 0 }),
+      body: JSON.stringify({ candidate_node_count: 1200, candidate_edge_count: 0, link_count: 1194 }),
     });
   });
   await page.route("**/*/expand", async (route) => {

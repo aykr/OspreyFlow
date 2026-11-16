@@ -38,6 +38,8 @@ const CATALOGUE = {
   built_in: [
     { id: "analyst", label: "Analyst", rights: ["investigate", "triage_alerts"], gives: [] },
     { id: "data_engineer", label: "Data Engineer", rights: ["edit_pipelines", "review_promotions"], gives: [] },
+    // Route A2: Admin carries administration rights, so a giver without them is not offered it.
+    { id: "osprey-admin", label: "Admin", rights: ["administer_system", "manage_people"], gives: [] },
     { id: "super_user", label: "Super user", rights: ["investigate", "edit_pipelines"], gives: ["analyst", "data_engineer", "rule_author"] },
   ],
   custom: [{ id: "r1", name: "Intel desk", version: 1, rights: ["investigate"], changed_by: "a", changed_at: "", holders: 1, team: TEAM }],
@@ -80,6 +82,9 @@ async function serve(page: Page, opts: { owns?: boolean; entra?: boolean } = {})
     if (path === "operations/ageing") return json(200, AGEING);
     // ADR-148 Amendment 8: how people sign in; Entra ID adds a person by object id.
     if (path === "sign-in") return json(200, { kind: opts.entra ? "entra" : "keycloak" });
+    // ADR-148 Amendment 17: whether guest accounts are admitted, switched in People on Entra ID.
+    if (path === "sign-in/guests")
+      return json(200, { admitted: request.method() === "PUT" ? (request.postDataJSON() as { admitted: boolean }).admitted : false });
     if (path === "people/by-object-id" && request.method() === "POST") {
       const sent = request.postDataJSON() as { object_id: string };
       return json(201, { ...PERSON, id: sent.object_id, username: sent.object_id, name: sent.object_id, roles: [] });
@@ -403,6 +408,22 @@ test("a person is added by Entra object id by keyboard", async ({ page }) => {
   registerCovered(REGISTRY, "add-a-person-by-object-id-by-keyboard");
 });
 
+// ADR-148 Amendment 17 (rule 13): guest accounts admitted in People on Entra ID, by keyboard alone.
+test("guest accounts are admitted by keyboard", async ({ page }) => {
+  const asked = await serve(page, { entra: true });
+  await page.goto("/keyboard/admin-harness.html?rights=manage_people");
+  const box = page.getByLabel("Admit guest accounts");
+  await expect(box).toBeEnabled();
+  await expect(box).not.toBeChecked();
+  const sent = page.waitForRequest((r) => r.url().endsWith("/sign-in/guests") && r.method() === "PUT");
+  await box.focus();
+  await page.keyboard.press("Space");
+  expect((await sent).postDataJSON()).toEqual({ admitted: true });
+  await expect(box).toBeChecked();
+  expect(asked).toContain("PUT sign-in/guests");
+  registerCovered(REGISTRY, "admit-guest-accounts-by-keyboard");
+});
+
 test("a person's access is edited by keyboard", async ({ page }) => {
   const asked = await serve(page);
   await page.goto("/keyboard/admin-harness.html?rights=manage_people");
@@ -688,20 +709,20 @@ test("Admin's sections are moved between by keyboard", async ({ page }) => {
   registerCovered(REGISTRY, "move-between-admin-sections-by-keyboard");
 });
 
-// ADR-145 decision 5: a section not built yet opens by keyboard to say what it will hold, and asks the
-// Conduit nothing.
-test("a coming section is opened by keyboard, and calls nothing", async ({ page }) => {
+// ADR-145 decision 5, as the GOV.UK pass draws it (the owner's screenshot, 14 Nov): a section not built yet
+// is named in the side list with a Coming tag and says what it will hold there; it is no link, so Tab goes
+// from Grading scheme straight on to Audit, and nothing calls the Conduit.
+test("a coming section says what it will hold in the side list, and Tab passes over it", async ({ page }) => {
   const asked = await serve(page);
-  await page.goto("/keyboard/admin-harness.html?rights=administer_system");
+  await page.goto("/keyboard/admin-harness.html?rights=administer_system,read_audit");
   await expect(page.getByRole("heading", { name: "Datasets" })).toBeVisible();
   await expect.poll(() => asked).toContain("GET datasets");
-  const before = asked.length;
-  await open(page, "Uploads (coming)");
-  await expect(page.getByRole("heading", { name: "Uploads" })).toBeFocused();
-  await expect(page.getByText(/^Coming: The largest picture/)).toBeVisible();
-  await expect(section(page, "Uploads (coming)")).toHaveAttribute("aria-current", "page");
-  expect(asked.length).toBe(before);
-  registerCovered(REGISTRY, "open-a-coming-admin-section-by-keyboard");
+  const nav = page.getByRole("navigation", { name: "Admin sections" });
+  await expect(nav.locator(".admin-nav__coming-item", { hasText: "Uploads" })).toContainText(/Coming.*The largest picture/);
+  await section(page, "Grading scheme").focus();
+  await page.keyboard.press("Tab");
+  await expect(section(page, "Audit")).toBeFocused();
+  registerCovered(REGISTRY, "read-a-coming-admin-section-by-keyboard");
 });
 
 // L2.5 (ADR-145 decisions 6 and 7 and Amendment 5; rule 13): every new action of People and Roles, by
@@ -942,6 +963,23 @@ test("when promotions are overdue is set in Operations by keyboard", async ({ pa
 
 // L2.7 (ADR-145 Amendment 4 decision 12; rule 13): the tips of People, Roles and Datasets, each read
 // with the control it explains as that control takes focus, in roles' names and never people.
+// Route A2: a role the giver may not give is not offered, yet its box stays in the Tab order and says why; Space
+// leaves it as it was (the Conduit would refuse the change).
+test("why a role is not offered is read with its box by keyboard, and Space leaves it", async ({ page }) => {
+  await serve(page);
+  await page.goto("/keyboard/admin-harness.html?rights=manage_people");
+  await open(page, "People and roles");
+  const box = page.getByRole("checkbox", { name: "Admin for osprey-demo-analyst" });
+  await box.focus();
+  await expect(box).toBeFocused();
+  await expect(box).toHaveAttribute("aria-disabled", "true");
+  await expect(box).toHaveAccessibleDescription(/You cannot give Admin here: it would give Administer system, which you do not hold\./);
+  await page.keyboard.press("Space");
+  await expect(box).not.toBeChecked();
+  await expect(page.getByText(/A role that would give an administration right you do not hold is not offered/)).toBeVisible();
+  registerCovered(REGISTRY, "read-why-a-role-is-not-offered-by-keyboard");
+});
+
 test("a role's, a team lead's and a dataset's Authors' tips are read with their controls by keyboard", async ({ page }) => {
   await serve(page);
   await page.goto("/keyboard/admin-harness.html?rights=manage_people,administer_system");

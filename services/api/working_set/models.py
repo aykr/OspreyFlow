@@ -330,6 +330,25 @@ class ExpansionOutcome(BaseModel):
     #: `not_asked` past the automatic limits; `view_full` when they would have passed the cap, so
     #: none was added (never some of them) and the canvas says so.
     links_among: Literal["added", "not_asked", "view_full"] = "not_asked"
+    #: Step 3h (ADR-124 Amendment 19): the cluster each of the reader's nodes is in at the case's τ,
+    #: for every
+    #: node in a cluster of more than one, computed for this reader alone over what they may see. On
+    #: this
+    #: response only, never the shared stream (rule 3). None when no node of theirs is in such a
+    #: cluster.
+    clusters: DeltaReproject | None = None
+
+
+class AddedByIds(BaseModel):
+    """What `WorkingSetService.add_by_ids` returns (v0.6.0 #5, *Show all on graph* under an Ask &
+    Chat answer): the add, as a seed answers it, and how many of the ids asked for are not on the
+    canvas after it, never which. A node the reader may not see, or the Vault does not hold, and a
+    link they may not see or whose two ends they cannot both see (the orchestrator's ruling, 15
+    November 2026), are counted alike, as a saved view's `missing` is (ADR-144 decision 2): the ids
+    came from this reader's own answer, so the count names nothing they could not already ask."""
+
+    outcome: ExpansionOutcome
+    not_shown: int
 
 
 class LinksAmongRequest(BaseModel):
@@ -426,10 +445,17 @@ class CardinalityPreview(BaseModel):
     `expand` with this request would hit — the same `LimitExceeded` shape,
     computed without writing anything. Both counts are over the reader's own projected view
     plus what the request adds (ADR-124 decision 2), so they are the same with and without a
-    stored item the reader may not read."""
+    stored item the reader may not read.
+
+    `link_count` (ADR-098 Amendment 8): the links of the asked type at the asked node that the
+    reader may see, as the adapter's own expand returned them (rule 3), a link counted only when
+    its far end was returned too, and one already on the canvas counted. The right-click menu
+    shows it per type and folds a type with none into one line; it is not what the expansion
+    would add, which the two counts above give."""
 
     candidate_node_count: int
     candidate_edge_count: int
+    link_count: int
     would_breach: LimitExceeded | None = None
 
 

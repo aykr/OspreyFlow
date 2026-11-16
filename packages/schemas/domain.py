@@ -414,9 +414,9 @@ class DrawnAssertion(BaseModel):
 class Provenance(BaseModel):
     state: ProvenanceState
     sources: list[SourceRef]
-    #: ADR-130 Amendment 2: the element belongs to a dataset its reader's case does not read, so
-    #: its sources are not sent. Set only on a read, for a scoped principal; `sources` is empty
-    #: then, and only then.
+    #: ADR-130 Amendment 2: the element belongs to a dataset its reader's case does not read, so its
+    #: sources are not sent. Set only on a read, for a scoped principal; `sources` is empty then,
+    #: and only then.
     sources_withheld: bool = False
     extracted_by: str | None = None
     extraction_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -430,8 +430,8 @@ class Provenance(BaseModel):
     #: ADR-147 Amendment 2 (the owner's ruling 6): set on a case's own copy of a gazetteer's place,
     #: naming the gazetteer dataset it was copied from (`gazetteer-osm-<region>`). Kept for good,
     #: through every later write (`merge.merge_provenance`), since it is what withholds the place's
-    #: source identifiers from every request reader and keeps them from being matched (decision
-    #: 3b). `None` for everything else, and then left out of what is stored.
+    #: source identifiers from every request reader and keeps them from being matched (decision 3b).
+    #: `None` for everything else, and then left out of what is stored.
     gazetteer: str | None = None
 
     @model_serializer(mode="wrap")
@@ -681,6 +681,10 @@ class Principal(BaseModel):
     #: unlimited and only the Conduit's own background work reads so; the Conduit's principal for a
     #: request always carries a list, empty outside a case, and an empty list sees nothing.
     datasets: list[str] | None = None
+    #: ADR-148 Amendment 10: the routes alone this principal is admitted to, each
+    #: `"<METHOD> <path template>"` (a dashboard identity on Entra ID: the case list and the report
+    #: feed); `None`, every route its rights allow. `get_principal` refuses any other with 403.
+    routes: list[str] | None = None
 
 
 # --- GraphPort request/response types (00_ARCHITECTURE.md §2.1) --------
@@ -970,6 +974,16 @@ DomainPack = Literal["fibo", "niem", "stix"]
 #: or another owner can see it, not left as a silent skip with no visible state change. Written by
 #: the evaluator (`services/api/evaluation.py`), read by the Stage 6c list panels.
 WatchStatus = Literal["active", "stopped"]
+#: ADR-044 Amendment 1: why a hotlist or watch is `stopped`, kept beside the binary status
+#: (ADR-044's decision): its owner can no longer sign in (`revoked`); on Entra ID their access is
+#: out of date (`out_of_date`, ADR-148 Amendment 16); Admin › People does not hold them
+#: (`not_held`); the identity provider refused to act as them (`refused`); their sign-in could not
+#: be checked (`unreachable`);
+#: they could not be acted as, for no reason the caller was told (`unresolved`); a watch's saved
+#: pattern is no longer theirs (`pattern_gone`). `None` while active.
+StoppedReason = Literal[
+    "revoked", "out_of_date", "not_held", "refused", "unreachable", "unresolved", "pattern_gone"
+]
 
 
 class Hotlist(BaseModel):
@@ -1001,6 +1015,15 @@ class Hotlist(BaseModel):
     owner_id: str
     review_date: date
     status: WatchStatus = "active"
+    #: ADR-044 Amendment 1: why it is stopped, and that in words for the owner (never an id,
+    #: rule 7); both `None` while active.
+    status_detail: StoppedReason | None = None
+    stopped_why: str | None = None
+    #: ADR-044 Amendment 2: loads in a row whose owner's sign-in could not be checked (the third
+    #: stops it, a reachable one puts it back to 0), and the owner's words for it while it is
+    #: active.
+    unreachable_in_a_row: int = Field(default=0, ge=0)
+    status_note: str | None = None
     created_at: datetime
     #: ADR-099 Amendment 3: the dataset of the case it was made in; read only in a case reading
     #: it. `None` for one made before, until `stamp_datasets` places it.
@@ -1039,6 +1062,15 @@ class Monitor(BaseModel):
     pattern_id: str
     owner_id: str
     status: WatchStatus = "active"
+    #: ADR-044 Amendment 1: why it is stopped, and that in words for the owner (never an id,
+    #: rule 7); both `None` while active.
+    status_detail: StoppedReason | None = None
+    stopped_why: str | None = None
+    #: ADR-044 Amendment 2: loads in a row whose owner's sign-in could not be checked (the third
+    #: stops it, a reachable one puts it back to 0), and the owner's words for it while it is
+    #: active.
+    unreachable_in_a_row: int = Field(default=0, ge=0)
+    status_note: str | None = None
     created_at: datetime
     #: ADR-099 Amendment 3: the dataset of the case it was made in; read only in a case reading
     #: it. `None` for one made before, until `stamp_datasets` places it.
@@ -1122,8 +1154,8 @@ CLOSING_REASONS: dict[str, str] = {
 #: of these and is never queued.
 AlertSeverity = Literal["low", "medium", "high"]
 #: ADR-146 decision 1 adds `analyst`: raised by hand (*Raise an alert…*, R4), `rule_id`
-#: `analyst:case:<id>` or `analyst:dataset:<id>`. `drawn_watch` (L3.6, ADR-143 Amendment 2
-#: decision 8): a watch set by drawing, `rule_id` `drawn_watch:<watch id>`, its owner's in its case.
+#: `analyst:case:<id>` or `analyst:dataset:<id>`. `drawn_watch` (L3.6, ADR-143 Amendment 2 decision
+#: 8): a watch set by drawing, `rule_id` `drawn_watch:<watch id>`, its owner's in its case.
 AlertKind = Literal["typology", "hotlist", "monitor", "analyst", "drawn_watch"]
 #: ADR-133 ruling 3: whom a hotlist's alerts reach — its owner alone, or its owner's team too.
 HotlistAudience = Literal["only_me", "team"]
@@ -1728,10 +1760,10 @@ class AlertAtAddress(BaseModel):
 
 
 class AlertQueueCounts(BaseModel):
-    """A case's alert queue as counts alone (ADR-146 Amendment 2 point 3): what Home shows a reader
-    of the queue whom Rules and Monitoring is not offered to (the Data Engineer), who is given no
-    alert's title, words or id. Counted as the queue is, so an alert any of whose evidence is hidden
-    from the reader is not counted (rule 3)."""
+    """A case's alert queue as counts alone (ADR-146 Amendment 2 point 3): what Home shows a
+    reader of the queue whom Rules and Monitoring is not offered to (the Data Engineer), who is
+    given no alert's title, words or id. Counted as the queue is, so an alert any of whose
+    evidence is hidden from the reader is not counted (rule 3)."""
 
     open: int
     claimed: int
@@ -1864,6 +1896,11 @@ class AlertSource(BaseModel):
     #: name for a routed rule); never stored. The Glass shows this, never `owner`.
     owner_name: str | None = None
     state: Literal["draft", "live", "stopped"]
+    #: ADR-044 Amendment 1: why a stopped hotlist or watch is stopped, in the owner's words
+    #: (`watch_status.STOPPED_WHY`'s fixed sentences, never an id, rule 7), as Hotlists and Watches
+    #: say beside it; `None` while live, and for a rule, whose retirement records no reason.
+    #: Only the reader's own watches are listed here, so it reaches only their owner.
+    stopped_why: str | None = None
     expires_on: date | None = None
     last_fired_at: datetime | None = None
     alerts_30_days: int = 0

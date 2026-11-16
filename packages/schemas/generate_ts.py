@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from schemas.admin import ALL_MODELS as ADMIN_MODELS  # noqa: E402
 from schemas.analytics import ALL_MODELS as ANALYTICS_MODELS  # noqa: E402
+from schemas.batch_expansion import ALL_MODELS as BATCH_EXPANSION_MODELS  # noqa: E402
 from schemas.boards import ALL_MODELS as BOARD_MODELS  # noqa: E402
 from schemas.case_views import ALL_MODELS as CASE_VIEW_MODELS  # noqa: E402
 from schemas.compute import ALL_MODELS as COMPUTE_PORT_MODELS  # noqa: E402
@@ -43,12 +44,14 @@ from schemas.person_ownership import ALL_MODELS as OWNERSHIP_MODELS  # noqa: E40
 from schemas.profile import ALL_MODELS as PROFILE_MODELS  # noqa: E402
 from schemas.promotions import ALL_MODELS as PROMOTION_MODELS  # noqa: E402
 from schemas.provider_profile import ALL_MODELS as PROVIDER_PROFILE_MODELS  # noqa: E402
+from schemas.questions import ALL_MODELS as QUESTION_MODELS  # noqa: E402
 from schemas.release import ALL_MODELS as RELEASE_MODELS  # noqa: E402
 from schemas.release import DatasetRelease  # noqa: E402
 from schemas.rights import ALL_MODELS as RIGHTS_MODELS  # noqa: E402
 from schemas.rule_editor import ALL_MODELS as RULE_EDITOR_MODELS  # noqa: E402
 from schemas.rule_standards import ALL_MODELS as RULE_STANDARDS_MODELS  # noqa: E402
 from schemas.screening import ALL_MODELS as SCREENING_MODELS  # noqa: E402
+from schemas.search import ALL_MODELS as SEARCH_MODELS  # noqa: E402
 from schemas.sentences import ALL_MODELS as SENTENCE_MODELS  # noqa: E402
 from schemas.sources import ALL_MODELS as SOURCE_MODELS  # noqa: E402
 from schemas.staging import ALL_MODELS as STAGING_MODELS  # noqa: E402
@@ -94,6 +97,9 @@ ALL_MODELS: tuple[type[BaseModel], ...] = (
     *OWNERSHIP_MODELS,
     *OPERATIONS_MODELS,
     *RELEASE_MODELS,
+    *QUESTION_MODELS,
+    *SEARCH_MODELS,
+    *BATCH_EXPANSION_MODELS,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

@@ -95,6 +95,13 @@ from schemas.deployment import (
 
 #: Where the workspace's nginx serves the basemap's glyph files from
 #: (`apps/workspace/nginx.conf.template`).
+#: The search page's own words when search answers without an index, as the Conduit says them
+#: (`services/api/search_service.py`'s `LIMITED_REASONS`; the harness does not import the Conduit,
+#: so `tests/harness/test_search_fallback_words.py` holds the two to the fallback's real answer).
+_NO_INDEX = "Search is limited to exact identifiers: this deployment has no search index."
+_UNREACHABLE = (
+    "Search is limited to exact identifiers just now: the search index cannot be reached."
+)
 GLYPHS_CONTAINER_PATH = "/usr/share/nginx/fonts"
 
 #: **Where the ingest root is mounted inside the Conduit — fixed, not configurable** (owner ruling
@@ -146,6 +153,17 @@ _OLLAMA_PULL_SCRIPT = (
     "pull_and_verify moondream:1.8b-v2-q4_K_M c865c80afc38\n"
     "wait\n"
 )
+
+
+#: ADR-135 Amendment 13: how long a model call is waited for, in seconds, the deployment's own
+#: model's (ADR-095) and a hosted engine's, as the adapters default them
+#: (`model_litellm/client.py`, `extract_laurium/adapter.py`). Tunables, not secrets: compose
+#: reads each from the env file with this default, and the cluster render puts each in its
+#: environment at it (`harness/cluster.py`), never among the secrets.
+MODEL_TIMEOUTS: dict[str, str] = {
+    "OSPREY_MODEL_TIMEOUT_SECONDS": "900",
+    "OSPREY_HOSTED_MODEL_TIMEOUT_SECONDS": "120",
+}
 
 
 def render_ollama_pull_script(config: OspreyConfig) -> str:
@@ -1052,6 +1070,10 @@ def compose_services(config: OspreyConfig, images: Sequence[ServiceImage]) -> di
             api_environment["LITELLM_API_KEY"] = "${" + GATEWAY_MASTER + ":?set in the env file}"
             # ADR-135 Amendment 2 decision 2: the models file, on its own volume.
             api_environment["OSPREY_MODEL_SETTINGS_DIR"] = MODEL_SETTINGS_PATH
+            # ADR-135 Amendment 13: how long a model call is waited for, the deployment's own model
+            # (ADR-095) and a hosted engine's, each the operator's to set in the env file.
+            for name, seconds in MODEL_TIMEOUTS.items():
+                api_environment[name] = "${" + name + ":-" + seconds + "}"
             # ADR-095 Amendment 2: where to ask whether the models have arrived (`/v1/readiness`).
             api_environment["OSPREY_OLLAMA_URL"] = "http://ollama:11434"
             # ADR-098 decision 2: the fast recogniser. Not in `depends_on` below: without it the
@@ -1547,9 +1569,23 @@ def _grading_env(config: OspreyConfig) -> list[str]:
     return lines
 
 
+#: The profiles that render a job worker service of their own (cluster's and cloud-platform's
+#: `worker` workload, ADR-114 Amendment 10 point 6). Every other profile runs the job loop inside
+#: the Conduit, which reads `OSPREY_JOB_WORKER` (the orchestrator's fix, 14 November 2026).
+_PROFILES_WITH_A_WORKER = frozenset({Profile.CLUSTER.value, Profile.CLOUD_PLATFORM.value})
+
+
+def job_worker_place(profile: str) -> str:
+    """Where a profile's job loop runs: `service`, its own worker workload; `conduit`, the
+    Conduit's lifespan, where no worker is rendered. Never both, so no job stream has two kinds of
+    consumer."""
+    return "service" if profile in _PROFILES_WITH_A_WORKER else "conduit"
+
+
 def _render_env(config: OspreyConfig) -> str:
     lines = [
         f"OSPREY_PROFILE={config.profile.value}",
+        f"OSPREY_JOB_WORKER={job_worker_place(config.profile.value)}",
         f"OSPREY_RELEASE_VERSION={release_version(config)}",
         f"OSPREY_STATE_DIR={STATE_CONTAINER_PATH}",
         f"OSPREY_GRAPH_STORE={config.components.graph_store.value}",
@@ -1582,6 +1618,17 @@ def _render_env(config: OspreyConfig) -> str:
         *(
             ["CLICKHOUSE_HOST=clickhouse", "CLICKHOUSE_HTTP_PORT=8123", "CLICKHOUSE_USER=osprey"]
             if _uses_clickhouse(config)
+            else []
+        ),
+        # ADR-150 decision 7: where the worker's indexer and the search service find OpenSearch,
+        # and the deployment's own index alias, so two deployments on one server never meet.
+        *(
+            [
+                "OPENSEARCH_HOST=opensearch",
+                "OPENSEARCH_PORT=9200",
+                f"OSPREY_SEARCH_INDEX_ALIAS=ospreyflow-{compose_project(config)}",
+            ]
+            if config.components.search is SearchBackend.OPENSEARCH
             else []
         ),
         f"OSPREY_IDENTITY_PROVIDER={config.governance.identity_provider}",
@@ -1798,10 +1845,14 @@ Generated for this deployment. Regenerate rather than edit.
 {rows}
 
 Search backend: `{config.components.search.value}`{
-        " — the reduced variant (spec/05_DEPLOYMENT.md §3): OpenSearch is dropped and full-text "
-        "falls back to PostgreSQL. Search quality degrades and semantic search is unavailable."
+        " — the reduced variant (spec/05_DEPLOYMENT.md §3): OpenSearch is dropped, so there is no "
+        "search index and search is the graph store's own exact search, at most 100 matches and "
+        "with no date filter. The search page says so: "
+        f'"{_NO_INDEX}"'
         if config.components.search is SearchBackend.POSTGRES_FULLTEXT
-        else "."
+        else ". If OpenSearch does not answer, search is the graph store's own exact search until "
+        "it does, at most 100 matches and with no date filter, and the search page says so: "
+        f'"{_UNREACHABLE}"'
     }
 
 ## Hosts

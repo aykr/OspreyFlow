@@ -39,7 +39,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import asyncpg
 import yaml
@@ -64,6 +64,10 @@ from schemas.map_admin import (
 from schemas.mapconfig import MapConfig, MapProvider
 
 from .model_admin import _Exclusive
+
+if TYPE_CHECKING:
+    from ontology.handling import HandlingScheme
+    from ports.analytics import AnalyticsPort
 from .tile_math import tile_range_for_bbox, tiles_in_range
 
 log = logging.getLogger(__name__)
@@ -78,6 +82,12 @@ PLANETILER_JAR = "planetiler/planetiler.jar"
 #: ADR-147 decision 3: the one writable folder in the Conduit's read-only tiles folder, where a
 #: basemap built here and its extract are written (`harness/render.py`'s `TILES_BUILT_SUBDIR`).
 BUILT_FOLDER = "built"
+#: The settlements a tiles-only build saves beside its extract, for the places stage to load
+#: (v0.6.0 item 10: the demo's rebuild window reads them, not the 2 GB extract again).
+PLACES_FILE = "{region}.places.json"
+#: The build's stages (`--stage`): the tiles alone, with the demo up; or the places alone, from what
+#: the tiles stage left, with the Conduit stopped. Neither is the whole build, as before.
+STAGES = ("tiles", "places")
 #: The fonts the bundled style names (`scripts/fetch_basemap_glyphs.STYLE_FONTS`).
 GLYPH_FONTS: tuple[str, ...] = ("Noto Sans Regular",)
 
@@ -712,29 +722,10 @@ class MapAdmin:
             except OSError:
                 basemaps.append(LocalBasemap(provider_id=provider.id, file=local.name, built=False))
         fonts = [f for f in GLYPH_FONTS if (self._tiles_root / "fonts" / f / "0-255.pbf").is_file()]
-        java = self._java("java") is not None
-        jar = (self._tiles_root / PLANETILER_JAR).is_file()
-        if java and jar:
-            builder = "Ready: Java and the map builder are installed."
-        elif not java and os.environ.get("OSPREY_PROFILE") == "cloud-platform":
-            # ADR-148 decision 12: this profile's Conduit is built without Java. `ospreyflow map
-            # build` runs in a local deployment's Conduit and the tiles bucket and its upload do
-            # not exist yet (ADR-148 Amendment 1, "Left"), so neither is offered as a route.
-            builder = (
-                "On this platform the Conduit has no Java, so the basemap cannot be built here, "
-                "and a basemap built elsewhere cannot yet be brought onto the platform. Until it "
-                "can, the map uses its providers alone."
-            )
-        elif not java:
-            builder = "Java is not installed in the Conduit, so the map cannot be built here."
-        else:
-            builder = (
-                "The map builder (planetiler) is not in the tiles folder. Run `ospreyflow map "
-                "build <region> --unit <unit> --planetiler-jar <path>` once to place it."
-            )
+        builder, ready = builder_state(self._tiles_root, self._java)
         return BasemapState(
             basemaps=basemaps, glyphs_installed=len(fonts) == len(GLYPH_FONTS),
-            glyph_fonts=list(GLYPH_FONTS), builder_ready=java and jar, builder_state=builder,
+            glyph_fonts=list(GLYPH_FONTS), builder_ready=ready, builder_state=builder,
             regions=sorted(GEOFABRIK_REGIONS),
         )  # fmt: skip
 
@@ -1136,8 +1127,37 @@ class PrefetchScheduler:
 # --- the build, in the Conduit ------------------------------------------------------------------
 
 
+def builder_state(
+    tiles_root: Path, java_lookup: Callable[[str], str | None] | None = None
+) -> tuple[str, bool]:
+    """Whether the basemap can be built here, in words: Java and the planetiler jar in the tiles
+    folder. Read from the tiles folder alone, so the tiles stage can ask it with no settings.
+    `shutil.which` is looked up when called, not bound at import, so a test can stand in for it."""
+    java = (java_lookup or shutil.which)("java") is not None
+    jar = (tiles_root / PLANETILER_JAR).is_file()
+    if java and jar:
+        builder = "Ready: Java and the map builder are installed."
+    elif not java and os.environ.get("OSPREY_PROFILE") == "cloud-platform":
+        # ADR-148 decision 12: this profile's Conduit is built without Java. `ospreyflow map
+        # build` runs in a local deployment's Conduit and the tiles bucket and its upload do
+        # not exist yet (ADR-148 Amendment 1, "Left"), so neither is offered as a route.
+        builder = (
+            "On this platform the Conduit has no Java, so the basemap cannot be built here, "
+            "and a basemap built elsewhere cannot yet be brought onto the platform. Until it "
+            "can, the map uses its providers alone."
+        )
+    elif not java:
+        builder = "Java is not installed in the Conduit, so the map cannot be built here."
+    else:
+        builder = (
+            "The map builder (planetiler) is not in the tiles folder. Run `ospreyflow map "
+            "build <region> --unit <unit> --planetiler-jar <path>` once to place it."
+        )
+    return builder, java and jar
+
+
 async def build_basemap(
-    admin: MapAdmin,
+    admin: MapAdmin | None,
     *,
     by: str,
     region: str,
@@ -1147,15 +1167,25 @@ async def build_basemap(
     planetiler_runner: Callable[..., Path] | None = None,
     tiles_root: Path = Path(TILES_CONTAINER_PATH),
     settle: Callable[[], Awaitable[None]] | None = None,
+    stage: str | None = None,
 ) -> tuple[str, int, int, int]:
     """The tier-1 build (`00_ARCHITECTURE.md` §1.2's one button): the region's extract, planetiler
     into the tiles folder, the OSM gazetteer loaded (`load_places`, which the caller runs in a
     graph transaction), and the provider registered in the maps file. Returns the file's name and
     the gazetteer's created, referenced and rejected counts. A region not in the list is refused
-    by name; the jar is the tiles folder's own."""
+    by name; the jar is the tiles folder's own.
+
+    **`stage`** (v0.6.0 item 10, for the demo's rebuild window): `"tiles"` downloads the extract,
+    runs planetiler and saves the extract's settlements beside it (`PLACES_FILE`), loading and
+    registering nothing, so a running deployment's map is unchanged; `"places"` loads that file's
+    settlements and registers the provider, downloading and running nothing, and is refused in words
+    when the tiles stage's files are not there. `None` is the whole build."""
+    import json
+
     from scripts.build_local_basemap import (
         GEOFABRIK_REGIONS,
         download_extract,
+        read_places,
         resolve_extract,
         run_planetiler,
     )
@@ -1166,24 +1196,51 @@ async def build_basemap(
             f"Known regions: {', '.join(sorted(GEOFABRIK_REGIONS))}.",
             status=422,
         )
-    builder = admin.basemap()
-    if not builder.builder_ready:
-        # Said before anything is fetched: Java is in the Conduit image (ADR-147 Amendment 2), but a
-        # deployment built without it, or with no jar placed by the command line, says so here.
-        raise MapAdminRefused(builder.builder_state, status=409)
+    if admin is None and stage != "tiles":
+        raise ValueError("only the tiles stage builds with no maps admin: it registers nothing")
+    # Said before anything is fetched: Java is in the Conduit image (ADR-147 Amendment 2), but a
+    # deployment built without it, or with no jar placed by the command line, says so here.
+    if admin is not None:
+        state = admin.basemap()  # read once, so the words and the readiness cannot disagree
+        words, ready = state.builder_state, state.builder_ready
+    else:
+        words, ready = builder_state(tiles_root)
+    if not ready:
+        raise MapAdminRefused(words, status=409)
+    if stage is not None and stage not in STAGES:
+        raise MapAdminRefused(f"{_shown(stage)} is not a stage of the build: tiles or places.")
     jar = tiles_root / PLANETILER_JAR
     built = tiles_root / BUILT_FOLDER
     pmtiles = built / f"{region}.pmtiles"
-    # The download and planetiler are blocking and long: each runs in a worker thread, so the
-    # Conduit goes on answering, and the progress lines reach the stream as they are said.
-    extract = await asyncio.to_thread(
-        resolve_extract, region, built / "extracts", existing=None,
-        downloader=downloader or download_extract, progress=progress,
-    )  # fmt: skip
-    progress("Running planetiler...")
-    await asyncio.to_thread(planetiler_runner or run_planetiler, extract, pmtiles, jar_path=jar)
+    saved = built / "extracts" / PLACES_FILE.format(region=region)
+    if stage == "places":
+        if not (pmtiles.is_file() and saved.is_file()):
+            raise MapAdminRefused(
+                f"The {region} tiles and settlements are not built yet ({pmtiles.name} and "
+                f"{saved.name} in the tiles folder's {BUILT_FOLDER} folder). Run the build with "
+                "--stage tiles first.",
+                status=409,
+            )
+        progress(f"Loading the settlements saved by the tiles stage ({saved.name})...")
+        source = saved
+    else:
+        # The download and planetiler are blocking and long: each runs in a worker thread, so
+        # the Conduit goes on answering, and the progress lines reach the stream as they are said.
+        extract = await asyncio.to_thread(
+            resolve_extract, region, built / "extracts", existing=None,
+            downloader=downloader or download_extract, progress=progress,
+        )  # fmt: skip
+        progress("Running planetiler...")
+        await asyncio.to_thread(planetiler_runner or run_planetiler, extract, pmtiles, jar_path=jar)
+        if stage == "tiles":
+            progress("Saving the extract's settlements for the places stage...")
+            rows = await asyncio.to_thread(read_places, extract)
+            saved.write_text(json.dumps(rows), encoding="utf-8")
+            progress(f"Tiles built and {len(rows)} settlements saved; nothing is registered yet.")
+            return pmtiles.name, 0, 0, 0
+        source = extract
     progress("Loading the OSM-derived gazetteer...")
-    created, referenced, rejected = await load_places(extract)
+    created, referenced, rejected = await load_places(source)
     if settle is not None:
         # The places committed before the provider is registered, so the map never points at a
         # basemap whose gazetteer a failed commit lost (the independent review's minor 9).
@@ -1193,6 +1250,7 @@ async def build_basemap(
     )
     provider_id = f"osm-local-{region}"
     progress(f"Registering provider {provider_id}...")
+    assert admin is not None  # the tiles stage returned above
     await admin.register_local(by, provider_id, f"OpenStreetMap ({region})", pmtiles.name)
     return pmtiles.name, created, referenced, rejected
 
@@ -1250,12 +1308,20 @@ def command_parser() -> argparse.ArgumentParser:
     build = sub.add_parser("build")
     build.add_argument("region")
     build.add_argument("--by", required=True)
-    build.add_argument("--unit", required=True)
+    build.add_argument(
+        "--unit", required=True,
+        help="the unit that holds the gazetteer; checked by the places stage and a whole build, "
+        "not by --stage tiles, which registers nothing and reaches no database",
+    )  # fmt: skip
+    build.add_argument("--stage", choices=STAGES, default=None)
     return parser
 
 
 async def _main(argv: Sequence[str]) -> int:
     args = command_parser().parse_args(argv)
+    if args.verb == "build" and args.stage == "tiles":
+        # Before the settings and the audit are opened: the tiles stage reads neither (P3).
+        return await _tiles_here(args.region)
     admin, close = await open_admin()
     try:
         if args.verb == "list":
@@ -1277,7 +1343,7 @@ async def _main(argv: Sequence[str]) -> int:
             print("Verify passed." if report.passed else "Verify found issues.")
             return 0 if report.passed else 1
         if args.verb == "build":
-            return await _build_here(admin, args.by, args.region, args.unit)
+            return await _build_here(admin, args.by, args.region, args.unit, args.stage)
     except MapAdminRefused as refused:
         print(refused.words, file=sys.stderr)
         return 1
@@ -1286,7 +1352,59 @@ async def _main(argv: Sequence[str]) -> int:
     return 1
 
 
-async def _build_here(admin: MapAdmin, by: str, region: str, unit: str) -> int:
+async def _tiles_here(region: str) -> int:
+    """`build --stage tiles` from the command line (v0.6.0 item 10; P3, the rebuild's rehearsal):
+    the extract, planetiler and the saved settlements, into the tiles folder alone. It reads no
+    `osprey.yaml`, maps settings or audit, checks no unit and opens no graph or store, so it runs
+    as a bare `docker run` of the Conduit's image beside a running deployment, with only the
+    tiles folder mounted. The places stage checks the unit, loads and registers."""
+
+    async def never(_source: Path) -> tuple[int, int, int]:
+        raise AssertionError("the tiles stage loads no places")
+
+    try:
+        name, _created, _referenced, _rejected = await build_basemap(
+            None, by="", region=region, load_places=never, stage="tiles",
+            tiles_root=Path(TILES_CONTAINER_PATH),
+        )  # fmt: skip
+    except MapAdminRefused as refused:
+        print(refused.words, file=sys.stderr)
+        return 1
+    except Exception as error:  # noqa: BLE001 - said in words, exit 1
+        print(f"The build stopped ({type(error).__name__}): {error}", file=sys.stderr)
+        return 1
+    print(f"Built {name} and saved its settlements; run --stage places to load them.")
+    return 0
+
+
+async def _analytics_if_free(
+    scheme: HandlingScheme,
+) -> tuple[AnalyticsPort | None, Callable[[], Awaitable[None]]]:
+    """The Conduit's analytics store, opened as the Conduit opens it (`analytics_store`), so a
+    build writes the places' points (v0.6.0 item 10). DuckDB is one process's at a time: while the
+    Conduit runs it holds the file and the open is refused, and the build goes on without the
+    points and says so (`NO_POINTS_HERE`); run with the Conduit stopped, as the demo's install step
+    does, it writes them. ClickHouse is open to both."""
+    import duckdb
+    from services.api import analytics_store
+    from services.api.config import DEFAULT_ANALYTICS_DB_PATH
+
+    async def nothing() -> None:
+        return None
+
+    try:
+        return await analytics_store.open_analytics(
+            os.environ.get("OSPREY_ANALYTICS_ENGINE", "duckdb"),
+            duckdb_path=os.environ.get("ANALYTICS_DB_PATH", DEFAULT_ANALYTICS_DB_PATH),
+            handling_scheme=scheme,
+        )
+    except duckdb.IOException:
+        return None, nothing
+
+
+async def _build_here(
+    admin: MapAdmin, by: str, region: str, unit: str, stage: str | None = None
+) -> int:
     """`build` from the command line: the gazetteer loaded through the Conduit's own graph, held by
     `unit` (ADR-147 Amendment 2, the owner's ruling 8), which is checked before anything runs."""
     from services.api.map_places import DatasetsUnreachable, UnknownUnit, check_unit_from_env
@@ -1314,19 +1432,17 @@ async def _build_here(admin: MapAdmin, by: str, region: str, unit: str) -> int:
     graph = GraphArcadeDBAdapter(client, scheme)
     ontology = load_default_ontology()
     await graph.apply_schema(ontology)
-
-    held: dict[str, str] = {}
+    analytics, close_analytics = await _analytics_if_free(scheme)
 
     async def load_places(extract: Path) -> tuple[int, int, int]:
-        # ADR-147 Amendment 1: into the region's gazetteer dataset, as the Admin route's build.
+        # ADR-147 Amendment 1: into the region's gazetteer dataset, as the Admin route's build; a
+        # batch to a transaction, each committed by the load (v0.6.0 item 10).
         from services.api.map_places import gazetteer_dataset_id
 
-        tx = await graph.begin_transaction()
-        held["tx"] = tx
         report = await load_gazetteer(
-            extract, graph=graph, ontology=ontology, tx=tx, principal=principal,
+            extract, graph=graph, ontology=ontology, principal=principal,
             load_id=f"load-osm-gazetteer-{region}", dataset=gazetteer_dataset_id(region),
-            unit=unit,
+            unit=unit, analytics=analytics,
         )  # fmt: skip
         return report.nodes_created, report.nodes_referenced, len(report.rejections)
 
@@ -1341,8 +1457,8 @@ async def _build_here(admin: MapAdmin, by: str, region: str, unit: str) -> int:
             register_gazetteer_dataset_from_env,
         )
 
-        await graph.commit_transaction(held.pop("tx"))
-        print(NO_POINTS_HERE)
+        if analytics is None:
+            print(NO_POINTS_HERE)
         try:
             await register_gazetteer_dataset_from_env(region, by=by, unit=unit)
             # ADR-147 Amendment 2: every case that added the gazetteer given its places again.
@@ -1354,15 +1470,14 @@ async def _build_here(admin: MapAdmin, by: str, region: str, unit: str) -> int:
 
     try:
         name, created, referenced, rejected = await build_basemap(
-            admin, by=by, region=region, load_places=load_places, settle=settle
+            admin, by=by, region=region, load_places=load_places, settle=settle, stage=stage
         )
     except Exception as error:  # noqa: BLE001 - said in words, exit 1
-        if "tx" in held:
-            await graph.rollback_transaction(held["tx"])
         print(f"The build stopped ({type(error).__name__}): {error}", file=sys.stderr)
         return 1
     finally:
         await client.aclose()
+        await close_analytics()
     print(
         f"Built {name}: {created} places created, {referenced} already known, {rejected} rejected."
     )

@@ -160,22 +160,28 @@ at. That is Phase 8a's and does not apply here.
 On the client's platform the stores are not containers on one machine and there is no `harness.backup`:
 the managed stores (PostgreSQL on RDS, Valkey on ElastiCache, the media and staging buckets) are the
 platform's, under its own snapshots and versioning, and **this section covers what the deployment runs
-itself**: ArcadeDB, ClickHouse and, in the proof-of-concept shape, the Ingest root's claim
-(`ospreyflow-ingest`: uploads and the drop folder). **The restore below is supported for one copy of
+itself**: ArcadeDB, ClickHouse, the shared claim's published pipelines (`data/recipes`), model settings
+(`model-settings`) and map settings (`map-settings`'s maps file; the map key file beside it is never in a set, as
+ADR-147 decision 1 says of every key, and a restore names each provider whose key is entered again), in every shape (ADR-148
+Amendment 13), and the Ingest root (uploads and the drop folder) beside them: in the proof-of-concept
+shape its own claim (`ospreyflow-ingest`), and in the standard shape the shared claim's `ingest` folder,
+a part of its own (`shared-ingest`), read-only to the backup and put back by `restore-claims`. Uploads
+can be large, so the claims run's size and time grow with them. **The restore below is supported for one copy of
 each store** (development, and the proof-of-concept shape); the production shape's (three ArcadeDB
 copies, ClickHouse ON CLUSTER with two replicas) is not supported yet, and the render refuses it.
 
 **The schedule.** Two CronJobs, daily at 02:15 UTC (their time zone is UTC whatever the cluster's):
-`ospreyflow-backup` (ArcadeDB's `BACKUP DATABASE`, then ClickHouse's `BACKUP … TO S3`) and, in the
-proof-of-concept shape, `ospreyflow-backup-claims` (each claim of its own, read-only, beside the pods
-that mount it). Both write one set, `s3://<prefix>backups/sets/<YYYYMMDDTHHMMSSZ>/`, named by their
+`ospreyflow-backup` (ArcadeDB's `BACKUP DATABASE`, then ClickHouse's `BACKUP … TO S3`) and, in every
+shape, `ospreyflow-backup-claims` (the shared claim's three parts and, in the proof-of-concept shape, each
+claim of its own, all read-only, beside the pods that mount them). Both write one set,
+`s3://<prefix>backups/sets/<YYYYMMDDTHHMMSSZ>/`, named by their
 schedule slot; `manifest.json` is written last, only once every part is there, with the time the set
 finished. A set without it is unfinished and is never restored from. Every object is encrypted by the
 backups bucket's own KMS key (`alias/<namespace>-backups`). Two roles write it, each to its own prefix
 (ClickHouse's own, for its part; the runner's, for the rest), and no key is stored anywhere. Neither role
 can erase a set: the bucket is versioned, so an object overwritten keeps its previous version for 7 days,
-and a set's objects expire by the bucket's lifecycle rule 35 days after they were written (the retention
-is the total, 35 days). A run killed part-way leaves ArcadeDB's zip on its backups claim; the next run
+and a set's objects expire by the bucket's lifecycle rule 34 days after they were written (the retention
+is the total, 34 days). A run killed part-way leaves ArcadeDB's zip on its backups claim; the next run
 removes it before it starts.
 
 **Is last night's backup there?** A backup Job that completed wrote a finished set (the manifest is its
@@ -268,7 +274,13 @@ restore refuses part-way for space.
 **The managed database with the stores.** The stores and PostgreSQL must agree: restoring ArcadeDB and
 ClickHouse to a set while PostgreSQL stays as it is now would bring back, visible under today's grants,
 anything withdrawn or deleted since the set. So PostgreSQL (RDS) is restored point in time to the set's finish
-time (`sets` prints it), by the platform team's own RDS procedure. The new instance may be started at once,
+time (`sets` prints it), by the platform team's own RDS procedure. RDS keeps point in time for 35 days
+(`backup_retention_period`, AWS's maximum), and the sets expire a day sooner, at 34: RDS's earliest restorable
+point lags its retention by up to a day, and S3's expiry rounds up to midnight UTC, so every set kept in the bucket
+can be met by it. That brings
+back every database on the instance together: `ospreyflow` (with the report mart, the schema `osprey_reports`),
+the gateway's `litellm` and, with Superset on, Superset's `superset` (ADR-148 Amendment 11); Superset and the
+report sync are among the writers step 2 stops, so neither writes to the old instance meanwhile. The new instance may be started at once,
 since restoring it takes a while; **the deployment is pointed at it only after step 2**, once nothing that
 writes runs:
 
@@ -313,13 +325,40 @@ kubectl -n <namespace> rollout status deployment/<each one noted> --timeout=10m 
 for c in ospreyflow-backup ospreyflow-backup-claims; do
   kubectl -n <namespace> patch cronjob "$c" -p '{"spec":{"suspend":false}}' 2>/dev/null
 done
+# 5. Where the deployment searches with OpenSearch: the search index is not backed up (it is rebuilt from
+#    the graph, ADR-150), so the restore ends with its rebuild, then the drift check, each a Job started from
+#    its standing template (under the namespace's own service account, signing as its role).
+#    The Jobs come from cronjob/ospreyflow-search-rebuild, then cronjob/ospreyflow-search-drift.
+#    Each is given five minutes to start and then its own bound (the rebuild 30 minutes, the drift check
+#    10), and stops the restore by name if it does not start, fails, or runs past it.
+for job in search-rebuild:30m search-drift:10m; do
+  J="${job%%:*}-$(date -u +%Y%m%dt%H%M%S)"
+  kubectl -n <namespace> create job --from=cronjob/ospreyflow-"${job%%:*}" "$J"
+  for i in $(seq 60); do   # started (or already ended) within five minutes
+    phase=$(kubectl -n <namespace> get pod -l job-name="$J" -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
+    case "$phase" in Running|Succeeded|Failed) break ;; esac
+    sleep 5
+  done
+  case "$phase" in Running|Succeeded|Failed) ;;
+    *) echo "$J did not start in five minutes: kubectl -n <namespace> describe pod -l job-name=$J says why"; false ;;
+  esac
+  kubectl -n <namespace> wait --for=jsonpath='{.status.conditions[0].status}'=True "job/$J" --timeout="${job#*:}" \
+    || { echo "$J ran past ${job#*:}: read its log (kubectl -n <namespace> logs job/$J)"; false; }
+  kubectl -n <namespace> logs "job/$J" --tail=1
+  kubectl -n <namespace> get job "$J" -o jsonpath='{.status.succeeded}' | grep -qx 1 \
+    || { echo "$J failed: read its log (kubectl -n <namespace> logs job/$J)"; false; }
+done
 ```
 
 **A healthy restore.** Each step's log ends in plain words, and none holds a stack trace: the restore Job's
 `restore: set <set> verified, every part; nothing writing`, then
 `restore-graph: <database> restored from the set, checked and put in place; the old one removed` (or `there
 was no live database`) and `restore: ClickHouse restored from set <set>`; the claims Job's
-`restore: ingest put back from set <set>`. A step whose words say `refused:` (`restore-graph refused: …`,
+`restore: ingest put back from set <set>`; where the deployment searches with OpenSearch, step 5's
+`search index rebuilt: <N> documents from <N> nodes, alias <alias> -> <index>` and
+`search index drift: none (<N> nodes in the graph, <N> documents in the index)`. The search index is not
+backed up: until the rebuild has finished, the search bar finds what it found before the restore, or
+nothing. A step whose words say `refused:` (`restore-graph refused: …`,
 `fetch-graph refused: …`), or a Job that did not finish, is not a restore: read *If it fails*, below.
 
 **Where the data is if a restore stopped part-way.** Each store keeps its live data until the restored copy

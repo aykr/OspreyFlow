@@ -165,7 +165,10 @@ KIND_ACTIONS: dict[str, tuple[str, ...]] = {
         "invite_person",
         "add_person_by_object_id",
         "grant_first_administrator",
+        # ADR-148 Amendment 15: the first administrators' values at install, on the poc fallback.
+        "grant_first_administrator_access",
         "set_person_roles",
+        "set_guest_sign_in",  # ADR-148 Amendment 17: guests admitted, or no longer
         "set_person_access",
         "disable_person",
         "disable_person_incomplete",
@@ -233,11 +236,13 @@ READS_AND_OTHER: tuple[str, ...] = (
     "read_alert_sources",
     # Rules-b's L2.11a (ADR-146 decision 3): a rule's .bpmn or .dmn exported.
     "export_rule_file",
+    # Rules-b's v052D (ADR-098 Amendment 7): what a question would read, before it is asked.
+    "will_read_question",
     # Rules' L2.11 (ADR-146 decision 3, Amendment 6): the rule editor's datasets read, a draft
     # saved, tested, made live or asked to go live; with the other rule actions.
     "read_rule_datasets", "rule_draft_saved", "rule_tested", "rule_made_live",
     "rule_make_live_proposed",
-    "access_admin_override", "access_denied", "add_by_identifiers", "add_pack_item",
+    "access_admin_override", "access_denied", "add_by_identifiers", "add_by_ids", "add_pack_item",
     "alert_assigned", "alert_canvas", "alert_claimed", "alert_close_approved",
     "alert_close_proposed", "alert_close_sent_back", "alert_disposed", "alert_released",
     "analytics_cross_filter", "analytics_first_seen", "analytics_geo_bins", "analytics_geometries",
@@ -246,7 +251,11 @@ READS_AND_OTHER: tuple[str, ...] = (
     "case_brief_remove_requirement", "case_brief_set_priority", "case_brief_set_status",
     "case_strength_influencers_set", "connections", "create_investigation", "create_pack",
     "create_site", "delete_board", "delete_case_view", "delete_trend",
-    "embedded_dashboard_guest_token", "expand", "expand_preview", "explain_alert",
+    "embedded_dashboard_guest_token", "expand", "expand_preview",
+    # Case's S7 (v0.5.2): the case's suppression marks read back as the reader may see them.
+    "list_suppression_marks",
+    # ADR-151: the cap's batch job queued, and refused (its saved view is `save_case_view`).
+    "batch_expand", "batch_expand_refused", "explain_alert",
     "explain_resolution_cluster", "explore_busiest_days", "explore_busiest_links",
     "explore_counts", "explore_groups", "explore_most_connected", "explore_starter_questions",
     "explore_starter_run", "explore_whats_new", "export", "export_pack", "extract_document",
@@ -610,6 +619,8 @@ _WITHHELD_WORDS = frozenset({
 _SETTING_CHANGES = frozenset({
     "change_custom_role", "set_dataset_egress", "set_dataset_promotion_policy",
     "set_dataset_owner_setting", "set_case_datasets",
+    # ADR-148 Amendment 17: whether guest accounts are admitted, false or true.
+    "set_guest_sign_in",
 })
 
 

@@ -151,6 +151,15 @@ export const CANVAS_ACTIONS = defineActionRegistry("CANVAS_ACTIONS", [
   // selection bar (reached by Tab like Remove from view and Clear) and from a selected node's menu.
   "save-selected-as-a-view-from-the-selection-bar",
   "save-selected-as-a-view-from-a-selected-nodes-menu",
+  // ADR-078 Amendment 1 (the owner's Part C, 13 November 2026): the menu is the selection's, opened by the
+  // ContextMenu key and Shift+F10 as by `\`, moved through by the arrows, Home and End, offering the bar's
+  // actions in its words, and folding the link types with no links into a line that opens in place.
+  "menu-opens-on-the-context-menu-key",
+  "menu-opens-on-shift-f10",
+  "menu-arrows-home-and-end-move-through-it",
+  "menu-offers-the-selections-actions-in-the-bars-words",
+  "menu-folds-types-with-no-links-and-opens-them-in-place",
+  "undo-select-what-is-lit-from-the-selections-menu",
   // 26 October 2026 (ADR-128 decision 2, B3): a window set by Set exact dates lights part of the
   // canvas; Select what is lit replaces the selection with it, Save as a view then keeps
   // only that slice, and one undo gives the earlier selection back.
@@ -183,6 +192,13 @@ export const CANVAS_ACTIONS = defineActionRegistry("CANVAS_ACTIONS", [
   // and the pickers it opens are native controls, but whether Tab reaches them, an arrow key chooses,
   // and the label on the canvas then changes is exactly what the suite exists to prove.
   "labels-menu-by-keyboard",
+  // v0.6.1 glass-rows A (ADR-145 Amendment 19 decision 5): Match strictness in the canvas toolbar, a button
+  // opening the same slider, which an arrow key moves and Escape closes.
+  "match-strictness-by-keyboard",
+  // v0.6.1 glass-rows C (Amendment 19 decision 6): Hide toolbar and Show toolbar, focus moving between them, and
+  // T on the focused canvas doing the same (the owner's ruling of 16 November 2026).
+  "hide-and-show-the-toolbar-by-keyboard",
+  "t-on-the-canvas-hides-and-shows-the-toolbar",
   "an-expansion-leaves-the-view-and-the-settled-nodes-where-they-were",
 ] as const);
 
@@ -383,6 +399,8 @@ export const LINK_NOTES_ACTIONS = defineActionRegistry("LINK_NOTES_ACTIONS", [
  */
 export const LINK_MENU_ACTIONS = defineActionRegistry("LINK_MENU_ACTIONS", [
   "backslash-opens-the-menu-of-a-selected-same-as-link",
+  // ADR-078 Amendment 1: the ContextMenu key and Shift+F10 open it too.
+  "context-menu-key-and-shift-f10-open-a-selected-links-menu",
   "collapse-folds-the-matched-nodes-into-one",
   "group-node-menu-expands-the-group",
   "confirm-asks-why-and-sends-the-reason",
@@ -432,6 +450,10 @@ export const SELECTION_ACTIONS = defineActionRegistry("SELECTION_ACTIONS", [
   "show-links-within-degrees-from-the-selection-bar",
   // ADR-098 decision 4.
   "ask-the-model-about-the-selected-documents-from-the-selection-bar",
+  // ADR-078 Amendment 1: the same actions from the selection's right-click menu, by keyboard.
+  "show-links-among-the-selection-from-its-menu",
+  "ask-the-model-about-the-selected-documents-from-its-menu",
+  "show-links-within-the-bars-degrees-from-its-menu",
   // ADR-115 E4.
   "clear-the-selection-with-escape-on-the-canvas",
 ] as const);
@@ -479,8 +501,11 @@ export const VIEW_ACTIONS = defineActionRegistry("VIEW_ACTIONS", [
   "go-back-to-the-case-from-an-open-view-by-keyboard",
   // ADR-143 Amendment 2 decision 7 (L3.9).
   "open-a-merged-drawings-notes-by-keyboard",
-  // ADR-144 Amendment 3: the graph's *Views ▾*, a view chosen there, the lens open on it, and Back.
-  "open-a-view-from-views-by-the-graph-by-keyboard",
+  // ADR-145 Amendment 17 (ADR-144 Amendment 6 withdrew Amendment 3's *Views ▾* by the graph, and its case with it): a
+  // saved view opened from the case line into the strip, and Back to the whole case.
+  "open-a-saved-view-from-the-case-line-and-back-to-the-whole-case-by-keyboard",
+  // ADR-145 Amendment 19 (v0.6.1, the strip withdrawn): the open saved view's *Details*, on the case line.
+  "open-a-saved-views-details-from-the-case-line-by-keyboard",
 ] as const);
 
 /** Drawing boards (ADR-143 decisions 4 to 7; Amendment 2 decision 5; L3.3): a board opened, made
@@ -695,11 +720,11 @@ export const STRENGTH_ACTIONS = defineActionRegistry("STRENGTH_ACTIONS", [
   "propose-an-influencer-version-by-keyboard",
   "set-a-case-override-by-keyboard",
   "write-a-strength-rule-by-keyboard",
-  // ADR-139 Amendment 2: the case switched to client parity, an installation version's composition
-  // and rarity measure chosen, and a rule's figure named on the client's scale.
-  "switch-a-case-to-client-parity-by-keyboard",
+  // ADR-139 Amendment 2: the case switched to rarity plus adds, an installation version's composition
+  // and rarity measure chosen, and a rule's figure named on the raw-sum scale.
+  "switch-a-case-to-rarity-plus-adds-by-keyboard",
   "choose-an-installation-composition-and-rarity-measure-by-keyboard",
-  "write-a-strength-rule-on-the-clients-scale-by-keyboard",
+  "write-a-strength-rule-on-the-raw-sum-scale-by-keyboard",
 ] as const);
 
 /** ADR-133 stage (d) in the Monitoring place: a rule written to run on a schedule, its schedule and
@@ -752,16 +777,29 @@ export const QUESTIONS_ACTIONS = defineActionRegistry("QUESTIONS_ACTIONS", [
   "open-a-cited-document-by-keyboard",
   "accept-a-proposal-by-keyboard",
   "reject-a-proposal-by-keyboard",
-  // The drawer's visible Close (the owner, 9 October 2026).
-  "close-the-questions-drawer-by-keyboard",
+  // The page's visible Back to ‹view› (the owner, 9 October 2026; a drawer's Close until ADR-145 Amendment 18).
+  "back-from-ask-and-chat-by-keyboard",
+  // ADR-145 Amendment 18 decision 5: a cited graph fact chosen on the page leaves it for the canvas, focus there.
+  "select-a-graph-fact-from-the-ask-page-by-keyboard",
+  // ADR-145 Amendment 18: Show all on graph on the page leaves it for the canvas, the items selected, focus there.
+  "show-all-from-the-ask-page-by-keyboard",
   // ADR-129 decision 1: a cited graph fact selects what it stands for and brings it into view.
   "select-a-graph-fact-from-an-answer-by-keyboard",
+  // ADR-129 Amendment 5: a source Whole case's search found ([S-n]) selects its records.
+  "select-a-search-source-from-an-answer-by-keyboard",
   // ADR-135 decision 5: the model engine is reached and changed by keyboard, and the engine chosen
   // is the one the question names.
   "choose-the-model-engine-by-keyboard",
   // ADR-144 decision 4 (L3.2b): asked in a private view (*Ask the model about these*), and left for
   // the whole case by *Ask about the whole case instead*.
   "ask-in-a-view-then-about-the-whole-case-by-keyboard",
+  // ADR-098 Amendment 7: what to read from (Selected items, Everything on the graph; Whole case
+  // disabled with why) is chosen by arrow keys, and the question sends the choice.
+  "choose-what-to-read-from-by-keyboard",
+  "open-an-earlier-answer-by-keyboard",
+  // v0.6.0 #5: under an answer, every item its markers stand for put on the canvas and selected, and saved as a view.
+  "show-all-of-an-answers-items-on-the-graph-by-keyboard",
+  "save-an-answers-items-as-a-view-by-keyboard",
 ] as const);
 
 /** Files added straight to a case (ADR-094 step 3): from the strip over the canvas, standing alone,
@@ -830,8 +868,8 @@ export const INSPECTOR_ACTIONS = defineActionRegistry("INSPECTOR_ACTIONS", [
   "expand-a-node-from-the-inspector-by-keyboard",
   // ADR-139 decision 9: a link's strength explained, and what its ends share ranked by rarity.
   "explain-a-links-strength-by-keyboard",
-  // ADR-139 Amendment 2: under client parity, the composition and the raw sum on the client's scale.
-  "read-a-links-raw-sum-under-client-parity-by-keyboard",
+  // ADR-139 Amendment 2: under rarity plus adds, the composition and the raw sum on the raw-sum scale.
+  "read-a-links-raw-sum-under-rarity-plus-adds-by-keyboard",
 ] as const);
 
 /** The workspace shell (ADR-097 step 1): the top bar, the left rail, the classification strip.
@@ -850,16 +888,22 @@ export const SHELL_ACTIONS = defineActionRegistry("SHELL_ACTIONS", [
   "help-from-the-rail-by-keyboard",
   // ADR-132: the skip link, under both brands.
   "skip-to-main-content-by-keyboard",
-  // ADR-145 decisions 1–3: the place switcher (both brands), the banner's cross-link and its
-  // sections, and Home's cards.
+  // ADR-145 decisions 1–3: the place switcher (both brands), the banner's cross-link, and Home's cards (the
+  // banner's sections left the Glass with Amendment 15).
   "switch-place-by-keyboard",
   "banner-cross-link-by-keyboard",
-  // ADR-145 Amendment 13: the sections are the mode toggle, Graph · Drawing board, with each mode's note.
-  "banner-sections-by-keyboard",
+  // ADR-145 Amendment 15 (the owner's navigation decision, replacing Amendment 13's mode toggle): the case line's
+  // Views in this case opens the Cases panel, focus returned to it.
+  "case-line-views-by-keyboard",
+  // ...and the case menu's All cases, which opens the same panel, focus returned to the menu's button.
+  "all-cases-by-keyboard",
   "home-place-cards-by-keyboard",
-  // ADR-145 Amendment 2 (variant B): the rail's More and each destination under it, More views, and a
-  // folded panel of the column opened with one keypress.
-  "rail-more-by-keyboard",
+  // ADR-145 Amendment 2 (variant B) and Amendment 15: each rail panel opened and closed, the view kept and focus
+  // returned to its opener (the rail's More left with Amendment 15), More views, and a folded panel of the column
+  // opened with one keypress.
+  "rail-panels-by-keyboard",
+  // ADR-145 Amendment 18 (v0.6.0 #4): Ask & Chat opens as a page over the view; Back and the rail close it.
+  "ask-and-chat-page-by-keyboard",
   "more-views-by-keyboard",
   "open-a-folded-panel-by-keyboard",
   // ADR-145 Amendment 4 and ADR-146 decision 2 (L2.9): Rules and Monitoring, the fourth place, in the
@@ -869,6 +913,12 @@ export const SHELL_ACTIONS = defineActionRegistry("SHELL_ACTIONS", [
   "back-to-the-glass-from-rules-and-monitoring-by-keyboard",
   "open-an-alert-from-home-by-keyboard",
   "open-rules-and-monitoring-from-home-by-keyboard",
+  // ADR-145 Amendment 15 (the owner's ruling, Q2): Build a report beside Reports, a link to Superset in a new tab.
+  "build-a-report-by-keyboard",
+  // The owner's ruling of 14 November 2026 (spec 02 §3, `BAR_FOLD_ORDER`): when the bar runs out of room on one line,
+  // a folded view chosen under More views, a folded Build a report followed from it, and a place from the folded places.
+  "folded-view-chosen-by-keyboard",
+  "folded-place-chosen-by-keyboard",
 ] as const);
 
 /** Rules and Monitoring (ADR-146 decisions 2 and 6, L2.9): its tabs, an alert opened at its own
@@ -940,6 +990,8 @@ export const ADMIN_ACTIONS = defineActionRegistry("ADMIN_ACTIONS", [
   "invite-a-person-by-keyboard",
   // ADR-148 Amendment 8: on Entra ID sign-in, a person added by object id.
   "add-a-person-by-object-id-by-keyboard",
+  // ADR-148 Amendment 17 (audit 4b): guest accounts admitted, or no longer, in People on Entra ID.
+  "admit-guest-accounts-by-keyboard",
   "edit-a-persons-access-by-keyboard",
   "disable-and-enable-a-person-by-keyboard",
   "reset-a-persons-sign-in-by-keyboard",
@@ -969,7 +1021,8 @@ export const ADMIN_ACTIONS = defineActionRegistry("ADMIN_ACTIONS", [
   "name-a-connection-by-keyboard",
   // ADR-145 decision 5: Admin's sections.
   "move-between-admin-sections-by-keyboard",
-  "open-a-coming-admin-section-by-keyboard",
+  // The GOV.UK pass (ADR-145 decision 5): a coming section is read in the side list, never opened.
+  "read-a-coming-admin-section-by-keyboard",
   // ADR-145 decisions 6 and 7 and Amendment 5 (L2.5): People's row, Name an Author, Disable…, and
   // Roles: a custom role made, copied and edited, a team, its lead and its cover.
   "give-the-super-user-preset-by-keyboard",
@@ -1004,6 +1057,8 @@ export const ADMIN_ACTIONS = defineActionRegistry("ADMIN_ACTIONS", [
   "read-a-roles-tip-by-keyboard",
   "read-a-teams-lead-tip-by-keyboard",
   "read-a-datasets-authors-tip-by-keyboard",
+  // Route A2: a role the giver may not give says why on its own box.
+  "read-why-a-role-is-not-offered-by-keyboard",
 ] as const);
 
 // ADR-145 decision 11 (A2), L2.7: the top bar's Needs you and the Studio's proposals reminder.
@@ -1132,6 +1187,22 @@ export const WELCOME_ACTIONS = defineActionRegistry("WELCOME_ACTIONS", [
   "open-the-welcome-panel-with-question-mark",
   "pick-up-a-history-step-from-the-welcome-panel",
   "close-the-welcome-panel",
+] as const);
+
+// The search results page (the owner's navigation decision of 13 November 2026, Part A; ADR-145 Amendment 15 Part A):
+// opened by Enter in the top bar's search box, each of its actions by keyboard, and Back with focus in the box.
+export const SEARCH_RESULTS_ACTIONS = defineActionRegistry("SEARCH_RESULTS_ACTIONS", [
+  "open-search-results-by-keyboard",
+  "choose-a-result-group-by-keyboard",
+  "filter-search-results-by-keyboard",
+  "next-page-of-results-by-keyboard",
+  "previous-page-of-results-by-keyboard",
+  "clear-search-filters-by-keyboard",
+  "filter-results-by-date-by-keyboard",
+  "show-a-result-on-the-graph-by-keyboard",
+  "open-a-document-from-the-results-by-keyboard",
+  "ask-instead-from-the-results-by-keyboard",
+  "back-from-the-results-by-keyboard",
 ] as const);
 
 // ADR-124 decision 2 (U6b): the dialog a reader is shown when their own view of the case is past a cap.
@@ -1265,7 +1336,7 @@ export const MATRIX_ACTIONS = defineActionRegistry("MATRIX_ACTIONS", [
 export const SOURCES_CONNECTORS_ACTIONS = defineActionRegistry("SOURCES_CONNECTORS_ACTIONS", [
   "subscribe-a-dataset-to-a-screening-list-by-keyboard",
   "import-a-screening-list-through-a-template-by-keyboard",
-  "import-a-client-list-through-the-blank-template-by-keyboard",
+  "import-your-own-list-through-the-blank-template-by-keyboard",
   "refresh-a-screening-list-now-by-keyboard",
   "schedule-a-screening-lists-refresh-by-keyboard",
   "import-a-datasets-own-list-rows-by-keyboard",
@@ -1292,4 +1363,33 @@ export const STUDIO_TIPS_ACTIONS = defineActionRegistry("STUDIO_TIPS_ACTIONS", [
 export const ACCOUNT_UNREAD_ACTIONS = defineActionRegistry("ACCOUNT_UNREAD_ACTIONS", [
   "try-reading-the-account-again-by-keyboard",
   "sign-out-with-no-account-read-by-keyboard",
+] as const);
+
+// An expansion the working set's cap refused (rule 2; spec/00 §4's choices on the canvas): expand by one
+// relationship instead, save a smaller view of the case, and run it whole as a batch job (ADR-151, case-b's).
+export const CANVAS_CAP_ACTIONS = defineActionRegistry("CANVAS_CAP_ACTIONS", [
+  "narrow-an-over-cap-expansion-by-link-type-by-keyboard",
+  "save-a-smaller-view-from-an-over-cap-expansion-by-keyboard",
+  "run-an-over-cap-expansion-as-a-batch-job-by-keyboard",
+] as const);
+
+// ADR-151 (v0.5.2): the batch job's own panel, followed while it runs (`keyboard/batch-expansion.spec.ts`).
+// Opened from the cap's refusal, which `CANVAS_CAP_ACTIONS` proves end to end.
+export const BATCH_EXPANSION_ACTIONS = defineActionRegistry("BATCH_EXPANSION_ACTIONS", [
+  "open-a-batch-jobs-view-by-keyboard",
+  "try-a-failed-batch-job-again-by-keyboard",
+  "close-the-batch-job-panel-by-keyboard",
+] as const);
+
+// ADR-115 E6, ADR-145 Amendment 12 (CARRIES 224): the rail's Help opens its panel from every view of the real
+// Glass, not the Graph alone (`keyboard/help-every-view.spec.ts`).
+export const HELP_ACTIONS = defineActionRegistry("HELP_ACTIONS", [
+  "open-help-from-every-view-by-keyboard",
+] as const);
+
+// ADR-145 Amendment 17 (the owner's exception, 14 November 2026): the saved views panel the case line's *Saved views*
+// opens (`keyboard/saved-views-panel.spec.ts`). The case line, the strip and its back link are case's own registries.
+export const SAVED_VIEWS_PANEL_ACTIONS = defineActionRegistry("SAVED_VIEWS_PANEL_ACTIONS", [
+  "open-a-saved-view-from-the-panel-by-keyboard",
+  "open-the-whole-case-from-the-panel-by-keyboard",
 ] as const);

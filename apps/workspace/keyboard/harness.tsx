@@ -8,7 +8,7 @@
 // way to reach, and a real `expand` network call `keyboard.spec.ts`
 // intercepts via `page.route` rather than this harness faking it.
 import { createRoot } from "react-dom/client";
-import { createRef, useEffect, useState } from "react";
+import { createRef, StrictMode, useEffect, useState } from "react";
 
 import "../src/design/tokens.css";
 import { applyHarnessBrand } from "./brandHarness";
@@ -19,18 +19,31 @@ import { SelectionList } from "../src/inspector/SelectionList";
 import { createCrossFilterStore } from "../src/crossfilter/store";
 import { OntologyRegistry } from "../src/ontology/schema";
 import { bringFactIntoView } from "../src/questions/graphFacts";
+import type { AnswerIds } from "../src/questions/AnswerActions";
+import { showAnswerOnCanvas } from "../src/questions/showAnswer";
+import { saveView } from "../src/views/viewsApi";
 import { QuestionsPanel } from "../src/questions/QuestionsPanel";
+import { AskPage } from "../src/questions/AskPage";
+import { useAskPage } from "../src/questions/useAskPage";
 import { Timeline } from "../src/timeline/Timeline";
 import { createWorkingSet } from "../src/workingset/store";
+import { BatchExpansion } from "../src/workingset/BatchExpansion";
+import type { BatchExpansionRequest } from "../src/workingset/batchExpansionApi";
+import { loadLookFaces } from "./lookFaces";
+import { ResolutionThresholdControl } from "../src/resolution/ThresholdControl";
 import type { OntologySchema, Node, Edge } from "../../../packages/schemas/generated";
 
 declare global {
   interface Window {
     __KEYBOARD__?: {
+      /** `?strictness=1`: what the Match strictness control announced, as App's Toast would say it. */
+      strictnessSaid?: string;
       focused: string | null;
       selection: string[];
       viewMessagesNodeId: string | null;
       selectedEdge: string | null;
+      /** What the canvas said last (*Show all on graph*'s notice, v0.6.0 #5). */
+      said?: string;
       /** The last link-menu entry that hands over to the Inspector (ADR-080): which link and what. */
       linkAction: { edgeId: string; action: string } | null;
       /** The view the canvas said the selection was saved as (ADR-144 decision 4). */
@@ -42,6 +55,12 @@ declare global {
       openedDocument: string | null;
       /** The node whose menu asked for the Inspector's Picture part (ADR-105 Amendment 1). */
       pictureRequested?: string | null;
+      /** An expansion the cap refused, its *Save a smaller view* chosen (spec/00 §4): the figure handed up. */
+      savedSmallerView?: { would_be: number; cap: number; subject: string | undefined } | null;
+      /** At `?batch=1`, what *Run as a batch job* handed up (ADR-151's slot, case-b's handler). */
+      batchRequested?: { nodeId: string; edgeType: string | null; depth: number; would_be: number } | null;
+      /** At `?batch=panel`, the view the batch job's panel opened as its result (ADR-151, case-b's). */
+      batchViewOpened?: string | null;
     };
     __CANVAS__?: {
       viewportPositionOf: (nodeId: string) => { x: number; y: number } | null;
@@ -65,6 +84,13 @@ declare global {
       /** Land a `reproject` delta, as the server sends when the resolution slider moves: each node
        * named takes the cluster id given. */
       reproject: (clusterIds: Record<string, string>) => void;
+      /** Land a `remove` delta for one node, as when another reader's change takes it out. */
+      removeNode?: (nodeId: string) => void;
+      /** Land a `snapshot` of the working set without one node, as a resync does: the graph is cleared and drawn again. */
+      resnapshotWithout?: (nodeId: string) => void;
+      /** Land an `add` of a copy of `fromId` under `newId`, as the case's stream does before an answer reaches
+       * the canvas; returns the copy's body, to answer a route with. */
+      landCopy?: (fromId: string, newId: string) => unknown;
       /** The cluster id the working set holds on a node now (ADR-124: what a manual link's answer
        * moved), or `null` when it holds none. */
       clusterOf: (nodeId: string) => string | null;
@@ -167,6 +193,19 @@ window.__CANVAS__ = {
   setTheme: (theme) => applyTheme(theme),
   nodeImage: (id) => (workingSet.graph.hasNode(id) ? (workingSet.graph.getNodeAttribute(id, "image") as string) : null),
   hasNode: (id) => workingSet.graph.hasNode(id),
+  removeNode: (id) =>
+    workingSet.store.getState().applyDelta({ seq: workingSet.store.getState().seq + 1, op: "remove", node_ids: [id] }),
+  landCopy: (fromId, newId) => {
+    const node = { ...workingSet.graph.getNodeAttribute(fromId, "data"), id: newId };
+    workingSet.store.getState().applyDelta({ seq: workingSet.store.getState().seq + 1, op: "add", nodes: [node], edges: [] });
+    return node;
+  },
+  resnapshotWithout: (id) => {
+    const graph = workingSet.graph;
+    const nodes = graph.filterNodes((n) => n !== id).map((n) => graph.getNodeAttribute(n, "data"));
+    const edges = graph.filterEdges((_, __, source, target) => source !== id && target !== id).map((e) => graph.getEdgeAttribute(e, "data"));
+    workingSet.store.getState().applyDelta({ seq: workingSet.store.getState().seq + 1, op: "snapshot", nodes, edges });
+  },
   reproject: (clusterIds) =>
     workingSet.store.getState().applyDelta({
       seq: workingSet.store.getState().seq + 1,
@@ -232,6 +271,9 @@ const SCHEMA: OntologySchema = wantsSameAs
 // chosen `[G-n]` goes to the canvas through `bringFactIntoView` (ADR-129, rule 13), so
 // `questions.spec.ts` proves the selection on the real canvas, not on a recording fake.
 const wantsQuestions = new URLSearchParams(window.location.search).get("questions") === "1";
+// `?questions=page`: the panel inside Ask & Chat's real page over the canvas, by App's own hook (ADR-145 Amendment 18):
+// a marker leaves the page, brings its fact into view on the real canvas and puts focus on it.
+const wantsAskPage = new URLSearchParams(window.location.search).get("questions") === "page";
 
 const workingSet = createWorkingSet();
 const ontology = new OntologyRegistry(SCHEMA);
@@ -358,6 +400,18 @@ await applyHarnessBrand();
 
 const container = document.getElementById("root");
 if (!container) throw new Error("#root not found");
+// v0.6.1 glass-rows A (ADR-145 Amendment 19 decision 5): `?strictness=1` hands the canvas toolbar the real
+// Match strictness control after Layout, as App does, its threshold read and set at the address the spec
+// routes. `?width=1131` lays the canvas out that wide, so the toolbar's own width decides its words.
+const wantsStrictness = new URLSearchParams(window.location.search).get("strictness") === "1";
+const wantsWidth = Number(new URLSearchParams(window.location.search).get("width") ?? "");
+if (wantsWidth > 0) {
+  container.style.width = `${wantsWidth}px`;
+  // Widths are measured in the product's own faces, as `src/main.tsx` loads them.
+  await import("../src/design/fonts");
+  // The look's own faces, never left to blank the page (`lookFaces.ts`).
+  await loadLookFaces(["400", "600"]);
+}
 
 // `?fixture=lit` is ADR-128's (B3, select what is lit): the chain above with the real timeline under
 // it, so a keyboard walkthrough can set a window by Set exact dates, run Select what is lit, and
@@ -389,6 +443,35 @@ const judged = new Map<string, number>(
     }),
 );
 
+// `?batch=panel` (ADR-151, case-b's): *Run as a batch job* opens the real batch job's panel, as the App does
+// (`App.tsx`'s onRunExpansionAsBatch), against the address the test routes (`keyboard/canvas-expand-cap.spec.ts`).
+// The App's own hold on it, to its case and person and away from an open view, is proved in jsdom
+// (`workingset/useBatchExpansion.test.ts`, `App.batchExpand.test.tsx`).
+const wantsBatch = new URLSearchParams(window.location.search).get("batch");
+let showBatchPanel: (request: BatchExpansionRequest) => void = () => undefined;
+function HarnessBatchPanel() {
+  const [asked, setAsked] = useState<{ request: BatchExpansionRequest; n: number } | null>(null);
+  useEffect(() => {
+    showBatchPanel = (request) => setAsked((current) => ({ request, n: (current?.n ?? 0) + 1 }));
+  }, []);
+  if (!asked) return null;
+  return (
+    <BatchExpansion
+      key={asked.n}
+      request={asked.request}
+      apiBaseUrl="http://keyboard-test.invalid"
+      bearerToken="unused"
+      investigationId="keyboard-fixture"
+      pollMs={100}
+      onOpenView={async (viewId) => {
+        window.__KEYBOARD__!.batchViewOpened = viewId;
+        return null;
+      }}
+      onClose={() => setAsked(null)}
+    />
+  );
+}
+
 // ADR-093: the Inspector's selected list, wired to the canvas as App wires it.
 function HarnessSelectionList() {
   const [ids, setIds] = useState<string[]>([]);
@@ -408,10 +491,26 @@ function HarnessSelectionList() {
 }
 const selectionListeners = new Set<(ids: string[]) => void>();
 
+// `?strict=1`: under React's StrictMode, as `src/main.tsx` mounts the App, so each effect runs, is
+// cleaned up and runs again on mount, as in every dev build (the live tier's, DEMO_GUIDE.md §3.6's).
+const Mount = new URLSearchParams(window.location.search).get("strict") === "1" ? StrictMode : "div";
 createRoot(container).render(
-  <>
+  <Mount {...(Mount === "div" ? { style: { display: "contents" } } : {})}>
     <GlassCanvas
       lastChange={lastChange}
+      toolbarAfterLayout={
+        wantsStrictness ? (
+          <ResolutionThresholdControl
+            apiBaseUrl="http://keyboard-test.invalid"
+            bearerToken="unused"
+            investigationId="keyboard-fixture"
+            store={workingSet.store}
+            onChangeSummary={(said) => {
+              window.__KEYBOARD__!.strictnessSaid = said;
+            }}
+          />
+        ) : undefined
+      }
       ref={canvasHandle}
       judgementCounts={judged}
       degreeMarks={degrees}
@@ -431,6 +530,18 @@ createRoot(container).render(
       onSetPicture={(nodeId) => {
         window.__KEYBOARD__!.pictureRequested = nodeId;
       }}
+      onSaveSmallerView={(refused, subject) => {
+        window.__KEYBOARD__!.savedSmallerView = { would_be: refused.would_be, cap: refused.cap, subject };
+      }}
+      onRunExpansionAsBatch={
+        wantsBatch === "1" || wantsBatch === "panel"
+          ? (request) => {
+              const { nodeId, edgeType, depth, refused } = request;
+              window.__KEYBOARD__!.batchRequested = { nodeId, edgeType, depth, would_be: refused.would_be };
+              if (wantsBatch === "panel") showBatchPanel(request);
+            }
+          : undefined
+      }
       onSelectionChange={(ids) => {
         window.__KEYBOARD__!.selection = ids;
         for (const listener of selectionListeners) listener(ids);
@@ -486,6 +597,8 @@ createRoot(container).render(
       </div>
     )}
     <HarnessSelectionList />
+    {wantsBatch === "panel" && <HarnessBatchPanel />}
+    {wantsAskPage && <AskPageOverCanvas />}
     {wantsQuestions && (
       <QuestionsPanel
         apiBaseUrl="http://keyboard-test.invalid"
@@ -496,7 +609,71 @@ createRoot(container).render(
         onSelectFacts={(citation) => {
           if (canvasHandle.current) bringFactIntoView(canvasHandle.current, citation);
         }}
+        // v0.6.0 #5, as `App.tsx` wires them: the answer's items on the real canvas by id, and saved as a view.
+        onShowAll={(ids) => void showAllOnCanvas(ids)}
+        onSaveAsView={async (ids, name) => {
+          const saved = await saveView("http://keyboard-test.invalid", "unused", "keyboard-fixture", { name, nodeIds: ids.nodeIds });
+          return saved.ok ? null : saved.message;
+        }}
       />
     )}
-  </>,
+  </Mount>,
 );
+
+/** *Show all on graph*, as `App.tsx`'s `showAnswerOnGraph` draws it through `questions/showAnswer.ts`. */
+function showAllOnCanvas(ids: AnswerIds) {
+  return showAnswerOnCanvas({ apiBaseUrl: "http://keyboard-test.invalid", bearerToken: "unused", investigationId: "keyboard-fixture" }, ids, () =>
+    canvasHandle.current
+      ? {
+          applyDelta: (delta) => workingSet.store.getState().applyDelta(delta),
+          hasNode: (id) => workingSet.graph.hasNode(id),
+          highlightNodes: (nodeIds) => canvasHandle.current?.highlightNodes(nodeIds),
+          centreOn: (nodeId) => canvasHandle.current?.centreOn(nodeId),
+          say: (words) => (window.__KEYBOARD__!.said = words),
+        }
+      : null,
+  );
+}
+
+function AskPageOverCanvas() {
+  const ask = useAskPage(false, { leave: () => undefined }, true);
+  if (!ask.open) return null;
+  return (
+    <div style={{ position: "fixed", inset: 0 }}>
+      <AskPage backLabel="Graph" onBack={ask.back}>
+        <QuestionsPanel
+          apiBaseUrl="http://keyboard-test.invalid"
+          bearerToken="unused"
+          investigationId="keyboard-fixture"
+          onDelta={() => undefined}
+          selection={{ nodeIds: [], linkIds: [] }}
+          // As `App.tsx`'s: the page left, the fact brought into view, focus on the canvas.
+          onSelectFacts={(citation) =>
+            ask.showOnGraph(() => {
+              if (canvasHandle.current) bringFactIntoView(canvasHandle.current, citation);
+            })
+          }
+          // As `App.tsx`'s `showAnswerOnGraph`: the page left, the items shown on the canvas, focus there.
+          onShowAll={(ids) => ask.showOnGraph(() => void showAllOnCanvas(ids))}
+        />
+      </AskPage>
+    </div>
+  );
+}
+
+// a11y/every-harness.spec.ts (ADR-078 Amendment 1): the canvas's menu open, by the keyboard's own route — the
+// canvas focused (n0 selected), then `\` on one node, or ArrowRight and Space first for two.
+const wantsMenu = new URLSearchParams(window.location.search).get("menu");
+if (wantsMenu === "node" || wantsMenu === "two") {
+  const press = (target: HTMLElement, key: string) =>
+    target.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
+  const open = () => {
+    const canvas = document.querySelector<HTMLElement>("[role='application'][aria-label='Network canvas']");
+    if (!canvas) return void window.setTimeout(open, 50);
+    canvas.focus();
+    // One key per task, as a person presses them, so each is heard after the last one's render.
+    const keys = wantsMenu === "two" ? ["ArrowRight", " ", "\\"] : ["\\"];
+    keys.forEach((key, i) => window.setTimeout(() => press(canvas, key), 150 * (i + 1)));
+  };
+  open();
+}

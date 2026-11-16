@@ -69,10 +69,24 @@ async function stubSmallExpansionPreview(page: Page): Promise<void> {
       contentType: "application/json",
       body: JSON.stringify({
         candidate_node_count: 3,
-        candidate_edge_count: 0,
+        candidate_edge_count: 0, link_count: 2,
       }),
     });
   });
+}
+
+/** ADR-078 Amendment 1: reach a menu entry by the menu's own arrow keys (ArrowDown, wrapping), at most once
+ * round; the selection's actions now come first, so an entry's place depends on the selection. */
+async function arrowTo(page: Page, name: string | RegExp): Promise<void> {
+  const list = page.locator(".radial-menu__list[role='menu']");
+  const target = list.getByRole("menuitem", { name, exact: typeof name === "string" }).first();
+  await expect(target).toBeVisible();
+  const n = await list.getByRole("menuitem").count();
+  for (let i = 0; i <= n; i += 1) {
+    if (await target.evaluate((el) => el === document.activeElement)) return;
+    await page.keyboard.press("ArrowDown");
+  }
+  await expect(target).toBeFocused();
 }
 
 declare global {
@@ -312,7 +326,7 @@ for (const [shape, query, origin] of [
           contentType: "application/json",
           body: JSON.stringify({
             candidate_node_count: 500,
-            candidate_edge_count: 0,
+            candidate_edge_count: 0, link_count: 494,
           }),
         });
       },
@@ -537,12 +551,9 @@ test("Space, then the radial list, reaches manual link — a real POST, not a st
   const menu = page.locator(".radial-menu__list[role='menu']");
   await expect(menu).toBeVisible();
 
-  // Item order on a `Person` node: `radialMenuItems`' `valid` filter matches an edge type on
-  // either its `from` *or* `to` list, so `USES` (from: Person) qualifies here too, alongside
-  // `ASSOCIATE_OF` — two edge-type items, not one, both ahead of the manual-link/split pair
-  // `radialMenuItems` appends after them. `RadialMenu` focuses the first item (`ASSOCIATE_OF`) on
-  // open; two native Tabs (past `USES`) reach "Link to n0". Nothing here calls `preventDefault`
-  // on Tab while a menu is open (`onKeyDown`'s own guard).
+  // Two selected (ADR-078 Amendment 1): the selection's actions first ("Expand" has focus), then the
+  // pair's own — "Link to n0", "Split from n0", "Find paths to n0"; no link types for two. Tab walks
+  // the entries (nothing calls `preventDefault` on Tab while a menu is open).
   await tabUntilFocused(
     page,
     page.getByRole("menuitem", { name: /Link to n0/ }),
@@ -599,9 +610,7 @@ test("the radial list also reaches Split, not only Link", async ({ page }) => {
   const menu = page.locator(".radial-menu__list[role='menu']");
   await expect(menu).toBeVisible();
 
-  // Item order on n1: `ASSOCIATE_OF`, `USES` (see the manual-link test above for why there are two
-  // edge-type items on a `Person` node), then "Link to n0", then "Split from n0" —
-  // `radialMenuItems`' own push order. Three Tabs past the auto-focused first item reaches it.
+  // The selection's actions, then the pair's own: "Link to n0", then "Split from n0" (see above).
   await tabUntilFocused(
     page,
     page.getByRole("menuitem", { name: /Split from n0/ }),
@@ -624,7 +633,7 @@ test("the radial list also reaches Split, not only Link", async ({ page }) => {
   registerCovered("CANVAS_ACTIONS", "menu-item-manual-split");
 });
 
-test("the radial list's own auto-focused first item is itself reachable and activatable", async ({
+test("a link type in the radial list is reached by the arrows and expands by that type", async ({
   page,
 }) => {
   // Untested before Phase 6a Stage 4: "Enter expands" above proves the direct `Enter`
@@ -647,21 +656,20 @@ test("the radial list's own auto-focused first item is itself reachable and acti
   });
 
   const canvas = page.getByRole("application", { name: "Network canvas" });
-  await canvas.focus(); // establishes n0, ring: {n0} — no second selected node, so no
-  // manual-link/split items compete for the auto-focused first slot.
+  await canvas.focus(); // establishes n0, ring: {n0}: one selected, so its link types are offered
 
   await page.keyboard.press("\\");
   const menu = page.locator(".radial-menu__list[role='menu']");
   await expect(menu).toBeVisible();
-  await expect(
-    page.getByRole("menuitem", { name: /^Associate of/ }),
-  ).toBeFocused();
+  // The selection's actions come first now (ADR-078 Amendment 1); the type is reached by the arrows.
+  await arrowTo(page, /^Associate of/);
 
   await page.keyboard.press("Enter");
 
   await expect.poll(() => expandRequestBody !== null).toBe(true);
+  // By that type, not the selection's untyped Expand (which sends no edge_types).
   expect(expandRequestBody).toMatchObject({
-    request: { node_ids: ["n0"], depth: 1 },
+    request: { node_ids: ["n0"], depth: 1, edge_types: ["ASSOCIATE_OF"] },
   });
   await expect(menu).toBeHidden();
   registerCovered("CANVAS_ACTIONS", "menu-item-expand-by-edge-type");
@@ -719,10 +727,8 @@ test("the radial list reaches Explain cluster, and the explanation actually rend
   const menu = page.locator(".radial-menu__list[role='menu']");
   await expect(menu).toBeVisible();
 
-  // Item order: `ASSOCIATE_OF`, `USES` (`radialMenuItems`' own edge-type items — see the
-  // manual-link test above for why a `Person` node gets two of them — come before the cluster
-  // item), then "Explain cluster". Two native Tabs past the auto-focused first item reaches it,
-  // the same navigation shape the manual-link test above already proves.
+  // One selected: the selection's actions, its link types under "Expand by link type", then its own
+  // "Actions", among them "Explain cluster", reached by Tab.
   await tabUntilFocused(
     page,
     page.getByRole("menuitem", { name: "Explain cluster" }),
@@ -802,16 +808,9 @@ test("the radial list reaches View messages on an Endpoint node", async ({
   await page.keyboard.press("\\");
   const menu = page.locator(".radial-menu__list[role='menu']");
   await expect(menu).toBeVisible();
-  // `n4` (`Endpoint`) has no cluster and is never a `selected` pair member here, but `USES`
-  // (`from: Person, to: Endpoint`) still qualifies as one of its own edge types — `radialMenuItems`'
-  // `valid` filter matches on `to` as well as `from`, the same reason a `Person` node gets two
-  // edge-type items in the tests above. `USES` is auto-focused first; one Tab reaches "View
-  // messages", the only item after it (no other edge type, no cluster, no selected pair).
-  await expect(page.getByRole("menuitem", { name: "USES" })).toBeFocused();
-  await page.keyboard.press("Tab");
-  await expect(
-    page.getByRole("menuitem", { name: "View messages" }),
-  ).toBeFocused();
+  // `n4` (`Endpoint`), selected by the menu (ADR-078 Amendment 1): the selection's actions, `USES` under
+  // "Expand by link type", then "View messages", reached by the menu's arrows.
+  await arrowTo(page, "View messages");
   await page.keyboard.press("Enter");
 
   await expect
@@ -846,7 +845,7 @@ test("the radial list reaches Mark for suppression, and the mark toggles", async
           investigation_id: "inv-1",
           marked_by: "analyst-1",
           marked_at: "2026-09-27T00:00:00Z",
-          reason: "Marked from the canvas",
+          reason: "A duplicate of the confirmed record n7",
         }),
       });
     },
@@ -859,16 +858,40 @@ test("the radial list reaches Mark for suppression, and the mark toggles", async
   const menu = page.locator(".radial-menu__list[role='menu']");
   await expect(menu).toBeVisible();
 
-  // Offered on every node, so it is always the last item — reached with `End` rather than by
-  // counting Tabs, which would otherwise need changing whenever the fixture gains an edge type.
-  const item = page.getByRole("menuitem", { name: "Mark for suppression" });
+  // Offered on every node, so it is always the last item; focused directly, then pressed with Enter, rather
+  // than counted to by Tabs, which would need changing whenever the fixture gains an edge type.
+  // Its words say what it does today (the owner, 14 November 2026): it records a mark and a reason, and hides
+  // nothing yet (R7's second step comes after v0.5.2).
+  const item = page.getByRole("menuitem", { name: "Mark for suppression (hides nothing yet)", exact: true });
   await expect(item).toBeVisible();
   await item.focus();
   await page.keyboard.press("Enter");
 
+  // v0.5.2 route row S8 (ADR-046 step 1, "a reversible mark with a reason"): it asks why first, the reason required,
+  // all by keyboard. Escape leaves it unmarked; the button stays off until there are words.
+  const why = page.getByRole("textbox", { name: /Why should it be suppressed\? \(required, kept with the mark\)/ });
+  await expect(why).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(why).toHaveCount(0);
+  expect(calls).toEqual([]);
+  await canvas.focus();
+  await page.keyboard.press("\\");
+  await item.focus();
+  await page.keyboard.press("Enter");
+  await expect(why).toBeFocused();
+  const confirm = page.getByRole("button", { name: "Mark for suppression", exact: true });
+  await expect(confirm).toBeDisabled();
+  await page.keyboard.type("   ");
+  await expect(confirm).toBeDisabled();
+  await page.keyboard.type("A duplicate of the confirmed record n7");
+  await page.keyboard.press("Tab");
+  await page.keyboard.press("Tab");
+  await expect(confirm).toBeFocused();
+  await page.keyboard.press("Enter");
+
   await expect.poll(() => calls.length).toBe(1);
   expect(calls[0].method).toBe("POST");
-  expect(calls[0].body).toMatchObject({ reason: "Marked from the canvas" });
+  expect(calls[0].body).toMatchObject({ reason: "A duplicate of the confirmed record n7" });
 
   // Reversible: the same item now offers to take the mark off, and uses DELETE.
   // Re-focusing the canvas first: RadialMenu moves focus onto itself when it opens and does not
@@ -888,6 +911,42 @@ test("the radial list reaches Mark for suppression, and the mark toggles", async
   await expect.poll(() => calls.length).toBe(2);
   expect(calls[1].method).toBe("DELETE");
 
+  registerCovered("CANVAS_ACTIONS", "menu-item-mark-for-suppression");
+});
+
+test("a mark read back after a reload offers Remove, never the mark again over its reason (v0.5.2 S7)", async ({ page }) => {
+  // Before it the canvas began with no marks after every load, so the menu offered the mark again on a marked node,
+  // and choosing it overwrote the reason. Here the case already holds a mark on every node of the harness.
+  const writes: string[] = [];
+  await page.route("**/v1/investigations/*/suppression-marks", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(
+        Array.from({ length: 12 }, (_, i) => ({
+          node_id: `n${i}`,
+          investigation_id: "inv-1",
+          marked_by: "analyst-3",
+          marked_at: "2026-11-13T09:00:00Z",
+          reason: "already proposed",
+        })),
+      ),
+    }),
+  );
+  await page.route("**/v1/investigations/*/nodes/*/suppression-mark", async (route) => {
+    writes.push(route.request().method());
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ removed: true }) });
+  });
+  await page.goto("/keyboard/harness.html");
+  const canvas = page.getByRole("application", { name: "Network canvas" });
+  await canvas.focus();
+  await page.keyboard.press("\\");
+  const remove = page.getByRole("menuitem", { name: "Remove suppression mark", exact: true });
+  await expect(remove).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Mark for suppression (hides nothing yet)", exact: true })).toHaveCount(0);
+  await remove.focus();
+  await page.keyboard.press("Enter");
+  await expect.poll(() => writes).toEqual(["DELETE"]);
   registerCovered("CANVAS_ACTIONS", "menu-item-mark-for-suppression");
 });
 
@@ -996,9 +1055,7 @@ async function selectN0AndN3ThenOpenMenu(
 
   await page.keyboard.press("\\");
   await expect(page.locator(".radial-menu__list[role='menu']")).toBeVisible();
-  // Item order on `n3` (a `Person`): `ASSOCIATE_OF`, `USES` (both qualify, same reasoning the
-  // manual-link test above already gives), "Link to n0", "Split from n0", "Find paths to n0" —
-  // `radialMenuItems`' own push order. Auto-focused first item; four Tabs reach the last one.
+  // Two selected: the selection's actions, then "Link to n0", "Split from n0", "Find paths to n0".
   await tabUntilFocused(
     page,
     page.getByRole("menuitem", { name: /Find paths to n0/ }),
@@ -1354,7 +1411,7 @@ test("in an opened view the canvas offers nothing that changes the case, and say
   for (const name of ["Expand", "Remove from view", "Show links among these"]) {
     await expect(bar.getByRole("button", { name })).toHaveCount(0);
   }
-  for (const name of ["Clear view", "Add files", "Show links among all"]) {
+  for (const name of ["Clear the graph", "Add files", "Show links among all"]) {
     await expect(page.getByRole("button", { name, exact: true })).toHaveCount(
       0,
     );
@@ -1367,7 +1424,8 @@ test("in an opened view the canvas offers nothing that changes the case, and say
   expect(
     offered.every(
       (label) =>
-        /^Save selected \(1\) as a view/.test(label) ||
+        // The selection's actions a view's bar offers (ADR-078 Amendment 1), and the item's own lens-safe ones.
+        /^(Ask the model about these…|Save as a view|Clear)$/.test(label) ||
         /Read full screen|View messages|Expand group/.test(label),
     ),
   ).toBe(true);
@@ -1377,7 +1435,7 @@ test("in an opened view the canvas offers nothing that changes the case, and say
   await page.keyboard.press("Delete");
   await expect(
     page.getByText(
-      "This is a view: nothing in it changes the case. Go back to the case to change it.",
+      "This is a saved view: nothing in it changes the case. Go back to the whole case to change it.",
     ),
   ).toBeVisible();
   expect(writes).toEqual([]);
@@ -1386,7 +1444,7 @@ test("in an opened view the canvas offers nothing that changes the case, and say
   ]);
 });
 
-test("Clear view asks first, and clears only after Enter on the confirmation", async ({
+test("Clear the graph asks first, and clears only after Enter on the confirmation", async ({
   page,
 }) => {
   await page.goto("/keyboard/harness.html");
@@ -1401,10 +1459,10 @@ test("Clear view asks first, and clears only after Enter on the confirmation", a
   });
   const canvas = page.getByRole("application", { name: "Network canvas" });
   await canvas.focus();
-  await tabTo(page, page.getByRole("button", { name: "Clear view" }));
+  await tabTo(page, page.getByRole("button", { name: "Clear the graph" }));
   await page.keyboard.press("Enter");
   await expect(
-    page.getByRole("alertdialog", { name: "Clear the view" }),
+    page.getByRole("alertdialog", { name: "Clear the graph" }),
   ).toBeVisible();
   expect(body).toBeNull();
 
@@ -1502,11 +1560,11 @@ test("a selected node's own menu offers Save selected as a view for the whole se
     .poll(() => page.evaluate(() => window.__KEYBOARD__?.selection?.length))
     .toBe(2);
   await page.keyboard.press("\\");
-  const item = page.getByRole("menuitem", {
-    name: /^Save selected \(2\) as a view/,
-  });
+  // ADR-144 Amendment 5: one of the selection's actions, in the bar's words, under "2 selected".
+  await expect(page.getByRole("menu")).toHaveAttribute("aria-label", "2 selected");
+  const item = page.getByRole("menuitem", { name: "Save as a view", exact: true });
   await expect(item).toBeVisible();
-  await item.focus();
+  await arrowTo(page, "Save as a view");
   await page.keyboard.press("Enter");
   await expect(page.getByLabel("View name")).toBeFocused();
   await page.keyboard.press("Enter");
@@ -1723,6 +1781,25 @@ test("Undo select what is lit gives back the selection that was there before, on
     page.getByRole("button", { name: "Undo select what is lit" }),
   ).toHaveCount(0);
   registerCovered("CANVAS_ACTIONS", "undo-select-what-is-lit-by-keyboard");
+});
+
+test("Undo select what is lit from the selection's menu gives back the earlier selection", async ({ page }) => {
+  await stubTheTimelineReads(page, LIT_LINKS);
+  await page.goto("/keyboard/harness.html?fixture=lit");
+  const canvas = page.getByRole("application", { name: "Network canvas" });
+  await canvas.focus();
+  await expect.poll(() => page.evaluate(() => window.__KEYBOARD__?.selection)).toEqual(["n0"]);
+  await setExactDatesByKeyboard(page, "2026-01-05T00:00:00Z", "2026-05-01T00:00:00Z");
+  await selectWhatIsLitByKeyboard(page);
+  await expect
+    .poll(() => page.evaluate(() => window.__KEYBOARD__?.selection.slice().sort()))
+    .toEqual(["n0", "n1", "n2"]);
+  await canvas.focus();
+  await page.keyboard.press("\\");
+  await arrowTo(page, "Undo select what is lit");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => page.evaluate(() => window.__KEYBOARD__?.selection)).toEqual(["n0"]);
+  registerCovered("CANVAS_ACTIONS", "undo-select-what-is-lit-from-the-selections-menu");
 });
 
 test("a window that lights nothing says so and leaves the selection as it was", async ({
@@ -1977,7 +2054,7 @@ test("a very large expansion asks first; Escape cancels it and nothing is added"
       contentType: "application/json",
       body: JSON.stringify({
         candidate_node_count: 1200,
-        candidate_edge_count: 0,
+        candidate_edge_count: 0, link_count: 1194,
       }),
     });
   });
@@ -2018,7 +2095,7 @@ test("a very large expansion can be accepted by keyboard, and only then does it 
       contentType: "application/json",
       body: JSON.stringify({
         candidate_node_count: 1200,
-        candidate_edge_count: 0,
+        candidate_edge_count: 0, link_count: 1194,
       }),
     });
   });
@@ -2122,6 +2199,126 @@ test("the Labels control is reached by Tab, and a property chosen with the arrow
   await expect(picker).toHaveCount(0);
   await expect(button).toBeFocused();
   registerCovered("CANVAS_ACTIONS", "labels-menu-by-keyboard");
+});
+
+// --- Match strictness in the canvas toolbar (v0.6.1 glass-rows A, ADR-145 Amendment 19 decision 5) ----------
+// The Graph's own row above the canvas held strictness alone; it is a button in the canvas toolbar now, after
+// Layout, opening the same three-stop slider and saying the same words when a stop is chosen.
+async function routeThreshold(page: Page): Promise<{ puts: number[] }> {
+  const puts: number[] = [];
+  await page.route("**/v1/investigations/keyboard-fixture/resolution/threshold", async (route) => {
+    if (route.request().method() === "PUT") {
+      const body = route.request().postDataJSON() as { threshold: number };
+      puts.push(body.threshold);
+      await route.fulfill({
+        json: { delta: { seq: 1, op: "reproject", reason: "threshold", affected_cluster_ids: {} }, merged: 2, split: 1, affected: 3 },
+      });
+      return;
+    }
+    await route.fulfill({ json: { threshold: 0.95 } });
+  });
+  return { puts };
+}
+
+test("Match strictness is reached by Tab in the canvas toolbar after Layout, set with the arrow keys, and closed by Escape", async ({
+  page,
+}) => {
+  const { puts } = await routeThreshold(page);
+  await page.goto("/keyboard/harness.html?strictness=1");
+  await settle(page, "n0");
+  const tools = page.getByRole("toolbar", { name: "Canvas tools" });
+  const button = tools.getByRole("button", { name: "Match strictness: Balanced" });
+  await expect(button).toHaveAttribute("aria-expanded", "false");
+  // After the Layout group, before Show: the order the owner's ruling 1 names.
+  const order = await tools.evaluate((bar) => {
+    const layout = bar.querySelector('[role="group"][aria-label="Layout"]')!;
+    const strict = [...bar.querySelectorAll("button")].find((b) => b.getAttribute("aria-label")?.startsWith("Match strictness"))!;
+    const show = bar.querySelector('[role="group"][aria-label="Show"]')!;
+    return [layout.compareDocumentPosition(strict) & Node.DOCUMENT_POSITION_FOLLOWING, strict.compareDocumentPosition(show) & Node.DOCUMENT_POSITION_FOLLOWING];
+  });
+  expect(order.every((bit) => bit !== 0)).toBe(true);
+
+  await page.getByRole("application", { name: "Network canvas" }).focus();
+  await tabTo(page, button);
+  await page.keyboard.press("Enter");
+  await expect(button).toHaveAttribute("aria-expanded", "true");
+  const slider = page.getByRole("slider", { name: "Match strictness" });
+  await tabTo(page, slider);
+  const focusedBefore = await page.evaluate(() => window.__KEYBOARD__?.focused);
+  // Balanced is the middle stop; one step left is Strict.
+  await page.keyboard.press("ArrowLeft");
+  await expect.poll(() => puts).toEqual([0.99]);
+  await expect
+    .poll(() => page.evaluate(() => window.__KEYBOARD__?.strictnessSaid))
+    .toBe("Match strictness: Strict — 2 merged, 1 split, 3 affected");
+  // A key on the slider belongs to the slider: the canvas did not take it as its own.
+  expect(await page.evaluate(() => window.__KEYBOARD__?.focused)).toBe(focusedBefore);
+  await expect(slider).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(slider).toHaveCount(0);
+  const named = tools.getByRole("button", { name: "Match strictness: Strict" });
+  await expect(named).toBeFocused();
+  registerCovered("CANVAS_ACTIONS", "match-strictness-by-keyboard");
+});
+
+// --- A toolbar that can be hidden (v0.6.1 glass-rows C, ADR-145 Amendment 19 decision 6) -----------------------------
+// On the real canvas toolbar and case line, wired by App's own `useViewToolbar` (`glass-toolbar-harness.tsx`).
+test("Hide toolbar is reached by Tab and pressed with Enter; Show toolbar on the case line then has focus, and Enter on it brings the toolbar back with focus on Hide toolbar", async ({
+  page,
+}) => {
+  await page.goto("/keyboard/glass-toolbar-harness.html");
+  const tools = page.getByRole("toolbar", { name: "Canvas tools" });
+  const hide = tools.getByRole("button", { name: "Hide toolbar" });
+  await expect(hide).toHaveAttribute("aria-expanded", "true");
+  await page.getByRole("application", { name: "Network canvas" }).focus();
+  await tabTo(page, hide);
+  await page.keyboard.press("Enter");
+  await expect(tools).toHaveCount(0);
+  const show = page.getByRole("region", { name: "You are in the Glass" }).getByRole("button", { name: "Show toolbar" });
+  await expect(show).toBeFocused();
+  await expect(show).toHaveAttribute("aria-expanded", "false");
+  await page.keyboard.press("Enter");
+  await expect(tools).toBeVisible();
+  await expect(tools.getByRole("button", { name: "Hide toolbar" })).toBeFocused();
+  registerCovered("CANVAS_ACTIONS", "hide-and-show-the-toolbar-by-keyboard");
+});
+
+// The owner's ruling of 16 November 2026: T, with no modifier, while the canvas has focus (as F, L and G are; WCAG
+// 2.1.4, active only on focus); Alt+Shift+T was Chrome's own toolbar key on Windows and Linux.
+test("T on the focused canvas hides the toolbar and shows it again, focus staying on the canvas; T typed in a field, or pressed with focus elsewhere, does nothing", async ({ page }) => {
+  await page.goto("/keyboard/glass-toolbar-harness.html");
+  const tools = page.getByRole("toolbar", { name: "Canvas tools" });
+  const canvas = page.getByRole("application", { name: "Network canvas" });
+  await expect(tools).toBeVisible();
+  // Each checked on its own, so two that each toggled could not cancel out. Focus elsewhere: on a toolbar button, on
+  // the case line.
+  const stillShown = async () => {
+    await page.waitForTimeout(150);
+    await expect(tools).toBeVisible();
+  };
+  await tools.getByRole("button", { name: "Hide toolbar" }).focus();
+  await page.keyboard.press("t");
+  await stillShown();
+  await page.getByRole("button", { name: /^Case: Kestrel/ }).focus();
+  await page.keyboard.press("t");
+  await stillShown();
+  // Typed in a field: the Layout picker, inside the canvas itself.
+  await tools.getByRole("combobox", { name: "Layout" }).focus();
+  await page.keyboard.press("t");
+  await stillShown();
+  // Alt+Shift+T, the first key, is the browser's again.
+  await canvas.focus();
+  await page.keyboard.press("Alt+Shift+KeyT");
+  await stillShown();
+  await canvas.focus();
+  await page.keyboard.press("t");
+  await expect(tools).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Show toolbar" })).toBeVisible();
+  await expect(canvas).toBeFocused();
+  await page.keyboard.press("T");
+  await expect(tools).toBeVisible();
+  await expect(canvas).toBeFocused();
+  registerCovered("CANVAS_ACTIONS", "t-on-the-canvas-hides-and-shows-the-toolbar");
 });
 
 test("a chosen label is still there after the page is reloaded, and Default puts it back", async ({
@@ -2454,7 +2651,7 @@ test("a double-click inside a box folds the group, and a double-click on the Gro
   // to it pushes the rest left. A folded group can sit right under the strip, and the double-click
   // then lands on a button instead of on the Group Node. This case is about the gesture on the
   // canvas, not about the strip, so the strip is made to pass the pointer through for its length.
-  await page.getByRole("button", { name: "Clear view" }).evaluate((button) => {
+  await page.getByRole("button", { name: "Clear the graph" }).evaluate((button) => {
     const strip = button.parentElement?.parentElement;
     if (strip) strip.style.pointerEvents = "none";
   });
@@ -2547,7 +2744,7 @@ test("choosing a search result draws three steps out from it, counted first, in 
       contentType: "application/json",
       body: JSON.stringify({
         candidate_node_count: 20,
-        candidate_edge_count: 0,
+        candidate_edge_count: 0, link_count: 14,
       }),
     });
   });
@@ -2588,7 +2785,7 @@ test("a three-step draw that is very large asks first, and the answer keeps its 
       contentType: "application/json",
       body: JSON.stringify({
         candidate_node_count: 1200,
-        candidate_edge_count: 0,
+        candidate_edge_count: 0, link_count: 1194,
       }),
     });
   });
@@ -2678,7 +2875,7 @@ test("an expansion that adds nothing says so, and Escape dismisses the message",
   const canvas = page.getByRole("application", { name: "Network canvas" });
   await canvas.focus(); // n0
   await page.keyboard.press("\\");
-  await page.keyboard.press("Tab");
+  await arrowTo(page, /^Associate of/);
   await page.keyboard.press("Enter");
   // The type by its display name (ADR-091), and the message found by its words: the canvas's
   // selection chip is a status region too (ADR-093).
@@ -2829,7 +3026,9 @@ test("the legend docks below a wrapped toolbar and moves by keyboard from its gr
   page,
 }) => {
   await page.setViewportSize({ width: 760, height: 900 });
-  await page.goto("/keyboard/harness.html");
+  // A canvas 600 px wide: since the toolbar's short words (v0.6.1 glass-rows, the owner's ruling 7) the harness's
+  // 900 px canvas keeps it to one row, and a toolbar wraps only below about 900 px of its own width.
+  await page.goto("/keyboard/harness.html?width=600");
   const toolbar = page.getByRole("toolbar", { name: "Canvas tools" });
   const legend = page.locator(".canvas-legend");
   await expect(legend).toBeVisible();
@@ -2991,6 +3190,188 @@ test("Shift with an arrow key moves the selected node by keyboard, further with 
   registerCovered("CANVAS_ACTIONS", "move-the-selection-with-shift-and-arrows");
 });
 
+// --- The selection's menu (ADR-078 Amendment 1, ADR-098 Amendment 8) -------------------------------
+
+async function captureExpand(page: Page): Promise<() => unknown> {
+  let body: unknown = null;
+  await page.route("**/*/expand", async (route) => {
+    body = route.request().postDataJSON();
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ delta: { seq: 2, op: "add", nodes: [], edges: [] } }),
+    });
+  });
+  return () => body;
+}
+
+test("the ContextMenu key opens the menu on the focused node, headed with its name, and its Expand acts", async ({
+  page,
+}) => {
+  await page.goto("/keyboard/harness.html");
+  await stubSmallExpansionPreview(page);
+  const expanded = await captureExpand(page);
+  const canvas = page.getByRole("application", { name: "Network canvas" });
+  await canvas.focus(); // n0, selected
+  await page.keyboard.press("ContextMenu");
+  const menu = page.locator(".radial-menu__list[role='menu']");
+  await expect(menu).toHaveAttribute("aria-label", "n0");
+  // The selection's own actions first, Expand the first of them, focused.
+  await expect(menu.getByRole("menuitem", { name: "Expand", exact: true })).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect.poll(expanded).toMatchObject({ request: { node_ids: ["n0"], depth: 1 } });
+  await expect(menu).toBeHidden();
+  registerCovered("CANVAS_ACTIONS", "menu-opens-on-the-context-menu-key");
+});
+
+test("Shift+F10 opens the menu on a focused node it selects first, and its Clear acts", async ({ page }) => {
+  await page.goto("/keyboard/harness.html");
+  const canvas = page.getByRole("application", { name: "Network canvas" });
+  await canvas.focus(); // n0 selected
+  await page.keyboard.press("ArrowRight"); // focus n1; the selection is still n0
+  await expect.poll(() => page.evaluate(() => window.__KEYBOARD__?.focused)).toBe("n1");
+  await page.keyboard.press("Shift+F10");
+  const menu = page.locator(".radial-menu__list[role='menu']");
+  await expect(menu).toHaveAttribute("aria-label", "n1");
+  expect(await page.evaluate(() => window.__KEYBOARD__?.selection)).toEqual(["n1"]);
+  await arrowTo(page, "Clear");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => page.evaluate(() => window.__KEYBOARD__?.selection)).toEqual([]);
+  registerCovered("CANVAS_ACTIONS", "menu-opens-on-shift-f10");
+});
+
+test("in the menu End and Home go to the ends, the arrows wrap, and Enter acts on the entry reached", async ({
+  page,
+}) => {
+  await page.goto("/keyboard/harness.html");
+  await stubSmallExpansionPreview(page);
+  const expanded = await captureExpand(page);
+  const canvas = page.getByRole("application", { name: "Network canvas" });
+  await canvas.focus();
+  await page.keyboard.press("\\");
+  const items = page.locator(".radial-menu__list[role='menu']").getByRole("menuitem");
+  await expect(items.first()).toBeFocused();
+  await page.keyboard.press("End");
+  await expect(items.last()).toBeFocused();
+  await page.keyboard.press("ArrowDown"); // wraps
+  await expect(items.first()).toBeFocused();
+  await page.keyboard.press("ArrowUp"); // wraps back
+  await expect(items.last()).toBeFocused();
+  await page.keyboard.press("Home");
+  await expect(items.first()).toBeFocused();
+  // The canvas's own arrow keys do not move the node focus while the menu has it.
+  expect(await page.evaluate(() => window.__KEYBOARD__?.focused)).toBe("n0");
+  await page.keyboard.press("Enter"); // Expand
+  await expect.poll(expanded).toMatchObject({ request: { node_ids: ["n0"] } });
+  registerCovered("CANVAS_ACTIONS", "menu-arrows-home-and-end-move-through-it");
+});
+
+test("on two selected the menu says so and offers the bar's actions in its words; Remove from view acts", async ({
+  page,
+}) => {
+  await page.goto("/keyboard/harness.html");
+  let removed: unknown = null;
+  await page.route("**/*/investigations/*/nodes", async (route) => {
+    removed = route.request().postDataJSON();
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ seq: 5 }) });
+  });
+  const canvas = page.getByRole("application", { name: "Network canvas" });
+  await canvas.focus();
+  await page.keyboard.press("Control+Shift+ArrowRight");
+  await page.keyboard.press("Space");
+  await expect.poll(() => page.evaluate(() => window.__KEYBOARD__?.selection?.length)).toBe(2);
+  const bar = page.getByRole("toolbar", { name: "Selection" });
+  const barWords = (await bar.getByRole("button").allTextContents())
+    .map((w) => w.replace(/\s*Esc$/, "").trim())
+    .filter((w) => !["−", "+"].includes(w));
+  await page.keyboard.press("\\");
+  const menu = page.locator(".radial-menu__list[role='menu']");
+  await expect(menu).toHaveAttribute("aria-label", "2 selected");
+  const menuWords = (await menu.getByRole("menuitem").allTextContents()).map((w) => w.trim());
+  expect(menuWords.slice(0, barWords.length)).toEqual(barWords);
+  await arrowTo(page, "Remove from view");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => (removed as { node_ids?: string[] } | null)?.node_ids?.length).toBe(2);
+  registerCovered("CANVAS_ACTIONS", "menu-offers-the-selections-actions-in-the-bars-words");
+});
+
+test("a link type whose count failed is shown, never folded into the types with no links", async ({ page }) => {
+  await page.goto("/keyboard/harness.html");
+  await page.route("**/*/expand/preview", async (route) => {
+    const asked = (route.request().postDataJSON() as { request: { edge_types: string[] | null } }).request.edge_types;
+    if (asked?.[0] === "USES") return route.fulfill({ status: 503, contentType: "application/json", body: "{}" });
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ candidate_node_count: 2, candidate_edge_count: 1, link_count: 0 }), // drawn already: none new, none at all
+    });
+  });
+  const canvas = page.getByRole("application", { name: "Network canvas" });
+  await canvas.focus();
+  await page.keyboard.press("\\");
+  const group = page.locator(".radial-menu__list[role='menu']").getByRole("group", { name: "Expand by link type" });
+  await expect(group.getByRole("menuitem", { name: /^uses \(count unavailable\)/i })).toBeVisible();
+  await expect(group.getByRole("menuitem", { name: "2 types with no links" })).toBeVisible(); // Associate of, Depicts
+  await expect(group.getByRole("menuitem", { name: /^Associate of/ })).toHaveCount(0);
+});
+
+test("the types with no links fold only once every count has answered, not as each arrives", async ({ page }) => {
+  await page.goto("/keyboard/harness.html");
+  let release: () => void = () => undefined;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  await page.route("**/*/expand/preview", async (route) => {
+    const asked = (route.request().postDataJSON() as { request: { edge_types: string[] | null } }).request.edge_types;
+    if (asked?.[0] === "USES") await held; // one count held back
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ candidate_node_count: 2, candidate_edge_count: 1, link_count: asked?.[0] === "ASSOCIATE_OF" ? 3 : 0 }),
+    });
+  });
+  const canvas = page.getByRole("application", { name: "Network canvas" });
+  await canvas.focus();
+  await page.keyboard.press("\\");
+  const group = page.locator(".radial-menu__list[role='menu']").getByRole("group", { name: "Expand by link type" });
+  await expect(group.getByRole("menuitem", { name: /^Associate of \(3\)/ })).toBeVisible();
+  await expect(group.getByRole("menuitem", { name: /^Depicts \(0\)/ })).toBeVisible(); // known 0, not yet folded
+  await expect(group.getByRole("menuitem", { name: /types? with no links/ })).toHaveCount(0);
+  release();
+  await expect(group.getByRole("menuitem", { name: "2 types with no links" })).toBeVisible();
+  await expect(group.getByRole("menuitem", { name: /^Depicts/ })).toHaveCount(0);
+});
+
+test("link types with no links fold into one line, which opens in place, and a type there expands", async ({
+  page,
+}) => {
+  await page.goto("/keyboard/harness.html");
+  // The Conduit's link_count (ADR-098 Amendment 8): two links of ASSOCIATE_OF, none of USES.
+  await page.route("**/*/expand/preview", async (route) => {
+    const asked = (route.request().postDataJSON() as { request: { edge_types: string[] | null } }).request.edge_types;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ candidate_node_count: 3, candidate_edge_count: 0, link_count: asked?.[0] === "USES" ? 0 : 2 }),
+    });
+  });
+  const expanded = await captureExpand(page);
+  const canvas = page.getByRole("application", { name: "Network canvas" });
+  await canvas.focus();
+  await page.keyboard.press("\\");
+  const menu = page.locator(".radial-menu__list[role='menu']");
+  const group = menu.getByRole("group", { name: "Expand by link type" });
+  await expect(group.getByRole("menuitem", { name: "1 type with no links" })).toBeVisible();
+  await expect(group.getByRole("menuitem", { name: /^Associate of \(2\)/ })).toBeVisible();
+  await expect(group.getByRole("menuitem", { name: /^uses/i })).toHaveCount(0);
+  await arrowTo(page, "1 type with no links");
+  await page.keyboard.press("Enter");
+  await expect(menu).toBeVisible(); // opened in place
+  await expect(group.getByRole("menuitem", { name: /^uses \(0\)/i })).toBeVisible();
+  await arrowTo(page, /^uses/i);
+  await page.keyboard.press("Enter");
+  await expect.poll(expanded).toMatchObject({ request: { node_ids: ["n0"], edge_types: ["USES"] } });
+  registerCovered("CANVAS_ACTIONS", "menu-folds-types-with-no-links-and-opens-them-in-place");
+});
+
 test("every registered keyboard action has its own proving test case above", () => {
   assertAllCovered("CANVAS_ACTIONS", CANVAS_ACTIONS);
 });
@@ -3023,7 +3404,9 @@ test("a right-click menu names its node, and a click elsewhere closes it", async
   await page.mouse.click(x, y, { button: "right" });
   const menu = page.getByRole("menu");
   await expect(menu).toBeVisible();
-  await expect(menu).toHaveAttribute("aria-label", /^Person: /);
+  // ADR-078 Amendment 1: the right-click selected n1 first, and the heading is its name.
+  await expect(menu).toHaveAttribute("aria-label", "n1");
+  expect(await page.evaluate(() => window.__KEYBOARD__?.selection)).toEqual(["n1"]);
   // Elsewhere in the canvas, well away from every node and from the menu. The bottom-left corner:
   // the grouped list (ADR-078) is wider and taller than the old one and, opened low on the right as
   // here, reached the bottom-right corner this used to click.

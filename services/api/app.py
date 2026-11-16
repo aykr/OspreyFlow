@@ -24,11 +24,11 @@ from __future__ import annotations
 
 import asyncio
 import csv
-import functools
 import io
 import json
 import logging
 import os
+import socket
 import time
 from collections import Counter
 from collections.abc import (
@@ -107,12 +107,14 @@ from services.ingest.staging_catalogue import DEPLOYMENT_WIDE
 from services.ingest.transforms import STRUCTURED_PARTS
 from services.ingest.watermark import RefreshRead
 from services.resolve.trigger import service_principal
+from services.search_index.pending import PendingIds, pending_node_ids
 from valkey.asyncio import Valkey
 
 from adapters.model_litellm.adapter import ModelLiteLLMAdapter
 from adapters.model_litellm.client import LiteLLMClient, LiteLLMConfig
 from adapters.model_litellm.errors import (
     ExtractionFailedError,
+    ModelEngineRefused,
     ModelLimitReached,
     ModelUnavailableError,
     UsageUnavailableError,
@@ -133,7 +135,12 @@ from ontology.influencers import StrengthDefaults, as_the_reader_sees, load_stre
 from ontology.packs import pack_catalogue
 from ontology.pattern_where import PatternConditionRefused, check_pattern_conditions
 from ontology.yardstick import Yardstick, load_phia_yardstick
-from ports.analytics import AnalyticsPort, TrendLimitExceeded
+from ports.analytics import (
+    AmountTotalOutOfRange,
+    AnalyticsFieldRefused,
+    AnalyticsPort,
+    TrendLimitExceeded,
+)
 from ports.compute import ComputePort
 from ports.graph import GraphPort
 from ports.media import MediaStore
@@ -142,7 +149,6 @@ from ports.recognise import RecogniserRefusedError, RecogniserUnavailableError
 from principal_auth import (
     ROLE_LOOKUP_TIMEOUT_SECONDS,
     PrincipalLookupUnavailable,
-    PrincipalRevoked,
     SigningKeysUnavailable,
     in_keys_thread,
 )
@@ -176,6 +182,8 @@ from schemas.admin import (
     DisableInput,
     DisablePlan,
     EmbeddedDashboard,
+    GuestSignIn,
+    GuestSignInInput,
     InviteInput,
     LayerAction,
     LayerDryRun,
@@ -185,6 +193,7 @@ from schemas.admin import (
     OrganisationArrival,
     OrganisationLinkInput,
     PauseScheduleInput,
+    PersonAccessInput,
     PersonAccount,
     PromotionAlertSetting,
     RegisteredDashboard,
@@ -218,6 +227,7 @@ from schemas.analytics import (
     Sighting,
     SightingRequest,
 )
+from schemas.batch_expansion import BatchExpansion, BatchExpansionInput
 from schemas.boards import (
     Board,
     BoardInput,
@@ -464,6 +474,7 @@ from schemas.rights import (
     Right,
     RightsResponse,
     rights_for,
+    rights_listed,
 )
 from schemas.rule_editor import RuleDatasetOffer, RuleTestResult
 from schemas.rule_standards import ImportedRule
@@ -474,6 +485,7 @@ from schemas.screening import (
     ScreeningListUpdate,
     ScreeningSubscriptionInput,
 )
+from schemas.search import SearchPageRequest, SearchPageResponse
 from schemas.sentences import (
     RULE_TEST_DAYS,
     RulePreview,
@@ -524,6 +536,7 @@ from . import (
     map_places,
     raised_alerts,
     rule_editor,
+    search_service,
     sentence_rules,
 )
 from . import audit_section as audit_section_module
@@ -546,7 +559,6 @@ from . import resolution_trigger as resolution_trigger_module
 from . import review as review_module
 from . import risk as risk_module
 from . import rules_place as rules_place_clock
-from . import search as search_module
 from .add_by_identifiers import (
     MAX_IDENTIFIERS,
     AddByIdentifiersRequest,
@@ -588,6 +600,9 @@ from .assessments import (
 )
 from .audit import AuditWriteError, AuditWriter
 from .auth import PrincipalResolutionError, PrincipalResolver, bearer_scheme
+from .batch_expansion import BatchExpandBindings, BatchNotFound, BatchRunning
+from .batch_expansion import read as read_batch_expansion
+from .batch_expansion import submit as submit_batch_expansion
 from .board_store import BoardItemStore, InMemoryBoardItemStore, PostgresBoardItemStore
 from .boards import BoardNotFound, Boards, DrawingRefused, ItemNotFound, NotTheBoardsCreator
 from .case_brief import (
@@ -607,15 +622,14 @@ from .case_views import (
     NotTheViewsCreator,
     PostgresCaseViewStore,
     ViewNotFound,
+    first_item,
     open_view,
 )
 from .change_stream import touched_node_ids
 from .compute_routes import (
-    JOB_TYPE_COMPUTE_METRIC,
     ComputeMetricAccepted,
     ComputeMetricName,
     ComputeMetricRequest,
-    run_compute_metric_job,
 )
 from .config import ApiConfig, DeploymentModels, GradingSettings, MonitoringSettings
 from .connection_strength import case_connection_strengths, case_legend, case_rarity
@@ -701,7 +715,13 @@ from .entity_pictures import (
     PictureNotFoundError,
     PictureSetResponse,
 )
-from .entra_people import STALE_ACCESS_WORDS, EntraPeopleAdmin, access_current
+from .entra_people import (
+    STALE_ACCESS_WORDS,
+    AccessBeyondTheSetter,
+    EntraPeopleAdmin,
+    NoSuchPerson,
+    access_current,
+)
 from .event_scope import own_events_only
 from .explore import (
     ExploreService,
@@ -836,6 +856,7 @@ from .list_connector import (
     offered_lists,
 )
 from .list_schedule import ListRefreshExecutor, ListScheduleRefused, check_list_schedule
+from .list_schedule import owner_refusal_words as list_owner_refusal_words
 from .load_checks import READ_ONLY, ChecksRefused, check_choice, checks_view, would_raise
 from .load_records import LedgerSink, may_see_counts, released_from_of, report_view
 from .mapconfig_loader import load_map_config, public_view
@@ -875,14 +896,12 @@ from .pattern_ask import (
 )
 from .pattern_store import PatternNotFoundError, PatternStore
 from .patterns import (
-    JOB_TYPE_PATTERN_MATCH,
     PatternPreview,
     PatternRunAccepted,
     SavedPatternList,
     SavePatternRequest,
     preview_pattern,
     run_pattern,
-    run_pattern_match_job,
 )
 from .person_ownership import PostgresOwnershipStore
 from .pipeline_run import (
@@ -907,12 +926,17 @@ from .promotions import (
 )
 from .questions import (
     AskRequest,
-    NoDocumentsError,
+    CaseSearch,
+    NothingToReadError,
     PostgresQuestionStore,
     QuestionAccepted,
     QuestionAnswer,
     QuestionsService,
     QuestionsTooLargeError,
+    QuestionTooLongToSearchError,
+    ReadFromUnavailableError,
+    WillRead,
+    WillReadRequest,
 )
 from .recipe_run import (
     RecipeRunDeps,
@@ -987,7 +1011,7 @@ from .screening_refresh import (
     check_location,
 )
 from .screening_refresh import refresh as refresh_screening_list
-from .search import SearchRequest, SearchResponse, SuggestRequest, SuggestResponse
+from .search import SuggestRequest, SuggestResponse
 from .sentence_rules import (
     is_deployment_wide,
     run_on_list_refresh,
@@ -995,6 +1019,7 @@ from .sentence_rules import (
     strength_context,
 )
 from .service_identity import (
+    DASHBOARD_IS_NO_SERVICE_IDENTITY,
     DEPLOYMENT_CLIENT_WORDS,
     ServiceIdentityRefused,
     ServiceIdentityVerifier,
@@ -1094,7 +1119,12 @@ from .superset_embed import (
     identity_principal,
     may_open,
 )
-from .suppression import NodeNotVisibleError, SuppressionMark, SuppressionMarkStore
+from .suppression import (
+    NodeNotVisibleError,
+    SuppressionMark,
+    SuppressionMarkStore,
+    marks_on_the_canvas,
+)
 from .target_models import (
     InMemoryTargetModelStore,
     NoModelYet,
@@ -1141,9 +1171,10 @@ from .watch_routes import (
     with_what_fired_it,
 )
 from .worker import JobWorker
-from .worker_main import register_all
+from .worker_main import register_all, registered_job_types, run_forever
 from .working_set.models import (
     MAX_NODES,
+    AddedByIds,
     CardinalityPreview,
     ClusterExplanation,
     ClusterNotFoundError,
@@ -1505,12 +1536,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # `06_DECISIONS.md` ADR-025: this system's first job-queue worker,
     # generalised by `job_type` rather than resolution-specific — closes
     # `services/api/supersede.py`'s own long-disclosed "no worker attached
-    # yet" gap in the same stroke. Constructed and its handlers registered
-    # here so a standalone worker process (`services/api/worker_main.py`)
-    # has something real to import and drive in a loop; this app process
-    # itself does not spin up that loop — running the worker is deployment
-    # wiring (its own process/container), not additional Conduit logic.
-    job_worker = JobWorker(valkey, jobs, graph)
+    # yet" gap in the same stroke. Its loop runs in its own worker workload
+    # where the profile renders one (cluster, cloud-platform), and here, in the
+    # Conduit's lifespan, where it does not (`job_loop_in_conduit`): one place
+    # per deployment, under a consumer name of the Conduit's own.
+    job_worker = JobWorker(valkey, jobs, graph, consumer_name=_conduit_consumer_name())
     # The supersede and resolution jobs, bound as the standalone worker binds them, by the one
     # function (`worker_main.register_all`): the alerts' repoint journal on both (ADR-109
     # Amendment 11), a layer's split its own case's (ADR-143 Amendment 1), the review flag here.
@@ -1522,11 +1552,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         analyst_layers=datasets_store.layer_ids,
         alerts=alerts_store,
         judgement_store=judgements_store,
+        compute=compute,
+        batch=BatchExpandBindings(
+            views=case_view_store,
+            investigations=lambda: investigations,
+            datasets=datasets_store,
+            jobs=jobs,
+            audit=audit,
+        ),
     )
-    job_worker.register(
-        JOB_TYPE_COMPUTE_METRIC, functools.partial(run_compute_metric_job, compute=compute)
-    )
-    job_worker.register(JOB_TYPE_PATTERN_MATCH, run_pattern_match_job)
     app.state.job_worker = job_worker
     app.state.principal_resolver = resources.principal_resolver
     # ADR-106: display names for principal ids, resolved when a read is served.
@@ -1538,15 +1572,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ADR-148 Amendment 8: on Entra ID sign-in, Admin › People writes the deployment's own store,
     # which an open delta socket also asks before each message (`_socket_standing`).
     app.state.people_store = resources.people_store
-    app.state.identity_admin = (
-        EntraPeopleAdmin(resources.people_store)
-        if resources.people_store is not None
-        else IdentityAdmin(
-            config,
-            by_email=os.environ.get("OSPREY_SIGN_IN_EMAIL", "").lower() == "true",
-            organisation=os.environ.get("OSPREY_ORGANISATION_SIGN_IN") or None,
-        )
-    )
+    app.state.identity_admin = people_directory(resources, config)
     # ADR-111 Amendment 3: Superset dashboards inside the Glass; None when not configured.
     superset_settings = SupersetSettings.from_env()
     app.state.superset_embedder = SupersetEmbedder(superset_settings) if superset_settings else None
@@ -1584,6 +1610,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             principal_for_owner=app.state.principal_resolver.resolve_for_owner,
             sweeper=sweeper,
             datasets=datasets_store,
+            deployer_of=app.state.principal_resolver.resolve_for_owner_detailed,
         )
 
     sweep_task = asyncio.create_task(run_daily_kyc_sweep(valkey, _sweep_day))
@@ -1616,6 +1643,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         promotion_ageing, promotion_ageing, lambda: app.state.waiting_promotions,
         lambda p: _promotion_recipients(app, p),
     )  # fmt: skip
+    # Where no worker workload is rendered (local-lite, small), the Conduit drains every job
+    # stream itself (the orchestrator's fix, 14 November 2026), as `worker_main` does, stopped at
+    # shutdown; elsewhere the worker does, and this never starts (`job_loop_in_conduit`).
+    job_loop_stop = asyncio.Event()
+    job_loop_task = (
+        asyncio.create_task(
+            run_forever(job_worker, sorted(registered_job_types()), stop=job_loop_stop)
+        )
+        if job_loop_in_conduit()
+        else None
+    )
     promotion_task = asyncio.create_task(
         promotion_ageing_module.run_every(
             app.state.promotion_sweep,
@@ -1631,6 +1669,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         schedule_task.cancel()
         monitoring_task.cancel()
         promotion_task.cancel()
+        if job_loop_task is not None:
+            # A job in hand finishes and is acknowledged; the loop then sees the stop and ends.
+            job_loop_stop.set()
+            try:
+                await asyncio.wait_for(job_loop_task, timeout=JOB_LOOP_STOP_SECONDS)
+            except TimeoutError:
+                job_loop_task.cancel()
         await investigations.close()
         await custom_roles.close()
         await admin_people.close()
@@ -2120,6 +2165,33 @@ def get_compute(request: Request) -> ComputePort:
     return request.app.state.compute  # type: ignore[no-any-return]
 
 
+def people_directory(resources: Any, config: ApiConfig) -> PeopleDirectory:
+    """Admin › People's and Dashboards' directory: the deployment's own store on Entra ID sign-in
+    (ADR-148 Amendment 8), told the Glass's and this API's own application ids, which it never
+    registers as dashboard identities (Amendment 10); Keycloak's admin API otherwise."""
+    if resources.people_store is not None:
+        mapping = resources.principal_resolver.claim_mapping
+        return EntraPeopleAdmin(
+            resources.people_store, own_clients=(mapping.client_id, mapping.api_client_id)
+        )
+    return IdentityAdmin(
+        config,
+        by_email=os.environ.get("OSPREY_SIGN_IN_EMAIL", "").lower() == "true",
+        organisation=os.environ.get("OSPREY_ORGANISATION_SIGN_IN") or None,
+    )
+
+
+class SignInRefused(Exception):
+    """A sign-in refused with words the person can act on, and their stable tag
+    (`principal_auth`'s `PrincipalResolutionError.error`: access_not_set, token_version,
+    guest_not_admitted): answered as a 401 whose body carries both, so the Glass shows these
+    words and no others."""
+
+    def __init__(self, words: str, error: str) -> None:
+        super().__init__(words)
+        self.words, self.error = words, error
+
+
 async def get_principal(
     request: Request,
     credentials: Annotated[HTTPAuthorizationCredentials, Depends(bearer_scheme)],
@@ -2131,6 +2203,8 @@ async def get_principal(
     try:
         identity = await resolver.resolve_principal(credentials.credentials)
     except PrincipalResolutionError as exc:
+        if exc.error is not None:
+            raise SignInRefused(str(exc), exc.error) from exc
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
     except SigningKeysUnavailable as exc:
         # ADR-148 Amendment 8: the identity provider's keys could not be read; said so, never as a
@@ -2154,6 +2228,20 @@ async def get_principal(
                 "Try again shortly.",
             },
         ) from exc
+    # ADR-148 Amendment 10: a principal admitted to named routes alone (a dashboard identity on
+    # Entra ID) is refused every other, before anything is read for it.
+    if identity.routes is not None:
+        route = request.scope.get("route")
+        asked = f"{request.method} {getattr(route, 'path', request.url.path)}"
+        if asked not in identity.routes:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": "route_not_admitted",
+                    "message": "this identity is admitted only to "
+                    + ", ".join(sorted(identity.routes)),
+                },
+            )
     # The token's own roles, kept apart for what must read a custom role's rights afresh later
     # (the delta socket's ticket, `issue_ws_ticket`).
     request.state.token_roles = list(identity.roles)
@@ -2190,6 +2278,25 @@ async def with_custom_roles(app_: Any, principal: Principal) -> Principal:
     if store is None or not custom_role_ids(principal.roles):
         return principal
     return cast("Principal", await store.expand(principal))
+
+
+#: How long shutdown waits for the Conduit's job loop to finish the job in hand: one `run_once`
+#: blocks for `worker_main.BLOCK_MS` waiting for an entry, then the stop is seen.
+JOB_LOOP_STOP_SECONDS = 10.0
+
+
+def job_loop_in_conduit(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether this Conduit runs the job loop: only where the render says so
+    (`OSPREY_JOB_WORKER=conduit`, `harness.render.job_worker_place`, a profile with no worker
+    workload). Unset, as a test app or a deployment rendered before this is, it does not, so a
+    worker that exists is never joined by a Conduit consuming beside it."""
+    return (os.environ if environ is None else environ).get("OSPREY_JOB_WORKER") == "conduit"
+
+
+def _conduit_consumer_name() -> str:
+    """This Conduit's name in the `workers` consumer group, distinct from every worker's and every
+    other Conduit replica's (`worker_main.consumer_name`'s rule)."""
+    return f"conduit-{socket.gethostname()}"
 
 
 def _owner_with_custom_roles(app_: Any, resolve: Callable[[str], Awaitable[Principal]]) -> Any:
@@ -2280,11 +2387,42 @@ async def get_service_identity(
     anyio's shared pool, with no bound of its own)."""
     verifier: ServiceIdentityVerifier = request.app.state.service_identities
     try:
-        return await in_keys_thread(verifier.client_of, credentials.credentials)
+        client = await in_keys_thread(verifier.client_of, credentials.credentials)
     except SigningKeysUnavailable as unavailable:
         raise HTTPException(status_code=503, detail=str(unavailable)) from unavailable
     except ServiceIdentityRefused as refused:
+        # ADR-148 Amendment 20: an application refused for want of the run role may be a dashboard
+        # identity whose token holds no role; it is told it is a dashboard's, as Amendment 10 says.
+        # The registrations only choose the words: if they cannot be read, the refusal stands in
+        # the run role's words, never a 503 for a door that is shut either way.
+        if refused.client is not None:
+            try:
+                await _refuse_a_registered_dashboard(request, refused.client)
+            except HTTPException as answer:
+                if answer.status_code != 503:
+                    raise
         raise HTTPException(status_code=refused.status, detail=str(refused)) from refused
+    await _refuse_a_registered_dashboard(request, client)
+    return client
+
+
+async def _refuse_a_registered_dashboard(request: Request, client: str) -> None:
+    """ADR-148 Amendment 10: a client Admin › Dashboards registered is a dashboard identity, which
+    reads the report feed and never submits runs, whatever its token holds. The read is bounded as
+    a person's stored roles are; past it, the same 503."""
+    store = getattr(request.app.state, "people_store", None)
+    if store is None:
+        return
+    try:
+        registered = await asyncio.wait_for(
+            store.dashboard(store.tenant_id, client), timeout=ROLE_LOOKUP_TIMEOUT_SECONDS
+        )
+    except Exception as exc:  # noqa: BLE001 - any failure of the read is the one 503
+        raise HTTPException(
+            status_code=503, detail="the dashboard identities could not be read"
+        ) from exc
+    if registered is not None:
+        raise HTTPException(status_code=403, detail=DASHBOARD_IS_NO_SERVICE_IDENTITY)
 
 
 ServiceIdentityDep = Annotated[str, Depends(get_service_identity)]
@@ -2878,6 +3016,23 @@ async def _too_many_identifiers_handler(
 async def _view_not_found_handler(request: Request, exc: ViewNotFound) -> JSONResponse:
     """ADR-144 decision 3: someone else's private view, another case's, and none at all alike."""
     return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content={"error": "view_not_found"})
+
+
+@app.exception_handler(BatchNotFound)
+async def _batch_not_found_handler(request: Request, exc: BatchNotFound) -> JSONResponse:
+    """ADR-151 decision 4: another member's batch expansion, another case's, and none alike."""
+    return JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND, content={"error": "batch_expansion_not_found"}
+    )
+
+
+@app.exception_handler(BatchRunning)
+async def _batch_running_handler(request: Request, exc: BatchRunning) -> JSONResponse:
+    """ADR-151 decision 2: one at a time per requester and case, naming the one running."""
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={"error": "batch_expansion_running", "detail": str(exc), "id": exc.job_id},
+    )
 
 
 @app.exception_handler(NotTheViewsCreator)
@@ -3505,11 +3660,36 @@ async def _dataset_refused_handler(request: Request, exc: DatasetRefusedError) -
     )
 
 
-@app.exception_handler(NoDocumentsError)
-async def _no_documents_handler(request: Request, exc: NoDocumentsError) -> JSONResponse:
-    """ADR-098 decision 4: the case holds no Document the analyst can see to ask about."""
+@app.exception_handler(NothingToReadError)
+async def _nothing_to_read_handler(request: Request, exc: NothingToReadError) -> JSONResponse:
+    """ADR-098 Amendment 7: nothing selected that the asker's view holds, or an empty graph. There
+    is no refusal for want of documents: with none, the model answers from the links and events."""
     return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, content={"error": "no_documents"}
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"error": "nothing_to_read", "detail": exc.words},
+    )
+
+
+@app.exception_handler(ReadFromUnavailableError)
+async def _read_from_unavailable_handler(
+    request: Request, exc: ReadFromUnavailableError
+) -> JSONResponse:
+    """ADR-098 Amendment 7: *Whole case* asked for before the case's search is called (D(iii))."""
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"error": "read_from_unavailable", "detail": exc.words},
+    )
+
+
+@app.exception_handler(QuestionTooLongToSearchError)
+async def _question_too_long_to_search_handler(
+    request: Request, exc: QuestionTooLongToSearchError
+) -> JSONResponse:
+    """ADR-098 Amendment 9: *Whole case* with a question longer than the search takes; refused in
+    words that say what to do, never cut (rule 2)."""
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"error": "question_too_long_to_search", "detail": exc.words},
     )
 
 
@@ -3609,6 +3789,21 @@ async def _model_limit_reached_handler(request: Request, exc: ModelLimitReached)
         status_code=429,
         content={"error": "model_limit_reached", "detail": exc.words},
         headers=headers,
+    )
+
+
+#: ADR-135 Amendment 13: each kind of an engine's refusal, as an HTTP status.
+_ENGINE_REFUSED_STATUS = {"busy": 429, "key": 502, "unavailable": 503, "timed_out": 504}
+
+
+@app.exception_handler(ModelEngineRefused)
+async def _model_engine_refused_handler(request: Request, exc: ModelEngineRefused) -> JSONResponse:
+    """ADR-135 Amendment 13: the engine refused, failed or gave no answer in time. Said in the
+    Conduit's own words naming the engine, never the provider's (which can carry part of a key),
+    and never as a server fault."""
+    return JSONResponse(
+        status_code=_ENGINE_REFUSED_STATUS.get(exc.kind, 503),
+        content={"error": "model_engine_refused", "kind": exc.kind, "detail": exc.words},
     )
 
 
@@ -4298,19 +4493,40 @@ async def _may_hold_a_level(
             )
         return
     people = await names.people([grantee])
-    if people is None or grantee in people:
+    if people is not None and grantee in people:
         return
-    dashboards = {d.account_id for d in await get_identity_admin(request).list_dashboards()}
-    if grantee in dashboards and level is AccessLevel.VIEWER:
+    # Not a person the directory holds, so its registration is read: on Entra ID the names
+    # directory holds no people (`people` is None) and a registered dashboard is still a Viewer
+    # and nothing more (ADR-148 Amendment 10). With no directory, an identity provider that
+    # cannot answer leaves the grant as before: the deployment cannot tell.
+    admin = getattr(request.app.state, "identity_admin", None)
+    try:
+        dashboards = {d.account_id for d in await admin.list_dashboards()} if admin else set()
+    except IdentityAdminRefused:
+        if people is None:
+            return
+        raise
+    if grantee in dashboards:
+        if level is AccessLevel.VIEWER:
+            return
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "service_account",
+                "message": f"a dashboard identity may be a Viewer of a case and nothing more; "
+                f"{grantee} was asked to be {level.value}",
+            },
+        )
+    if people is None:
         return
-    words = (
-        f"a dashboard identity may be a Viewer of a case and nothing more; {grantee} was asked "
-        f"to be {level.value}"
-        if grantee in dashboards
-        else f"{grantee} is not an enabled person: a service account owns nothing and is never a "
-        "case member, and a disabled account holds no level"
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": "service_account",
+            "message": f"{grantee} is not an enabled person: a service account owns nothing and "
+            "is never a case member, and a disabled account holds no level",
+        },
     )
-    raise HTTPException(status_code=409, detail={"error": "service_account", "message": words})
 
 
 @app.put(
@@ -4399,10 +4615,17 @@ async def get_investigation(
 
 @app.get("/v1/investigations/{investigation_id}/views")
 async def list_case_views(
-    investigation: InvestigationViewerDep, principal: PrincipalDep, views: CaseViewsDep
+    investigation: InvestigationViewerDep,
+    principal: PrincipalDep,
+    views: CaseViewsDep,
+    graph: GraphDep,
 ) -> list[CaseView]:
-    """The case's views this reader may see: their own, and those shared with the case."""
-    return [v.wire() for v in await views.visible_in(investigation.id, principal.id)]
+    """The case's views this reader may see: their own, and those shared with the case. Each says
+    its first item as this reader may see it (ADR-145 Amendment 17), never a hidden one."""
+    return [
+        v.wire().model_copy(update={"first_item": await first_item(graph, v, principal)})
+        for v in await views.visible_in(investigation.id, principal.id)
+    ]
 
 
 @app.post(
@@ -4427,6 +4650,51 @@ async def save_case_view(
         result_cardinality=1,
     )
     return view.wire()
+
+
+# --- batch expansions (ADR-151; spec 03 §3.2) -------------------------------------------------
+#
+# The working-set cap's third choice: the refused expansion run by the job worker under the
+# requester's own access and saved as a private view, or refused with its figures (rule 2).
+
+
+@app.post(
+    "/v1/investigations/{investigation_id}/batch-expansions",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_right(Right.INVESTIGATE))],
+)
+async def start_batch_expansion(
+    investigation: InvestigationEditorDep,
+    body: BatchExpansionInput,
+    principal: PrincipalDep,
+    jobs: JobsDep,
+    valkey: ValkeyDep,
+    audit: AuditDep,
+) -> BatchExpansion:
+    """Queues the expansion the cap refused, at Editor as `expand` is; reads nothing from the graph
+    and adds nothing to the working set (ADR-151 decision 1)."""
+    started = await submit_batch_expansion(jobs, valkey, investigation.id, principal, body)
+    await audit.record(
+        principal=principal,
+        action="batch_expand",
+        investigation_id=investigation.id,
+        resolved_query={"job_id": started.id, **body.request.model_dump(mode="json")},
+        result_cardinality=0,
+        justification=body.justification,
+    )
+    return started
+
+
+@app.get("/v1/investigations/{investigation_id}/batch-expansions/{job_id}")
+async def get_batch_expansion(
+    investigation: InvestigationViewerDep,
+    job_id: str,
+    principal: PrincipalDep,
+    jobs: JobsDep,
+    views: CaseViewsDep,
+) -> BatchExpansion:
+    """The job as its requester is told it; anyone else's is not found (ADR-151 decision 4)."""
+    return await read_batch_expansion(jobs, views, investigation.id, job_id, principal)
 
 
 @app.get("/v1/investigations/{investigation_id}/views/{view_id}")
@@ -5189,6 +5457,14 @@ class SeedRequest(BaseModel):
     edges: list[Edge] = []
 
 
+class AddByIdsRequest(BaseModel):
+    """*Show all on graph* under an Ask & Chat answer (v0.6.0 #5): the ids its markers stand for.
+    Bounded by the working set's own cap, which the add counts after it reads (rule 2)."""
+
+    node_ids: list[NodeId] = Field(default_factory=list, max_length=50_000)
+    link_ids: list[str] = Field(default_factory=list, max_length=250_000)
+
+
 class ExpandBody(BaseModel):
     request: ExpandRequest
     justification: str | None = None
@@ -5229,6 +5505,43 @@ async def seed(
         result_cardinality=len(outcome.delta.nodes) + len(outcome.delta.edges),
     )
     return outcome
+
+
+@app.post(
+    "/v1/investigations/{investigation_id}/working-set/add-by-ids",
+    dependencies=[Depends(require_right(Right.INVESTIGATE))],
+)
+async def add_by_ids_route(
+    investigation: InvestigationEditorDep,
+    body: AddByIdsRequest,
+    principal: PrincipalDep,
+    working_set: WorkingSetDep,
+    history: HistoryDep,
+    audit: AuditDep,
+    valkey: Annotated[Valkey, Depends(get_valkey)],
+) -> AddedByIds:
+    """*Show all on graph* under an Ask & Chat answer (v0.6.0 #5): the answer's nodes and links put
+    on the canvas by id, as the case's reader may see them (`WorkingSetService.add_by_ids`, `seed`'s
+    own by-id reading; rule 3), and how many are not, never which. Past the working set's cap it is
+    refused with the typed `limit_exceeded` and its three choices, as any add is (rule 2)."""
+    added = await working_set.add_by_ids(investigation.id, body.node_ids, body.link_ids, principal)
+    await publish_delta(valkey, investigation.id, added.outcome.delta)
+    await _record_history_step(
+        working_set,
+        history,
+        investigation.id,
+        seq=added.outcome.delta.seq,
+        label=SEEDED,
+        principal=principal,
+    )
+    await audit.record(
+        principal=principal,
+        action="add_by_ids",
+        investigation_id=investigation.id,
+        resolved_query={"node_count": len(body.node_ids), "link_count": len(body.link_ids)},
+        result_cardinality=len(added.outcome.delta.nodes) + len(added.outcome.delta.edges),
+    )
+    return added
 
 
 @app.post(
@@ -5837,8 +6150,48 @@ async def confirm_node_route(
 class SuppressionMarkInput(BaseModel):
     investigation_id: str
     #: Why this node is proposed for suppression. Required and non-empty: an unexplained
-    #: mark is a puzzle for whoever finds it, and step two has to cite something.
-    reason: str
+    #: mark is a puzzle for whoever finds it, and step two has to cite something. Held here,
+    #: not only in the Glass's box (v0.5.2 route row S8): a reason of spaces alone, or none,
+    #: is refused (422).
+    reason: str = Field(max_length=1000)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_has_words(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("a suppression mark needs a reason")
+        return value.strip()
+
+
+@app.get(
+    "/v1/investigations/{investigation_id}/suppression-marks",
+    # Weighed against ADR-145 Amendment 4 decision 10, 14 November 2026: a mark's reason is an
+    # analyst's note on a record, beyond the Reports Viewer's Figures and boards, and only the
+    # canvas reads it, which only a holder of `investigate` is offered (`offeredViews`). So it
+    # names `investigate`, and the Reports Viewer is refused 403 `right_required` with the rest
+    # (`test_reports_viewer_journey.py`'s sweep).
+    dependencies=[Depends(require_right(Right.INVESTIGATE))],
+)
+async def list_suppression_marks(
+    investigation: InvestigationViewerDep,
+    principal: PrincipalDep,
+    working_set: WorkingSetDep,
+    audit: AuditDep,
+    marks: SuppressionMarksDep,
+) -> list[SuppressionMark]:
+    """The marks on this case's canvas, read back when it loads (v0.5.2 route row S7: a mark
+    survived a reload only in the store, so the menu offered the mark again and a second choice
+    overwrote it). Only the nodes of the working set this principal may see are asked about
+    (`suppression.marks_on_the_canvas`); a mark on any other node is never named (rules 3, 4)."""
+    found = await marks_on_the_canvas(working_set, marks, investigation.id, principal)
+    await audit.record(
+        principal=principal,
+        action="list_suppression_marks",
+        investigation_id=investigation.id,
+        resolved_query={},
+        result_cardinality=len(found),
+    )
+    return found
 
 
 @app.post(
@@ -6008,22 +6361,199 @@ async def restore_history_step(
 # --- search -------------------------------------------------------------------
 
 
+def get_search_index(request: Request) -> search_service.SearchIndexSetup | None:
+    """ADR-149: the index search asks, made once per process, or `None` where no OpenSearch is
+    configured (`OPENSEARCH_URL` or `OPENSEARCH_HOST`), and then every search takes the fallback
+    and says so. The client and the alias are the index's own (ADR-150 decision 7). A setting the
+    client refuses (no signing credentials, a malformed address) is logged and searched without
+    the index, never a 500 on every search; it is tried again after a minute."""
+    held = getattr(request.app.state, "search_index", None)
+    now = time.monotonic()
+    if held is not None and (held[0] is not None or now - held[1] < 60):
+        return held[0]  # type: ignore[no-any-return]
+    from services.search_index.client import SearchIndexConfig, search_client
+    from services.search_index.run import configured
+
+    setup = None
+    if configured():
+        try:
+            config = SearchIndexConfig.from_env()
+            setup = search_service.SearchIndexSetup(
+                # No retries: an unreachable index costs one short timeout, then the fallback.
+                searcher=search_service.opensearch_searcher(
+                    search_client(config, max_retries=0), config.alias
+                ),
+                schema=request.app.state.ontology,
+                scheme=request.app.state.handling_scheme,
+            )
+        except Exception:
+            logger.exception("the search index is configured but its client could not be made")
+    request.app.state.search_index = (setup, now)
+    return setup
+
+
+SearchIndexDep = Annotated[search_service.SearchIndexSetup | None, Depends(get_search_index)]
+
+
+async def get_search_pending(request: Request, index: SearchIndexDep) -> PendingIds:
+    """ADR-149 decision 2 (the orchestrator's ruling on page A): the nodes the index may hold at
+    older facts, from both of ADR-150's outboxes, which every index query leaves out in its own
+    filter. Read only where there is an index to ask; ids alone, never shown."""
+    if index is None:
+        return PendingIds(ids=frozenset(), complete=True)
+    return await pending_node_ids(
+        request.app.state.graph,
+        request.app.state.extraction_candidates,
+        limit=search_service.PENDING_LIMIT,
+    )
+
+
+SearchPendingDep = Annotated[PendingIds, Depends(get_search_pending)]
+
+
+def get_search_working_set(request: Request) -> WorkingSetService | None:
+    """The working set search reads the case's resolution threshold from (page A §2). The lifespan
+    always sets it; a test app without one merges nothing, and a test overrides this to merge."""
+    return getattr(request.app.state, "working_set", None)
+
+
+SearchWorkingSetDep = Annotated[WorkingSetService | None, Depends(get_search_working_set)]
+
+
+async def _search_tau(working_set: WorkingSetService | None, investigation_id: str) -> float | None:
+    if working_set is None:
+        return None
+    return await working_set.get_resolution_threshold(investigation_id)
+
+
+def case_search_with(
+    graph: GraphPort,
+    index: search_service.SearchIndexSetup | None,
+    *,
+    pending_of: Callable[[], Awaitable[PendingIds]],
+    names_of: Callable[[Principal], Awaitable[Mapping[str, str]]],
+    tau_of: Callable[[str], Awaitable[float | None]],
+) -> CaseSearch:
+    """*Whole case*'s search (ADR-098 Amendment 9; `SEARCH_RESPONSE_SHAPE.md` note 5): the same
+    service, the access filter built here from the asker's own principal (page A §1), the case's
+    threshold and the exclusion of what the index has not caught up with, as `POST …/search` has
+    them, called in-process, not over HTTP. Each part is read only when the search is called, so a
+    question that does not read the whole case costs nothing more. The leak test calls this, the
+    routes' own call site (`test_ask_whole_case_leak_live.py`)."""
+    from services.search_index.document import phonetic_codes
+
+    from .search_access import index_access_filter
+
+    async def search(
+        investigation_id: str, principal: Principal, body: SearchPageRequest
+    ) -> SearchPageResponse:
+        pending = await pending_of()
+        return await search_service.search_page(
+            body,
+            principal,
+            graph,
+            searcher=index.searcher if index is not None else None,
+            access_filter=index_access_filter(index.scheme, principal)
+            if index is not None
+            else None,
+            phonetic_codes=phonetic_codes,
+            types=index.types if index is not None else (),
+            case_datasets=await names_of(principal),
+            tau=await tau_of(investigation_id),
+            pending=sorted(pending.ids),
+            pending_complete=pending.complete,
+            schema=index.schema if index is not None else None,
+        )
+
+    return search
+
+
+def _case_search(
+    request: Request,
+    index: search_service.SearchIndexSetup | None,
+    datasets: DatasetStore,
+    working_set: WorkingSetService | None,
+) -> CaseSearch:
+    """`case_search_with` from the dependencies `POST …/search` uses."""
+
+    async def names_of(principal: Principal) -> Mapping[str, str]:
+        case = set(principal.datasets or ())
+        return {d.id: d.name for d in await datasets.list_for(principal) if d.id in case}
+
+    async def tau_of(investigation_id: str) -> float | None:
+        return await _search_tau(working_set, investigation_id)
+
+    async def search(
+        investigation_id: str, principal: Principal, body: SearchPageRequest
+    ) -> SearchPageResponse:
+        # The graph is read here, when the search is called, not when the route builds it: a
+        # question that does not read the whole case touches nothing of the search's.
+        built = case_search_with(
+            request.app.state.graph,
+            index,
+            pending_of=lambda: get_search_pending(request, index),
+            names_of=names_of,
+            tau_of=tau_of,
+        )
+        return await built(investigation_id, principal, body)
+
+    return search
+
+
 @app.post(
     "/v1/investigations/{investigation_id}/search",
     dependencies=[Depends(require_right(Right.INVESTIGATE))],
 )
 async def search_route(
     investigation: InvestigationViewerDep,
-    body: SearchRequest,
+    body: SearchPageRequest,
     principal: PrincipalDep,
     graph: GraphDep,
     audit: AuditDep,
-) -> SearchResponse:
-    result = await search_module.search(graph, body, principal)
+    datasets: DatasetsDep,
+    working_set: SearchWorkingSetDep,
+    index: SearchIndexDep,
+    pending: SearchPendingDep,
+) -> SearchPageResponse:
+    """ADR-149: the index when there is one, today's exact search otherwise, saying so. The
+    reader's access filter is built here from their own principal (page A §1) and goes into the
+    index's query; the case's threshold merges the visible hits (page A §2)."""
+    from services.search_index.document import phonetic_codes
+
+    from .search_access import index_access_filter
+
+    case = set(principal.datasets or ())
+    names = {d.id: d.name for d in await datasets.list_for(principal) if d.id in case}
+    try:
+        result = await search_service.search_page(
+            body,
+            principal,
+            graph,
+            searcher=index.searcher if index is not None else None,
+            access_filter=index_access_filter(index.scheme, principal)
+            if index is not None
+            else None,
+            phonetic_codes=phonetic_codes,
+            types=index.types if index is not None else (),
+            case_datasets=names,
+            tau=await _search_tau(working_set, investigation.id),
+            pending=sorted(pending.ids),
+            pending_complete=pending.complete,
+            schema=index.schema if index is not None else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     await audit.record(
         principal=principal,
         action="search",
-        resolved_query={"query": body.query},
+        resolved_query={
+            "query": body.query,
+            "group": body.group,
+            "filters": body.filters.model_dump(mode="json"),
+            "page": body.page,
+            "page_size": result.page_size,
+            "source": result.source,
+        },
         result_cardinality=len(result.nodes),
     )
     return result
@@ -6039,8 +6569,30 @@ async def suggest_route(
     principal: PrincipalDep,
     graph: GraphDep,
     audit: AuditDep,
+    index: SearchIndexDep,
+    pending: SearchPendingDep,
 ) -> SuggestResponse:
-    result = await search_module.suggest(graph, body, principal)
+    """ADR-059 Amendment 1: from the index when there is one, with the reader's own access filter
+    in its query; from the graph's prefix read otherwise, as before, saying a "starts with"
+    suggestion is limited. A prefix the index cannot ask (longer than its stored prefixes) or an
+    entity type the ontology does not have is refused with 422, never cut."""
+    from .search_access import index_access_filter
+
+    try:
+        result = await search_service.suggest_page(
+            body,
+            principal,
+            graph,
+            searcher=index.searcher if index is not None else None,
+            access_filter=index_access_filter(index.scheme, principal)
+            if index is not None
+            else None,
+            schema=index.schema if index is not None else None,
+            pending=sorted(pending.ids),
+            pending_complete=pending.complete,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     await audit.record(
         principal=principal,
         action="suggest",
@@ -6049,6 +6601,7 @@ async def suggest_route(
             "mode": body.mode,
             "ignore_case": body.ignore_case,
             "types": body.types,
+            "source": result.source,
         },
         result_cardinality=len(result.nodes),
     )
@@ -7489,6 +8042,10 @@ async def ask_question_route(
     principal_names: PrincipalNamesDep,
     views: CaseViewsDep,
     working_set: WorkingSetDep,
+    request: Request,
+    index: SearchIndexDep,
+    datasets: DatasetsDep,
+    search_working_set: SearchWorkingSetDep,
 ) -> QuestionAnswer:
     """Asks the model about the case's Documents and graph facts the analyst can see (ADR-098
     decision 4, ADR-129 decision 1): the selection and one link around it, or the whole view. What
@@ -7511,16 +8068,72 @@ async def ask_question_route(
         engine=body.engine,
         view_id=body.view_id,
         view_node_ids=in_view,
+        read_from=body.read_from,
+        case_search=_case_search(request, index, datasets, search_working_set),
     )
     await audit.record(
         principal=principal,
         action="ask_question",
         investigation_id=investigation.id,
-        resolved_query={"question_id": answer.id},
+        # The question's own row says it read the whole case; its search writes no second one.
+        resolved_query={
+            "question_id": answer.id,
+            "read_from": answer.read.read_from if answer.read is not None else None,
+        },
         result_cardinality=len(answer.candidates),
     )
     names = await principal_names.display_names([answer.author])
     return answer.model_copy(update={"author_name": names.get(answer.author)})
+
+
+@app.post(
+    "/v1/investigations/{investigation_id}/questions/will-read",
+    dependencies=[Depends(require_right(Right.ASK_MODEL))],
+)
+async def will_read_route(
+    investigation: InvestigationEditorDep,
+    body: WillReadRequest,
+    principal: PrincipalDep,
+    questions: QuestionsDep,
+    audit: AuditDep,
+    views: CaseViewsDep,
+    working_set: WorkingSetDep,
+    request: Request,
+    index: SearchIndexDep,
+    datasets: DatasetsDep,
+    search_working_set: SearchWorkingSetDep,
+) -> WillRead:
+    """ADR-098 Amendment 7, ADR-135 Amendment 12: what a question asked with this scope would read,
+    counted as the asker (rule 3), and the engine that would answer it as the routing decides, with
+    the engines that cannot and why. Nothing is sent to a model. The same right and case level as
+    asking, the same refusals (`nothing_to_read`, `read_from_unavailable`,
+    `question_too_long_to_search`, the typed `limit_exceeded`), so what it says is what asking would
+    do. Under *Whole case* the question as typed so far is sent too: its words are the search's."""
+    in_view = (
+        await _view_node_ids(views, working_set, investigation.id, body.view_id, principal)
+        if body.view_id is not None
+        else None
+    )
+    will = await questions.will_read(
+        investigation.id,
+        principal,
+        selected_node_ids=body.selected_node_ids,
+        selected_link_ids=body.selected_link_ids,
+        window=body.window,
+        engine=body.engine,
+        view_node_ids=in_view,
+        read_from=body.read_from,
+        question=body.question,
+        case_search=_case_search(request, index, datasets, search_working_set),
+    )
+    await audit.record(
+        principal=principal,
+        action="will_read_question",
+        investigation_id=investigation.id,
+        resolved_query={"read_from": will.read.read_from, "view_id": body.view_id},
+        result_cardinality=will.read.documents,
+    )
+    return will
 
 
 async def _view_node_ids(
@@ -8782,8 +9395,8 @@ async def build_basemap_route(
     own (`map_admin.build_basemap`), never a path typed in the Glass, and the provider is registered
     in the maps file. Streamed the same way Launch is (`harness/webapp.py`'s own `_launch_events`):
     one line of real progress at a time, the build's `progress` callback bridged into an SSE
-    generator via a queue. The gazetteer loads in one graph transaction, rolled back if anything
-    fails."""
+    generator via a queue. The gazetteer loads a batch to a transaction (v0.6.0 item 10), a failed
+    batch rolled back alone, and its dataset is registered only once the whole load is in."""
     body = await _map_admin_body(request, BuildBasemapInput)
     if body.region not in GEOFABRIK_REGIONS:
         raise HTTPException(
@@ -8806,7 +9419,6 @@ async def build_basemap_route(
     async def _events() -> AsyncIterator[bytes]:
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[str] = asyncio.Queue()
-        transaction: dict[str, str] = {}
         audited = False
 
         def _progress(line: str) -> None:
@@ -8816,11 +9428,9 @@ async def build_basemap_route(
             # ADR-147 Amendment 1: into the region's gazetteer dataset, which a case's Author
             # adds to a case for its place search; before P4 the places were in no dataset. The
             # dataset is registered once they are committed (`_settle`), so a failed build leaves
-            # none behind.
-            tx = await graph.begin_transaction()
-            transaction["tx"] = tx
+            # none behind. A batch to a transaction, each committed by the load (v0.6.0 item 10).
             report = await load_gazetteer(
-                extract, graph=graph, ontology=ontology, tx=tx, principal=principal,
+                extract, graph=graph, ontology=ontology, principal=principal,
                 load_id=f"load-osm-gazetteer-{body.region}",
                 dataset=map_places.gazetteer_dataset_id(body.region), analytics=analytics,
                 unit=gazetteer_unit,
@@ -8828,8 +9438,8 @@ async def build_basemap_route(
             return report.nodes_created, report.nodes_referenced, len(report.rejections)
 
         async def _settle() -> None:
-            # Committed before the provider is registered (`map_admin.build_basemap`).
-            await graph.commit_transaction(transaction.pop("tx"))
+            # The load committed its batches before the provider is registered
+            # (`map_admin.build_basemap`).
             await map_places.register_gazetteer_dataset(
                 datasets, body.region, by=principal.id, unit=gazetteer_unit
             )
@@ -8853,8 +9463,6 @@ async def build_basemap_route(
                     progress=_progress, tiles_root=admin.tiles_root, settle=_settle,
                 )  # fmt: skip
             except BaseException as exc:  # noqa: BLE001 - reported to the caller, not swallowed
-                if "tx" in transaction:
-                    await graph.rollback_transaction(transaction.pop("tx"))
                 return None, exc
             return result, None
 
@@ -9546,7 +10154,7 @@ async def set_site_grid(
         await graph.rollback_transaction(tx)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="grid cells were rejected by the recipe engine",
+            detail="grid cells were rejected by the pipeline engine",
         )
     await graph.commit_transaction(tx)
 
@@ -13776,21 +14384,21 @@ def _deployment_list_scheduler(application: FastAPI) -> DeploymentListScheduler:
     async def may_run(owner_id: str) -> str | None:
         try:
             owner = await resolve(owner_id)
-        except PrincipalRevoked:
-            return f"the schedule's owner, {owner_id}, can no longer sign in"
-        except Exception:  # noqa: BLE001 - said, not raised
-            return f"OspreyFlow could not act as the schedule's owner, {owner_id}"
+        except Exception as error:  # noqa: BLE001 - said, not raised
+            return list_owner_refusal_words(error, owner_id)
         if Right.LOAD_SCREENING_LISTS not in rights_for(owner.roles):
             return f"the schedule's owner, {owner_id}, no longer holds load_screening_lists"
         return None
 
     async def run(list_id: str, owner_id: str) -> ListImport:
+        # Audited as the person the schedule runs as, as ADR-133's scheduled refresh is: resolved
+        # before the import, so an owner who cannot be acted as by now (on Entra ID, past the 24
+        # hours since may_run asked) leaves no import standing without its audit row.
+        owner = await resolve(owner_id)
         done = await import_list(
             list_id, store=state.list_store, rows_kept=state.list_rows, trigger="schedule"
         )
         await _rules_on_list_refresh(state, done, DEPLOYMENT_WIDE)
-        # Audited as the person the schedule runs as, as ADR-133's scheduled refresh is.
-        owner = await resolve(owner_id)
         await state.audit.record(
             principal=owner, action="deployment_list_refreshed", investigation_id=None,
             resolved_query={"list_id": list_id, "outcome": done.outcome, "version": done.version,
@@ -14185,8 +14793,13 @@ async def read_alert_queue(
         principal=principal,
         action="read_alert_queue",
         investigation_id=investigation.id,
-        resolved_query={"status": status_filter, "kind": kind, "severity": severity, "show": show,
-                        "older_than_days": older_than_days},  # fmt: skip
+        resolved_query={
+            "status": status_filter,
+            "kind": kind,
+            "severity": severity,
+            "show": show,
+            "older_than_days": older_than_days,
+        },  # fmt: skip
         result_cardinality=len(rows),
     )
     rows = await _with_team_names(request, rows)
@@ -14652,8 +15265,12 @@ async def suppress_alert(
         principal=principal,
         action="alert_suppressed",
         investigation_id=investigation.id,
-        resolved_query={"alert_id": alert.id, "until": body.until.isoformat(),
-                        "reason": body.reason, "team": alert.routed_team},  # fmt: skip
+        resolved_query={
+            "alert_id": alert.id,
+            "until": body.until.isoformat(),
+            "reason": body.reason,
+            "team": alert.routed_team,
+        },  # fmt: skip
         result_cardinality=1,
     )
     return alert
@@ -14815,8 +15432,11 @@ async def raise_an_alert(
         action="alert_raised",
         investigation_id=investigation.id,
         resolved_query={
-            "alert_id": alert.id, "to": body.to, "dataset_id": body.dataset_id,
-            "severity": body.severity, "node_ids": alert.referent_node_ids,
+            "alert_id": alert.id,
+            "to": body.to,
+            "dataset_id": body.dataset_id,
+            "severity": body.severity,
+            "node_ids": alert.referent_node_ids,
         },  # fmt: skip
         result_cardinality=1,
     )
@@ -16019,8 +16639,10 @@ async def _use_the_rule_editor_handler(request: Request, exc: UseTheRuleEditor) 
 def _refuse_outside_just_me(sentence: RuleSentence, current: TypologyRule | None = None) -> None:
     if sentence.scope != "just_me":
         raise UseTheRuleEditor()
-    if current is not None and isinstance(current.params, SentenceRuleParams) and (
-        current.params.sentence.scope != "just_me"
+    if (
+        current is not None
+        and isinstance(current.params, SentenceRuleParams)
+        and (current.params.sentence.scope != "just_me")
     ):
         raise UseTheRuleEditor()
 
@@ -16604,9 +17226,7 @@ async def make_team_route(
     return team.model_copy(update={"members": [TeamMember(id=p.id, name=p.name) for p in holders]})
 
 
-async def _member_of(
-    identity_admin: PeopleDirectory, role_id: str, account: str
-) -> PersonAccount:
+async def _member_of(identity_admin: PeopleDirectory, role_id: str, account: str) -> PersonAccount:
     """`account` as one of the team's members, or a refusal in words: only a member, never a
     service account, may be lead or cover (ADR-112 Amendment 5 decisions 4 and 5)."""
     people = {p.id: p for p in await identity_admin.list_people()}
@@ -16864,20 +17484,22 @@ async def person_ownership_route(
 
 
 def _within_your_reach(
-    principal: Principal, access: AccessInput, handling_scheme: HandlingScheme
+    principal: Principal, access: AccessInput | PersonAccessInput, handling_scheme: HandlingScheme
 ) -> None:
     """Nobody is given more than the administrator holds (ADR-114 Amendment 5) — the dashboard rule
     (rule 3) for people: a clearance above one's own, or a handling code one cannot receive, would
-    be a way to read above them. Checked before the identity provider is asked."""
+    be a way to read above them. Checked before the identity provider is asked. A value not given
+    (ADR-148 Amendment 15: one Entra sends) is not being given, so is not checked."""
     order = list(handling_scheme.classification)
-    if access.clearance not in order:
+    if access.clearance is not None and access.clearance not in order:
         raise UnknownRoleError(f"{access.clearance} is not a classification of this deployment")
-    codes = access.receivable_handling_codes
+    codes = access.receivable_handling_codes or []
     unknown = [c for c in codes if c not in handling_scheme.handling_codes]
     if unknown:
         raise UnknownRoleError(f"not a handling code of this deployment: {', '.join(unknown)}")
-    if principal.clearance not in order or order.index(access.clearance) > order.index(
-        principal.clearance
+    if access.clearance is not None and (
+        principal.clearance not in order
+        or order.index(access.clearance) > order.index(principal.clearance)
     ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -16910,7 +17532,7 @@ def _may_give(
     if beyond := sorted(r.value for r in given if not giver_may_give(r, held)):
         raise RoleRefused(
             "beyond_your_rights",
-            f"you cannot give a right you do not hold: {', '.join(beyond)}",
+            f"you cannot give a right you do not hold: {rights_listed(beyond)}",
             rights=beyond,
         )
 
@@ -16947,8 +17569,76 @@ async def invite_person_route(
 
 @app.get("/v1/admin/sign-in", dependencies=[Depends(require_right(Right.MANAGE_PEOPLE))])
 async def sign_in_kind_route(identity_admin: IdentityAdminDep) -> SignInKind:
-    """ADR-148 Amendment 8: how people sign in here, so Admin › People offers invite (Keycloak) or
-    add by object id (Entra ID). Behind `manage_people`, as People is."""
+    """ADR-148 Amendment 8: how people sign in here, so Admin › People and roles offers invite
+    (Keycloak) or add by object id (Entra ID), and on Entra ID which values it sets itself
+    (Amendment 15). Behind `manage_people`, as People is."""
+    if isinstance(identity_admin, EntraPeopleAdmin):
+        sets = sorted(identity_admin.by_administrator)
+        return SignInKind(kind="entra", administrator_sets=sets)  # type: ignore[arg-type]
+    return SignInKind(kind="keycloak")
+
+
+def _guest_sign_in_admin(identity_admin: Any) -> EntraPeopleAdmin:
+    """Guests are Entra ID's (ADR-148 Amendment 17): on Keycloak there is no setting to read or
+    set."""
+    if not isinstance(identity_admin, EntraPeopleAdmin):
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "not_entra", "detail": "guests are admitted only where people sign in "
+                    "with Entra ID; this deployment signs in with Keycloak"},
+        )  # fmt: skip
+    return identity_admin
+
+
+@app.get(
+    "/v1/admin/sign-in/guests", dependencies=[Depends(require_right(Right.MANAGE_PEOPLE))]
+)
+async def guest_sign_in_route(identity_admin: IdentityAdminDep) -> GuestSignIn:
+    """ADR-148 Amendment 17: whether guest (B2B) accounts are admitted, who last changed it and
+    when. Behind `manage_people`, as People is; 409 `not_entra` on Keycloak."""
+    admitted, by, at = await _guest_sign_in_admin(identity_admin).guest_sign_in()
+    return GuestSignIn(admitted=admitted, changed_by=by, changed_at=at)
+
+
+@app.put(
+    "/v1/admin/sign-in/guests", dependencies=[Depends(require_right(Right.MANAGE_PEOPLE))]
+)
+async def set_guest_sign_in_route(
+    body: GuestSignInInput,
+    principal: PrincipalDep,
+    identity_admin: IdentityAdminDep,
+    custom_roles: CustomRolesDep,
+    audit: AuditDep,
+) -> GuestSignIn:
+    """ADR-148 Amendment 17: admit guest (B2B) accounts, or no longer; only an administrator of
+    people (`manage_people`) may. Audited with what it was and what it is now. Turning it off is
+    refused (409 `locks_out_administrators`) when it would leave no enabled member who has signed in
+    able to manage people: every one of them a guest."""
+    admin = _guest_sign_in_admin(identity_admin)
+    async with custom_roles.people_lock():
+        current = await custom_roles.current_rights()  # fresh under the lock, as disabling reads it
+        if not body.admitted:
+            try:
+                leaves_no_people_manager(
+                    [p for p in await admin.list_people() if not p.guest], current
+                )
+            except RoleRefused as error:
+                raise _role_refused(error) from None
+        before = await admin.set_guests_admitted(body.admitted, principal.id)
+    await audit.record(principal=principal, action="set_guest_sign_in",
+                       resolved_query={"before": before, "after": body.admitted},
+                       result_cardinality=1)  # fmt: skip
+    admitted, by, at = await admin.guest_sign_in()
+    return GuestSignIn(admitted=admitted, changed_by=by, changed_at=at)
+
+
+@app.get(
+    "/v1/admin/dashboards/sign-in", dependencies=[Depends(require_right(Right.MANAGE_DASHBOARDS))]
+)
+async def dashboards_sign_in_kind_route(identity_admin: IdentityAdminDep) -> SignInKind:
+    """ADR-148 Amendment 10: the same answer for Admin › Dashboards, which asks an application id on
+    Entra ID and nothing on Keycloak; behind `manage_dashboards`, as Dashboards is, so an
+    administrator of dashboards alone is not refused it."""
     return SignInKind(kind="entra" if isinstance(identity_admin, EntraPeopleAdmin) else "keycloak")
 
 
@@ -16983,19 +17673,35 @@ async def add_person_by_object_id_route(
 )
 async def set_person_access_route(
     user_id: str,
-    body: AccessInput,
+    body: PersonAccessInput,
     principal: PrincipalDep,
     identity_admin: IdentityAdminDep,
     handling_scheme: HandlingSchemeDep,
     audit: AuditDep,
 ) -> PersonAccount:
     """A person's clearance, unit and receivable handling codes — none above the administrator's."""
-    _within_your_reach(principal, body, handling_scheme)
-    person = await identity_admin.set_access(user_id, body)
+    if isinstance(identity_admin, EntraPeopleAdmin):
+        # ADR-148 Amendment 15: on Entra ID, only the values the claim mapping sources from the
+        # administrator, within the setter's own as the people store holds them (rule 3), audited
+        # in the store's own transaction. A body that sets nothing changes nothing, so writes no
+        # "set by" and no audit row with before equal to after.
+        if (body.clearance, body.org_unit, body.receivable_handling_codes) == (None, None, None):
+            raise UnknownRoleError("Access sets at least one of clearance, unit and handling codes")
+        _within_your_reach(principal, body, handling_scheme)
+        return await identity_admin.set_administrator_access(
+            user_id, principal, body, list(handling_scheme.classification), audit
+        )
+    if body.clearance is None or body.org_unit is None:
+        raise UnknownRoleError("Access sets a clearance and a unit together here")
+    codes = body.receivable_handling_codes or []
+    access = AccessInput(clearance=body.clearance, org_unit=body.org_unit,
+                         receivable_handling_codes=codes)  # fmt: skip
+    _within_your_reach(principal, access, handling_scheme)
+    person = await identity_admin.set_access(user_id, access)
     await audit.record(principal=principal, action="set_person_access",
-                       resolved_query={"user_id": user_id, "clearance": body.clearance,
-                                       "org_unit": body.org_unit,
-                                       "receivable_handling_codes": body.receivable_handling_codes},
+                       resolved_query={"user_id": user_id, "clearance": access.clearance,
+                                       "org_unit": access.org_unit,
+                                       "receivable_handling_codes": codes},
                        result_cardinality=1)  # fmt: skip
     return person
 
@@ -17297,8 +18003,9 @@ async def register_dashboard_route(
             detail={"error": "dashboard_above_your_clearance", "clearance": body.clearance},
         )
     made = await identity_admin.create_dashboard(
-        body.name, clearance=body.clearance, org_unit=body.org_unit
-    )
+        body.name, clearance=body.clearance, org_unit=body.org_unit,
+        application_id=body.application_id,
+    )  # fmt: skip
     await audit.record(principal=principal, action="register_dashboard",
                        resolved_query={"client_id": made.dashboard.client_id,
                                        "clearance": body.clearance, "org_unit": body.org_unit},
@@ -17312,11 +18019,29 @@ async def register_dashboard_route(
     dependencies=[Depends(require_right(Right.MANAGE_DASHBOARDS))],
 )
 async def remove_dashboard_route(
-    client_id: str, principal: PrincipalDep, identity_admin: IdentityAdminDep, audit: AuditDep
+    client_id: str,
+    principal: PrincipalDep,
+    identity_admin: IdentityAdminDep,
+    investigations: InvestigationsDep,
+    audit: AuditDep,
 ) -> Response:
+    """Removed, and every case grant its account holds revoked with it (ADR-148 Amendment 10), so a
+    dashboard registered again later finds no level waiting. The grants go first, while the
+    registration still names the account: if that fails, the dashboard stays registered and removing
+    it again revokes; if the removal then fails, it holds no level and is removed again. One not
+    registered revokes nothing and is refused by the identity provider's own answer. The audit row
+    counts the grants revoked; it never names their cases."""
+    accounts = [d.account_id for d in await identity_admin.list_dashboards()
+                if d.client_id == client_id]  # fmt: skip
+    revoked = [
+        case
+        for account in accounts
+        for case in await investigations.revoke_everywhere(account, by=principal)
+    ]
     await identity_admin.delete_dashboard(client_id)
     await audit.record(principal=principal, action="remove_dashboard",
-                       resolved_query={"client_id": client_id}, result_cardinality=1)  # fmt: skip
+                       resolved_query={"client_id": client_id, "grants_revoked": len(revoked)},
+                       result_cardinality=1)  # fmt: skip
     return Response(status_code=204)
 
 
@@ -17505,9 +18230,7 @@ async def manage_screening_lists(
     lists, and their refreshes, the reader is cleared for (ADR-146 Amendment 7; review item 3)."""
     cleared = ListClearance.of(principal, handling_scheme)
     found = await screening_lists.subscriptions(cleared=cleared)
-    updates = await screening_lists.updates(
-        org_unit=principal.org_unit, cleared=cleared, limit=20
-    )
+    updates = await screening_lists.updates(org_unit=principal.org_unit, cleared=cleared, limit=20)
     await audit.record(principal=principal, action="list_screening_lists", investigation_id=None,
                        resolved_query={"manage": True}, result_cardinality=len(found))  # fmt: skip
     return ScreeningLists(lists=found, updates=updates, can_manage=True)
@@ -17658,9 +18381,7 @@ async def refresh_screening_list_route(
                                        "version": update.version, "alerts": update.alerts,
                                        **await screening_lists.audit_marking(list_name)},
                        result_cardinality=update.alerts)  # fmt: skip
-    own = await screening_lists.update_for(
-        update.id, org_unit=principal.org_unit, cleared=cleared
-    )
+    own = await screening_lists.update_for(update.id, org_unit=principal.org_unit, cleared=cleared)
     if own is None:  # recorded a moment ago in the same store
         raise HTTPException(
             status_code=500,
@@ -18457,6 +19178,24 @@ async def delete_trend(
 @app.exception_handler(TrendDefinitionRefused)
 async def _trend_refused(request: Request, exc: TrendDefinitionRefused) -> JSONResponse:
     return JSONResponse(status_code=422, content={"error": "trend_refused", "detail": str(exc)})
+
+
+@app.exception_handler(AnalyticsFieldRefused)
+async def _analytics_field_refused(request: Request, exc: AnalyticsFieldRefused) -> JSONResponse:
+    """spec 08's A7: a field name that is not one is refused in the port's words, which name the
+    rule and never what was sent; on every route that reads the analytics store, not a bare 500."""
+    return JSONResponse(
+        status_code=422, content={"error": "field_name_refused", "detail": str(exc)}
+    )
+
+
+@app.exception_handler(AmountTotalOutOfRange)
+async def _amount_total_out_of_range(request: Request, exc: AmountTotalOutOfRange) -> JSONResponse:
+    """ADR-133 Amendment 10: a total of declared amounts too large to count exactly is refused in
+    the port's words, which name the limit and never the total or an amount; not a bare 500."""
+    return JSONResponse(
+        status_code=422, content={"error": "amount_total_out_of_range", "detail": str(exc)}
+    )
 
 
 @app.exception_handler(TrendLimitExceeded)
@@ -19256,6 +19995,24 @@ async def _identity_admin_refused(request: Request, exc: IdentityAdminRefused) -
     return JSONResponse(
         status_code=502, content={"error": "identity_provider_refused", "detail": str(exc)}
     )
+
+
+@app.exception_handler(SignInRefused)
+async def _sign_in_refused(request: Request, exc: SignInRefused) -> JSONResponse:
+    """A 401 with the refusal's words and its tag (ADR-148 Amendments 15, 17 and 18)."""
+    return JSONResponse(status_code=401, content={"detail": exc.words, "error": exc.error})
+
+
+@app.exception_handler(NoSuchPerson)
+async def _no_such_person(request: Request, exc: NoSuchPerson) -> JSONResponse:
+    """ADR-148 Amendment 15: a person not recorded in this tenant's people store."""
+    return JSONResponse(status_code=404, content={"error": "no_such_person", "detail": str(exc)})
+
+
+@app.exception_handler(AccessBeyondTheSetter)
+async def _access_beyond_the_setter(request: Request, exc: AccessBeyondTheSetter) -> JSONResponse:
+    """ADR-148 Amendment 15: the people store's own limit, answered as the route's own check is."""
+    return JSONResponse(status_code=403, content={"detail": {"error": exc.error, **exc.detail}})
 
 
 @app.exception_handler(PersonActionRefused)
@@ -20433,6 +21190,15 @@ async def _socket_standing(app_: Any, raw: Principal) -> int | None:
         return status.WS_1008_POLICY_VIOLATION
     if list(dict.fromkeys(stored.roles)) != list(raw.roles):
         return status.WS_1008_POLICY_VIOLATION
+    # ADR-148 Amendment 15: a value an administrator set, changed since the socket opened.
+    by_administrator: frozenset[str] = getattr(store, "by_administrator", frozenset())
+    if ("clearance" in by_administrator and stored.clearance != raw.clearance) or (
+        "org_unit" in by_administrator and stored.org_unit != raw.org_unit
+    ) or (
+        "handling_codes" in by_administrator
+        and sorted(stored.receivable_handling_codes or ()) != sorted(raw.receivable_handling_codes)
+    ):
+        return status.WS_1008_POLICY_VIOLATION
     return None
 
 
@@ -20671,6 +21437,12 @@ async def stream(websocket: WebSocket, investigation_id: str) -> None:
         return
     except PrincipalLookupUnavailable:
         await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
+        return
+    # ADR-148 Amendment 10: the socket asks no `get_principal`, so the route gate is its own here. A
+    # principal admitted to named routes alone (a dashboard identity) opens no stream; nothing of
+    # the case is read for it.
+    if raw.routes is not None:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
     # ADR-148 Amendment 8: a ticket minted before a disable or a change of roles stands no longer.
     if (refused := await _socket_standing(websocket.app, raw)) is not None:

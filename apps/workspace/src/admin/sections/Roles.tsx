@@ -78,7 +78,7 @@ function RoleForm({
         void onSave(name, [...chosen].sort()).catch((err: Error) => setProblem(err.message));
       }}
     >
-      <h3 style={{ margin: 0 }}>{title}</h3>
+      <h2 style={{ margin: 0 }}>{title}</h2>
       {problem && (
         <div role="alert" className="govuk-error-summary-like" style={{ border: "2px solid var(--danger)", padding: "var(--sp-8)" }}>
           <p style={{ margin: 0 }}>{`There is a problem: ${problem}`}</p>
@@ -271,7 +271,7 @@ export function Roles({ api }: { api: AdminApi }) {
           {builtIn.map((role) => (
             <tr key={role.id}>
               <td>
-                <span className="value">{role.label}</span>
+                <span className="admin-words">{role.label}</span>
                 {role.gives?.length ? (
                   <>
                     <br />
@@ -315,7 +315,7 @@ export function Roles({ api }: { api: AdminApi }) {
           {custom.map((role) => (
             <tr key={role.id}>
               <td>
-                <span className="value">{role.name}</span>
+                <span className="admin-words">{role.name}</span>
                 <br />
                 <span className="label">{`v${role.version}${role.team ? ` · team ${role.team.display_name}, ${role.team.mailbox}` : ""}`}</span>
               </td>

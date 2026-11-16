@@ -123,7 +123,7 @@ function Harness() {
         views={views}
         actions={
           <>
-            {(variant === "b" || variant === "c") && <MoreMenu label="More views" items={["Matrix", "Figures"]} />}
+            {(variant === "b" || variant === "c") && <MoreMenu label="More" items={["Matrix", "Figures"]} />}
             <button type="button" className="btn" aria-haspopup="dialog">Export <span aria-hidden="true">▾</span></button>
           </>
         }
@@ -149,7 +149,7 @@ function Harness() {
           </>
         }
         datasets={["Prison intel"]}
-        crossLink={{ label: "Open Prison intel in the Ingest Studio ↗", onFollow: () => undefined }}
+        crossLink={{ label: "Open this case's data in the Ingest Studio ↗", onFollow: () => undefined }}
       />
       <div role="toolbar" aria-label="Graph view" className="view-toolbar">
         <label className="label" style={{ display: "flex", alignItems: "center", gap: "var(--sp-6)" }}>

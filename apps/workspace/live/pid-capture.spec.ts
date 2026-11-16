@@ -20,7 +20,7 @@ import {
   monitoringTab,
   openCaseNamed,
   openQueuedAlert,
-  explorePlace, rail,
+  casesPanel, explorePlace, rail,
   reportsTab,
   runNowAndWait,
   scrollAllToTop,
@@ -114,7 +114,7 @@ export async function pickFromSearch(page: Page, text: string, pick: RegExp): Pr
 /** The working set is the server's, per case, so a shot starts by emptying what an earlier one
  * left, through the view's own Clear view and its confirmation. */
 export async function clearCanvas(page: Page): Promise<void> {
-  const clear = page.getByRole("button", { name: "Clear view" });
+  const clear = page.getByRole("button", { name: "Clear the graph" });
   // The case's saved working set arrives after the page draws: checked at once, Clear view was still
   // disabled and the saved nodes landed after it (357 of them, 1 November 2026). So it is checked
   // again until the canvas reads empty.
@@ -292,7 +292,7 @@ test("CAP-A1-J3", async ({ page }) => {
 
 test("CAP-A2-C1", async ({ page }) => {
   await freshCase(page);
-  await rail(page, "Cases").click();
+  await casesPanel(page);
   const brief = page.getByRole("region", { name: "Brief" });
   await expect(brief).toBeVisible();
   await brief.scrollIntoViewIfNeeded();
@@ -670,7 +670,13 @@ test("CAP-A2-C8-a", async ({ page }) => {
     for (let i = 0; i < 40 && !(await cited.first().isVisible().catch(() => false)); i++) {
       await page.waitForTimeout(30_000);
       if (await page.getByRole("button", { name: "Asking…" }).isVisible().catch(() => false)) continue;
-      await page.getByRole("button", { name: "Close Ask & Chat" }).click().catch(() => undefined);
+      // Ask & Chat is a page (ADR-145 Amendment 18): its Back leaves it, and the rail opens it again. The rail's press
+      // toggles, so Back is pressed only when the page is there, and waited for, never missed and then undone.
+      const back = page.getByRole("region", { name: "Ask & Chat" }).getByRole("button", { name: /^Back to / });
+      if (await back.isVisible().catch(() => false)) {
+        await back.click();
+        await expect(page.getByRole("region", { name: "Ask & Chat" })).toHaveCount(0);
+      }
       await rail(page, "Ask & Chat").click();
     }
     console.log(`C8-a answered after ${Math.round((Date.now() - started) / 1000)} s`);
@@ -996,11 +1002,12 @@ test("CAP-A2-C10M-e", async ({ page }) => {
   // hotlist, so it holds S1 alone.
   await signIn(page, "viewer");
   await openCase(page);
-  const boards = rail(page, "Dashboards");
+  // ADR-145 Amendment 15: the dashboards view is the view switch's Reports.
+  const boards = page.getByRole("group", { name: "View" }).getByRole("button", { name: "Reports", exact: true });
   test.skip(!(await boards.isVisible().catch(() => false)), "no dashboard for this case: P4 is a slide");
   await boards.click();
   await page.waitForTimeout(15_000);
-  // Dashboards on, the rail entry is there whether or not a board is registered for this case: the
+  // Reports on, the view switch's entry is there whether or not a board is registered for this case: the
   // place then says so, and that empty page was shot (2 November 2026). Skip it instead.
   test.skip(
     await page.getByText(/^No dashboard you may open/).isVisible().catch(() => false),
@@ -1052,9 +1059,9 @@ test("CAP-A2-C7", async ({ page }) => {
   await expect(name).toHaveValue(/, selected$/);
   const called = await name.inputValue();
   await page.getByRole("button", { name: "Save view" }).click();
-  await rail(page, "Cases").click();
+  await casesPanel(page);
   await page.getByRole("button", { name: `Open ${called}` }).click();
-  await expect(page.getByRole("region", { name: "Open view" })).toContainText(called, { timeout: 60_000 });
+  await expect(page.getByRole("region", { name: "Saved view" })).toContainText(called, { timeout: 60_000 });
   await page.waitForTimeout(6000);
   await shot(page, "CAP-A2-C7-b");
 });

@@ -83,7 +83,8 @@ INVENTORY: tuple[ServiceEntry, ...] = (
         created_in="ADR-114 B7",
         note=(
             "Only a Dockerfile: the job worker's image (ADR-114 Amendment 10 point 6), built "
-            "from services/api's code. Lite runs the same loop inside the Conduit."
+            "from services/api's code. Lite runs the same loop inside the Conduit: every profile "
+            "rendering no worker (local-lite, small) sets OSPREY_JOB_WORKER=conduit."
         ),
     ),
     ServiceEntry(
@@ -140,6 +141,18 @@ INVENTORY: tuple[ServiceEntry, ...] = (
         note=(
             "Imported by services/api/evaluation.py, resolution_trigger.py, app.py and "
             "working_set/service.py. Ships inside the api image."
+        ),
+    ),
+    ServiceEntry(
+        directory="services/search_index",
+        kind=Kind.LIBRARY,
+        entrypoint=None,
+        imported_by=("services/api",),
+        created_in="v0.5.2 (ADR-150)",
+        note=(
+            "The search index feed: run by services/api/worker_main.py where an OpenSearch is "
+            "configured, and by scripts/rebuild_search_index.py and scripts/search_index_drift.py. "
+            "Ships inside the api image."
         ),
     ),
     ServiceEntry(

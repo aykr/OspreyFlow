@@ -21,8 +21,15 @@ const CONTACTS = JSON.parse(
   row_template: unknown; unmapped_fields: { field: string; note?: string }[] };  // prettier-ignore
 const HARNESS = "/keyboard/ingest-studio-harness.html";
 
+/** A Studio button is disabled while the pipeline's last save is answered (`PipelineStudio`'s `busy`),
+ * and a disabled button takes neither focus nor Enter: pressed then, the press is lost and nothing is
+ * sent. So a person waits for it to be free, as this does, before pressing it (as `applyStep` below
+ * always did). Found on CI under load: *Apply extract settings* pressed while the save of the Extract
+ * just added was still answered, so no save ever carried the library. */
 async function press(page: Page, name: string, exact = true) {
-  await page.getByRole("button", { name, exact }).focus();
+  const button = page.getByRole("button", { name, exact });
+  await expect(button).toBeEnabled();
+  await button.focus();
   await page.keyboard.press("Enter");
 }
 
@@ -1133,7 +1140,7 @@ test("a pipeline is handed to an orchestrator by keyboard, its quota and DAG rea
   const pipeline = region.getByRole("combobox", { name: "Pipeline to orchestrate" });
   await pipeline.focus();
   const first = await pipeline.inputValue();
-  await region.getByLabel("The orchestrator's client").focus();
+  await region.getByLabel("The orchestrator's sign-in ID").focus();
   await page.keyboard.type("syn-airflow");
   await region.getByRole("button", { name: "Mark owned externally" }).focus();
   await page.keyboard.press("Enter");

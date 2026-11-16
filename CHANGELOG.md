@@ -6,6 +6,198 @@ update. Work not yet in a release is listed under *Unreleased*.
 
 ## Unreleased
 
+## v0.6.0 — 2026-11-18
+
+**v0.6.0 is installed fresh: there is no upgrade to it from any earlier version.**
+
+The release that searches. Search runs on OpenSearch, with each reader's access inside every query, and
+every change to the graph reaches the index in the graph's own transaction. It was measured on a
+client-size synthetic load of about 281,000 people, and each search met its budget. On the `cloud-platform`
+profile, scheduled runs, reporting and the data-safety fixes are in. The Glass is easier to find your way
+around: one view switch, a case line that says what is open, and "view" kept for saved views alone.
+
+**Before you install.**
+- **A new deployment, not an earlier one moved.** Install v0.6.0 where no OspreyFlow deployment is, or
+  into a new namespace on `cloud-platform`. A deployment made by an earlier release stays on that release.
+  `ospreyflow update`, an install over an existing deployment and the rendered `INSTALL.md` each refuse
+  an earlier one, in words, before anything is changed ("v0.6.0 is installed fresh; this deployment is
+  v0.5.1, and nothing moves it onto v0.6.0…"). A deployment at v0.6.0 or later is not refused.
+- **The search index is built from the graph** on `install`, by `ospreyflow start --build` (its last
+  step) and after a restore, wherever the deployment searches with OpenSearch (`components.search:
+  opensearch`, the default). A build that fails fails the install, saying so.
+- **On `cloud-platform`, `INSTALL.md` builds the index by a Job** once the Conduit and the workers are
+  rolled out (administration guide §6a.1). With reporting on, Superset and the report sync need Entra
+  registrations of their own, and `INSTALL.md` counts them.
+- **Hosted model engines are bounded at 120 seconds a call, and the deployment's own model at 900**
+  (administration guide §10), set in `deployment.env` on Lite and Small.
+- **A model engine's key is entered in Admin › Models** (**Enter key**, then **Set the key**), write-only,
+  kept by the model gateway alone and used with nothing restarted. `ospreyflow models key` does the same
+  from the command line. A key given at install is handed to the gateway, and its line leaves
+  `deployment.env`.
+
+**Search (ADR-149, ADR-150).**
+- **Search on OpenSearch**, with the reader's clearance, handling codes, the case's datasets and a
+  document's owning unit in every query, never applied after the answer. Names are found with typos,
+  variants and sounds-like matches, and full text with the passage highlighted. Ranking is strict, by
+  tier, with no word-rarity scoring.
+- **The index feed:** every load, merge, new version, promotion and deletion reaches the index through an
+  outbox written in the graph's own transaction. A rebuild from the graph and a drift check come with it.
+- **The search results page,** over the view: groups counting records (so *All* need not equal their sum,
+  and the page says so), **Show on graph** and **Open**, and an over-long query refused with its limit
+  named.
+- **Suggestions as you type** fill their page, case-sensitive ones included. When they are limited, the
+  line says why.
+- **Without an index** (`postgres-fulltext`), or while OpenSearch does not answer, search falls back to
+  the graph's exact search, up to 100 matches, and says so. Its candidates are found by index first
+  (ADR-124 Amendment 21), so it stays inside its 5-second budget at client size.
+- **Ask & Chat's *Whole case*** reads the case through the search service, as the asker.
+
+**Measured** (step 4, ADR-149 Amendment 2: the shipping code, at the poc shape's limits, p50 / p95).
+- Suggestions 56 / 61 ms (budget 300 ms); a name search 111 / 126 ms (budget 1 s); full text 144 /
+  184 ms (budget 1.5 s); an exact identifier ranked first 117 / 144 ms (budget 1 s).
+- A drawn node searchable in 1.0 / 2.1 s (budget 5 s). With OpenSearch stopped mid-session, every search
+  fell back and said so, the slowest in 1.5 s.
+- **The leak test at scale:** in 500 cases, nothing a part-cleared reader may not see was in their
+  results, counts, suggestions or snippets, and a fully cleared control found each hidden record.
+- Not measured here: the suggestion list in a browser, the full rebuild and drift check on the whole load,
+  and each container's peak.
+
+**The `cloud-platform` profile (ADR-148).**
+- **Scheduled runs on Entra ID:** a schedule, a watched folder, *Run now*, `ospreyflow run`, a scheduled
+  rule, the KYC check, a list's refresh and a watch run as their owner. Roles, and whether the owner is
+  disabled, are read from *People and roles* at each run. Access comes from the owner's last sign-in and
+  is refused past 24 hours, in words.
+- **Reporting:** Superset and the report sync, one copy each, signed in with Entra ID. Embedded boards are
+  read through the guest token, with each dashboard identity's rows alone.
+- **OpenSearch on the poc shape:** two nodes, reached by the namespace's IAM role with SigV4
+  (`opensearch_signing`), no fine-grained access control, and rebuilt rather than backed up.
+- **Data safety:** the shared volume in the backup set, and the standard shape's Ingest root too. RDS's
+  point-in-time restore is 35 days, and the backup sets expire at 34, a day inside it.
+- **The administrator fallback:** where Entra sends no clearance, unit or handling codes, an
+  administrator sets them, never above their own. **Guest accounts** are refused until a people manager
+  turns them on for the tenant. **A token of the other version** is refused in words.
+- **Amazon Bedrock is London-only:** the models AWS serves in-Region there (Amazon Nova and the Titan
+  embeddings), not current Claude models, which London serves only through AWS's EU and global profiles.
+  Claude through the EU profile is not offered.
+- **The run API admits an orchestrator only with this API's app role `OspreyFlow.Run`** (ADR-148
+  Amendment 20). The client's Entra administrator defines it on the API's registration (allowed member
+  types: Applications) and grants it to the orchestrator's own application with admin consent, as the
+  rendered `INSTALL.md`'s *What it needs* says. Any other application of the tenant is refused (403), in
+  words saying where to grant it.
+- **`ospreyflow run` on Entra ID sends the API's scope,** `OSPREY_TOKEN_SCOPE`: the API's application ID
+  URI followed by `/.default`. Without it Entra ID issues no token (AADSTS1002012), and the command says
+  so. Keycloak needs none.
+- **The poc manifest:** one source for the shape's containers, Jobs, images, registry, managed services,
+  Entra registrations and egress, held to the render both ways. `seed_poc` seeds the named case with the
+  first administrator as its author.
+
+**The Glass.**
+- **Navigation** (ADR-145 Amendments 15 and 17). The rail holds panels alone. One view switch in the top
+  bar: Graph, Map, Drawing board and Reports, with the rest under **More**. The bar stays one line high,
+  folding less-used views into More. The case line reads "Case ‹name› · Saved views (n) · reads
+  ‹dataset›".
+- **Fewer rows above the graph** (ADR-145 Amendment 19). The case line says what is on the graph,
+  "Whole case" or "Saved view: ‹name›" with **Details ▾** and **Back to the whole case**, so there is no
+  strip over the graph, and it stays one line on a narrow window. **Match strictness** is a control in the
+  graph's toolbar. **Hide toolbar** gives the graph the toolbar's row; **Show toolbar** or T, with the graph
+  selected, brings it back, and the choice is remembered for you in this browser. The Map has the buttons.
+- **Saved views:** "view" now means a saved view alone. **Back to the whole case** is on the case line,
+  which names the view open. The list starts with *The whole case*, and
+  a view saved under the default name is told apart by its first item and when it was saved. The graph
+  toolbar's *Views* menu is gone (ADR-144 Amendment 6), and *Clear view* is **Clear the graph**.
+- **A batch job past the working set's cap** (ADR-151): the expansion runs on the server as you, and its
+  result is saved as a private view of the case.
+- **Merged records arrive as one** when they enter the graph, worked out for each reader from what they
+  may see (ADR-124 Amendment 19). A view or a batch result past about 10,000 nodes now opens with its
+  links (ADR-124 Amendment 20).
+- **The selection's actions,** one set in the bar and the menu, with **Expand by link type**.
+- **Mark for suppression** says it hides nothing yet. It asks why, keeps the reason, survives a reload and
+  offers **Remove suppression mark**.
+- **Help** opens its panel from every view. The map's attribution is readable in every look. The version
+  shown is the code's own. Every panel and menu is on the page's own type scale, and no screen carries an
+  internal note.
+- **The GOV.UK look's type:** headings, labels and controls are on one scale, in both looks. Names are
+  in the page's face, and only values and code are in mono.
+- **Words, not codes:** a hosted engine's refusals and time-outs; a sign-in refused for an access value
+  not set, a token-version mismatch or a guest; an analytics field refused with a 422; the Ingest Studio's
+  messages saying *pipeline*; a Studio SQL step stopped at its time limit; and only an administrator may
+  give the administrator role.
+- **Ask & Chat is a page** (ADR-145 Amendment 18): it opens over the view as the search results page does,
+  with **Back to ‹view›** first and focus on its heading, the view kept beneath it and inert. The results
+  page and the Ask & Chat page replace each other, and Back from either returns to the view. Opening it
+  while a document is open closes the document and shows the page. **Show all on graph** closes the page
+  and puts focus on the canvas.
+- **Ask & Chat's earlier questions** collapse to their lines, the newest answer open; asking a new
+  question closes the earlier ones, and a closed line says how many proposals in it are left to decide.
+- **Under an Ask & Chat answer, Show all on graph** puts every item its markers stand for on the case's
+  graph, selected together; what cannot be shown is counted, never named. **Save as a view** saves them
+  as a saved view of the case, named from the question.
+
+**Rules and watches.**
+- **What raises alerts** says why a hotlist or watch stopped, in the same words as under *Stopped*.
+- **A watch stays active** until three unreachable evaluations in a row (ADR-044 Amendment 2), and a
+  stopped hotlist or watch shows why beside its badge.
+
+**The local basemap (ADR-147), for operators building one.**
+- **The gazetteer holds settlements alone:** OSM's `place` of city, borough, town, village, hamlet,
+  isolated_dwelling, suburb, quarter or neighbourhood. For Great Britain that is 56,486 places of about
+  1.06 million named points; farms, localities and points of interest are left out.
+- **The places load 5,000 to a transaction.** A failed batch is rolled back alone and stops the load, and
+  the gazetteer's dataset is registered only once the whole load is in. planetiler runs with a 2 GB heap.
+- **The places' points are written when the Conduit is stopped.** The build opens the analytics store as
+  the Conduit does; while a running Conduit holds DuckDB, the build goes on without the points and says so.
+- **Two stages, so most of a build runs beside a working deployment:** `python -m services.api.map_admin
+  build <region> --unit <unit> --by <who> --stage tiles` downloads the extract, runs planetiler and saves
+  the settlements beside it. It checks no unit, reaches no database and reads no settings, so it runs as a
+  bare `docker run` of the Conduit's image with only the tiles folder mounted, registering nothing
+  (`--unit` is still given). `--stage places`, in a one-off container of the deployment's own Conduit with
+  the Conduit stopped, checks the unit, loads that file with its points and registers the provider; without
+  the first stage's files it is refused in words. `ospreyflow map build` is still the whole build.
+- **What Great Britain takes** (measured on a 16-core server): a 2.1 GB download, planetiler 7 min 18 s
+  at a peak of 3.0 GB of memory, the load 37 min at 2.4 GB, and about 5 GB of disk, 3.5 GB of which can be
+  removed afterwards.
+
+**Images and the release.**
+- **Every image's distribution upgrade is made again each day wherever it is built:** `ospreyflow start
+  --build`, install and apply, `ospreyflow images push`, the Makefiles, CI and the release workflow each
+  pass the day's date (`OSPREY_UPGRADE_STAMP`), so a builder's cached copy of that layer can no longer keep
+  a distribution's older fixes.
+- **The Superset image's PostgreSQL client libraries** (libpq, libecpg and libpgtypes) are at
+  15.20-0+deb12u1, which fixes 192 HIGH CVEs found at 15.19, and its build stops, in words, if any is older.
+- **A release is made by the product repository's own workflow,** which stops if the tag is not the
+  code's own `VERSION`.
+
+**Fixed.**
+- **The Glass no longer throws its page away** when a search draws under React's StrictMode.
+- **On Lite, where no worker runs,** the Conduit runs every job type's loop.
+- **The graph adapter's write path** finds items by type index, so a load's time grows with its own size
+  alone (ADR-124 Amendment 18).
+- **The search results page is drawn over the graph's toolbar and zoom**, in every look; before, they
+  showed through it.
+- **People are matched again where no person has a date of birth.** If none of a deployment's people
+  had one (every source loaded without that column), the matching run for people failed every time,
+  without saying so, and no two records of one person were ever linked. People with a date of birth
+  are matched as before.
+- **The report sync reaches a Valkey that needs a password or TLS.** On the cloud-platform shape, where
+  Valkey is the platform's own over TLS with a password, it was refused as soon as a dashboard was
+  registered, and restarted again and again without pulling anything. It now opens Valkey as the rest
+  of OspreyFlow does. The Lite and Small shapes were not affected.
+- **A Reports Viewer reads in Superset and changes nothing there.** Superset's own Gamma role, which a
+  Reports Viewer was given, let them save dashboards and charts. They are now given a read-only role, and
+  so is every account at its first sign-in. A builder of reports reads every board's figures in Superset,
+  whatever the case or clearance, so the guides now say to give that right only to people cleared for
+  them all.
+- **The POC seed (`INSTALL.md` step 9) can reach the buckets.** On the cloud-platform shape the seed's Job
+  ran with no service account and without the deployment's bucket prefix. So the HMP seed was refused
+  at the staging bucket, and the seed could never succeed. It now runs as the Conduit's own account,
+  with the same bucket prefix and the same access to S3.
+- **A failed POC seed now ends step 9 failed.** The step went on to rebuild the search index after a
+  seed that had failed, and then ended as if it had succeeded. It now stops after a failed seed, and
+  its last line says that the seed did not succeed.
+- **Step 6's token-version check now reads every Conduit pod's log.** It read the log of one pod alone,
+  and the cloud-platform shape runs two, so it could say that no sign-in had been refused while the other
+  pod was refusing every one.
+
 ## v0.5.1 — 2026-11-14
 
 The release a shared Kubernetes platform installs from. The `cloud-platform` profile's proof-of-concept
@@ -16,19 +208,14 @@ Entra ID on that profile. The workspace gains a reworked left rail, a Views menu
 in the GOV.UK look, and a refresh that keeps you signed in and where you were.
 
 **Before you update.**
-- **On v0.5.0, the `ospreyflow` command fails to start** ("No module named 'httpx'"), and that includes
-  `ospreyflow update`. Repair it once, in the checkout's folder, before anything else:
-  `uv tool install --force --editable --with httpx ./cli`, then `ospreyflow --help` to check it starts.
-  If `uv` is not to hand, `cd cli && ../.venv/bin/python -m ospreyflow update --name <deployment>` runs the
-  same update from the checkout's own environment.
 - **Back up first,** as for every update: `ospreyflow update` takes its own backup and rolls back if
   anything fails.
 - **Small and Lite deployments: the deployment's PostgreSQL restarts once** with a higher
-  `max_connections` (660), rendered by the update's own files step from what the deployment's own services
+  `max_connections` (660 on Small), rendered by `ospreyflow apply` from what the deployment's own services
   hold (ADR-114 Amendment 43). Nothing else to do.
-- **After the update, put the command back as `install.sh` makes it:** `uv tool install --force --editable
-  ./cli` in the checkout's folder (administration guide §6a). From v0.5.1 the command loads only the
-  standard library and PyYAML again; the `--with httpx` from the repair above is then harmless.
+- **The `ospreyflow` command is installed with `uv tool install ./cli`** (administration guide §6a). An
+  install made earlier keeps working; if `ospreyflow --help` fails with "No module named 'httpx'", update
+  the checkout. The command loads only the standard library and PyYAML again.
 
 **The `cloud-platform` profile (ADR-148), as installed and checked on kind.**
 - The install and decommission runbooks, rendered for the deployment, were run block by block. The fixes

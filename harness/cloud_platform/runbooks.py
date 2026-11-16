@@ -39,8 +39,10 @@ from harness.cloud_platform.connections import (  # noqa: F401 - the figures, re
 from harness.cloud_platform.decommission_check import DISK_NAMESPACE_TAG, KINDS
 from harness.cloud_platform.settings import PlatformSettings
 from harness.cloud_platform.terraform import BUCKETS, RDS_INSTANCE_CLASS, ecr_repositories
-from harness.cloud_platform_backups import BUCKET_SUFFIX, KEPT_AT_DECOMMISSION
-from schemas.deployment import OspreyConfig, generated_folder
+from harness.cloud_platform_backups import BUCKET_SUFFIX, EXPIRE_DAYS, KEPT_AT_DECOMMISSION
+from harness.fresh_only import FRESH_FROM
+from principal_auth import TOKEN_VERSION_LOG
+from schemas.deployment import OspreyConfig, SearchBackend, generated_folder
 
 RELEASE = "ospreyflow"
 CHART = "deploy/helm/ospreyflow"
@@ -49,10 +51,173 @@ RENDER = '"$PY" -m harness.render --config "$CONFIG"'
 _FENCE = re.compile(r"^```bash( platform)?\n(.*?)^```\n", re.S | re.M)
 
 
+def _bi(values: dict[str, Any]) -> str | None:
+    return next((r["host"] for r in values["ingress"]["rules"] if r["service"] == "superset"), None)
+
+
+_COUNT = {2: "two", 3: "three", 4: "four"}
+
+
+def entra_registrations(config: OspreyConfig) -> int:
+    """The app registrations the client's Entra administrator makes for this deployment (the poc
+    manifest's `entra` list): the Glass and the API always, Superset's own and the report sync's
+    where reporting renders them (ADR-148 Amendments 8, 9 and 10)."""
+    return 2 + int(config.reporting.superset) + int(config.reporting.sync)
+
+
+def _reporting_registrations(config: OspreyConfig, values: dict[str, Any]) -> str:
+    """ADR-148 Amendments 9 and 10: what the client's Entra administrator registers for Superset and
+    the report sync, before step 2 (whose Terraform asks for their secrets); and Amendment 20's app
+    role for an orchestrator's own registration."""
+    cp = config.cloud_platform
+    assert cp is not None and cp.claims is not None
+    claims, parts = cp.claims, []
+    if config.reporting.superset:
+        parts.append(
+            f"**For Superset, before step 2** (ADR-148 Amendment 9): a third app registration, Superset's own (application id\n"
+            f"`{claims.superset_client_id}`), a web application whose redirect URI is\n"
+            f"`https://{_bi(values)}/oauth-authorized/entra`, with a client secret, and granted this API's\n"
+            f"delegated scope `{claims.scope}` with admin consent. Its secret is step 2's\n"
+            f"`superset_oidc_client_secret`. Superset reads who signed in from the Conduit, so its roles are\n"
+            f"the person's rights here: `administer_system` is Superset's Admin, `manage_dashboards` its\n"
+            f"builder (Alpha), `read_reports` its read-only Gamma, and a person with none of them is not let in."
+        )
+    if config.reporting.sync:
+        parts.append(
+            "**For the report sync, before step 2** (ADR-148 Amendment 10): on this API's registration, an app role\n"
+            "`Dashboard.Read` (allowed member types: Applications). Each dashboard identity is an app\n"
+            "registration of its own with a client secret, granted `Dashboard.Read` with admin consent;\n"
+            "step 6a registers it here. Until there is one, step 2's `report_sync_dashboards` is `[]`."
+        )
+    # ADR-148 Amendment 20: the orchestrator's registration is the client's own, not one of the
+    # deployment's (entra_registrations does not count it), so it is said whatever reporting renders.
+    parts.append(
+        "**For an orchestrator that runs pipelines** (ADR-141 decision 10, ADR-148 Amendment 20): on this API's\n"
+        "registration, an app role `OspreyFlow.Run` (allowed member types: Applications). The orchestrator's\n"
+        "own app registration, the client's and not one of this deployment's counted registrations, signs in\n"
+        "with the client-credentials grant and is granted `OspreyFlow.Run` as an application permission with\n"
+        "admin consent; without it the run API refuses its token, in words saying where to grant it.\n"
+        "`ospreyflow run` signs it in with its own application id and secret (`OSPREY_CLIENT_ID`,\n"
+        f"`OSPREY_CLIENT_SECRET`), `OSPREY_TOKEN_URL` set to\n"
+        f"`https://login.microsoftonline.com/{claims.tenant_id}/oauth2/v2.0/token` and `OSPREY_TOKEN_SCOPE` to\n"
+        f"`{claims.id_uri}/.default`, the API's application ID URI and `/.default`, without which Entra ID issues\n"
+        "no token."
+    )
+    return ("\n" + "\n\n".join(parts) + "\n") if parts else ""
+
+
+def _reporting_section(config: OspreyConfig, values: dict[str, Any]) -> str:
+    """ADR-148 Amendment 11: reports on this profile, after sign-in."""
+    if not (config.reporting.superset or config.reporting.sync):
+        return ""
+    lines = ["## 6a. Reports\n"]
+    if config.reporting.superset:
+        lines.append(
+            f"Superset answers at `https://{_bi(values)}`, signing people in with Entra ID as its own\n"
+            "registration; its settings live in its own database, `superset`, which it makes on the managed\n"
+            "PostgreSQL at its first start, beside `ospreyflow` and the gateway's `litellm`. The reports\n"
+            "themselves are the schema `osprey_reports` inside `ospreyflow`, as on Small.\n"
+        )
+    if config.reporting.sync:
+        lines.append(
+            "**A dashboard identity**, for each dashboard the report sync fills: once its app registration\n"
+            "exists and holds `Dashboard.Read` (*What it needs*), an administrator registers it in\n"
+            "Admin › Dashboards by its application id, with a name (the dashboard's, lower case letters,\n"
+            "digits and hyphens), its clearance, unit and handling codes: it reads no more than those allow.\n"
+            "Then add it to the Terraform's `report_sync_dashboards`, a JSON list, as\n"
+            "`{\"client_id\": \"<its application id>\", \"secret\": \"<its client secret>\"}`, apply, and restart\n"
+            "the report sync:\n\n"
+            "```bash later\n"
+            'kubectl -n "$NS" rollout restart deploy/report-sync\n'
+            'kubectl -n "$NS" rollout status deploy/report-sync --timeout 10m\n'
+            "```\n"
+        )
+    lines.append(
+        "**Power BI, if the client uses it** (an option, not a step): Power BI reads the schema\n"
+        "`osprey_reports` in `ospreyflow` through a read-only login of its own, made on the managed\n"
+        "PostgreSQL by the platform's team (`GRANT USAGE ON SCHEMA osprey_reports` and `SELECT ON ALL\n"
+        "TABLES IN SCHEMA osprey_reports`, nothing else), reached from wherever Power BI's gateway runs.\n"
+        "It reads every row of the mart: who may hold that login is the client's decision.\n"
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _opensearch_needs(config: OspreyConfig, platform: PlatformSettings) -> str:
+    """v0.5.2 step 3a: what the namespace's OpenSearch needs of the client, where the deployment
+    searches with it."""
+    if config.components.search is not SearchBackend.OPENSEARCH:
+        return ""
+    signing = (
+        "Every request is signed with SigV4 as the namespace's IAM role (IRSA): the domain's access "
+        "policy admits that role alone, with no fine-grained access control, so there is no user or "
+        "master password to keep."
+        if platform.opensearch_signing == "sigv4"
+        else "The platform's own proxy signs the requests to it (`opensearch_signing: none`), so the "
+        "pods send them unsigned to the address its secret names."
+    )
+    return (
+        "**The OpenSearch domain** (OpenSearch 2.17, two `t3.medium.search` data nodes with 50 GiB each, "
+        "one in each of two availability zones) needs two private subnets, in two availability zones, "
+        "in `subnet_ids`, and is reached inside the VPC on 443. " + signing + " The index is not "
+        "backed up: it is rebuilt from the graph, and a restore ends with that rebuild.\n"
+    )
+
+
+def _opensearch_goes(config: OspreyConfig) -> str:
+    if config.components.search is not SearchBackend.OPENSEARCH:
+        return ""
+    return (
+        " The OpenSearch domain goes with them, and its index is not kept: it was never backed up,"
+        " and a deployment made again rebuilds it from its graph."
+    )
+
+
+def _destroy_backups(namespace: str) -> str:
+    """The backups bucket emptied of every version and removed, then its key's deletion scheduled:
+    step 7 with `BACKUPS=destroy`, and step 9 when a kept retention ends (one text, so the two cannot
+    differ)."""
+    return f"""\
+B="${{PREFIX}}{BUCKET_SUFFIX}"
+aws s3api delete-bucket-policy --region "$REGION" --bucket "$B"
+while :; do
+  aws s3api list-object-versions --region "$REGION" --bucket "$B" --max-items 500 --output json \\
+    --query '{{Objects: [Versions, DeleteMarkers][][].{{Key: Key, VersionId: VersionId}}}}' > "$WORK/versions.json"
+  grep -q '"Key"' "$WORK/versions.json" || break
+  aws s3api delete-objects --region "$REGION" --bucket "$B" --delete "file://$WORK/versions.json" >/dev/null
+done
+aws s3api delete-bucket --region "$REGION" --bucket "$B"
+ACCOUNT=$(aws sts get-caller-identity --region "$REGION" --query Account --output text)
+printf '{{"Version": "2012-10-17", "Statement": [{{"Sid": "Administer", "Effect": "Allow", "Principal": {{"AWS": "arn:aws:iam::%s:root"}}, "Action": "kms:*", "Resource": "*"}}]}}' "$ACCOUNT" > "$WORK/key-policy.json"
+KEY=$(aws kms describe-key --region "$REGION" --key-id "alias/{namespace}-backups" --query KeyMetadata.Arn --output text)
+aws kms put-key-policy --region "$REGION" --key-id "$KEY" --policy-name default --policy "file://$WORK/key-policy.json"
+aws kms schedule-key-deletion --region "$REGION" --key-id "$KEY" --pending-window-in-days 30
+aws kms delete-alias --region "$REGION" --alias-name "alias/{namespace}-backups"
+"""
+
+
 def command_blocks(text: str, *, on_the_platform: bool) -> list[str]:
     """A runbook's blocks in order: every `bash` block, and the `bash platform` blocks only when
     the runbook is followed on the client's platform."""
     return [body for platform, body in _FENCE.findall(text) if on_the_platform or not platform]
+
+
+def _fresh_only(values: dict[str, Any]) -> str:
+    """v0.6.0 is installed fresh (`harness.fresh_only`): run over a namespace that already holds a
+    deployment, this runbook stops before anything is changed unless that deployment is at v0.6.0
+    or later. The deployment's release is the `OSPREY_RELEASE_VERSION` in its `ospreyflow-env`
+    ConfigMap; the one being installed, the render's own."""
+    installing = str((values.get("environment") or {}).get("OSPREY_RELEASE_VERSION", ""))
+    return f"""This runbook installs a new deployment, or moves one already in the namespace to this release.
+{FRESH_FROM} is installed fresh: a namespace holding a deployment of an earlier release is not moved onto
+it, and the next block stops there, saying so, before anything is changed.
+
+```bash
+if helm status "$RELEASE" -n "$NS" >/dev/null 2>&1; then
+  "$PY" -m harness.fresh_only --installing {installing} \\
+    --installed "$(kubectl -n "$NS" get configmap ospreyflow-env -o jsonpath='{{.data.OSPREY_RELEASE_VERSION}}' 2>/dev/null)"
+fi
+```
+"""
 
 
 def _settings(config: OspreyConfig, platform: PlatformSettings) -> str:
@@ -100,6 +265,11 @@ def render_install(config: OspreyConfig, platform: PlatformSettings, values: dic
         f'kubectl -n "$NS" rollout status {w["kind"].lower()}/{w["name"]} --timeout=900s'
         for w in values["workloads"]
     )
+    # The CARRIES row "an upgrade must rebuild when the mapping changes" (ADR-150 decision 4): on a
+    # fresh install and on every upgrade, the index made again from the graph once the Conduit and
+    # the worker are rolled out, or the step fails naming the Job.
+    if "searchIndex" in values:
+        rollouts += "\n" + _SEARCH_REBUILD.rstrip("\n")
     hosts = [r["host"] for r in values["ingress"]["rules"]]
     glass = next(r["host"] for r in values["ingress"]["rules"] if r["service"] == "workspace")
     host = cp.registry.split("/")[0]
@@ -122,13 +292,13 @@ that folder. If a command fails, stop there: put right what it says, then run it
 A block fenced `bash later` is not part of that order: the words before it say when, if ever, it is run.
 
 **Before step 5, from the client's Entra administrator** (ADR-148 Amendment 8; step 6 checks it):
-two app registrations in tenant `{claims.tenant_id}`, the Glass (application id `{claims.client_id}`)
+{_COUNT[entra_registrations(config)]} app registrations in tenant `{claims.tenant_id}`: the Glass (application id `{claims.client_id}`)
 and this API (`{claims.api_client_id}`, exposing the scope `{claims.scope}`, which the Glass is
-granted), with the claims `cloud_platform.claims` names.
-
+granted), with the claims `cloud_platform.claims` names{"; and, for reports, those below" if entra_registrations(config) > 2 else ""}.
+{_reporting_registrations(config, values)}
 **The managed PostgreSQL** allows a `max_connections` of {POSTGRES_MAX_CONNECTIONS}. The least it must allow in this
 shape is {least}: two Conduits side by side during an update, the worker, the gateway and a reserve (ADR-114
-Amendment 43's figures), with Superset and the report sync (from v0.5.2, as many copies as this shape renders)
+Amendment 43's figures), with Superset and the report sync (as many copies as this shape renders)
 doubled by an upgrade in progress. {POSTGRES_MAX_CONNECTIONS} is set for every shape, the production shape's least
 ({least_for(True)}) among them, so this shape has more room: {POSTGRES_MAX_CONNECTIONS - least} to spare. The Terraform
 renders it as a {RDS_INSTANCE_CLASS} (8 GiB) with a parameter group setting it. In the environments repository,
@@ -136,7 +306,7 @@ with `cloud-platform-terraform-rds-instance`, set it on the module:
 `db_parameter = [{{ name = "max_connections", value = "{POSTGRES_MAX_CONNECTIONS}", apply_method = "pending-reboot" }}]`.
 `max_connections` is static in PostgreSQL: it takes effect at creation, and on an existing instance only at
 its next reboot. With too few, the new Conduit of an update stops at `TooManyConnectionsError`.
-{_bare_connector_hosts(cp.connector_hosts)}
+{_opensearch_needs(config, platform)}{_bare_connector_hosts(cp.connector_hosts)}
 ## 1. The settings and the namespace
 
 {_settings(config, platform)}
@@ -147,6 +317,7 @@ kubectl auth can-i create statefulsets -n "$NS"
 kubectl auth can-i create persistentvolumeclaims -n "$NS"
 ```
 
+{_fresh_only(values)}
 ## 2. The namespace's resources (the platform team's pull request)
 
 Copy `$FOLDER/terraform/` into the namespace's folder in the environments repository and raise the
@@ -201,13 +372,30 @@ helm upgrade --install "$RELEASE" "$CHART" -n "$NS" -f "$FOLDER/values.yaml" --t
 ## 6. Sign-in: Entra ID and the first administrators
 
 People sign in with the client's own Entra ID (ADR-148 Amendment 8): there is no sign-in service of
-ours to set up, only the two app registrations *What it needs* asks for, in tenant
+ours to set up, only the {_COUNT[entra_registrations(config)]} app registrations *What it needs* asks for, in tenant
 `{claims.tenant_id}`. The first administrators ({", ".join(claims.first_administrators)}) were given the Admin role when the
-Conduit first started; they give everyone else their roles in Admin › People. Check the Conduit reads
+Conduit first started; they give everyone else their roles in Admin › People and roles. Check the Conduit reads
 Entra's settings:
 
 ```bash
 kubectl -n "$NS" exec deploy/api -- printenv OSPREY_IDENTITY_PROVIDER OIDC_ISSUER
+```
+
+**The token version** (ADR-148 Amendment 18). The Conduit expects v{claims.token_version} access tokens
+(`cloud_platform.claims.token_version`). If the API registration issues the other version, every sign-in is
+refused, and the Conduit says why, once, in its log: which version the registration issues and what to set
+(`requestedAccessTokenVersion` in the API registration's manifest, or `token_version`). Run this after the
+first administrator's first sign-in (section 8, item 2). Before anyone has signed in it can only say that no
+sign-in has been refused for this so far.
+
+```bash
+# Every api pod's log, whole (`logs deploy/api` reads one pod; `-l` alone reads ten lines a pod).
+said="$(kubectl -n "$NS" logs -l app.kubernetes.io/name=api --since=24h --tail=-1 --prefix 2>/dev/null | grep -m1 -F "{TOKEN_VERSION_LOG}" || true)"
+if [ -n "$said" ]; then
+  echo "$said"; echo "sign-in is refused for the token version: fix it as said, render again (step 4) and install"; false
+else
+  echo "no sign-in refused for its token version so far"
+fi
 ```
 
 **If no administrator is left** (nobody enabled who has signed in can manage people): add the Entra
@@ -223,7 +411,7 @@ helm upgrade --install "$RELEASE" "$CHART" -n "$NS" -f "$FOLDER/values.yaml" --t
 kubectl -n "$NS" rollout status deploy/api --timeout 10m
 ```
 
-## 7. Check
+{_reporting_section(config, values)}## 7. Check
 
 The doors answer through the platform's ingress ({", ".join(hosts)}): `/healthz` is the Conduit's,
 answered through the Glass. `OSPREY_CURL_OPTS` is curl's options for that door, if it needs any:
@@ -244,14 +432,15 @@ stop and raise it with the client's Entra administrator before anyone else is to
 
 1. **Token version.** With `token_version` 2.0, the API registration's manifest has
    `requestedAccessTokenVersion` set to 2. Without it, Entra issues v1.0 tokens with another issuer,
-   and every sign-in is refused.
+   and every sign-in is refused, in words that say so: step 6's token-version check, run after this
+   first sign-in, shows them.
 2. **The first administrator.** One of {", ".join(claims.first_administrators)} signs in at
-   `https://{glass}`. Admin › People lists them with Admin, and their clearance (for example
+   `https://{glass}`. Admin › People and roles lists them with Admin, and their clearance (for example
    OFFICIAL-SENSITIVE), unit and handling codes are the ones their groups give. If they are not, the
    claims set in the registration (`claims_mapping_policy`, optional claims) do not send what
    `cloud_platform.claims` names.
 3. **A person given no role.** A member of the tenant whom no administrator has given a role signs in,
-   is listed in Admin › People with no role, and sees no case and no Admin.
+   is listed in Admin › People and roles with no role, and sees no case and no Admin.
 4. **Who may sign in at all.** If the Glass's enterprise application has *Assignment required*, a person
    who is not assigned is refused by Entra itself (AADSTS50105) and never reaches the deployment. If it
    does not, every member of the tenant can sign in, with no role until given one: confirm which the
@@ -261,7 +450,120 @@ stop and raise it with the client's Entra administrator before anyone else is to
    groups out of the token. Limit the claim to the groups assigned to the application.
 7. **Keys.** Entra rolls its signing key unannounced. The Conduit fetches the tenant's keys again
    within five minutes. A sign-in still refused for an unknown key after that is a fault: report it.
+{_seed_section(values)}"""
+
+
+#: The POC seed path's optional block (ADR-148 Amendment 14), run after step 7 if at all. Plain text,
+#: not an f-string: `<rebuild>` is the search index's rebuild (an `else` branch, after a seed that
+#: succeeded) where the deployment has one.
+_SEED_BLOCK = """\
+(
+set -e
+# The Conduit's and the worker's copies now, to put back. Either at none (a run cut short before, or
+# stopped by hand) is refused: start them at their copy counts first, so "back" means back.
+api=$(kubectl -n "$NS" get deployment/api -o jsonpath='{.spec.replicas}')
+worker=$(kubectl -n "$NS" get deployment/worker -o jsonpath='{.spec.replicas}')
+for n in "$api" "$worker"; do
+  case "$n" in ''|*[!0-9]*|0) echo "the Conduit or the worker is at none now (api $api, worker $worker): start them first; no seed"; exit 1 ;; esac
+done
+J="seed-$(date -u +%Y%m%dt%H%M%S)"
+seeded=0
+finish() {   # whatever happened, on the way out: a Job that did not succeed deleted, then all put back
+  set +e
+  if [ "$seeded" != 1 ]; then
+    kubectl -n "$NS" logs "job/$J" 2>/dev/null
+    kubectl -n "$NS" delete job "$J" --ignore-not-found --cascade=foreground --wait --timeout=5m
+  fi
+  kubectl -n "$NS" scale deployment/api --replicas="$api"
+  kubectl -n "$NS" scale deployment/worker --replicas="$worker"
+  for c in ospreyflow-backup ospreyflow-backup-claims; do
+    kubectl -n "$NS" patch cronjob "$c" -p '{"spec":{"suspend":false}}' 2>/dev/null
+  done
+  kubectl -n "$NS" rollout status deployment/api --timeout=10m \\
+    && kubectl -n "$NS" rollout status deployment/worker --timeout=10m \\
+    || echo "the Conduit or the worker is not back yet: kubectl -n $NS scale deployment/api --replicas=$api, deployment/worker --replicas=$worker"
+}
+trap finish EXIT
+# The daily backups held for the seed's length, so none catches it halfway; then the Conduit and the
+# worker to none (the seed writes the stores they hold open).
+for c in ospreyflow-backup ospreyflow-backup-claims; do
+  kubectl -n "$NS" patch cronjob "$c" -p '{"spec":{"suspend":true}}' 2>/dev/null || true
+done
+kubectl -n "$NS" scale deployment/api deployment/worker --replicas=0
+kubectl -n "$NS" wait --for=delete pod -l 'app.kubernetes.io/name in (api,worker)' --timeout=10m \\
+  || { echo "the Conduit's or the worker's pods are still running: no seed beside them"; exit 1; }
+kubectl -n "$NS" create job --from=cronjob/ospreyflow-seed "$J" \\
+  || { echo "$J could not be started (kubectl create job above says why)"; exit 1; }
+for i in $(seq 60); do   # started (or already ended) within five minutes
+  phase=$(kubectl -n "$NS" get pod -l job-name="$J" -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
+  case "$phase" in Running|Succeeded|Failed) break ;; esac
+  sleep 5
+done
+case "$phase" in Running|Succeeded|Failed) ;;
+  *) echo "$J did not start in five minutes (kubectl -n $NS describe pod -l job-name=$J says why); deleted"; exit 1 ;;
+esac
+kubectl -n "$NS" wait --for=jsonpath='{.status.conditions[0].status}'=True "job/$J" --timeout=30m \\
+  || { echo "$J ran past 30 minutes; deleted"; exit 1; }
+kubectl -n "$NS" get job "$J" -o jsonpath='{.status.succeeded}' | grep -qx 1 \\
+  || { echo "$J failed: its log above"; exit 1; }
+kubectl -n "$NS" logs "job/$J"   # every line the seeds report
+seeded=1
+)
+# The block ends with the seed's outcome: a seed that did not succeed is named last, nothing runs
+# after it, and the block ends failed.
+if [ "$?" != 0 ]; then
+  echo "the seed did not succeed: what it says above. Nothing after it was run."
+  false
+<rebuild>fi
 """
+
+_SEARCH_REBUILD = """\
+# The search index rebuilt from the graph as it stands (ADR-150 decision 4): five minutes to start,
+# 30 to finish, deleted and named if it does not.
+J="search-rebuild-$(date -u +%Y%m%dt%H%M%S)"
+kubectl -n "$NS" create job --from=cronjob/ospreyflow-search-rebuild "$J"
+for i in $(seq 60); do
+  phase=$(kubectl -n "$NS" get pod -l job-name="$J" -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
+  case "$phase" in Running|Succeeded|Failed) break ;; esac
+  sleep 5
+done
+ok=1
+case "$phase" in Running|Succeeded|Failed) ;; *) ok=0 ;; esac
+[ "$ok" = 1 ] && { kubectl -n "$NS" wait --for=jsonpath='{.status.conditions[0].status}'=True "job/$J" --timeout=30m || ok=0; }
+[ "$ok" = 1 ] && { kubectl -n "$NS" get job "$J" -o jsonpath='{.status.succeeded}' | grep -qx 1 || ok=0; }
+kubectl -n "$NS" logs "job/$J" --tail=1 2>/dev/null || true
+[ "$ok" = 1 ] || { kubectl -n "$NS" delete job "$J" --ignore-not-found --wait=false; echo "$J failed (it did not start, ran past 30 minutes or failed); deleted"; false; }
+"""
+
+
+def _seed_section(values: dict[str, Any]) -> str:
+    """Step 9 of a poc's install runbook (ADR-148 Amendment 14): spec 08's acceptance data, if the
+    POC wants it. Not part of the order (`bash later`); nothing where the shape renders no seed."""
+    if "seed" not in values:
+        return ""
+    rebuild = "else\n" + _SEARCH_REBUILD if "searchIndex" in values else ""
+    return """
+## 9. Optional: spec 08's acceptance data (a POC alone)
+
+**Not part of the order, and never on a deployment holding real data.** For a proof of concept that is
+to be shown with spec 08's synthetic acceptance data: the HMP fixture, Fixture Corp and the acceptance
+scenarios, into one case named *Acceptance scenarios (spec 08)* whose first Author is the first
+administrator ({first}), in that administrator's own unit. Run it after step 7, once, after the first
+administrator has signed in (step 6): the seed is refused before it writes anything if they have not.
+Spec 08's data holds SECRET items (HMP's and Fixture Corp's), above this profile's default ceiling of
+OFFICIAL-SENSITIVE. So a POC shown with it declares `deployment.highest_marking: SECRET` in its
+osprey.yaml, rendered and applied before this step. That is the client's choice, for a POC holding
+synthetic data alone; otherwise the seed is refused before it writes anything, naming both values.
+It holds the daily backups and stops the Conduit and the worker for its length (a few
+minutes; the door answers 503 meanwhile), puts them all back whether or not it succeeded, and ends by
+naming what failed, if anything. A seed Job that did not finish is deleted before the Conduit is back.
+
+```bash later
+{block}```
+""".format(
+        first="the first of `cloud_platform.claims.first_administrators`",
+        block=_SEED_BLOCK.replace("<rebuild>", rebuild),
+    )
 
 
 def render_decommission(
@@ -418,26 +720,47 @@ test -z "$failed"
 
 ## 7. The namespace's resources (the platform team's pull request)
 
-First the kept bucket's lifecycle rule is set to the retention you agree, so the deployment's own
-35-day rule cannot expire the sets this decommission keeps; then, in the namespace's folder, the
-backups bucket and its key are taken out of the state, so the removal keeps them (`prevent_destroy`
-holds only while their file is there). Give the retention, in days, as `BACKUP_RETENTION_DAYS`. Then remove the
-deployment's resources (the files from `$FOLDER/terraform/`) from the namespace's folder in the
-environments repository and raise the pull request; the folder's other resources are the
-platform's and stay.
+**First, choose what happens to the backups bucket and its key: there is no default.** Give
+`BACKUPS=keep` or `BACKUPS=destroy`; the block refuses anything else, and touches nothing until you
+have. The choice is written to `$WORK/backups`, and step 8's record states it.
+
+- **keep**: the kept bucket's lifecycle rule is set to the retention you agree, so the deployment's
+  own {EXPIRE_DAYS}-day rule cannot expire the sets this decommission keeps (give it, in days, as
+  `BACKUP_RETENTION_DAYS`). The sets stay readable: step 9 removes them when that retention ends,
+  and step 10 restores one.
+- **destroy**: every set goes now, and cannot be had back. The bucket's policy is removed, every
+  version of every object, then the bucket; then the key's policy is replaced by one keeping the
+  account's administration, and its deletion scheduled (thirty days, cancellable with
+  `aws kms cancel-key-deletion` until then).
+
+Either way the bucket and its key are then taken out of the state, in the namespace's folder, so the
+removal does not meet their `prevent_destroy`. Then remove the deployment's resources (the files from
+`$FOLDER/terraform/`) from the namespace's folder in the environments repository and raise the pull
+request; the folder's other resources are the platform's and stay.{_opensearch_goes(config)}
 
 ```bash platform
+: "${{BACKUPS:?choose keep or destroy for the backups bucket and its key (there is no default)}}"
+case "$BACKUPS" in
+  keep|destroy) ;;
+  *) echo "BACKUPS: choose keep or destroy for the backups bucket and its key (there is no default)"; false ;;
+esac
+if [ "$BACKUPS" = keep ]; then
 : "${{BACKUP_RETENTION_DAYS:?the retention you agree for the kept backups, in days}}"
 printf '{{"Rules": [{{"ID": "abort-unfinished-uploads", "Status": "Enabled", "Filter": {{"Prefix": ""}}, "AbortIncompleteMultipartUpload": {{"DaysAfterInitiation": 7}}}}, {{"ID": "retained-sets", "Status": "Enabled", "Filter": {{"Prefix": "sets/"}}, "Expiration": {{"Days": %d}}, "NoncurrentVersionExpiration": {{"NoncurrentDays": 7}}}}, {{"ID": "remove-expired-markers", "Status": "Enabled", "Filter": {{"Prefix": "sets/"}}, "Expiration": {{"ExpiredObjectDeleteMarker": true}}}}]}}' \\
   "$BACKUP_RETENTION_DAYS" > "$WORK/retention.json"
 aws s3api put-bucket-lifecycle-configuration --region "$REGION" --bucket "${{PREFIX}}{BUCKET_SUFFIX}" \\
   --lifecycle-configuration "file://$WORK/retention.json"
 aws s3api get-bucket-lifecycle-configuration --region "$REGION" --bucket "${{PREFIX}}{BUCKET_SUFFIX}" | grep -q retained-sets
+fi
+echo "$BACKUPS" > "$WORK/backups"
 M="${{TF_MODULE:+$TF_MODULE.}}"   # the deployment's module in the environments repository, if any
 removed=0
 for kept in {" ".join(KEPT_AT_DECOMMISSION)}; do tofu state rm "$M$kept" >/dev/null 2>&1 && removed=$((removed + 1)); done
 test "$removed" -gt 0 || {{ echo "no kept resource was in the state (is TF_MODULE right?): stop"; false; }}
 tofu state list | grep -E '(^|[.])({"|".join(re.escape(k) for k in KEPT_AT_DECOMMISSION)})$' && {{ echo "a kept resource is still in the state: stop"; false; }}
+if [ "$BACKUPS" = destroy ]; then
+{_destroy_backups(cp.namespace)}
+fi
 echo "Raise the pull request removing $FOLDER/terraform/'s files, and wait for it to be applied."
 ```
 
@@ -480,6 +803,7 @@ fi
 for listing in state.txt buckets.txt; do
   test -f "$WORK/$listing" || {{ echo "no $WORK/$listing: step 8's first block (the platform's) writes it"; false; }}
 done
+test -f "$WORK/backups" || {{ echo "no $WORK/backups: step 7's platform block writes it"; false; }}
 objects=()
 for kind in {kinds}; do
   if kubectl api-resources -o name | grep -qx "$kind"; then
@@ -493,11 +817,13 @@ seen=()
 test "${{#seen[@]}}" -gt 0 || {{ echo "no listing of the disks: give DISKS, or let the platform team run step 8's first block"; false; }}
 "$PY" -m harness.cloud_platform.decommission_check --values "$WORK/values.yaml" "${{objects[@]}}" "${{seen[@]}}" \\
   ${{TF_MODULE:+--module "$TF_MODULE"}} --state "$WORK/state.txt" --terraform "$WORK/terraform" \\
-  --buckets "$WORK/buckets.txt" --bucket-prefix "$PREFIX"
+  --buckets "$WORK/buckets.txt" --bucket-prefix "$PREFIX" --backups "$(cat "$WORK/backups")"
 ```
 
-The check names the backups bucket and its key as kept (`kept: the backups (retention)`), never as
-left behind, and fails on anything else.
+The check states the choice step 7 recorded (`backups: kept (the operator chose keep)`, or
+`backups: destroyed (the operator chose destroy)`). With keep, it names the backups bucket and its key
+as kept (`kept: the backups (retention)`), never as left behind; with destroy, either still there is
+left behind. It fails on anything else.
 
 ## 9. When the retention ends: the backups bucket, then its key
 
@@ -509,21 +835,7 @@ by one keeping the account's administration, and the deletion scheduled (thirty 
 A key deleted while the bucket still held a set would leave that set unreadable.
 
 ```bash later
-B="${{PREFIX}}{BUCKET_SUFFIX}"
-aws s3api delete-bucket-policy --region "$REGION" --bucket "$B"
-while :; do
-  aws s3api list-object-versions --region "$REGION" --bucket "$B" --max-items 500 --output json \\
-    --query '{{Objects: [Versions, DeleteMarkers][][].{{Key: Key, VersionId: VersionId}}}}' > "$WORK/versions.json"
-  grep -q '"Key"' "$WORK/versions.json" || break
-  aws s3api delete-objects --region "$REGION" --bucket "$B" --delete "file://$WORK/versions.json" >/dev/null
-done
-aws s3api delete-bucket --region "$REGION" --bucket "$B"
-ACCOUNT=$(aws sts get-caller-identity --region "$REGION" --query Account --output text)
-printf '{{"Version": "2012-10-17", "Statement": [{{"Sid": "Administer", "Effect": "Allow", "Principal": {{"AWS": "arn:aws:iam::%s:root"}}, "Action": "kms:*", "Resource": "*"}}]}}' "$ACCOUNT" > "$WORK/key-policy.json"
-KEY=$(aws kms describe-key --region "$REGION" --key-id "alias/{cp.namespace}-backups" --query KeyMetadata.Arn --output text)
-aws kms put-key-policy --region "$REGION" --key-id "$KEY" --policy-name default --policy "file://$WORK/key-policy.json"
-aws kms schedule-key-deletion --region "$REGION" --key-id "$KEY" --pending-window-in-days 30
-aws kms delete-alias --region "$REGION" --alias-name "alias/{cp.namespace}-backups"
+{_destroy_backups(cp.namespace)}
 ```
 
 ## 10. Restoring a kept set, after the decommission (the platform team's)

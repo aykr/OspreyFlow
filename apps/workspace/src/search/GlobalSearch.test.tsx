@@ -8,7 +8,13 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Node } from "../../../../packages/schemas/generated";
-import { GlobalSearch, SEARCH_HINT_MS, SUGGEST_MIN_CHARS, SUGGEST_PAUSE_MS } from "./GlobalSearch";
+import {
+  GlobalSearch,
+  LIMITED_SUGGESTIONS,
+  SEARCH_HINT_MS,
+  SUGGEST_MIN_CHARS,
+  SUGGEST_PAUSE_MS,
+} from "./GlobalSearch";
 
 function account(id: string, value: string): Node {
   return { id, type: "Endpoint", properties: { value_normalised: value } } as unknown as Node;
@@ -163,6 +169,29 @@ describe("GlobalSearch as the analyst types", () => {
     expect(screen.getByRole("status").getAttribute("data-faded")).toBeNull();
   });
 
+  // Docs' review, 14 Nov: a "Starts with" search past 50 characters showed "Suggestions are
+  // unavailable." The Conduit refuses it in words (a 422), and the box now says those words (rule 2).
+  it("says the Conduit's own words when it refuses what was typed", async () => {
+    const words = "a suggestion is at most 50 characters";
+    stubFetch(() => ({ status: 422, body: { detail: words } }));
+    mount();
+    type("C13");
+    await pause();
+    expect(screen.getByRole("status").textContent).toBe(words);
+    expect(screen.getByRole("status").textContent).not.toMatch(/unavailable/i);
+  });
+
+  it("still says unavailable for a refusal with no words, and for a failure", async () => {
+    for (const reply of [{ status: 422, body: { detail: [{ msg: "field required" }] } }, { status: 503 }]) {
+      stubFetch(() => reply);
+      mount();
+      type("C13");
+      await pause();
+      expect(screen.getByRole("status").textContent).toMatch(/unavailable/i);
+      cleanup();
+    }
+  });
+
   it("says so when the Conduit cannot answer, and does not leave the last answer standing", async () => {
     stubFetch((query) =>
       query === "C13" ? { body: { nodes: [account("n1", "C1305486145")], more: false } } : { status: 500 },
@@ -174,6 +203,69 @@ describe("GlobalSearch as the analyst types", () => {
     await pause();
     expect(screen.getByRole("status").textContent).toMatch(/unavailable/i);
     expect(screen.queryByText("Endpoint: C1305486145")).toBeNull();
+  });
+
+  // ADR-059 Amendment 1, the owner's requirement c: when the search index cannot answer, the box's
+  // suggestions come from today's prefix read, and the box says so, in one line under them.
+  it("says suggestions are limited when the Conduit answered without the search index", async () => {
+    stubFetch(() => ({
+      body: { nodes: [account("n1", "C1305486145")], more: false, source: "graph", limited: true, limited_why: "unreachable" },
+    }));
+    mount();
+    type("C13");
+    await pause();
+    expect(screen.getByRole("status").textContent).toBe(LIMITED_SUGGESTIONS.unreachable);
+  });
+
+  it("does not say so when the index answered, or for an older reply with no such field", async () => {
+    stubFetch((query) => ({
+      body: query === "C13" ? { nodes: [account("n1", "C1")], more: false, source: "index", limited: false } : { nodes: [account("n1", "C1")], more: false },
+    }));
+    mount();
+    const box = type("C13");
+    await pause();
+    expect(screen.queryByRole("status")).toBeNull();
+    fireEvent.change(box, { target: { value: "C130" } });
+    await pause();
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("keeps the limited line in view, and beside the 'more match' hint when both apply", async () => {
+    stubFetch(() => ({ body: { nodes: [account("n1", "C1")], more: true, source: "graph", limited: true, limited_why: "unreachable" } }));
+    mount();
+    type("C13");
+    await pause();
+    await pause(SEARCH_HINT_MS + 1000);
+    const status = screen.getByRole("status");
+    expect(status.textContent).toContain(LIMITED_SUGGESTIONS.unreachable);
+    expect(status.textContent).toMatch(/more match/);
+    expect(status.getAttribute("data-faded")).toBeNull();
+  });
+
+  // The orchestrator's list, defect 2: where the deployment has no search index the line said
+  // "limited just now", which is never true there. Each reason has its own words.
+  it("says truly why its suggestions are limited, and 'just now' only when it will pass", async () => {
+    for (const why of ["no_index", "unreachable", "catching_up"] as const) {
+      stubFetch(() => ({ body: { nodes: [account("n1", "C1")], more: false, source: "graph", limited: true, limited_why: why } }));
+      mount();
+      type("C13");
+      await pause();
+      expect(screen.getByRole("status").textContent).toBe(LIMITED_SUGGESTIONS[why]);
+      cleanup();
+    }
+    expect(LIMITED_SUGGESTIONS.no_index).not.toMatch(/just now/);
+    expect(LIMITED_SUGGESTIONS.no_index).toMatch(/no search index/);
+    expect(LIMITED_SUGGESTIONS.unreachable).toMatch(/just now/);
+    expect(LIMITED_SUGGESTIONS.catching_up).toMatch(/catch/);
+  });
+
+  it("from a Conduit that gives no reason, says it is limited without saying for how long", async () => {
+    stubFetch(() => ({ body: { nodes: [account("n1", "C1")], more: false, source: "graph", limited: true } }));
+    mount();
+    type("C13");
+    await pause();
+    expect(screen.getByRole("status").textContent).toBe(LIMITED_SUGGESTIONS.unknown);
+    expect(LIMITED_SUGGESTIONS.unknown).not.toMatch(/just now/);
   });
 
   it("says when nothing starts with what was typed", async () => {

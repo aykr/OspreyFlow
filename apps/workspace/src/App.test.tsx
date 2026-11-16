@@ -417,10 +417,10 @@ describe("the tab the launcher asked for is the tab the Glass opens on", () => {
   // ADR-146 decision 2: Monitoring left the Glass; Rules and Monitoring is a place of the switcher.
   const rulesPlace = async () =>
     within(await screen.findByRole("navigation", { name: "Places" })).findByRole("button", { name: /^Rules and Monitoring/ });
-  // ADR-139: Connection strength, which stayed in the Glass, under the rail's Explore Details
-  // (ADR-145 Amendment 12).
+  // Connection strength is under the top bar's More views (the owner's navigation decision, ADR-145 Amendment 15).
   const openStrength = async () => {
-    fireEvent.click(within(await screen.findByRole("navigation", { name: "Workspace" })).getByRole("button", { name: /^Explore Details/ }));
+    await screen.findByRole("group", { name: "View" });
+    fireEvent.click(screen.getByRole("button", { name: /^More ways to show the case/ }));
     fireEvent.click(await screen.findByRole("button", { name: "Connection strength" }));
   };
 
@@ -511,7 +511,7 @@ describe("the tab the launcher asked for is the tab the Glass opens on", () => {
     const rail = await screen.findByRole("navigation", { name: "Workspace" });
     expect(within(rail).queryByRole("button", { name: "Watches" })).toBeNull();
     expect(within(rail).queryByRole("button", { name: /Monitoring/ })).toBeNull();
-    expect(within(await screen.findByRole("navigation", { name: "In the Glass" })).queryByRole("button", { name: /Monitoring/ })).toBeNull();
+    expect(within(await screen.findByRole("region", { name: "You are in the Glass" })).queryByRole("button", { name: /Monitoring/ })).toBeNull();
     fireEvent.click(await rulesPlace());
     expect(await screen.findByRole("region", { name: "You are in Rules and Monitoring" })).toBeTruthy();
     expect((await rulesPlace()).getAttribute("aria-current")).toBe("page");
@@ -711,11 +711,12 @@ describe("the tab the launcher asked for is the tab the Glass opens on", () => {
     note("figures");
     render(<App />);
     await screen.findByRole("note", { name: "Opened from an alert" });
-    // ADR-145 Amendment 12: Dashboards is on the rail itself.
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Workspace" })).getByRole("button", { name: "Dashboards" }));
+    // ADR-145 Amendment 15: Dashboards is the view switch's Reports, and Figures is under its More views.
+    fireEvent.click(within(screen.getByRole("group", { name: "View" })).getByRole("button", { name: "Reports" }));
     await screen.findByRole("region", { name: "Alert monitoring" });
     expect(screen.queryByRole("note", { name: "Opened from an alert" })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Figures" }));
+    fireEvent.click(screen.getByRole("button", { name: /^More ways to show the case/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Figures" }));
     await screen.findByRole("heading", { name: "Figures" });
     expect(screen.queryByRole("note", { name: "Opened from an alert" })).toBeNull();
   });
@@ -780,22 +781,27 @@ describe("the tab the launcher asked for is the tab the Glass opens on", () => {
       fireEvent.click(await screen.findByRole("button", { name: /Open alert:.*Structuring/ }));
       await vi.waitFor(() => expect(window.location.pathname).toBe("/alerts/a1"));
       fireEvent.click(await screen.findByRole("button", { name: "Open the evidence" }));
-      const banner = await screen.findByRole("region", { name: "Open view" });
+      const caseLine = await screen.findByRole("region", { name: "You are in the Glass" });
+      const named = await within(caseLine).findByText(/^Saved view:/);
       expect(saved).toEqual([{ name: "From alert: Structuring", node_ids: ["n1"] }]);
-      expect(within(banner).getByText("From alert: Structuring")).toBeTruthy();
-      expect(within(banner).getByText("Opened from an alert")).toBeTruthy();
-      // The way back has focus when the view opens, so a keyboard user is on it.
-      await vi.waitFor(() => expect(document.activeElement?.textContent).toBe("← Back to the alert"));
-      expect(within(banner).getByText("Private")).toBeTruthy();
-      expect(screen.getByRole("region", { name: "You are in the Glass" })).toBeTruthy();
-      fireEvent.click(within(banner).getByRole("button", { name: "← Back to the alert" }));
+      expect(named.textContent).toBe("Saved view: From alert: Structuring");
+      // ADR-145 Amendment 19: opening a saved view takes focus to its name on the case line; its ways back follow it.
+      await vi.waitFor(() => expect(document.activeElement).toBe(named));
+      expect(within(caseLine).getByText("Private")).toBeTruthy();
+      // Where it came from, with the alert's title, in Details (ADR-146 decision 6's "From alert ‹title›").
+      fireEvent.click(within(caseLine).getByRole("button", { name: "Details" }));
+      const details = screen.getByRole("region", { name: "Saved view details" });
+      expect(details.textContent).toContain("From alert Structuring");
+      fireEvent.keyDown(details, { key: "Escape" });
+      // The way back to the alert, on the line itself.
+      fireEvent.click(within(caseLine).getByRole("button", { name: "← Back to the alert" }));
       expect(await screen.findByRole("region", { name: "You are in Rules and Monitoring" })).toBeTruthy();
       expect(window.location.pathname).toBe("/alerts/a1");
       await vi.waitFor(() =>
         expect(screen.getByRole("button", { name: /Open alert:.*Structuring/ }).getAttribute("aria-pressed")).toBe("true"),
       );
       expect(await screen.findByRole("button", { name: "Open the evidence" })).toBeTruthy();
-      expect(screen.queryByRole("region", { name: "Open view" })).toBeNull();
+      expect(screen.queryByText(/^Saved view:/)).toBeNull();
     } finally {
       window.history.replaceState(null, "", "/");
     }
@@ -838,7 +844,7 @@ describe("the tab the launcher asked for is the tab the Glass opens on", () => {
       ).toBeTruthy();
       expect(window.location.pathname).toBe("/alerts/a1");
       expect(screen.getByRole("region", { name: "You are in Rules and Monitoring" })).toBeTruthy();
-      expect(screen.queryByRole("region", { name: "Open view" })).toBeNull();
+      expect(screen.queryByRole("region", { name: "Saved view" })).toBeNull();
       // Round 3: said on the alert only; the Glass, visited next, carries no stale "could not be opened".
       fireEvent.click(within(await screen.findByRole("navigation", { name: "Places" })).getByRole("button", { name: /^The Glass/ }));
       await vi.waitFor(() => expect(window.location.pathname).not.toBe("/alerts/a1"));
@@ -853,7 +859,7 @@ describe("the tab the launcher asked for is the tab the Glass opens on", () => {
     holdAllRequests();
     render(<App />);
 
-    // The top bar's view switch; the banner's mode toggle is named Graph too (ADR-145 Amendment 13).
+    // The top bar's view switch (ADR-145 Amendment 15).
     const graph = await within(await screen.findByRole("group", { name: "View" })).findByRole("button", { name: "Graph" });
     expect(graph.getAttribute("aria-pressed")).toBe("true");
     expect(document.querySelector("header.app-header")!.getAttribute("data-app")).toBe("glass");
@@ -1142,6 +1148,40 @@ describe("a person disabled in this deployment is told so (ADR-148 Amendment 8)"
     render(<App />);
     expect(await screen.findByText(/could not be used to reach the workspace/i)).toBeTruthy();
     expect(screen.queryByText(/disabled in this deployment/)).toBeNull();
+  });
+});
+
+// ADR-148 Amendments 15, 17 and 18 (signinwords): a refusal the person can act on is shown in the Conduit's
+// own words, and only when its 401 carries one of the three tags; an untagged refusal keeps the general words.
+describe("a refusal the person can act on is shown in its own words", () => {
+  beforeEach(() => {
+    vi.mocked(userManager.isSignInRedirectCallback).mockReset().mockReturnValue(true);
+    vi.mocked(userManager.completeSignInFromRedirect).mockReset().mockResolvedValue({
+      access_token: "a-token", profile: { sub: "pairwise-sub", preferred_username: "ana" },
+    } as never);
+  });
+
+  test.each([
+    ["access_not_set", "your clearance has not been set in this deployment: ask an administrator to set it in Admin › People"],
+    ["token_version", "this deployment's app registration issues version 1 access tokens: set requestedAccessTokenVersion to 2"],
+    ["guest_not_admitted", "guest accounts are not admitted to this deployment: ask an administrator"],
+  ])("%s: the sign-in page shows the Conduit's words, not the general ones", async (error, detail) => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(new Response(JSON.stringify({ detail, error }), { status: 401 })),
+    );
+    render(<App />);
+    expect(await screen.findByText(detail)).toBeTruthy();
+    expect(screen.queryByText(/could not be used to reach the workspace/i)).toBeNull();
+  });
+
+  test("the same words with no tag are never shown", async () => {
+    const detail = "your clearance has not been set in this deployment: ask an administrator to set it in Admin › People";
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(new Response(JSON.stringify({ detail }), { status: 401 })),
+    );
+    render(<App />);
+    expect(await screen.findByText(/could not be used to reach the workspace/i)).toBeTruthy();
+    expect(screen.queryByText(detail)).toBeNull();
   });
 });
 

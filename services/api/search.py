@@ -82,6 +82,14 @@ class SuggestResponse(BaseModel):
 
     nodes: list[Node]
     more: bool
+    #: ADR-059 Amendment 1: who answered ("graph" until the index answers), and whether the box
+    #: should say its suggestions are limited (a "starts with" one the graph answered for want of
+    #: the index: the owner's requirement c, on screen).
+    source: Literal["index", "graph"] = "graph"
+    limited: bool = False
+    #: Why a suggestion is limited, so the box can say it truly: the deployment has no search index
+    #: (for good), or the index cannot be reached or is catching up (for now). `None` when not.
+    limited_why: Literal["no_index", "unreachable", "catching_up"] | None = None
 
 
 async def suggest(

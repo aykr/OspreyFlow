@@ -5,7 +5,7 @@
 // way the Pathfinder puts a path there (ADR-033): what the canvas lacks is sent to the case's `/seed`,
 // so it is part of the working set, not only drawn.
 import type { Connections, Edge, Node, Path } from "../../../../packages/schemas/generated";
-import type { WorkingSetDelta } from "../workingset/models";
+import { outcomeDeltas, type ExpansionOutcome, type WorkingSetDelta } from "../workingset/models";
 
 export interface ConnectionsContext {
   apiBaseUrl: string;
@@ -69,18 +69,18 @@ export async function findConnections(
   return (await response.json()) as Connections;
 }
 
-/** Sends what the canvas lacks of `route` to the case's working set, and gives back the change to
- * draw; `null` when the route is already all there, so nothing is asked. */
+/** Sends what the canvas lacks of `route` to the case's working set, and gives back the changes to
+ * draw, in order; `null` when the route is already all there, so nothing is asked. */
 export async function seedRoute(
   context: ConnectionsContext,
   route: Path,
   canvas: CanvasContents,
-): Promise<WorkingSetDelta | null> {
+): Promise<WorkingSetDelta[] | null> {
   return seedElements(context, route.nodes, route.edges, canvas, "The route");
 }
 
 /** Sends what the canvas lacks of `nodes` and `edges` to the case's working set — each once — and
- * gives back the change to draw; `null` when all of it is there already. Also how Explore adds what
+ * gives back the changes to draw, in order (the add, then the reader's own clusters); `null` when all of it is there already. Also how Explore adds what
  * an analyst chose (ADR-100 Amendment 9), so the server's working set and the canvas's own counters
  * see it, rather than a local add neither does. */
 export async function seedElements(
@@ -89,7 +89,7 @@ export async function seedElements(
   edges: readonly Edge[],
   canvas: CanvasContents,
   what = "It",
-): Promise<WorkingSetDelta | null> {
+): Promise<WorkingSetDelta[] | null> {
   const lackingNodes = [...new Map(nodes.filter((n) => !canvas.hasNode(n.id)).map((n) => [n.id, n])).values()];
   const lackingEdges = [...new Map(edges.filter((e) => !canvas.hasEdge(e.id)).map((e) => [e.id, e])).values()];
   if (lackingNodes.length === 0 && lackingEdges.length === 0) return null;
@@ -99,6 +99,34 @@ export async function seedElements(
     body: JSON.stringify({ nodes: lackingNodes, edges: lackingEdges }),
   });
   if (!response.ok) throw new Error(`${what} could not be added to the canvas (${response.status}). Try again.`);
-  const outcome = (await response.json()) as { delta: WorkingSetDelta };
-  return outcome.delta;
+  // The add, then the reader's own clusters (ADR-124 Amendment 19), in that order.
+  return outcomeDeltas((await response.json()) as ExpansionOutcome);
+}
+
+/** What `POST …/working-set/add-by-ids` answered (v0.6.0 #5, *Show all on graph*): the add, as the deltas to apply, and
+ * how many of the ids asked for are not on the canvas after it (never which); or the working set's own typed refusal
+ * past its cap (rule 2), with its figures, nothing added. */
+export type AddedByIds =
+  | { kind: "added"; deltas: WorkingSetDelta[]; notShown: number }
+  | { kind: "limit_exceeded"; capKind: string; cap: number; wouldBe: number };
+
+/** An Ask & Chat answer's items put on the canvas by id alone, read on the server as this reader may see them. */
+export async function addByIds(
+  context: ConnectionsContext,
+  nodeIds: readonly string[],
+  linkIds: readonly string[],
+): Promise<AddedByIds> {
+  const response = await fetch(caseUrl(context, "working-set/add-by-ids"), {
+    method: "POST",
+    headers: headers(context),
+    body: JSON.stringify({ node_ids: [...new Set(nodeIds)], link_ids: [...new Set(linkIds)] }),
+  });
+  if (response.status === 409) {
+    const body = (await response.json().catch(() => null)) as { error?: string; cap_kind?: string; cap?: number; would_be?: number } | null;
+    if (body?.error === "limit_exceeded")
+      return { kind: "limit_exceeded", capKind: body.cap_kind ?? "nodes", cap: body.cap ?? 0, wouldBe: body.would_be ?? 0 };
+  }
+  if (!response.ok) throw new Error(`The answer's items could not be added to the canvas (${response.status}). Try again.`);
+  const added = (await response.json()) as { outcome: ExpansionOutcome; not_shown: number };
+  return { kind: "added", deltas: outcomeDeltas(added.outcome), notShown: added.not_shown };
 }

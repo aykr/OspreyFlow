@@ -136,7 +136,7 @@ export function Schedules({ api }: { api: AdminApi }) {
   return (
     <>
       <p className="label" style={{ margin: 0 }}>
-        Every scheduled recipe in this deployment. A scheduled run acts as its owner, in the case the schedule was set
+        Every scheduled pipeline in this deployment. A scheduled run acts as its owner, in the case the schedule was set
         in. A run&apos;s counts are shown only where its source is within your clearance.
       </p>
       {problem && <p role="alert">{problem}</p>}
@@ -159,7 +159,7 @@ export function Schedules({ api }: { api: AdminApi }) {
             {schedules.map((s) => (
               <tr key={s.recipe_id}>
                 <td>
-                  <span className="value">{s.label}</span>
+                  <span className="admin-words">{s.label}</span>
                   {s.flagged && <div className="label">Needs attention: the ontology changed since it was deployed</div>}
                   {s.paused && <div className="label">{s.paused_reason ?? "paused"}</div>}
                   {open === s.recipe_id && <History api={api} schedule={s} />}

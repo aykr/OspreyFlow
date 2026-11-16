@@ -15,6 +15,9 @@ which. This is that sequence, in order:
 5. Register the sign-in accounts again. Keycloak's database is not persisted, so a restart removes
    the demo administrator while `deployment.env` still names their password; registering is safe to
    repeat and makes the file true again.
+6. Where the deployment searches with OpenSearch, rebuild the search index from the graph
+   (`harness.search_rebuild`, as install, update and restore do; ADR-150 Amendment 2), so a new
+   version's mapping is never left behind an index made for an old one.
 
 A third-party store the checkout pins at a new version (ADR-101: ArcadeDB 26.10.1) is moved to it:
 the service takes the rendered image, its probe and the rendered value of each setting the render
@@ -59,8 +62,10 @@ from harness import (
     ingest_uploads,
     model_downloads,
     register_sign_in,
+    search_rebuild,
     store_volumes,
     update,
+    upgrade_stamp,
 )
 from harness.apply import _compose, release_registry
 from harness.atomic import replace_whole
@@ -922,7 +927,7 @@ def _refresh(
     owed_before = _pending(directory)  # what an earlier run that died still owes
     changed = files_up_to_date(repo_root)
     theme_changed, proxy_changed = changed["theme_changed"], changed["proxy_changed"]
-    run([*compose, "build", "--pull"])
+    run([*compose, "build", "--pull", *upgrade_stamp.build_args()])
     _uploads_ready(directory / "compose.yaml", run)
     # ADR-114 Amendment 35: a store's data moved into its named volume, once, before anything
     # starts on it. `docker` is Docker itself unless a test stands one in.
@@ -973,6 +978,28 @@ def _refresh(
             "administrator may not be able to sign in. Run `ospreyflow repair-sign-in` once "
             "Keycloak answers."
         )
+    _search_index_rebuilt(directory / "compose.yaml", compose, run)
+
+
+def _search_index_rebuilt(
+    compose_file: Path, compose: Sequence[str], run: Callable[[Sequence[str]], None]
+) -> None:
+    """The search index made again from the graph where the deployment searches with OpenSearch,
+    as install, update and restore do (the CARRIES row "an upgrade must rebuild when the mapping
+    changes"; ADR-150 decision 4 and Amendment 2). Last, so every `up` and restart is done and the
+    Conduit healthy: a deployment brought to a new version from its checkout otherwise keeps an
+    index made for another mapping, the indexer writes nothing to it and search stays on the
+    exact-identifier fallback (found on osprey-small, 14 November 2026)."""
+    if not search_rebuild.renders_opensearch(compose_file):
+        return
+    try:
+        run(search_rebuild.rebuild_argv(compose))
+    except RefreshFailed as failed:
+        raise RefreshFailed(
+            f"The stack is up and the sign-in accounts registered, but the search index could not "
+            f"be rebuilt from the graph ({failed}), so search answers only exact identifiers until "
+            f"it is. Run `ospreyflow start --build` again once the Conduit and OpenSearch answer."
+        ) from failed
 
 
 def main(argv: Sequence[str] | None = None, *, repo_root: Path = REPO_ROOT) -> int:

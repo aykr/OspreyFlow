@@ -6,7 +6,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AdminPlace } from "./AdminPlace";
-import { ENTRA_PEOPLE_WORDS } from "./sections/People";
+import { ENTRA_PEOPLE_WORDS, GUEST_WORDS } from "./sections/People";
 
 afterEach(() => {
   cleanup();
@@ -95,5 +95,72 @@ describe("Admin › People on Keycloak (the control)", () => {
     serve("keycloak", (path) => (path === "sign-in" ? json(500, {}) : null));
     place();
     expect(await screen.findByRole("form", { name: "Invite a person" })).toBeTruthy();
+  });
+});
+
+// ADR-148 Amendment 17: guest (B2B) accounts admitted behind a setting, switched here by an administrator of people.
+describe("Admin › People's guests on Entra ID", () => {
+  it("shows guests not admitted, and admits them when the box is ticked", async () => {
+    const sent = serve("entra", (path, init) =>
+      path === "sign-in/guests"
+        ? json(200, { admitted: init?.method === "PUT" ? (JSON.parse(String(init.body)) as { admitted: boolean }).admitted : false })
+        : null,
+    );
+    place();
+    const box = (await screen.findByLabelText("Admit guest accounts")) as HTMLInputElement;
+    await waitFor(() => expect(box.disabled).toBe(false));
+    expect(box.checked).toBe(false);
+    fireEvent.click(box);
+    await waitFor(() => expect(box.checked).toBe(true));
+    expect(sent.filter((s) => s.path === "PUT sign-in/guests")).toEqual([{ path: "PUT sign-in/guests", body: { admitted: true } }]);
+  });
+
+  it("shows the Conduit's refusal of turning guests off in its words, the box left as it was", async () => {
+    serve("entra", (path, init) => {
+      if (path !== "sign-in/guests") return null;
+      if (init?.method === "PUT") return json(409, { detail: { error: "locks_out_administrators", message: "this would leave nobody able to manage people" } });
+      return json(200, { admitted: true });
+    });
+    place();
+    const box = (await screen.findByLabelText("Admit guest accounts")) as HTMLInputElement;
+    await waitFor(() => expect(box.checked).toBe(true));
+    fireEvent.click(box);
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("this would leave nobody able to manage people"));
+    expect(box.checked).toBe(true);
+  });
+
+  it("marks a guest in the list", async () => {
+    serve("entra", (path) => (path === "people" ? json(200, [{ ...ANA, guest: true }]) : null));
+    place();
+    expect(await screen.findByText(GUEST_WORDS)).toBeTruthy();
+  });
+
+  it("offers no guest setting on Keycloak", async () => {
+    serve("keycloak");
+    place();
+    expect(await screen.findByRole("form", { name: "Invite a person" })).toBeTruthy();
+    expect(screen.queryByLabelText("Admit guest accounts")).toBeNull();
+  });
+});
+
+// The GOV.UK pass (the owner's screenshot, 14 Nov): a person's actions in a row beneath them, one primary
+// (Save) and the rest as links, each keeping its name; the person's name in the body face, not mono.
+describe("a person's row in Admin › People", () => {
+  it("has one primary action and the rest as named links beneath it, and the name outside mono", async () => {
+    serve("keycloak");
+    place();
+    const name = await screen.findByText(ANA.name);
+    expect(name.hasAttribute("data-person-name")).toBe(true);
+    expect(name.classList.contains("value")).toBe(false);
+    const actions = name.closest("tr")!.nextElementSibling!;
+    expect(actions.classList.contains("admin-row-actions-row")).toBe(true);
+    // Save the one button; every other action a link-styled button.
+    const buttons = [...actions.querySelectorAll("button")].filter((b) => !b.classList.contains("admin-row-actions__link"));
+    expect(buttons.map((b) => b.textContent)).toEqual(["Save"]);
+    const links = [...actions.querySelectorAll(".admin-row-actions__link")].map((b) => b.getAttribute("aria-label"));
+    expect(links).toEqual([
+      `Super user preset for ${ANA.username}`, `Edit access for ${ANA.username}`, `Disable ${ANA.username}`,
+      `Reset sign-in for ${ANA.username}`, `Remove ${ANA.username}`,
+    ]); // prettier-ignore
   });
 });

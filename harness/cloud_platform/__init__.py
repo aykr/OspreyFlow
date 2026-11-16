@@ -29,6 +29,7 @@ Conduits still read one folder. It is not spread across nodes; P8 removes it (a 
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import re
 from collections.abc import Sequence
@@ -50,6 +51,7 @@ from schemas.deployment import (
     ENGINES_AS,
     AnalyticsEngine,
     CloudPlatformConfig,
+    EntraSignInConfig,
     GraphStore,
     OspreyConfig,
     Profile,
@@ -71,7 +73,9 @@ NOT_RENDERED = frozenset(
 #: roles in the deployment's own store) and the realm's public address (Amendment 8).
 REALM_SETTINGS = frozenset(
     {"OIDC_TOKEN_EXCHANGE_URL", "OIDC_TOKEN_EXCHANGE_CLIENT_ID", "OIDC_ADMIN_USERS_URL",
-     "OSPREY_IDENTITY_ORIGIN"}
+     "OSPREY_IDENTITY_ORIGIN",
+     # Superset's sign-in through the realm (ADR-148 Amendment 9 replaces it with Entra ID's).
+     "SUPERSET_IDP_INTERNAL", "SUPERSET_IDP_PUBLIC", "SUPERSET_IDP_ISSUER"}
 )  # fmt: skip
 #: Our Secret's keys only the realm, or the Conduit's exchange with it, reads.
 REALM_SECRETS = frozenset(
@@ -153,16 +157,6 @@ def _refuse(config: OspreyConfig) -> None:
             "a cloud platform runs ArcadeDB (ADR-148 decision 5); components.graph_store is "
             f"{config.components.graph_store.value!r}"
         )
-    cp = config.cloud_platform
-    if (
-        cp is not None
-        and cp.shape == "poc"
-        and config.components.search is SearchBackend.OPENSEARCH
-    ):
-        raise CloudPlatformNotRenderable(
-            "the poc shape makes no OpenSearch domain (ADR-148 Amendment 5), so its Conduit would "
-            "reach for one that is not there: set components.search: postgres-fulltext"
-        )
     if config.components.source_path is not None:
         raise CloudPlatformNotRenderable(
             "a cloud platform pulls its images from its registry; components.source_path asks "
@@ -170,14 +164,6 @@ def _refuse(config: OspreyConfig) -> None:
         )
     if not config.network.public_origin.startswith("https://"):
         raise CloudPlatformNotRenderable("a cloud platform is reached over HTTPS")
-    if config.reporting.sync or config.reporting.superset:
-        # The orchestrator's ruling (a), P10 part 2: both signed in through Keycloak, which this
-        # profile does not render; each gets Entra ID's sign-in in its own later step (CARRIES).
-        raise CloudPlatformNotRenderable(
-            "report sync and Superset are not on this profile yet: they signed in through "
-            "Keycloak, and people sign in with Entra ID here; their own step after P10 (reporting "
-            "on Entra ID) brings them. Set reporting.sync and reporting.superset to false"
-        )
     claims = _cp(config).claims
     if claims is None:
         raise CloudPlatformNotRenderable(
@@ -185,14 +171,61 @@ def _refuse(config: OspreyConfig) -> None:
             "cloud_platform.claims (the tenant, the Glass's and the API's app registrations, where "
             "each claim comes from and the first administrators)"
         )
+    if config.reporting.superset and claims.superset_client_id is None:
+        # ADR-148 Amendment 9: Superset signs people in as its own app registration.
+        raise CloudPlatformNotRenderable(
+            "reporting.superset is on, and people sign in to Superset with Entra ID as its own app "
+            "registration: name it in cloud_platform.claims.superset_client_id (its application "
+            "id; "
+            "INSTALL.md says how to register it)"
+        )
     from principal_auth import ClaimMapping
 
     try:
-        ClaimMapping.model_validate(claims.claim_mapping())
+        mapping = ClaimMapping.model_validate(claims.claim_mapping())
     except ValueError as error:
         raise CloudPlatformNotRenderable(
             f"cloud_platform.claims cannot be read as a claim mapping: {error}"
         ) from None
+    by_administrator = [
+        name
+        for name, source in (("clearance", mapping.clearance), ("org_unit", mapping.org_unit),
+                             ("handling_codes", mapping.handling_codes))
+        if source.administrator
+    ]  # fmt: skip
+    held = claims.first_administrator_access or {}
+    if by_administrator and (missing := [f for f in by_administrator if f not in held]):
+        # Amendment 15: nobody could sign in to set anyone's values, the first administrators
+        # included.
+        raise CloudPlatformNotRenderable(
+            f"cloud_platform.claims sets {', '.join(by_administrator)} by the administrator, and "
+            f"first_administrator_access gives the first administrators no {', '.join(missing)}: "
+            "without it nobody can sign in to set anyone's"
+        )
+    # The shapes the Conduit's start takes (`first_administrator_access_from_env`), refused here
+    # in the same words rather than by a Conduit that will not start.
+    wrong = [
+        f
+        for f in by_administrator
+        if not (
+            isinstance(held[f], list) and all(isinstance(c, str) and c for c in held[f])
+            if f == "handling_codes"
+            else isinstance(held[f], str) and held[f]
+        )
+    ]
+    if wrong:
+        raise CloudPlatformNotRenderable(
+            f"cloud_platform.claims.first_administrator_access: {', '.join(wrong)} is not a value "
+            "(clearance and org_unit each a word, handling_codes a list of codes)"
+        )
+    if by_administrator and _cp(config).shape != "poc":
+        # ADR-148 Amendment 15: the fallback is the proof of concept's, while the client's Entra
+        # cannot yet send the values; a production namespace reads every one from Entra ID.
+        raise CloudPlatformNotRenderable(
+            f"cloud_platform.claims sets {', '.join(by_administrator)} by the administrator "
+            "(administrator: true), which only the poc shape allows: name the claim or the group "
+            "table Entra ID sends each in"
+        )
 
 
 def entra_settings(config: OspreyConfig) -> dict[str, str]:
@@ -208,8 +241,39 @@ def entra_settings(config: OspreyConfig) -> dict[str, str]:
         "OIDC_JWKS_URL": claims.jwks_url,
         "OSPREY_CLAIM_MAPPING": json.dumps(claims.claim_mapping(), sort_keys=True),
         "OSPREY_FIRST_ADMINISTRATORS": ",".join(claims.first_administrators),
+        # ADR-148 Amendment 15: what they hold of each value the administrator sets, at install.
+        **(
+            {"OSPREY_FIRST_ADMINISTRATOR_ACCESS": json.dumps(claims.first_administrator_access,
+                                                             sort_keys=True)}  # fmt: skip
+            if claims.first_administrator_access
+            else {}
+        ),
         "SUPERSET_SIGN_IN": "entra",
+        **_reporting_on_entra(config, claims),
     }
+
+
+def _reporting_on_entra(config: OspreyConfig, claims: EntraSignInConfig) -> dict[str, str]:
+    """ADR-148 Amendment 9: Superset signs people in as its own app registration, at the tenant's
+    own v2.0 endpoints, asking for the API's delegated scope, and reads who signed in from the
+    Conduit. The report sync's dashboard identities ask the tenant's token endpoint for the API's
+    application permissions (`.default`; Amendment 10, admin's step)."""
+    tenant = f"https://login.microsoftonline.com/{claims.tenant_id}"
+    settings: dict[str, str] = {}
+    if config.reporting.superset:
+        assert claims.superset_client_id is not None  # `_refuse`
+        settings |= {
+            "SUPERSET_ENTRA_TENANT": claims.tenant_id,
+            "SUPERSET_OIDC_CLIENT_ID": claims.superset_client_id,
+            "SUPERSET_ENTRA_API_SCOPE": f"{claims.id_uri}/{claims.scope}",
+            "SUPERSET_CONDUIT_URL": "http://api:8000",
+        }
+    if config.reporting.sync:
+        settings |= {
+            "REPORT_SYNC_TOKEN_URL": f"{tenant}/oauth2/v2.0/token",
+            "REPORT_SYNC_SCOPE": f"{claims.id_uri}/.default",
+        }
+    return settings
 
 
 #: Each variable a workload reads that a managed store's secret gives: (store, the secret's key).
@@ -228,12 +292,102 @@ def managed_variables(config: OspreyConfig) -> dict[str, tuple[str, str]]:
         "VALKEY_PASSWORD": ("redis", "password"),
         "MINIO_BUCKET_PREFIX": ("s3", "prefix"),
     }
-    # The platform's OpenSearch (decision 4) is made by the namespace's Terraform and its address
-    # written to its secret, but no pod is given it: nothing in the Conduit reads an OpenSearch
-    # address yet (`services/api/search.py`: the index leg has not landed), and a pod naming a key
-    # fails
-    # to start without it. The index leg names its variable here when it lands.
+    if config.components.search is SearchBackend.OPENSEARCH:
+        # Decision 4, v0.5.2 step 3a: the domain's address, from the secret the namespace's
+        # Terraform writes, to the pods that read the stores (ADR-150 decision 7's OPENSEARCH_URL).
+        variables["OPENSEARCH_URL"] = ("opensearch", "url")
     return variables
+
+
+#: The search index's two standing Jobs (ADR-150, rules' 3c): each a CronJob held suspended,
+#: started by the runbooks with `kubectl create job --from=cronjob/<name>`; the rebuild ends every
+#: restore.
+SEARCH_INDEX_JOBS = {
+    "ospreyflow-search-rebuild": ("search-rebuild", "scripts.rebuild_search_index"),
+    "ospreyflow-search-drift": ("search-drift", "scripts.search_index_drift"),
+}
+
+
+def opensearch_settings(config: OspreyConfig, platform: PlatformSettings) -> dict[str, str]:
+    """How the pods sign their requests to the namespace's OpenSearch (v0.5.2 step 3a, ADR-150
+    decision 7): `sigv4` with the namespace's IAM role, as service `es` in the platform's region, or
+    `none` where the platform's own proxy signs. Nothing where the deployment does not search with
+    OpenSearch."""
+    if config.components.search is not SearchBackend.OPENSEARCH:
+        return {}
+    return {
+        "OPENSEARCH_SIGNING": platform.opensearch_signing,
+        "OPENSEARCH_REGION": platform.aws_region,
+    }
+
+
+def search_index_values(
+    config: OspreyConfig, platform: PlatformSettings, workloads: Sequence[dict[str, Any]]
+) -> dict[str, Any]:
+    """The chart's `searchIndex`: the Conduit's image, settings and size, under the namespace's own
+    service account (the IRSA role the domain admits), for each standing Job."""
+    api = next(w for w in workloads if w["name"] == "api")
+    # The settings alone (no Secret of ours whole): the graph's password by name, the domain's
+    # address and the case store's address and credentials from the platform's secrets, each as the
+    # Conduit is given it. Both Jobs read the case store: `feed_resources` connects the extraction
+    # candidates' store by `PostgresConfig.from_env()`, whose default is the developer stack's
+    # localhost:5433 (v0.6.0's package test stopped there, 15 November 2026;
+    # `tests/harness/test_cloud_platform_search_jobs_postgres.py`).
+    held = {"OPENSEARCH_URL"} | {
+        name for name, (secret, _key) in managed_variables(config).items() if secret == "postgres"
+    }
+    return {
+        "serviceAccountName": platform.secrets.irsa.service_account,
+        "image": api["image"],
+        "resources": copy.deepcopy(api["resources"]),
+        "env": [
+            *(copy.deepcopy(e) for e in api.get("env", []) if e["name"] in held),
+            {"name": "ARCADEDB_ROOT_PASSWORD", "secret": "ARCADEDB_ROOT_PASSWORD"},
+        ],
+        "jobs": [
+            {"name": name, "label": label, "command": ["/app/.venv/bin/python", "-m", module]}
+            for name, (label, module) in SEARCH_INDEX_JOBS.items()
+        ],
+    }
+
+
+#: The POC seed path's standing Job (ADR-148 Amendment 14): spec 08's seeds, started by the install
+#: runbook's optional block with the Conduit and the worker scaled to none.
+SEED_JOB = "ospreyflow-seed"
+
+
+def seed_values(
+    config: OspreyConfig, platform: PlatformSettings, workloads: Sequence[dict[str, Any]]
+) -> dict[str, Any]:
+    """The chart's `seed` (the poc shape alone): the Conduit's image and size; the case store's
+    address and credentials, and the buckets' prefix, as the Conduit has them; the graph's and
+    ClickHouse's passwords by name; nothing else of ours. It runs as the Conduit's IRSA account,
+    whose role holds the buckets: the HMP seed stages its files in `<prefix>staging` (v0.6.0's
+    package test, INSTALL step 9, 16 November 2026: with no account and no prefix, HeadBucket on
+    `ospreyflow-staging` was refused; `tests/harness/test_cloud_platform_seed_irsa.py`). The case's
+    unit is not rendered: `seed_poc` reads the first administrator's own from the people store at
+    the run."""
+    api = next(w for w in workloads if w["name"] == "api")
+    # The platform's secrets' variables it reads, as the Conduit is given them: the RDS secret's,
+    # and the S3 secret's bucket prefix.
+    held = {
+        name
+        for name, (secret, _key) in managed_variables(config).items()
+        if secret in ("postgres", "s3")
+    }
+    return {
+        "name": SEED_JOB,
+        "label": "seed",
+        "serviceAccountName": platform.secrets.irsa.service_account,
+        "image": api["image"],
+        "resources": copy.deepcopy(api["resources"]),
+        "command": ["/app/.venv/bin/python", "-m", "scripts.seed_poc"],
+        "env": [
+            *(copy.deepcopy(e) for e in api.get("env", []) if e["name"] in held),
+            {"name": "ARCADEDB_ROOT_PASSWORD", "secret": "ARCADEDB_ROOT_PASSWORD"},
+            {"name": "CLICKHOUSE_PASSWORD", "secret": "CLICKHOUSE_PASSWORD"},
+        ],
+    }
 
 
 def person_given(config: OspreyConfig) -> set[str]:
@@ -244,6 +398,14 @@ def person_given(config: OspreyConfig) -> set[str]:
     given = set(model_key_variables(config).values()) | set(connection_secret_variables(config))
     if config.mail is not None and config.mail.username:
         given.add("OSPREY_SMTP_PASSWORD")
+    # ADR-148 Amendment 11: Superset's client secret is the one the client's Entra administrator
+    # makes for its registration, never one minted here; and the report sync's dashboard identities
+    # (each an Entra registration's application id and secret, Amendment 10) are given as they are
+    # registered, so a later apply writes the list given, never a fixed `[]` over it.
+    if config.reporting.superset:
+        given.add("SUPERSET_OIDC_CLIENT_SECRET")
+    if config.reporting.sync:
+        given.add("REPORT_SYNC_DASHBOARDS")
     return given
 
 
@@ -1078,6 +1240,11 @@ def render_cloud_platform(
     environment.update({k: v for k, v in install.settings.items() if k not in REALM_SETTINGS})
     # Entra ID's, last, so nothing the cluster's realm wrote stands (ADR-148 Amendment 8).
     environment.update(entra_settings(config))
+    environment.update(opensearch_settings(config, platform))
+    # Superset's rate limits in the managed cache, over TLS with its password (ADR-148 Amendment
+    # 11): `superset_config.py` builds the address from VALKEY_*, which the cache's secret gives;
+    # the cluster's `redis://valkey:6379/5` names a Valkey this profile does not run.
+    environment.pop("SUPERSET_RATELIMIT_STORAGE", None)
     sources = _cp(config).connector_sources
     if _cp(config).connector_hosts or sources.declared():
         # The Conduit's own allow-list, from the lists the egress policy allows (one list, both).
@@ -1132,7 +1299,10 @@ def render_cloud_platform(
         "podSecurity": {"user": UID, "group": UID},
         "networkPolicy": {"openEgress": False},
         # P9's backup and restore pods render beside the workloads; their rows by their names.
-        "egress": egress_policy(config, platform, profile, workloads, others=profile.egress.others),
+        # The seed's row only where its Job is rendered (the poc shape): no store admits a pod of
+        # that name elsewhere (ADR-148 Amendment 14).
+        "egress": egress_policy(config, platform, profile, workloads, others=[
+            o for o in profile.egress.others if o != "seed" or _cp(config).shape == "poc"]),
         "ingress": _ingress(config, platform, names, profile, environment),
         "environment": environment,
         "files": {
@@ -1145,6 +1315,10 @@ def render_cloud_platform(
         "workloads": workloads,
         "jobs": jobs,
     }
+    if config.components.search is SearchBackend.OPENSEARCH:
+        out["searchIndex"] = search_index_values(config, platform, workloads)
+    if _cp(config).shape == "poc":
+        out["seed"] = seed_values(config, platform, workloads)
     # Decision 13 (ADR-148 Amendment 7, P9): the backups, added to these values, and its Terraform.
     from harness.cloud_platform_backups import add_backups
 

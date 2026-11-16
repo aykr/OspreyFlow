@@ -5,7 +5,8 @@ fraud detection, and event monitoring and alerting.
 
 For whoever installs OspreyFlow and looks after it: **Lite** (one computer), **Small** (one cloud
 server on the cloud's managed services, or one server of your own with every store on it) and
-**Enterprise** (a Kubernetes cluster on the cloud's managed services). It describes what is built, and says plainly where something is not yet.
+**Enterprise** (a Kubernetes cluster on the cloud's managed services), and a namespace on an organisation's
+own shared Kubernetes platform (`cloud-platform`, section 6a). It describes what is built, and says plainly where something is not yet.
 
 The other guides in this folder are the [user guide](user-guide.md), for analysts, and the
 [developer guide](developer-guide.md), for data engineers. Appendix A, every `osprey.yaml` setting,
@@ -14,10 +15,40 @@ is made from the deployment's own schema, and is checked against it on every cha
 <!-- document-control:begin -->
 ## Document control
 
-**Version 1.94** · 2026-11-13 · For OspreyFlow v0.5.0 · Issued
+**Version 2.24** · 2026-11-16 · For OspreyFlow v0.6.0 · Issued
 
 | Version | Date | What changed |
 | --- | --- | --- |
+| 2.24 | 2026-11-16 | §6a.7's Superset: a Reports Viewer is Superset's OspreyReader, which reads and changes nothing there (Superset's own Gamma saves dashboards and charts; found by v0.6.0's package test, the owner's ruling of 16 November), and every account holds it; a builder (`manage_dashboards`) reads the whole reporting mart in their own session, so the right is for people cleared for every dashboard identity's cases (ADR-148 Amendment 21). |
+| 2.23 | 2026-11-15 | §6a.7: a service identity on Entra ID must hold this API's app role `OspreyFlow.Run` (ADR-148 Amendment 20; v0.6.0 #18), defined on the API's registration and granted to the orchestrator's application; §6a.2's poc tables list it beside `Dashboard.Read`. §6a.7 and §8's `run` row: `ospreyflow run` on Entra ID sends `OSPREY_TOKEN_SCOPE`, the API's `/.default` scope, without which Entra issues no token (the owner, beside #18). Version set at merge. PDF made by the orchestrator at merge. |
+| 2.22 | 2026-11-15 | §6a.9, Bedrock in London (the owner's ruling 17): the example's model is `amazon.nova-pro-v1:0`, a model AWS serves in-Region in London; Bedrock in London means Amazon Nova and the Titan embeddings, not current Claude models, which London serves only through the EU and global profiles the region rule refuses; Claude through AWS's EU profile is not offered in v0.6.0. Held by `tests/test_admin_guide_bedrock_london.py`. Version set at merge. PDF made by the orchestrator at merge. |
+| 2.21 | 2026-11-15 | §10's *Keys*, §8's `models key` row and §4.1's guided install, as the code has done since ADR-135 Amendment 2 (the owner followed the guide on 15 November and it was wrong): a key is entered in *Admin › Models* with **Enter key** (**Rotate key**) and **Set the key**, write-only, kept by the model gateway alone and used with nothing restarted; **Remove key** beside it; neither for an engine on the gateway's IAM role. The install hands a key from `deployment.env` to the gateway and removes its line; `ospreyflow models key` runs the Conduit's own key path and restarts nothing. Held by `tests/test_admin_guide_model_keys.py`. Version set at merge. PDF made by the orchestrator at merge. |
+| 2.20 | 2026-11-15 | The header names v0.6.0 (the owner's plan of 15 November: one release, installed fresh). §6a.1's *Moving to a new release* is for a release after v0.6.0, which is installed fresh into a namespace of its own, and the move is not yet rehearsed; §14 opens with the same rule. Passages for deployments only an earlier release could have made are struck: the checkout's deployment from before v0.4.2, an `admin` from v0.4.6, the rules' move at v0.5.0, the hosted engines' egress after an upgrade, HMP loaded before v0.2.0, the stores' move to named volumes and §14.1, an `osprey.yaml` from v0.4.x, sets from before v0.5.0, v0.4.8's backups on Linux, a bundle from before v0.4.12, and their rows in §16. Held by `tests/test_guides_release_header.py`, `tests/test_guide_6a_upgrade.py` and `tests/test_guides_v060_fresh.py`. Version set at merge. PDF made by the orchestrator at merge. |
+| 2.19 | 2026-11-15 | §6a.8: a backup set never holds the map key file on cloud-platform either (the claims run took it with the map settings before; the owner, 15 Nov, a fix in v0.5.2), and a restore names each provider whose key must be entered again (ADR-148 Amendment 13 point 4, corrected). Version set at merge. PDF made by the orchestrator at merge. |
+| 2.18 | 2026-11-15 | The header names v0.5.2 (step 5's sweep, §2, at the cut). Each "this release" or "this version" true only of an earlier one names it: named deployments and a dataset's egress from v0.4.2, a bundle's platform from v0.4.12, the backups folder from v0.5.0; Superset's and the report sync's copies no longer marked "from v0.5.2". Held by `tests/test_guides_release_header.py`. Version set at merge. PDF made by the orchestrator at merge. |
+| 2.17 | 2026-11-14 | §9.6 and §12: *Connection strength* is under the top bar's **More**, and neither it nor *Reports* is called a view, which means a saved view alone (ADR-145 Amendment 17). Held by `tests/test_guide_navigation_words.py`. Appendix A regenerated from the schema's descriptions without the client's words (studio's V3): the gateway is *your organisation's own*, and so is the Entra tenant id. Version set at merge. PDF made by the orchestrator at merge. |
+| 2.16 | 2026-11-14 | §10: *How long a model is waited for*, a hosted engine 120 seconds and the deployment's own model 900, each set in `deployment.env` on Lite and Small; a call past its bound stopped, and a provider's refusal said, naming the engine, nothing recorded (ADR-135 Amendment 13, D2). On Enterprise and §6a.9's shared platform both are rendered at their defaults, with no `osprey.yaml` setting. Held by `tests/test_admin_guide_model_timeouts.py`. PDF made by the orchestrator at merge. |
+| 2.15 | 2026-11-14 | The refusals quoted in §6a.7 and §9 name *Admin › People and roles* as the side list names it ("is not held in Admin › People and roles", "the people store behind …"), and on Entra ID a value Entra sends is refused in words, saying which values are set here (ADR-148 Amendment 19). Version set at merge. PDF made by the orchestrator at merge. |
+| 2.14 | 2026-11-14 | The Lite row: `ospreyflow start --build` rebuilds the search index from the graph as its last step (ADR-150 Amendment 2). |
+| 2.13 | 2026-11-14 | §16: a watch stays active through two unreachable evaluations in a row, with a note saying so, and stops at the third (ADR-044 Amendment 2). |
+| 2.12 | 2026-11-14 | Step 5's wording sweep. The freeze's last features: the search index rebuilt from the graph wherever OpenSearch is searched, on install (§4's step 4), on update (§14) and by `INSTALL.md`'s Job (§6a.1; ADR-150 Amendment 2); §6a.11 question 11 counting the reporting registrations; §14, `start --build` and the index rebuilt by hand. §6a.2: the poc shape's tables as its manifest prints them. Then the early part. Navigation as ADR-145 Amendments 12 and 15 built it: §9.6's *Connection strength* and §12's *Reports* in the top bar's view switch (More views for the first), not on the rail; *Ask & Chat* for Ask the case and Questions (§5a.4, §6a.1, §10); *Admin → Operations* for Schedules and runs, its screenshot marked for a new capture; *Admin › People and roles* and *Admin › Dashboard identities* as Admin labels them (the code's quoted words left as the code has them). §1's tiers: search as built (OpenSearch or the graph store's own reads, no PostgreSQL full-text) and three narrower ports, `IndexFeedSource` among them. §9: the refusal of a value Entra sends, under the administrator fallback, quoted. §9's "No administrator can give a missing clearance or unit" qualified by the poc shape's administrator fallback. §6a.1: `opensearch_signing`, `sigv4` or `none`, as the platform settings file holds it. §6a.11's question 13 (the orchestrator's ruling): whether the client's standard accepts an OpenSearch domain admitting one IAM role with no fine-grained access control, and what OspreyFlow does in its place, each reader's access in its own query to the index. The opening and §14 name the `cloud-platform` profile, §14 with a row for a shared-platform namespace (the poc shape by §6a.1; the standard shape's runbooks coming). Held by `tests/test_guide_navigation_words.py`, `test_guides_ports_and_search.py`, `test_guides_v051_gaps.py` and `test_guides_cloud_platform.py` (§9's Entra refusals now held both ways). PDF made by the orchestrator at merge. |
+| 2.11 | 2026-11-14 | §6a.7: the Glass's sign-in page shows the Conduit's words for a token-version refusal, a value not set yet and a guest not admitted, each tagged in its 401; every other refusal keeps the general words (ADR-148 Amendment 18 point 6). Version set at merge. PDF made by the orchestrator at merge. |
+| 2.10 | 2026-11-14 | §6a.7: a token-version refusal's words are in the Conduit's 401 and its log, and INSTALL step 6's check shows them; the Glass's sign-in page shows its general words, not these (the 2.07 text said the page showed them, which it does not). |
+| 2.09 | 2026-11-14 | §6a.7: an admitted guest under the administrator fallback takes the values set with *Access*, never their token's, and the Guests form says which come from where (ADR-148 Amendment 17, line added). Version set at merge. PDF made by the orchestrator at merge. |
+| 2.08 | 2026-11-14 | §9.1: a coming Admin section is plain words with a *Coming* tag, never a link, and a person's actions in *People and roles* sit on a line beneath them (ADR-145 Amendment 16). Version set at merge. PDF made by the orchestrator at merge. |
+| 2.07 | 2026-11-14 | §6a.7: a token of the other version than `token_version` is refused in words naming `requestedAccessTokenVersion` and the setting, and INSTALL step 6's check shows them after the first sign-in (ADR-148 Amendment 18). |
+| 2.06 | 2026-11-14 | §6a.7, the administrator fallback on the poc shape (ADR-148 Amendment 15): `{administrator: true}` as the source of a person's clearance, unit or handling codes, set in *Admin › People* with Access (none above the setter's own), a person with none set unable to sign in until set, the first administrators' values at install (`first_administrator_access`), refused on any other shape; Appendix A's three claim sources and `first_administrator_access`. PDF reprinted alone. |
+| 2.05 | 2026-11-14 | §6a.8: the Ingest root in the set in every shape (ADR-148 Amendment 13 point 4, amended 14 November): in the standard shape the shared volume's `ingest` folder is a part of its own, so it is no longer among what no set holds, and an upload no longer disagrees with a restore's stores. Held by `tests/test_guides_cloud_platform.py`, reading the render both ways. PDF made by the orchestrator at merge. |
+| 2.04 | 2026-11-14 | §6a.7 and §16's table of what to do when something is wrong: a stopped hotlist or watch says why beside *Stopped*, in the Conduit's words for its owner (ADR-044 Amendment 1). PDF made by the orchestrator at merge. |
+| 2.03 | 2026-11-14 | §6a.8: the backup sets kept 34 days, a day inside RDS's 35-day point-in-time window, since RDS's earliest restorable point lags by up to about a day and the sets' expiry rounds up to midnight UTC (ADR-148 Amendment 13 point 5, amended 14 November); platform's diff, with the retention said to be no longer than that. Held by `tests/test_guides_cloud_platform.py`. PDF made by the orchestrator at merge. |
+| 2.02 | 2026-11-14 | Guests on Entra ID as built (ADR-148 Amendment 17, the audit's ruling 4b). §6a.7: a guest account is refused, in its own words, until an administrator of people turns on *Admit guest accounts* in *Admin › People*; each change audited; admitted, a guest signs in through the same mapping and is given nothing a member with the same token would not be; turned off, every guest is refused at their next request, and a run as a guest owner stops; the untried guest token's shape restated. §9: the setting, and guests marked in the list. Held by `tests/test_guides_cloud_platform.py`. PDF made by the orchestrator at merge. |
+| 2.01 | 2026-11-14 | §9: on Entra ID a dashboard identity is registered by its app registration's application id, with no secret shown (ADR-148 Amendment 10), and its refusals quoted as `entra_people.py` words them; the refusal of every dashboard identity, which the code no longer raises, struck. §6a.1: the decommission's backups bucket and its key by a choice with no default, `BACKUPS=keep` or `BACKUPS=destroy`, as the rendered `DECOMMISSION.md` makes it (ADR-148 Amendment 13 decision 6). Held by `tests/test_guide_v052_admin.py`. PDF made by the orchestrator at merge. |
+| 2.00 | 2026-11-14 | §6a on search, as ADR-148 Amendment 13 and the render have it: §6a.1, the poc shape makes the platform's OpenSearch domain as the standard shape does (the refusal struck), `postgres-fulltext` makes none, and the Conduit, the workers and the index's two Jobs are given its address; the shared folders in the standard shape, the Ingest root and no staging; §6a.3, `opensearch.tf` in every shape; §6a.8, the restore's step 6 names the backups' CronJobs it resumes, and step 7, the index rebuilt and the drift check, the index not in a set. §6a.2: the index's rebuild and drift check sized as the Conduit (0.5 CPU, 2 GiB, a 4 GiB limit; the poc's CPU limit 2). §6a.5: their way out, ArcadeDB, the managed stores' networks (OpenSearch on 443), S3 and STS. §13: a local restore's last step rebuilds the index from the graph where there is an OpenSearch (no longer "holds no index of OspreyFlow's yet"). Held by `tests/test_guides_cloud_platform_search.py`, which reads the render, `profile.yaml`'s rows and `restore.py`. PDF made by the orchestrator at merge. |
+| 1.99 | 2026-11-14 | §6a.1: *Moving to a new release (poc shape)*, platform-b's paragraph checked against the rendered runbooks: `INSTALL.md` run again from the new release's copy, the backup first as the runbook's *Before an upgrade* does it (the report sync stopped too), the Terraform's pull request applied after the new release's render that makes it (step 3, not step 2), the install's own checks named, v0.5.2's install test planned for 25 November and not yet run, going back not rehearsed. §6a.8: the report sync is rendered only with reporting on. Held by `tests/test_guide_6a_upgrade.py`. PDF made by the orchestrator at merge. |
+| 1.98 | 2026-11-14 | Scheduled runs on Entra ID as built (ADR-148 Amendment 16, the audit's ruling 1, option A). §6a.7: a run acts as its owner as *Admin › People* holds them, roles and disabled read at each run, clearance, unit and codes as at their last sign-in; refused, in its own words, for a disabled owner, one not held, one not signed in within 24 hours (never counted toward pausing) and a store that cannot be read, never as "could not be reached", each followed by what happens next for its caller; the 24 hours run from the last recorded access (worked from a Friday to a Tuesday); a leaver to be disabled in *Admin › People* too; a stopped watch shows no reason yet. §8, §9.5, §9.11 and §6a.10 to match. Held by `tests/test_guides_cloud_platform.py`. PDF made by the orchestrator at merge. |
+| 1.97 | 2026-11-14 | §6a, v0.5.2's reporting on the cloud-platform profile (ADR-148 Amendments 9 to 11): Superset and the report sync rendered when switched on, one copy each in development; Superset signing in with Entra ID as its own registration, its role from the person's rights (a holder of `manage_dashboards` its builder, Alpha); the dashboard identities' app-only tokens (Viewer on a case at most; their grants removed with them); their egress, copies and secrets; the `superset` database beside `ospreyflow` and `litellm`; the line saying reporting is not available on Entra ID removed; Power BI reading the mart as an option. Appendix A: `cloud_platform.claims.superset_client_id`. PDF reprinted alone. |
+| 1.96 | 2026-11-13 | §6a.8: what a backup set holds, as ADR-148 Amendment 13 decision 4 and the render have it: the claims part holds, in every shape, the shared volume's published pipelines, model settings and map settings with the map key file, beside the poc shape's Ingest root, and `ospreyflow-backup-claims` runs in every shape; what is not in a set, the tiles and, in the standard shape, the Ingest root on the shared volume; "the shared volume is not backed up" struck. Held by `tests/test_guides_cloud_platform.py`, which reads the rendered values. PDF made by the orchestrator at merge. |
+| 1.95 | 2026-11-13 | §6a.8: RDS's point-in-time restore of 35 days, as the Terraform renders it since ADR-148 Amendment 13, the same as the sets' 35, so every set still kept can be restored with its database; the 7 days and the older set's warning struck. Held by `tests/test_guides_cloud_platform.py`, which reads the rendered Terraform. PDF made by the orchestrator at merge. |
 | 1.94 | 2026-11-13 | The `cloud-platform` profile against the ADR-148 audit of 13 November (docs' v0.5.2 sweep, part one). §6a.7: nothing acts as its owner on Entra ID, so loads are started by hand: a pipeline's schedule and watched folder, *Run now* in Operations, `ospreyflow run`, a scheduled rule, the daily check for lapsing KYC documents, a list's refresh schedule, a watch's runs and anyone else's rules, hotlists and watches at a load, each as built, with the scheduler's own words and why they never pause a schedule; §6a.10's "marked stopped" struck, as untrue. §6a.5: one S3 read's 1,000 objects, no SSE-KMS bucket, Athena's default catalog alone. §6a.8: RDS's point-in-time restore of 7 days against the sets' 35. §6a.11: two app registrations, not one; volume encryption by the storage class, a new question. §8, §9.5, §9.11: the same Entra limit where each runs as its owner. §9: *People and roles* on Entra ID, each refusal in its own words, no administrator's fallback for clearance or unit. §10a: on a shared platform, a proxied map provider added in Admin has no way out. Held by `tests/test_guides_cloud_platform.py`. PDF made by the orchestrator at merge. |
 | 1.93 | 2026-11-13 | §6a: the least connections counted from the copies each shape renders (the owner's ruling: one Superset and one report sync in poc and development), 834 there and 918 in production, so the 1000 leaves 166 and 82 to spare. PDF reprinted alone. |
 | 1.92 | 2026-11-13 | §6a: the managed PostgreSQL's `max_connections` set to 1000 in its RDS parameter group (the owner's decisions), not left to the class's default; the least it must allow, 918, with Superset and the report sync (from v0.5.2) and an upgrade in progress, so 82 to spare; the `db_parameter` line for MoJ's RDS module, and that the setting takes effect at creation or the next reboot. PDF reprinted alone. |
@@ -135,7 +166,7 @@ Three tiers; everything that passes between them crosses one of four typed ports
 | --- | --- |
 | **The Glass** | The browser workspace, one web application with four places: the Glass itself (the graph, map, timeline and figures), the Ingest Studio, Rules and Monitoring, and Admin |
 | **The Conduit** | The API (FastAPI). Every request is checked against the person making it: access control is applied inside each query to the stores, never after |
-| **The Vault** | The stores: the graph store (ArcadeDB), the analytics database (DuckDB inside the Conduit, or ClickHouse shared by several Conduits), search (OpenSearch, or PostgreSQL full-text), PostgreSQL, the object store, and the models |
+| **The Vault** | The stores: the graph store (ArcadeDB), the analytics database (DuckDB inside the Conduit, or ClickHouse shared by several Conduits), search (OpenSearch; where a deployment has none, `postgres-fulltext`, the graph store's own reads, and the results page says search is limited to exact identifiers), PostgreSQL, the object store, and the models |
 
 | Port | What passes through it |
 | --- | --- |
@@ -144,8 +175,10 @@ Three tiers; everything that passes between them crosses one of four typed ports
 | ComputePort | Graph algorithms: centrality, communities, ownership chains |
 | ModelPort | Extraction, vision, transcription and embedding, through the LiteLLM gateway |
 
-Two narrower ports sit beside them: the media store, for content files (an S3-protocol store —
-SeaweedFS or AWS S3 — or Azure Blob), and the recognition port.
+Three narrower ports sit beside them: the media store, for content files (an S3-protocol store —
+SeaweedFS or AWS S3 — or Azure Blob); the recognition port; and the search index feed's source
+(`IndexFeedSource`), through which the indexer alone reads each node as stored, to build its search
+document (ADR-150).
 
 The level 1 diagram names the technology in each component. Versions are those the release pins;
 Small and Enterprise use the cloud's managed services where the diagram's last row says.
@@ -342,13 +375,6 @@ ospreyflow switch default       # back to the checkout's own
 
 A Lite computer runs one deployment at a time by default, which is what `ospreyflow switch` is for.
 
-**The deployment installed in the checkout** — every install before this version, with its
-`osprey.yaml` in the checkout and its files in `deploy/generated/` — is listed as `default` and works
-exactly as before: no command moves, renames or changes it. It could later be moved under
-`~/.ospreyflow/deployments/` (install a named deployment, restore a backup of the checkout's into it,
-check it, then uninstall the checkout's with `--keep-data` until you are sure); that is a step for
-the administrator to take deliberately, never something an update does.
-
 ### 1a.2 Adding a public dataset
 
 A public dataset you download yourself can be added to any deployment, at install or later:
@@ -511,7 +537,11 @@ basemap, which demo packs — then (`--starter <theme>-<domain>` fills these in 
 3. starts the deployment and waits until every service is healthy and the extraction model has
    downloaded (it says which, and its size: `qwen2.5:7b-instruct`, about 4.7 GB, or the 14b on a GPU,
    about 9 GB), so Ask works as soon as the install says it is done;
-4. makes the demo accounts (unless `--no-demo-accounts`) and loads the chosen demo packs.
+4. makes the demo accounts (unless `--no-demo-accounts`);
+5. where the deployment searches with OpenSearch (`components.search: opensearch`, the default),
+   rebuilds the search index from the graph, so search answers from the index at once; a rebuild that
+   fails fails the install, saying so;
+6. loads the chosen demo packs.
 
 It ends by saying the address and that the sign-in details are in `deployment.env`.
 
@@ -851,8 +881,8 @@ The guided page (`--gui`) does not install this kind of Small.
 
 ### 5a.4 The local engine on an NVIDIA GPU
 
-Without a GPU the local engine (Ollama) runs on the server's processors, so a question to Ask the
-case on the local engine is slow, and material that may not leave the deployment can only ever run
+Without a GPU the local engine (Ollama) runs on the server's processors, so a question to Ask &
+Chat on the local engine is slow, and material that may not leave the deployment can only ever run
 there. A server with an NVIDIA GPU can give the local engine the GPU. The decision is ADR-135
 Amendment 1.
 
@@ -877,7 +907,7 @@ gives a container no NVIDIA GPU.
 **What changes.** The model server alone reserves every NVIDIA GPU on the server; its image, the
 models' pinned weights and the gateway are the same. Image descriptions and embeddings run in the
 same model server, so they use the GPU too; transcription stays on the processors. The extraction
-model, which also answers Ask the case and Ask to search on the local engine, becomes
+model, which also answers Ask & Chat and Ask to search on the local engine, becomes
 `qwen2.5:14b-instruct` (about 9 GB, downloaded once) instead of `qwen2.5:7b-instruct`, unless
 `osprey.yaml` names one under `models.extraction`, which always wins. `ospreyflow apply` fetches
 a newly chosen model, and waits for it, before the services that use it start again. An `osprey.yaml` saved by the
@@ -1059,10 +1089,9 @@ shape, which a development namespace alone may take ("cloud_platform.shape: poc 
 namespace's (one copy of each store); a production namespace takes the standard shape"). The poc
 shape runs one copy of each store, ClickHouse with its own Keeper inside it rather than ClickHouse
 Keeper beside it, no disruption budgets, a CPU limit on every container (section 6a.2), and the
-Ingest root (uploads and the drop folder) on a claim of its own, `ospreyflow-ingest`. It makes no
-OpenSearch domain, and refuses a render that would use one ("the poc shape makes no OpenSearch
-domain (ADR-148 Amendment 5), so its Conduit would reach for one that is not there: set
-components.search: postgres-fulltext"): name `components.search: postgres-fulltext` with it.
+Ingest root (uploads and the drop folder) on a claim of its own, `ospreyflow-ingest`. Like the
+standard shape, it makes the platform's OpenSearch domain when `components.search` is `opensearch`
+(the default; ADR-148 Amendment 13), and `components.search: postgres-fulltext` makes none.
 
 Then, in `OspreyFlow_Core`:
 
@@ -1089,10 +1118,16 @@ with the render to install.
 
 **The runbooks (poc shape).** `INSTALL.md` takes the deployment from its settings to a Glass that
 answers: the checks of the tools and rights, the Terraform's pull request, the unpinned render and
-the push, the pinned render, `helm upgrade --install`, the sign-in check (and the way back in when
+the push, the pinned render, `helm upgrade --install`, then, where the deployment searches with
+OpenSearch, the search index rebuilt from the graph by a Job once the Conduit and the workers are rolled out
+(on a fresh install and on every upgrade; the step fails, naming the Job and deleting it, if the Job fails, or has not started in five minutes or finished in 30), the sign-in check (and the way back in when
 nobody can manage people, section 6a.7), and the Glass's health. `DECOMMISSION.md` removes it: a
-last backup, `helm uninstall`, the claims and our Secret, the buckets and repositories emptied, the
-backups kept for their retention, then `python -m harness.cloud_platform.decommission_check`, which
+last backup, `helm uninstall`, the claims and our Secret, the buckets and repositories emptied, and
+the backups bucket and its key by a choice with no default: its step 7 refuses until it is given
+`BACKUPS=keep` or `BACKUPS=destroy`. **keep** sets the kept bucket's expiry to the retention you agree
+(`BACKUP_RETENTION_DAYS`), so the sets stay readable until then; **destroy** removes every set now,
+which cannot be had back, and schedules the key's deletion (thirty days, cancellable until then).
+Then `python -m harness.cloud_platform.decommission_check`, which
 names anything left behind and exits 1 while anything is. A block fenced `bash platform` runs only
 with the platform's access; the rest runs anywhere. A block fenced `bash later` is in neither
 runbook's sequence and is run only when its words say: the way back in when nobody can manage people,
@@ -1102,7 +1137,7 @@ and its step 2 checks the certificate Secret `cloud_platform.tls_secret` names, 
 The install's *What it needs* names the `ospreyflow` command's own install (`uv tool install ./cli`)
 and the managed PostgreSQL's `max_connections` of 1000, set in its parameter group. The least it must
 allow is 834 in the poc and development shapes and 918 in production: two Conduits side by side in an
-update, the worker, the gateway and a reserve, with Superset and the report sync (from v0.5.2: one copy
+update, the worker, the gateway and a reserve, with Superset and the report sync (one copy
 of each in poc and development, two in production) doubled by an upgrade in progress. 1000, set in every
 shape, leaves 166 and 82 to spare. The Terraform renders RDS as a `db.t4g.large` (8 GiB) in every shape, with a
 parameter group setting it; with MoJ's `cloud-platform-terraform-rds-instance` module the install gives
@@ -1115,6 +1150,31 @@ on a kind cluster (R1, 13 November 2026)**, with stand-ins for the platform's pa
 and KMS, EKS's pod identity, RDS, ElastiCache and Entra ID); neither has run against a real account
 or tenant. The standard shape has no rendered runbook yet.
 
+**Moving to a new release (poc shape).** v0.6.0 itself is installed fresh, into a namespace of its own: a
+namespace on an earlier release stays on it (section 14). For a release after v0.6.0 there is no separate
+upgrade runbook. A new release is
+installed by running `INSTALL.md` again from the new release's copy: its `helm upgrade --install` moves
+the deployment onto the new release's images and values. In order:
+
+1. **Back up first.** Take *A backup now* (section 6a.8) as the runbook's *Before an upgrade* does it,
+   with the Conduit, the workers and the report sync stopped and each one's copy count noted, and check
+   that the set finished (its `manifest.json` is written).
+2. **Get the new release's copy**: its tag, checked out in its own folder, with the deployment's own
+   `osprey.yaml` copied in. Read the release's notes first.
+3. **Render, push and render pinned from that copy**, exactly as section 6a.4 says. The values to
+   install are the new release's pinned render, never the old one's. A release that needs a change in
+   the Terraform says so in its notes, and the Terraform is this render's `terraform/` folder: its pull
+   request is applied now, before the install, as at the first install.
+4. **Run `INSTALL.md` again from that copy**, block by block. Its `helm upgrade --install` replaces each pod on the new release, the search index is rebuilt from the graph as on a fresh install, and its own checks
+   follow, as at the first install: section 6's check
+   that the Conduit reads Entra's settings, and section 7's `/healthz` through the Glass. Then start the Conduit and the workers again at the copy counts noted in
+   step 1, if the install has not.
+
+**Not yet rehearsed.** No deployment has yet been moved to a new release by these steps: v0.6.0's own
+package test is a fresh install. **Going back to the previous release** (installing its copy again the same way and
+restoring step 1's backup) **has not been rehearsed**: until it has, treat step 1's backup as the way
+back, and test the new release on the development namespace before production.
+
 **A platform is a settings file**, `harness/cloud_platform/platforms/<name>.yaml`: its ingress class
 and annotations, the controller's namespace, its storage class, its egress policy kind and the
 networks its managed stores answer in, and the names of the secrets the managed stores' details
@@ -1125,17 +1185,28 @@ own file is `client.yaml`.
 in the standard shape) run in the namespace as StatefulSets on the platform's `gp2-expand` class;
 in the standard shape each has a disruption budget allowing one copy down at a time, and two minutes
 for ArcadeDB to close its databases. Postgres is RDS PostgreSQL 16 and Valkey is ElastiCache
-(Redis 7), each reached over TLS; SeaweedFS is S3. In the standard shape the platform's OpenSearch
-2.x domain is made by default (`components.search` defaults to `opensearch`), but no pod is given its
-address yet, so it is unused. Caddy is not rendered: the platform's NGINX ingress is the front door,
+(Redis 7), each reached over TLS; SeaweedFS is S3. In every shape the platform's OpenSearch 2.x
+domain is made by default (`components.search` defaults to `opensearch`), and the pods that read the
+stores, the Conduit (`api`), the workers (`worker`) and the index's rebuild and drift check
+(`ospreyflow-search-rebuild`, `ospreyflow-search-drift`), are given its address (`OPENSEARCH_URL`).
+How they reach it is the platform settings file's `opensearch_signing`. With `sigv4`, the default,
+every request is signed with SigV4 as the namespace's IAM role (IRSA): the domain's access policy admits
+that role alone, with no fine-grained access control, so there is no user or master password to keep.
+With `none`, for a platform whose own module fronts the domain with a proxy that signs for us, the pods
+send their requests unsigned to the address the proxy's secret names (its `proxy_url`). The render's
+`INSTALL.md` says which.
+Caddy is not rendered: the platform's NGINX ingress is the front door,
 with ModSecurity on and the IP allow-list from `allow_from`. Local models and Whisper are not
 rendered, since the platform has no GPU. The model gateway (LiteLLM) is rendered always, with or
 without an engine (section 6a.3 says which identity it runs as; section 6a.9 is the model
-route). **Reporting is not rendered**:
-Superset and the report sync signed in through Keycloak, and a render setting `reporting.sync` or
-`reporting.superset` is refused ("report sync and Superset are not on this profile yet: they signed
-in through Keycloak, and people sign in with Entra ID here; their own step after P10 (reporting on
-Entra ID) brings them. Set reporting.sync and reporting.superset to false"). The Conduit's image is
+route). **Reporting is rendered when it is switched on** (`reporting.superset`, `reporting.sync`;
+ADR-148 Amendments 9 to 11): Superset, at the `bi.` name, signs people in with Entra ID as its own
+app registration (`cloud_platform.claims.superset_client_id`; a render without it is refused in
+words), and the report sync's dashboard identities get their tokens from Entra ID (section 6a.7).
+Superset's settings are its own database, `superset`, which it makes on the managed PostgreSQL at its
+first start, beside `ospreyflow` and the gateway's `litellm`; the reports are the schema
+`osprey_reports` inside `ospreyflow`, as on Small, which Power BI may read through a read-only login
+of its own (an option the install's runbook describes). The Conduit's image is
 built without Java on this profile, so *Admin › Maps*' **Build** says that the basemap cannot be
 built here; there is no way yet to bring a basemap built elsewhere onto the platform (*coming*), so
 the map uses its providers alone.
@@ -1147,8 +1218,7 @@ unless `models.extraction_engine: deep_read` is named (ADR-135 Amendments 6 and 
 not inside the Conduit or the workers: the Conduit alone calls it, and it reaches nothing but the
 model gateway, with a key of its own scoped to its models; it takes no service account, no token and
 none of our Secret. It is for the review queue's document extraction alone, and **no screen reaches
-it yet**: the Glass's own extraction (a document's content, email) and Questions and Ask stay on Deep
-read, so with the preset Laurium is rendered and runs while no analyst action reaches it, until a
+it yet**: the Glass's own extraction (a document's content, email) and Ask & Chat and Ask to search stay on Deep read, so with the preset Laurium is rendered and runs while no analyst action reaches it, until a
 screen calls the review queue's extraction (*coming*). It has read a real model's answer (3 of 3 on
 the product's own extraction model, outside the rendered route) but has not yet been run on the
 organisation's own engine. Until its key is held on the gateway, its calls are refused in words
@@ -1161,8 +1231,8 @@ group 0.
 
 **The shared folders** are one ReadWriteOnce volume, `ospreyflow-shared`, on the platform's class,
 and every pod that mounts it is placed on the same node. In the poc shape the Ingest root is on its
-own claim instead. Moving tiles, the settings files and, in the standard shape, uploads and staging
-off it, and the recipes repository off the shared disk, is *coming*.
+own claim instead. Moving tiles, the settings files and, in the standard shape, the Ingest root
+(`ingest`: uploads and the drop folder) off it, and the recipes repository off the shared disk, is *coming*.
 
 ### 6a.2 What the namespace asks for
 
@@ -1172,7 +1242,7 @@ bursts. So a LimitRange in the namespace with a default CPU limit puts that limi
 container, and a ResourceQuota counting `limits.cpu` refuses every pod that names none: both are
 questions for the platform's team (section 6a.11). **The poc shape names a CPU limit on every
 container** (0.5 by default; the Glass 0.5, the Conduit 2, the workers 2, named-entity extraction 1,
-ArcadeDB 2, ClickHouse 2), for a namespace whose quota counts them. ArcadeDB's Java heap is three
+ArcadeDB 2, ClickHouse 2, the search index's rebuild and drift check 2), for a namespace whose quota counts them. ArcadeDB's Java heap is three
 quarters of its memory limit. **These sizes are proposals, not measurements**: no load has yet run
 on the platform.
 
@@ -1186,9 +1256,12 @@ on the platform.
 | ClickHouse | 1 | 2 | 1 | 8 GiB | 8 GiB |
 | ClickHouse Keeper (standard shape) | 1 | 3 | 0.1 | 512 MiB | 512 MiB |
 | The model gateway (LiteLLM) | 1 | 1 | 0.25 | 512 MiB | 1 GiB |
+| Superset, when reporting is on | 1 | 2 | 0.25 | 1 GiB | 2 GiB |
+| The report sync, when reporting is on | 1 | 2 | 0.1 | 256 MiB | 512 MiB |
 | Laurium, when it is the extraction engine | 1 | 1 | 0.25 | 1 GiB | 2 GiB |
 | The backups' and the restore's Jobs | — | — | 0.5 | 2 GiB | 4 GiB |
 | The restore's ArcadeDB step | — | — | 1 | 12 GiB | 12 GiB |
+| The search index's rebuild and drift check, when OpenSearch is used | — | — | 0.5 | 2 GiB | 4 GiB |
 | Every init container, and any container not named above | — | — | 0.1 | 256 MiB | 512 MiB |
 
 From renders of the repository's synthetic deployments, counting each running copy:
@@ -1206,6 +1279,97 @@ and the extra copy a rolling update starts need room above them, so a ResourceQu
 memory limits must be larger, or pods are left unscheduled; in the standard shape one on
 `limits.cpu` refuses them whatever its size.
 
+**The poc shape, from its manifest.** The poc shape's containers, Jobs, images, managed services, app registrations
+and egress, as `python -m harness.cloud_platform.manifest tables` prints them from
+`harness/cloud_platform/poc_manifest.yaml`, the one list the render is checked against (`manifest check`). They list the poc shape with reporting on (Superset and the report sync), so their totals are above the table
+before them, which leaves reporting out. These tables are that output, checked against it on every change; an
+entry marked *pending* is one the release adds that is not yet rendered.
+
+<!-- manifest:begin -->
+
+#### Containers
+
+| Workload | Kind | Count | Image | CPU request / limit | Memory request / limit | Ready when |
+|---|---|---|---|---|---|---|
+| workspace | Deployment | 1 | `ospreyflow/workspace` | 100m / 500m | 128Mi / 256Mi | http://127.0.0.1:8080/ |
+| api | Deployment | 1 | `ospreyflow/api` | 500m / 2 | 2Gi / 4Gi | http://127.0.0.1:8000/healthz |
+| worker | Deployment | 1 | `ospreyflow/worker` | 500m / 2 | 2Gi / 4Gi | none |
+| ner | Deployment | 1 | `ospreyflow/ner` | 250m / 1 | 1Gi / 2Gi | http://127.0.0.1:8000/healthz |
+| laurium | Deployment | 1 | `ospreyflow/laurium` | 250m / 500m | 1Gi / 2Gi | http://127.0.0.1:8000/healthz |
+| litellm | Deployment | 1 | `berriai/litellm` | 250m / 500m | 512Mi / 1Gi | http://localhost:4000/health/liveliness |
+| arcadedb | StatefulSet | 1 | `arcadedata/arcadedb` | 1 / 2 | 12Gi / 12Gi | http://127.0.0.1:2480/api/v1/ready |
+| clickhouse | StatefulSet | 1 | `clickhouse/clickhouse-server` | 1 / 2 | 8Gi / 8Gi | http://localhost:8123/ping |
+| superset | Deployment | 1 | `ospreyflow/superset` | 250m / 500m | 1Gi / 2Gi | http://127.0.0.1:8088/health |
+| report-sync | Deployment | 1 | `ospreyflow/report-sync` | 100m / 500m | 256Mi / 512Mi | python -m services.report_sync --health |
+| **Total** | | **10** | | **4.2 / 11.5 CPU** | **27.88 / 35.75 GiB** | |
+| litellm/litellm-db (init) | | | `postgres` | 100m / 500m | 256Mi / 512Mi | runs first |
+
+#### Jobs and CronJobs
+
+| Name | Kind | When | Image | CPU request / limit | Memory request / limit |
+|---|---|---|---|---|---|
+| `ospreyflow-backup` | CronJob | 15 2 * * * | `ospreyflow/api` | 500m / 2 | 2Gi / 4Gi |
+| `ospreyflow-backup-claims` | CronJob | 15 2 * * * | `ospreyflow/api` | 500m / 2 | 2Gi / 4Gi |
+| `ospreyflow-restore-<set>` | Job | a restore, by the recovery runbook | `ospreyflow/api` | 500m / 2 | 2Gi / 4Gi |
+| `ospreyflow-restore-<set>`, step restore-graph | | | `arcadedata/arcadedb` | 1 / 2 | 12Gi / 12Gi |
+| `ospreyflow-restore-claims-<set>` | Job | a restore, by the recovery runbook | `ospreyflow/api` | 500m / 2 | 2Gi / 4Gi |
+| `ospreyflow-search-rebuild` | CronJob | suspended, started by the runbooks (a restore ends with it) | `ospreyflow/api` | 500m / 2 | 2Gi / 4Gi |
+| `ospreyflow-search-drift` | CronJob | suspended, started by the runbooks | `ospreyflow/api` | 500m / 2 | 2Gi / 4Gi |
+| `ospreyflow-seed` | CronJob | suspended, started by the install runbook's optional seed block | `ospreyflow/api` | 500m / 2 | 2Gi / 4Gi |
+
+#### Images and ECR repositories
+
+| ECR repository | Ours or upstream | From |
+|---|---|---|
+| `ospreyflow/workspace` | ours | built from `apps/workspace/Dockerfile` |
+| `ospreyflow/api` | ours | built from `services/api/Dockerfile` |
+| `ospreyflow/worker` | ours | built from `services/worker/Dockerfile` |
+| `ospreyflow/ner` | ours | built from `services/ner/Dockerfile` |
+| `ospreyflow/laurium` | ours | built from `services/laurium/Dockerfile` |
+| `ospreyflow/superset` | ours | built from `deploy/superset/Dockerfile` |
+| `ospreyflow/report-sync` | ours | built from `services/report_sync/Dockerfile` |
+| `arcadedata/arcadedb` | upstream | copied from `arcadedata/arcadedb:26.10.1` |
+| `clickhouse/clickhouse-server` | upstream | copied from `clickhouse/clickhouse-server:25.8.33.6` |
+| `berriai/litellm` | upstream | copied from `ghcr.io/berriai/litellm` |
+| `postgres` | upstream | copied from `postgres:16.4` |
+
+#### Managed services
+
+| Service | Setting | Value |
+|---|---|---|
+| RDS PostgreSQL | engine | postgres 16 |
+| RDS PostgreSQL | class | db.t4g.large |
+| RDS PostgreSQL | max connections | 1000 |
+| RDS PostgreSQL | point in time days | 35 |
+| RDS PostgreSQL | databases | ospreyflow, litellm, superset |
+| ElastiCache | engine | redis 7.1 |
+| ElastiCache | node type | cache.t4g.micro |
+| ElastiCache | nodes | 1 |
+| S3 | buckets | media, staging, site-images, tile-cache, backups |
+| OpenSearch Service | engine | OpenSearch_2.17 |
+| OpenSearch Service | instance type | t3.medium.search |
+| OpenSearch Service | data nodes | 2 |
+| OpenSearch Service | signing | sigv4 |
+
+#### Entra ID registrations
+
+| Registration | Kind | Details |
+|---|---|---|
+| glass | single-page application | redirect: https://<the deployment's name>/; grants: the API's access_as_user (delegated) |
+| api | web API | exposes: access_as_user; app roles: Dashboard.Read, OspreyFlow.Run |
+| superset | web application, with a client secret | redirect: https://bi.<the deployment's name>/oauth-authorized/<provider>; grants: the API's access_as_user (delegated) |
+| report-sync | application (client credentials), with a client secret | grants: the API's Dashboard.Read (application) |
+
+#### Egress
+
+| Host | Port |
+|---|---|
+| `login.microsoftonline.com` | 443 |
+| `s3.eu-west-2.amazonaws.com` | 443 |
+| `sts.eu-west-2.amazonaws.com` | 443 |
+
+<!-- manifest:end -->
+
 ### 6a.3 The namespace's Terraform, and the secrets each component reads
 
 The Terraform is plain AWS and Kubernetes resources, not the platform's own modules, and each file
@@ -1217,14 +1381,14 @@ leaves it unchanged and `tofu validate` accepts it.
 | `variables.tf` | What the platform gives the namespace: `namespace`, `vpc_id`, `subnet_ids`, `eks_oidc_provider_arn` and `eks_oidc_issuer`. The providers, the backend and the tags are the namespace folder's own |
 | `rds.tf` | RDS PostgreSQL 16, encrypted, reached over TLS, and the secret `rds-postgresql-instance-output` |
 | `elasticache.tf` | ElastiCache (Redis 7), TLS and a token, and the secret `elasticache-redis` |
-| `opensearch.tf` | The standard shape alone, when `components.search` is `opensearch`: the OpenSearch domain, encrypted, HTTPS only, inside the VPC, and the secret `opensearch-output` |
+| `opensearch.tf` | Every shape, when `components.search` is `opensearch` (the default): the OpenSearch domain, encrypted, HTTPS only, inside the VPC, and the secret `opensearch-output` |
 | `s3.tf` | The buckets, private and encrypted, named from a prefix, and the secret `s3-bucket-output` |
 | `irsa.tf` | The service account `ospreyflow` and its IAM role, given the buckets, so no S3 key exists anywhere |
 | `connector_sources.tf` | Only when S3 buckets or Athena workgroups are declared (section 6a.5): the reads on them, attached to `irsa.tf`'s role |
 | `gateway.tf` | Only while a Bedrock engine is declared in `osprey.yaml`: the model gateway's own service account and IAM role, allowed to invoke Bedrock's models in eu-west-2 (`bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream`) and nothing else, no S3 included, and trusted by the gateway's service account alone |
 | `backups.tf` | The backups' bucket and its own KMS key, their two roles and service accounts, ClickHouse's backup user's password and the Secrets `ospreyflow-clickhouse-backup` and `ospreyflow-backup-output` (section 6a.8) |
 | `ecr.tf` | A repository for each image, scanned on push |
-| `secrets.tf` | Our own Secret, `ospreyflow-secrets`: each password made here (`random_password`), and each key a person holds (a model engine's, a connection's, the mail server's password) as a sensitive variable |
+| `secrets.tf` | Our own Secret, `ospreyflow-secrets`: each password made here (`random_password`), and each key a person holds (a model engine's, a connection's, the mail server's password; with reporting on, Superset's client secret, `superset_oidc_client_secret`, and the report sync's dashboard identities, `report_sync_dashboards`) as a sensitive variable |
 
 **The platform's Terraform state holds every secret here**: the passwords it makes, and each key a
 person holds, which is a sensitive variable with no default written into the Secret's data. How the
@@ -1312,7 +1476,10 @@ single ports, never a range:
 | ArcadeDB; ClickHouse Keeper | Their own copies |
 | ClickHouse | Its own copies and, in the standard shape, ClickHouse Keeper; S3 and STS, for its backups |
 | The backups' runs and the restore | S3 and STS; ArcadeDB and ClickHouse, or the cluster's API, as each needs (section 6a.8) |
+| The search index's rebuild and drift check, when OpenSearch is used | ArcadeDB; the managed stores' networks (OpenSearch on 443); S3 and STS |
 | The Glass | The Conduit |
+| Superset, when reporting is on | The Conduit (who signed in); the managed stores' networks (its database and the mart, its rate limits); Entra ID's sign-in host |
+| The report sync, when reporting is on | The Conduit; the managed stores' networks (the mart); S3 and STS; Entra ID's sign-in host (its token) |
 | Named-entity extraction | Nothing beyond DNS |
 
 **An engine's way out is made at render.** With no engine declared, no engine's host is allowed. An
@@ -1379,9 +1546,9 @@ platform's team give them.
 
 **Ingress, each workload's own.** Each workload admits only the pods that call it, on its own ports
 (`ospreyflow-ingress-<workload>`), and one that nobody calls admits nothing; the Glass also admits the
-platform's controller, on its own port. The Ingress serves the Glass alone, at
-`network.public_origin`'s name: there is no `id.` (sign-in is Entra's) and no `bi.` (reporting is not
-rendered). Its read and send timeouts are an hour, for the Glass's live updates, and its body-size
+platform's controller, on its own port. The Ingress serves the Glass at `network.public_origin`'s
+name and, with Superset on, Superset at its `bi.` name (whose pod also admits the controller); there is
+no `id.` (sign-in is Entra's). Its read and send timeouts are an hour, for the Glass's live updates, and its body-size
 limit is the Conduit's upload cap, 512 MiB; ModSecurity may refuse an upload long before that (the
 first question in section 6a.11).
 
@@ -1453,6 +1620,17 @@ from `https://login.microsoftonline.com/<tenant>/discovery/v2.0/keys` (or `…/d
 at `https://login.microsoftonline.com/<tenant>/v2.0` whatever the version, by the authorisation code
 with PKCE, returning to the deployment's own address with a trailing `/`.
 
+**A token of the other version is refused in words** (ADR-148 Amendment 18). If the API registration
+issues the other version than `token_version` (with 2.0, its manifest's `requestedAccessTokenVersion`
+must be 2; left at null or 1, Entra issues v1.0), every sign-in is refused, and the Conduit says which
+version the registration issues and what to set, in its refusal (the 401) and once in its log. Its words are
+read only from a token the tenant signed, and never let it in. INSTALL step 6's token-version check,
+run after the first administrator's first sign-in, shows the same words, or says no sign-in has been
+refused for it so far. The Glass's sign-in page shows the same words, as it shows the words for a value
+not set yet (Amendment 15) and for a guest while guests are not admitted (Amendment 17): the 401 tags each
+of the three (`error`), and any other refusal keeps the page's general words ("Your sign-in could not be
+used to reach the workspace …").
+
 `groups_claim` names the token claim that lists the person's Entra group ids; every `{groups: …}`
 table is read from it. Leave it at `groups` unless the app registration emits the groups under
 another claim name.
@@ -1513,20 +1691,43 @@ stays `sub`.
 - an `oid` that is not an object id, or another tenant's token;
 - an app-only token (no delegated `scp`, or `idtyp: app`), which is a program, not a person;
 - a guest from another directory (`acct` of `1`, or an `idp` naming another tenant or a provider
-  that is not Entra). `acct` is an optional claim the app registration must ask for, so `idp` is the
-  check that works without configuration. Admitting guests would need a setting that does not exist.
+  that is not Entra), **while this deployment does not admit guests**, in these words: "this is a
+  guest account, homed outside this organisation's Entra ID, and this deployment does not admit
+  guests: an administrator can admit them in Admin › People and roles". `acct` is an optional claim the app
+  registration must ask for, so `idp` is the check that works without configuration.
+
+**Guests are admitted only when an administrator turns it on** (ADR-148 Amendment 17). In
+*Admin › People and roles*, **Admit guest accounts** is off on a new deployment; only someone holding
+`manage_people` can change it, and each change is recorded in the audit log
+(`set_guest_sign_in`, with what it was and what it is now). While it is on, a guest signs in as
+any person does: through the same mapping, so with the clearance, unit and handling codes their own
+token gives, or those set here, as below (a guest's token from another directory often carries none of your extension attributes
+or groups, and is then refused as anyone missing a clearance or unit is), and the roles you give them
+in *People and roles*, which marks them as a guest. Where this deployment sets a value itself (the
+administrator fallback, `administrator: true`), a guest's is the one set with **Access**, as anyone's
+is, never their token's, and they cannot sign in until it is set (a guest missing one is refused in
+the same words as a member); the Guests form says which values
+come from where. Nothing gives a guest more than a member with the
+same token would have. Turning it off refuses every guest at their next request to OspreyFlow, an open
+live view included, and a run acting as a guest as its owner stops, counted as an owner who can no
+longer sign in (above); a guest stops counting as someone who can manage people, and is shown as
+not enabled. A reporting session a guest already holds in Superset is not ended by it: Superset
+reads a person's role only when they sign in to it, as it does for a person disabled here. Turning it off is refused while every enabled person who has signed in and can
+manage people is a guest.
 
 On a deployment using the fixed names (Keycloak), a token carrying `tid` is refused, in these
 words: "token carries tid: an Entra ID token is refused without an Entra claim mapping".
 
-**Roles are not read from an Entra token.** Its `roles` are app roles an Entra administrator
-assigns; an app role named `osprey-admin` makes nobody an OspreyFlow administrator. Roles are
-assigned in *Admin › People*, which keeps them in the deployment's own Postgres, by tenant and
+**A person's roles are not read from an Entra token.** Its `roles` are app roles an Entra
+administrator assigns; an app role named `osprey-admin` makes nobody an OspreyFlow administrator.
+(Two app roles of this API's own are read, from an application's token, never a person's: a
+dashboard identity's `Dashboard.Read` and an orchestrator's `OspreyFlow.Run`, below.) Roles are
+assigned in *Admin › People and roles*, which keeps them in the deployment's own Postgres, by tenant and
 `oid`:
 
 - **A person appears after their first sign-in**, with no role, or is added beforehand by object id
-  (*Admin › People*, *Add a person by object id*). Names, sign-in names, passwords and removal are Entra's:
-  *Admin › People* sends you to the Entra admin centre for them. *Disable* is the deployment's own,
+  (*Admin › People and roles*, *Add a person by object id*). Names, sign-in names, passwords and removal are Entra's:
+  *Admin › People and roles* sends you to the Entra admin centre for them. *Disable* is the deployment's own,
   and a disabled person is refused at their next request, an open live connection included.
 - **The first administrators** are named by object id in `cloud_platform.claims.first_administrators`
   (at least one; a render with none is refused). The Conduit gives each the Admin role when it first
@@ -1554,31 +1755,109 @@ assigned in *Admin › People*, which keeps them in the deployment's own Postgre
   account could not be read, offers *Try again*, and keeps *Sign out* within reach.
 - **A service identity** (an orchestrator's `ospreyflow run`) signs in with an app-only token of the
   pinned tenant, carrying an expiry. Its client must be neither the Glass's nor this API's own
-  registration.
+  registration, and must hold this API's app role `OspreyFlow.Run` (ADR-148 Amendment 20): the
+  client's Entra administrator defines the role on the API's registration (allowed member types:
+  Applications) and grants it to the orchestrator's application with admin consent. Any other
+  application of the tenant is refused (403): "the orchestrator's application does not hold this
+  API's OspreyFlow.Run app role: in Entra ID, add it to the orchestrator's own registration (API
+  permissions, this API, Application permissions) and grant admin consent, then ask for a new
+  token". `ospreyflow run` asks Entra ID for that token with `OSPREY_TOKEN_SCOPE` set to the API's
+  own scope, its application ID URI followed by `/.default` (by default `api://<the API's
+  application id>/.default`; `api_id_uri` where one is set), which the install's *What it needs*
+  names; without it Entra ID issues none (AADSTS1002012), and the command says so.
 
-**Nothing acts as its owner on Entra yet, so loads are started by hand.** The Conduit acts as a
-person who is not present only through Keycloak's token exchange, which Entra ID does not have, so
-on this profile everything that runs as its owner is refused:
+- **Superset** (ADR-148 Amendment 9) signs a person in as its own app registration and asks Entra ID
+  for a token for this API's scope, issued to Superset, which the Conduit admits for `GET /v1/me` and
+  `GET /v1/me/rights` alone (any other route answers 403 `route_not_admitted`). Superset's role is
+  the person's rights here, read again at each sign-in: `administer_system` is its Admin,
+  `manage_dashboards` its builder (Alpha), whom *Build a report* in the Glass sends there,
+  `read_reports` its OspreyReader, which reads and changes nothing there (every account holds it too),
+  and a person with none of them is not let in.
+  **A builder reads the whole reporting mart** (ADR-148 Amendment 21): in their own Superset session,
+  every figure every dashboard identity's report sync pulled, whatever its clearance or case. The rule
+  keeping a board's rows to its own dashboard identity holds only for a board shown in the Glass.
+  **Give `manage_dashboards` only to people cleared for every dashboard identity's cases.**
+- **A dashboard identity** (ADR-148 Amendment 10), registered in *Admin › Dashboard identities* by its app
+  registration's application id and a name (the dashboard's), signs the report sync in with an
+  app-only token carrying the app role `Dashboard.Read`; it reads the case list and the report feed
+  alone, within its registration's clearance, unit and codes, and the cases whose Author gives it
+  Viewer (never Owner or Editor, refused). Removing it in *Admin › Dashboard identities* takes away every case
+  grant it held; registering the same application id again starts with none.
 
-- **a pipeline's schedule and its watched folder** (developer guide, §6.3), and **Run now** in
-  *Admin › Operations*, which runs as the schedule's owner (section 9.11). Each slot is refused and
-  recorded in the scheduler's words, "the identity provider could not be reached to act as the
-  schedule's owner": here that means no owner can be acted as, while Entra itself may be answering.
-  Such a refusal says nothing about the owner, so it never counts toward the three that pause a
-  schedule, and the schedule is refused again at every slot until it is set to run by hand;
-- **`ospreyflow run`**, an orchestrator's trigger (section 8), which runs as the pipeline's owner: it
-  is refused, in words, and recorded;
+**Where Entra cannot send a clearance, a unit or handling codes: the administrator sets them (the poc
+shape alone; ADR-148 Amendment 15).** In `cloud_platform.claims`, name `{administrator: true}` as
+the source of `clearance`, `org_unit` or `handling_codes` in place of a claim or a group table. The
+token is then never read for that value: an administrator sets it for each person in *Admin ›
+People and roles* with **Access**, which on Entra ID offers those values alone and shows the others as Entra
+sends them. Nobody can be given a clearance above, or a handling code beyond, what the
+administrator setting it holds as this deployment holds them; the change is audited
+(`set_person_access`, before and after), and a person's open live updates close and reconnect
+with it. **Until it is set, the person cannot sign in**, and is told so in words; they appear in
+People at that first sign-in, for you to set. A sign-in never changes it, and a token carrying a
+claim for it is not read. **The first administrators are given theirs at install**, from
+`cloud_platform.claims.first_administrator_access` (`{clearance: ..., org_unit: ..., handling_codes:
+[...]}`, each value the administrator sets), which the render requires; a restart never overwrites
+a value an administrator has since changed. The render refuses `{administrator: true}` on any shape
+but `poc`: a production namespace reads every value from Entra ID. **A run acting as its owner uses
+the values set here**, and the token's for the rest, from a sign-in within the day. A value set here
+never ages, and one not set yet refuses the run.
+
+**A run acts as its owner as Admin › People and roles holds them** (ADR-148 Amendment 16). Entra ID has no
+way for the Conduit to sign in as a person who is not present, so whatever runs as its owner uses
+what this deployment holds of them: their roles, and whether they are disabled, read from
+*Admin › People and roles* at each run; their clearance, unit and handling codes as their last sign-in gave
+them. That is:
+
+- **a pipeline's schedule and its watched folder** (developer guide, §6.3), **Run now** in
+  *Admin › Operations*, which runs as the schedule's owner (section 9.11), and **`ospreyflow run`**,
+  an orchestrator's trigger (section 8), which runs as the pipeline's owner;
 - **a rule that runs on a schedule** (user guide, §7.11), and **the daily check for KYC documents
   that lapse**, which runs each KYC rule as the person who deployed it;
-- **a screening list's refresh schedule** (section 9.5): **Refresh now** still works;
-- **a watch's own runs**: the watch is tried again each minute and does nothing, with a warning in
-  the Conduit's log;
-- **at a load, anyone else's rules, hotlists and watches**: only those of the person who started the
-  load are judged.
+- **a screening list's refresh schedule**, a subscribed list's or a deployment-wide one's
+  (section 9.5);
+- **a watch's own runs**, and **at a load, anyone else's rules, hotlists and watches** (user guide,
+  §7.5).
+
+**The 24 hours.** The access held for a person is recorded when they sign in, and again at most
+hourly while they use OspreyFlow. A run is refused when that record is more than 24 hours old, or
+there is none (a person added by object id who has never signed in). Such a refusal decides nothing
+about the owner, so it never counts toward the three refusals that pause a schedule. What it says,
+and what happens next, depends on what was asked:
+
+- **a slot of a schedule** (a pipeline's, a rule's or a list's), or a watch's run: "the schedule's
+  owner, <id>, has not signed in to OspreyFlow within the last 24 hours, so their clearance and unit
+  are out of date: it runs at its next slot after they sign in" (a rule's says "the rule's author").
+  A watch keeps its slot and is tried again each minute;
+- **Run now** and **`ospreyflow run`**: the same, ending "run it again once they have signed in",
+  since nothing asked for by hand runs again by itself;
+- **the daily KYC check**: the rule's audit says the deployer is out of date and that "the documents
+  that lapsed are not judged by this day's check; the rule judges its customers afresh at its next
+  load". The check does not come back for that day;
+- **at a load**: the owner's hotlists and watches are marked stopped, as for any owner who cannot be
+  acted as, and are made active again at the first load after they sign in; a stopped watch's own
+  runs wait for that load. Their rules are not judged at that load. The watch list shows *Stopped*
+  with why beside it, in the Conduit's words for its owner (ADR-044 Amendment 1).
+
+**Other refusals.** An owner disabled in *Admin › People and roles* is refused, and three such refusals
+in a row pause a schedule, as on Keycloak; so is an owner not held in *Admin › People and roles* ("is not
+held in Admin › People and roles"). If the people store behind *Admin › People and roles* cannot be read,
+the run is refused as that and never counted. None of these says "the identity provider could not be reached": Entra is
+not asked.
+
+**So a schedule runs only while its owner keeps signing in.** The 24 hours run from the owner's last
+recorded access, not from the day. An owner last active on Friday at 17:00, with a daily slot at
+06:00: Saturday's run goes ahead (13 hours later), Sunday's and Monday's are refused (Monday's comes
+before they sign in that morning), and Tuesday's goes ahead. Give a schedule that must run unattended
+for longer an owner who signs in each working day. There is no unattended owner on this profile:
+reading a person's access from Entra itself at each run needs an application permission the
+organisation would grant, which this release does not ask for.
+
+**A leaver's runs go on for up to 24 hours.** Disabling or removing a person in Entra stops their
+sign-in, but runs as them keep the access last recorded for up to 24 hours after it. Disable a leaver
+in *Admin › People and roles* as well: that stops every run as them at once.
 
 A load started by hand in the Ingest Studio (**Run now**, developer guide §3.9) runs as the person
-who starts it, and is not affected. Reporting is not available either: Superset and the report sync
-are refused at render on this profile until Superset signs in through Entra ID.
+who starts it, and is not affected.
 
 **Not yet tried against a real tenant.** The token shapes above are as Microsoft documents them, and
 one real token from the organisation's development tenant is to settle each:
@@ -1592,8 +1871,9 @@ one real token from the organisation's development tenant is to settle each:
   the real token carries.
 - **A claims-mapping policy** has its tokens signed with an application's own key, read with
   `?appid=<api_client_id>` (`claims_mapping_policy: true`).
-- **Guests**: that a real guest's token carries `idp` (and `acct` of `1`, where it is asked for) and
-  is refused, while a member's resolves.
+- **Guests**: that a real guest's token carries `idp` (and `acct` of `1`, where it is asked for), and
+  so is refused while guests are not admitted and signs in once they are, while a member's resolves
+  either way.
 - **Access tokens, not ID tokens**: the Glass is to send an access token for this API. An ID token
   carries no `scp`, and is refused as app-only.
 
@@ -1601,16 +1881,23 @@ one real token from the organisation's development tenant is to settle each:
 
 The managed stores (PostgreSQL on RDS, Valkey on ElastiCache, the media and staging buckets) are the
 platform's, under its own snapshots and versioning. **The deployment backs up what it runs itself**
-(ADR-148 Amendment 7): ArcadeDB, ClickHouse and, in the poc shape, the Ingest root's claim. **The
-shared volume, `ospreyflow-shared`, is not backed up**: it holds the settings files, the recipes
-repository and, in the standard shape, uploads and staging, so a restore brings the stores back and
-leaves it as it is, and the two can disagree. The
+(ADR-148 Amendments 7 and 13): ArcadeDB, ClickHouse and the claims part. **The claims part holds, in
+every shape, the shared volume's folders the deployment cannot make again**: the published
+pipelines (`data/recipes`), the model settings (`model-settings`) and the map settings
+(`map-settings`, ADR-147: its maps file, never the map key file beside it, since no backup holds a
+key; after a restore, `restore-claims` names each map provider whose key must be entered again in
+*Admin › Maps*); and the Ingest root (uploads and the drop folder) beside them:
+in the poc shape its own claim, and in the standard shape the shared volume's folder of it (`ingest`,
+a part of its own). Uploads can be large, so the claims run's size and time grow with them. Each is
+read-only to the backup, and the pods that mount them are writers a restore refuses to run beside.
+**Not in a set**: the rest of the shared volume, `ospreyflow-shared`: the tiles (`tiles`), made
+again. A restore leaves those as they are. The
 recovery runbook that ships with the product, `deploy/RUNBOOK.md`, has the whole procedure under *The
 `cloud-platform` profile*, with every command; this section says what it does.
 
 **Nightly, at 02:15 UTC**, whatever the cluster's time zone: the CronJob `ospreyflow-backup` (ArcadeDB's
-`BACKUP DATABASE`, then ClickHouse's `BACKUP … TO S3`) and, in the poc shape, `ospreyflow-backup-claims`
-(each claim, read-only). Both write one set, `s3://<prefix>backups/sets/<YYYYMMDDTHHMMSSZ>/`, named by
+`BACKUP DATABASE`, then ClickHouse's `BACKUP … TO S3`) and `ospreyflow-backup-claims` (the claims part,
+in every shape: each folder and claim, read-only). Both write one set, `s3://<prefix>backups/sets/<YYYYMMDDTHHMMSSZ>/`, named by
 their slot, and `manifest.json` last, holding each part's size and checksum and the time the set
 finished. A set without its manifest is unfinished and is never restored from. Every object is
 encrypted by the backups bucket's own KMS key (`alias/<namespace>-backups`), whose deletion its
@@ -1618,8 +1905,9 @@ policy denies against accident (an administrator who rewrites the policy can lif
 decommission does once the retention ends).
 Two roles write a set, ClickHouse's own and the runner's, each to its own prefix, by IRSA, so no key
 is stored anywhere; neither can erase a set. The bucket is versioned (an object overwritten keeps
-its previous version for 7 days), and a set's objects expire 35 days after they were written: the
-retention is 35 days in all, a proposal until the organisation agrees its own.
+its previous version for 7 days), and a set's objects expire 34 days after they were written: the
+retention is 34 days in all, a proposal until the organisation agrees its own, which may be shorter
+but not longer: a set kept longer would outlive RDS's point-in-time window (below), 35 days at most.
 
 **Checking last night's backup.** A backup Job that completed wrote a finished set, and its log names
 it (`backup: set …`). **A failed run is a failed Job**, its log naming the store, the step and the
@@ -1630,8 +1918,8 @@ refusing service's own words. **No alert is raised on it yet: look each morning*
 The nightly run does not stop the Conduit, so its parts are taken minutes apart and a load running
 across 02:15 can be in one part and not another: take the backup before an upgrade with the Conduit
 and the workers stopped (the runbook shows how). Note each one's copy count first. The runbook's
-commands also scale `deployment/report-sync`, which is not rendered on this profile, so its "not
-found" is expected, and they scale the Conduit and the workers back to 1: start them again at the
+commands also scale `deployment/report-sync`, which is rendered only with reporting on
+(`reporting.sync`), so without it its "not found" is expected, and they scale the Conduit and the workers back to 1: start them again at the
 copy counts noted instead (a known issue).
 
 **The restore** replaces what ArcadeDB, ClickHouse and the claims hold with one set, **for one copy of
@@ -1647,10 +1935,10 @@ ArcadeDB and one ClickHouse copy; this deployment runs more, and its restore is 
 2. **The managed database with the stores.** PostgreSQL must agree with the stores, or anything
    withdrawn or deleted since the set comes back under today's grants. The platform team restores RDS
    to the set's finish time by its own point-in-time procedure; the deployment is pointed at it only
-   once nothing that writes runs (step 4). **RDS keeps its point-in-time restore for 7 days**, as the
-   Terraform renders it (`backup_retention_period`), against the sets' 35: only a set finished in
-   the last 7 days can be restored with its database. An older set has no database to pair with it,
-   and is not to be restored.
+   once nothing that writes runs (step 4). **RDS keeps its point-in-time restore for 35 days**, as the
+   Terraform renders it (`backup_retention_period`), against the sets' 34: a day inside RDS's window,
+   since RDS's earliest restorable point lags by up to about a day and the sets' expiry rounds up to
+   midnight UTC, so every set still kept can be restored with its database.
 3. **No backup during the restore**: both CronJobs suspended, and any backup still running left to
    finish.
 4. **Everything that writes stopped**: the render's own list, `backups.writers` in `values.yaml`, each
@@ -1659,8 +1947,13 @@ ArcadeDB and one ClickHouse copy; this deployment runs more, and its restore is 
 5. **The restore's Jobs**, rendered for the set by its own name (never `latest`, never by
    `helm upgrade`) and applied, then each waited on.
 6. **Everything started again**, ArcadeDB first, at the copy counts noted, each waited on until it
-   is ready (the door answers), and the CronJobs resumed. A healthy restore's logs end in plain
+   is ready (the door answers), and the backups' CronJobs (`ospreyflow-backup`,
+   `ospreyflow-backup-claims`) resumed. A healthy restore's logs end in plain
    words, with no stack trace: the runbook's *A healthy restore* quotes each step's last line.
+7. **The search index rebuilt**, where the deployment searches with OpenSearch: the index is not in a
+   set (it is rebuilt from the graph, ADR-150), so the restore ends with its rebuild, then the drift
+   check between the graph and the index, each a Job started from its CronJob, held suspended
+   (`ospreyflow-search-rebuild`, then `ospreyflow-search-drift`), and each waited on.
 
 **It refuses, touching nothing**, while anything that writes still runs, while it cannot see what
 runs, or while any part of the set is missing, changed or another set's. Each store is replaced only
@@ -1688,7 +1981,9 @@ place; the runbook gives the commands.
 
 Every call to a hosted model goes through **the model gateway (LiteLLM)**, its own pod, `litellm`,
 rendered on this profile always, with or without an engine (section 6a.1). The Conduit and Laurium
-call it; nothing else does. Local models are not rendered here (the platform has no GPU). On this
+call it; nothing else does. Local models are not rendered here (the platform has no GPU). A call is waited for as section 10's *How long a model is waited for* says: the render puts both settings
+in the values at their defaults (120 seconds for a hosted engine), and `osprey.yaml` has no setting to change
+them. On this
 profile an engine is one of three kinds (ADR-135 Amendments 4 and 7):
 
 - **Your organisation's own AI gateway** (`kind: gateway`), an OpenAI-compatible endpoint at its
@@ -1720,7 +2015,7 @@ models:
     - name: bedrock                          # Amazon Bedrock in London
       kind: bedrock                          # auth: iam_role and region: eu-west-2 by default
       # a model's own id: check your account is offered it on demand in London
-      roles: {extraction: anthropic.claude-3-haiku-20240307-v1:0}
+            roles: {extraction: amazon.nova-pro-v1:0}
   defaults: {extraction: orggateway}
 cloud_platform:
   egress_nets:                               # each engine's host, by its networks
@@ -1729,10 +2024,13 @@ cloud_platform:
 ```
 
 **The region answer is London, and only London.** `region` is Bedrock's alone and takes only
-`eu-west-2`, its default. A Bedrock model is named by its own id (`anthropic.…`); a cross-region
+`eu-west-2`, its default. A Bedrock model is named by its own id (`amazon.nova-pro-v1:0`); a cross-region
 inference profile's id (`eu.…`, `us.…`, `apac.…`, `global.…`, or any other part before the
 provider's) and an ARN are refused, since either may send the call outside London. A model Bedrock
-offers in London only through an inference profile cannot therefore be used here.
+offers in London only through an inference profile cannot therefore be used here. **So Bedrock in
+London means the models AWS serves in-Region there: Amazon Nova and the Titan embeddings, not current
+Claude models, which AWS serves from London only through its EU and global profiles. Claude through
+AWS's EU profile is not offered in v0.6.0.**
 
 **Refused in words**, each naming the field and never its value, wherever an engine is read
 (`osprey.yaml` at render, the Conduit's start, the models file and *Admin › Models*): Bedrock by a
@@ -1815,8 +2113,8 @@ first install:
 - whether the gateway's AWS client uses STS's regional endpoint: only `sts.eu-west-2` is allowed out,
   and the gateway's account carries no regional-endpoint annotation;
 - whether a model's first use needs an administrator to enable it in Bedrock's *Model access*, or
-  AWS Marketplace actions, first; newer Claude models are offered in London only through inference
-  profiles, which are refused here;
+  AWS Marketplace actions, first (current Claude models are not among the models here: London serves
+  them only through inference profiles, which are refused);
 - Bedrock's own words for a model not enabled, an invalid id and a model not offered on demand, which
   AWS does not document and *Test the connection* reads (none has been measured against Bedrock);
 - any call through your organisation's own gateway, by its token, and whatever stands in front of it;
@@ -1825,8 +2123,8 @@ first install:
 
 ### 6a.10 Coming
 
-- **On Entra ID**: anything that runs as its owner, a scheduled run among them (until then each is
-  refused, section 6a.7), reporting (Superset and the report sync signing in through Entra ID), display names (a person is
+- **On Entra ID**: an owner's access read from Entra itself at each run, so a schedule runs on days
+  its owner does not sign in (section 6a.7), display names (a person is
   shown by object id until then), and one real token from the organisation's tenant to settle the
   shapes section 6a.7 lists as untried.
 - **The backups' alert** on a failed or missing run, the production shape's restore, the restore
@@ -1881,11 +2179,20 @@ Added in this guide, beyond ADR-148's own list:
     each as a sensitive variable with no default, and its state then holds it (section 6a.3).
 11. **The app registrations**: who in the organisation registers the Glass (a single-page
     application, returning to the deployment's address with a trailing `/`) and this API (exposing
-    its scope), and makes the extension attributes or groups the claims name (section 6a.7). They are
-    two registrations, `client_id` and `api_client_id`, not one.
+    its scope), and makes the extension attributes or groups the claims name (section 6a.7). They are two registrations, `client_id` and `api_client_id`, not one, and with reporting
+    on, Superset's and the report sync's too: the rendered `INSTALL.md` counts them.
 12. **Volume encryption**: whether the platform's storage class, `gp2-expand`, encrypts its volumes.
     ArcadeDB's and ClickHouse's data, the shared volume and, in the poc shape, the Ingest root are
     encrypted at rest only if it does; the render does not check.
+13. **OpenSearch without fine-grained access control.** Does your security standard accept an OpenSearch
+    domain whose access policy admits one IAM role, the namespace's, with no fine-grained access control and
+    no OpenSearch users? In its place, OspreyFlow applies each reader's access in its own query to the
+    index: the Conduit adds to every search, before it is sent, a filter that keeps only what the reader's
+    clearance, handling codes and the case's datasets allow, and a document's text only for the unit that
+    holds it, so a result the reader may not see is never returned or counted. If your platform fronts
+    OpenSearch with a proxy that signs for us, say so: OspreyFlow then sends its requests to it unsigned
+    (`opensearch_signing: none`, section 6a.1). And which two private subnets, in two availability zones,
+    may the domain use?
 
 ## 7. The answers file, `install.yaml`
 
@@ -1936,15 +2243,15 @@ server (with `server.certificate`, `key` and `ca` as `network.tls`, `server.back
 | `ospreyflow open` | Opens the Glass in your browser |
 | `ospreyflow logs [service] [--follow] [--tail N]` | The services' logs (the last 200 lines by default) |
 | `ospreyflow apply` | Applies a changed `osprey.yaml` to the installed deployment (section 8.3): renders it again, keeps every password and key, asks for a newly enabled provider's key (from `OSPREY_MODEL_KEY_<NAME>` or a hidden prompt), and restarts only the services whose settings changed. It makes no account, adds no demo pack and touches no data |
-| `ospreyflow repair-sign-in [--no-demo-accounts]` | Registers the sign-in again — the identity provider's clients, roles and the demo accounts (leave them out with `--no-demo-accounts`; a Small deployment installed without them never gets them), the Conduit's own client secret from the deployment's settings, which a wiped or re-imported identity provider no longer holds, the workspace's own client (which is given no refresh token), and the organisation's identity provider with its client secret, its first sign-in (refusing, or joining by email when `trust_email` is on) and the record of refused sign-ins Admin → People lists (section 5a.1); safe to run again, and prints no secret |
+| `ospreyflow repair-sign-in [--no-demo-accounts]` | Registers the sign-in again — the identity provider's clients, roles and the demo accounts (leave them out with `--no-demo-accounts`; a Small deployment installed without them never gets them), the Conduit's own client secret from the deployment's settings, which a wiped or re-imported identity provider no longer holds, the workspace's own client (which is given no refresh token), and the organisation's identity provider with its client secret, its first sign-in (refusing, or joining by email when `trust_email` is on) and the record of refused sign-ins Admin → People and roles lists (section 5a.1); safe to run again, and prints no secret |
 | `ospreyflow models` | Lists the model engines, each role's default engine, and whether each provider's key is present (yes or no — never the key) |
-| `ospreyflow models key <name>` | Sets or replaces a provider's key, from `OSPREY_MODEL_KEY_<NAME>` in the terminal or a hidden prompt; writes it to `deployment.env` alone and restarts the model gateway (and the Conduit when the key's presence changes) |
+| `ospreyflow models key <name>` | Sets or replaces a provider's key, from `OSPREY_MODEL_KEY_<NAME>` in the terminal or a hidden prompt, through the Conduit's own key path inside its container, as Admin › Models does: the key is kept by the model gateway alone, and nothing is restarted. Refused for an engine that signs in by the gateway's own IAM role |
 | `ospreyflow models remove-key <name>` | Removes a provider's key; the provider stays enabled but shows "no key" and is not offered to analysts |
 | `ospreyflow grading change --to <scheme> --mapping <file> --dry-run` | Says how many drawn items each line of the mapping (every grade of the old scheme to one of the new) would move, writes nothing, and gives the token the change needs. `--to` is `5x5x5`, `3x5x2` or a scheme file: a YAML file with `scheme` (a name of its own), `source`, `intelligence` and `handling`, each its list of grades. Runs beside a running deployment |
 | `ospreyflow grading change --to <scheme> --mapping <file> --confirm <token> [--stop-api]` | Changes every live drawn item's grade, each keeping the grade it had before beside the new one; refused unless the token is the dry run's for the items as they are now, and while the Conduit runs unless `--stop-api` says to stop it. After the change it sets `grading.scheme` (a scheme file kept beside `osprey.yaml`), applies the settings and starts the Conduit. A refusal names the items it concerns and changes nothing; a run stopped part way leaves the Conduit stopped: run the dry run and the change again |
 | `ospreyflow release export <dataset> --name <name> --release-version <version> --out <folder>` | Writes the dataset's release as a YAML bundle into a new, empty folder: `release.yaml` (`apiVersion: ospreyflow.io/v1`, `kind: DatasetRelease`, checked by `packages/schemas/release.schema.json`), the domain model, each published pipeline and each reference list's definition, and a small list's rows as a CSV named by its checksum. Never a credential, loaded data, case membership, an owner or a licensed screening list's rows. Does what Studio › Releases' *Export* does, as you: set `OSPREY_TOKEN` to your own sign-in token (and `OSPREY_API_URL` for another deployment's address). A pipeline marked above what you may view is left out, and the command says how many |
 | `ospreyflow release import <folder> --dataset <id> [--dry-run]` | Reads a bundle whole (every file's SHA-256, nothing it does not list) and lands the model, the pipelines and the lists as drafts in the dataset, each pipeline through the Studio's own save gates; with `--dry-run`, says what it would write and writes nothing. A refusal writes nothing. Nothing goes live: make the model live in the Studio |
-| `ospreyflow run <dataset> <pipeline> --external-run-id <id> [--version <n>\|latest] [--wait] [--fail-on held\|rejections>N%]` | Triggers a deployed pipeline as the deployment's service identity (`OSPREY_TOKEN_URL`, `OSPREY_CLIENT_ID`, `OSPREY_CLIENT_SECRET`, by client credentials); the run acts as the pipeline's owner, never as the identity. The same `--external-run-id` again loads nothing more. `--wait` waits for the run; `--fail-on` exits 2 when held rows or the share of rejected rows meets it, or when the run's counts are withheld. Exits 1 on a refusal, in words. Refused where people sign in with Entra ID (`cloud-platform`): nothing acts as its owner there (section 6a.7) |
+| `ospreyflow run <dataset> <pipeline> --external-run-id <id> [--version <n>\|latest] [--wait] [--fail-on held\|rejections>N%]` | Triggers a deployed pipeline as the deployment's service identity (`OSPREY_TOKEN_URL`, `OSPREY_CLIENT_ID`, `OSPREY_CLIENT_SECRET`, by client credentials, and on Entra ID `OSPREY_TOKEN_SCOPE`, the API's application ID URI followed by `/.default`); the run acts as the pipeline's owner, never as the identity. The same `--external-run-id` again loads nothing more. `--wait` waits for the run; `--fail-on` exits 2 when held rows or the share of rejected rows meets it, or when the run's counts are withheld. Exits 1 on a refusal, in words. Where people sign in with Entra ID (`cloud-platform`), the owner as *Admin › People and roles* holds them, refused if they have not signed in within 24 hours (section 6a.7) |
 | `ospreyflow map list` | Lists the map providers, each with its tier, whether its key is set (never the key) and its state; the local basemap, the place-name fonts and the prefetch areas |
 | `ospreyflow map verify` | Checks every provider's attribution, and a tier-4 service's projection and zooms, in the Conduit |
 | `ospreyflow map prefetch` | Fetches every prefetch area's tiles now, saying for each how many were fetched and any failure in plain words |
@@ -1993,7 +2300,7 @@ on this computer only.
 `RUNBOOK.md`, written for each deployment, lists what runs, its paths and its addresses.
 
 `deployment.env` is readable by your own account alone (`600`): `ospreyflow install` writes it so,
-and `ospreyflow apply`, `models key` and `models remove-key` keep it so.
+and `ospreyflow apply` keeps it so.
 
 ### 8.3 Changing a setting
 
@@ -2024,27 +2331,37 @@ its own sign-in page. What a person may do is their **roles**; what they may see
 **Where people sign in with Entra ID** (`cloud-platform`, section 6a.7), Entra holds their accounts,
 and *People and roles* gives them roles, adds them by object id before they first sign in, and
 disables them. What Entra holds is refused here, in words, each followed by "On this deployment
-Entra ID holds people's accounts…": inviting ("People are not invited here."), access ("A person's
-clearance, unit and handling codes are changed in Entra ID."), a sign-in's reset ("A sign-in is
+Entra ID holds people's accounts…": inviting ("People are not invited here."), access ("A person's clearance, unit and handling codes are changed in Entra ID."), a sign-in's reset ("A sign-in is
 reset in Entra ID."), removing ("A person is not removed here: they would return, with no roles, at
-their next sign-in. Disable them instead, or remove them in Entra ID."), joining ("There is no
-organisation account to join.") and a dashboard identity ("Dashboard identities are not registered
-on this deployment yet."). No administrator can give a missing clearance or unit instead: a person
-whose token carries neither is refused at sign-in (section 6a.7). A person is shown by object id,
-not by name.
+their next sign-in. Disable them instead, or remove them in Entra ID.") and joining ("There is no
+organisation account to join."). **A dashboard identity** is its own Entra app registration, which
+holds its secret: *Dashboard identities* registers it by its application id, and shows no secret.
+Without an application id it is refused ("on Entra ID a dashboard identity is its own app
+registration: give its application id (the registration holds its secret)"), and so is the
+deployment's own application, the Glass's or the API's. Unless the mapping names `{administrator: true}` for a value (the poc shape's fallback, section 6a.7),
+no administrator can give a missing clearance or unit instead: a person whose token carries neither is
+refused at sign-in (section 6a.7). A person is shown by object id,
+not by name. A guest account, homed in another organisation's Entra ID, signs in only while
+**Admit guest accounts** is on, below the list (section 6a.7), and is marked as a guest in it;
+while it is off, a guest is listed as not enabled.
+Under the administrator fallback (section 6a.7), a value Entra sends is refused on its own, saying which
+values come from where, never that all three do: "Here a person's unit comes from Entra ID, and is changed
+there. Their clearance and handling codes are set here, with Access."
 
 ### 9.1 The Admin place
 
 **Admin** is one of the four places (key `A`); Home and the place switcher offer it to whoever holds
 one of its sections' rights. A side list groups its sections, each shown only to someone holding its
 right, and each section's routes refuse anyone without it, so hiding a section is never the control.
-Under the GOV.UK theme the list is a GOV.UK side navigation.
+Under the GOV.UK theme the list is a GOV.UK side navigation. A section not built yet is not a link: its name
+stands with a **Coming** tag, and what it will hold is written beneath it. Each person in **People and roles**
+has **Save** and, beside it, links to the person's other actions on a line beneath their name.
 
 | Group | Section | Right | What it does |
 | --- | --- | --- | --- |
 | People | **People and roles** | `manage_people` | Invite people; set their roles, clearance, unit and handling codes; the Super user preset; **Disable…** with its transfers (section 9.9), re-enable; reset a sign-in; remove an account; join someone the organisation's sign-in refused to their account (section 9.7); name an Author for a case that has none |
 | People | **Roles** | `manage_people` | The built-in roles and their rights; custom roles; teams, their leads and cover (sections 9.2 and 9.8) |
-| People | **Dashboard identities** | `manage_dashboards` | Register a dashboard's account (its secret shown once), see when it last pulled, remove it |
+| People | **Dashboard identities** | `manage_dashboards` | Register a dashboard's account (its secret shown once; on Entra ID, by its app registration's application id, with no secret shown), see when it last pulled, remove it |
 | Data | **Datasets** | `administer_system` | Every dataset's kind, unit, highest marking, egress, promotion policy, Authors and linked cases (section 9.10) |
 | Data | **Connections** | `administer_system` | The named connections pipelines read through: files, a SQL database, an HTTP API or JSON files |
 | Running | **Operations** | `operate_schedules` | Every scheduled or watched pipeline (pause, resume, run now, change its time, its runs), and promotions waiting for review (section 9.11) |
@@ -2163,8 +2480,7 @@ and they see what that role allows.
 **The first administrator** (`admin`, on a deployment with no demo accounts) holds both the
 **Admin** and the **Analyst** roles from the start, whether or not demo packs are loaded. The Admin
 role alone does not open a case's graph, and the first administrator is the Author of every demo
-pack's case there. An `admin` made by v0.4.6 or earlier holds Admin alone: add the Analyst role in
-People and roles.
+pack's case there. 
 
 ### 9.3 Inviting someone
 
@@ -2201,15 +2517,7 @@ live**: give the person an Analyst role as well, or the **Super user** preset (A
 Engineer and Rule author, given as three roles). An administrator alone holds none of these. **No new
 rule covers the whole deployment**: a rule watches one dataset, chosen once in the editor.
 
-**After updating to v0.5.0.** No one holds Rule author: give it in Admin → People and roles to whoever
-writes rules. `scripts.migrate_rules_to_datasets` (in the update's one-off steps) turns each rule that
-covered the whole deployment into one rule per dataset, in that dataset's home case, with the same
-conditions, owner and name: a running rule keeps running, and one still waiting for its first
-approval becomes a draft, to be tested and made live. Run it with `--dry-run` first: it says what it
-would do and writes nothing. The original rule is then retired, with a version saying why. **A dataset
-with no home case is reported, never guessed**: that rule is left whole and running, converted to no
-dataset, so that no alert is raised twice and no dataset goes unwatched. Make the dataset's home case
-and run the script again; the second run converts it. **A rule runs as its author**: on every run (a
+**A rule runs as its author**: on every run (a
 load, a schedule, a list's refresh, *Test*) its author must still hold `author_rules` or
 `deploy_rules`, or it raises nothing and the run says why ("the rule's author, ‹owner›, no longer holds
 author_rules or deploy_rules"). Check that each rule's owner holds one, and transfer the rules of
@@ -2318,8 +2626,8 @@ A rule can also run **when a screening list refreshes** (user guide, section 7).
 - **A scheduled refresh runs as the person who saved the schedule**, resolved afresh each time —
   never as the system. If they can no longer sign in or no longer hold `load_screening_lists`, that
   refresh is refused, recorded under **Latest refreshes** in words, and nothing is read; save the
-  schedule again as someone who holds the right. Where people sign in with Entra ID, nobody can be
-  acted as, so every scheduled refresh is refused there: refresh by hand (section 6a.7).
+  schedule again as someone who holds the right. Where people sign in with Entra ID, a refresh is
+  refused while its owner has not signed in within the last 24 hours (section 6a.7).
 - Each scheduled time runs once, whichever Conduit replica takes it; after downtime only the latest
   runs. A refresh that ran on its schedule says so under **Latest refreshes**.
 - Put each new download in the list's location before the scheduled hour: the schedule reads the file
@@ -2345,7 +2653,7 @@ engineer attaches rules to pipelines (Checks on load) but does not write them.
 **So a dataset that asks for a second person needs at least two Authors of the case who hold
 `deploy_rules` and open Rules and Monitoring (Analysts)**; with one, a rule there can be tested but never made live.
 
-**Approving influencers.** In the Glass's rail, **Connection strength**, a version waiting for a second
+**Approving influencers.** In the Glass's **Connection strength** (the top bar's view switch, under **More**, or in the switch itself for someone offered nothing else there, as the built-in Administrator is), a version waiting for a second
 person shows what it would put in force, who proposed it and why. Another holder of the right chooses
 **Approve version N**, or **Send it back** with words; its proposer sees the approval withheld and may
 withdraw it. Until a version is approved, the influencers shipped in the weights file are in force.
@@ -2355,8 +2663,7 @@ second person; that too is audited. Give the right singly (`right:manage_strengt
 someone who should set influencers without the rest of a role.
 
 Every proposal, approval and rejection is in the case's rule audit, and every rule keeps its versions
-— who proposed each and who decided it. **After updating to v0.5.0**, a rule that covered the whole deployment is turned into one rule per
-dataset (section 9.4).
+— who proposed each and who decided it. 
 
 ### 9.7 Removing someone, and joining an organisation account
 
@@ -2461,7 +2768,8 @@ dry run first.
 
 **Operations** (`operate_schedules`) has the schedules (pipeline, case, schedule, owner, next and last
 run; **Pause**, **Resume**, **Run now**, **Save schedule**; **Run now** runs as the schedule's owner,
-so where people sign in with Entra ID it is refused, as every scheduled run is: section 6a.7) and **Promotions waiting for review**:
+so where people sign in with Entra ID it is refused, in those words, while the owner has not signed
+in within the last 24 hours: section 6a.7) and **Promotions waiting for review**:
 the load, the dataset it goes into, who sent it, when, and how long it has waited. **Alert the
 reviewers and administrators after N days** (1 to 90) sets when a waiting promotion is overdue; an
 overdue one alerts the dataset's Authors who hold `review_promotions`, and administrators of its unit.
@@ -2512,20 +2820,33 @@ models:
 - The older single `provider:` is still read, as a one-entry list whose roles default to it. Naming
   both `provider` and `providers` is refused.
 
-**Keys.** Each provider's key is `OSPREY_MODEL_KEY_<NAME>` — for example `OSPREY_MODEL_KEY_GEMINI`
+**Keys.** A key is kept by the deployment's model gateway alone, in the gateway's own database, and
+is never written to `osprey.yaml` and never shown again, in the Admin area or anywhere else.
+**On a running deployment, a key is entered in Admin › Models** (section 10.1): an engine's row
+offers **Enter key** (**Rotate key** once one is set), which opens a password field and **Set the
+key** (**Rotate the key**). The key is write-only, handed to the gateway at once and used from the
+next call, with nothing restarted; **Remove key** removes it. An engine that signs in by the gateway's
+own IAM role (Amazon Bedrock on `cloud-platform`, section 6a.9) keeps no key, and neither is offered
+for it.
+
+At install, each provider's key is `OSPREY_MODEL_KEY_<NAME>`, for example `OSPREY_MODEL_KEY_GEMINI`
 (the single `provider:` keeps `OSPREY_MODEL_PROVIDER_KEY`). Give it in the installer's terminal
 before `ospreyflow install`, or on the guided install's Models screen; an enabled provider without
-its key stops the install, and a later install keeps a key already given. To enable a provider on a
-running deployment, add it to `osprey.yaml` and run `ospreyflow apply` (section 8.3), which takes
-its key from `OSPREY_MODEL_KEY_<NAME>` or asks for it at a hidden prompt. On a running deployment,
-`ospreyflow models key <name>` sets or replaces a key and `ospreyflow models remove-key <name>`
-removes it (section 8); `ospreyflow models` says whether each is present. A key is kept in
-`deployment.env` alone and read only by the deployment's model gateway — never by the Conduit,
-never written to `osprey.yaml`, never shown in the Admin area or any page of the Glass.
+its key stops the install. The install writes it to `deployment.env` only until the gateway is up,
+then hands it to the gateway and removes its line. If that fails it says so, the key stays in
+`deployment.env`, and the next `ospreyflow apply` tries again. To enable a provider on a running
+deployment, add it to `osprey.yaml` and run `ospreyflow apply` (section 8.3), which takes its key
+from `OSPREY_MODEL_KEY_<NAME>` or asks for it at a hidden prompt, and hands it on the same way.
+
+**From the command line**, for headless use and recovery, `ospreyflow models key <name>` sets or
+replaces a key and `ospreyflow models remove-key <name>` removes it (section 8). Both run the
+Conduit's own key path inside its container, the one Admin › Models uses, with the key passed by name
+in the environment, never as an argument; nothing is restarted. `ospreyflow models` says whether each
+key is present: yes, no, or "lost: enter it again" after a restore.
 
 **On the guided install page** (section 4.1), the Models screen has a key field for each enabled
 provider. A key typed there is sent only to the install page, on this computer — a request from
-anywhere else is refused — and is held there until the install gives it to `deployment.env`. It is
+anywhere else is refused — and is held there until the install gives it to the model gateway, by way of `deployment.env`. It is
 never written anywhere else, never logged and never shown again: the field empties once the key is
 sent, and the page says only "key set" or "no key".
 
@@ -2546,13 +2867,20 @@ deployment has no local model for the role. Material whose datasets are not know
 the unit that holds it and its egress; choose the setting and press Save beside it. Each change is
 recorded in the audit log — who made it, when, and from what to what.
 
-> **After upgrading to this release, hosted engines receive nothing** until an administrator sets
-> a dataset's egress to `contracted` or `any`. Every existing dataset, demo packs included, starts
-> at `none`; until you change one, every question runs on the deployment's own models, whatever
-> engine an analyst chooses. Set only the datasets you are entitled to send.
+
+
+**How long a model is waited for.** A call to a hosted engine (any engine but the deployment's own) is waited
+for 120 seconds, `OSPREY_HOSTED_MODEL_TIMEOUT_SECONDS`; a call to the deployment's own model 900 seconds,
+`OSPREY_MODEL_TIMEOUT_SECONDS`. On Lite and Small each is set in the deployment's env file (`deployment.env`), and `ospreyflow apply` passes it
+to the Conduit. On Enterprise and on a shared platform both are rendered into the chart's values (`environment`),
+at these defaults, and reach the Conduit from its ConfigMap; `osprey.yaml` has no setting for them. A call past its bound is stopped, and the person is told the engine did
+not answer in the time this deployment allows, with the bound; nothing is recorded. When an engine's provider
+refuses (its own rate limit or quota, a key it does not accept, or no answer after the gateway's own retries), the
+person is told which, in words naming the engine; nothing is recorded then either. A limit set in *Admin › Models*
+is said as before.
 
 **Who chooses.** The administrator sets each role's default. An analyst may choose, for each
-question in Ask the case, among the engines offered — the local engine and each enabled provider
+question in Ask & Chat, among the engines offered — the local engine and each enabled provider
 that has a key — each shown "under contract" or "no contract". An engine the case's datasets may not
 reach is shown but cannot be chosen, with the reason beneath the choice. Ask to search offers the
 same choice: its question goes under the case's handling and from the case's datasets, through the
@@ -2656,9 +2984,7 @@ Choose them at install (`demo_packs`), or later: `ospreyflow demo list`, `osprey
 <id>`. Each loads into its own case, with the installing administrator as Author: the demo
 administrator where there are demo accounts (the demo analyst its Editor), and otherwise the first
 administrator, `admin`, in their own unit, with no Editor (section 1a); they hold the Analyst role
-as well as Admin, so the case opens for them. Adding **HMP**
-again is safe: a deployment that loaded it before v0.2.0 gains only its prison network, in the same
-case, and one that already has the network is left as it is. **PaySim** is a
+as well as Admin, so the case opens for them. Adding **HMP** again is safe: a deployment that already has its prison network is left as it is. **PaySim** is a
 download: get `PS_20174392719_1491204439457_log.csv` from its Kaggle page and pass it with
 `ospreyflow demo add paysim --file <path>`; it is checked by size and checksum before anything
 starts. PaySim is CC BY-SA 4.0 (E. A. Lopez-Rojas, A. Elmir and S. Axelsson, 2016); its licence and
@@ -2707,14 +3033,14 @@ minutes (`reporting.sync_interval_seconds`), and **Superset** shows them at `bi.
 through the deployment's identity provider (below). A business intelligence tool (Power BI, Tableau, Qlik)
 reads the same figures:
 
-1. register the dashboard in Admin → Dashboards and copy its secret (shown once);
+1. register the dashboard in Admin → Dashboard identities and copy its secret (shown once);
 2. add it to `REPORT_SYNC_DASHBOARDS` in `deployment.env` (a JSON list of `{"client_id", "secret"}`)
    and restart: `ospreyflow stop`, `ospreyflow start`;
 3. a case's Author gives the dashboard's account Viewer on the case.
 
 Each pull is made as that account, at its clearance, audited and recorded in the export ledger.
 
-![Admin → Dashboards: registering a dashboard's account and seeing when it last pulled](images/admin/03-dashboards.png)
+![Admin → Dashboard identities: registering a dashboard's account and seeing when it last pulled](images/admin/03-dashboards.png)
 
 ![Superset at bi.: the boards and charts built on the reporting figures](images/admin/07-superset.png)
 
@@ -2735,7 +3061,7 @@ A typology rule is named by its typology, never by its own name, which an analys
 feed does not carry. Every figure is counted as the dashboard's account may see it; a hotlist kept
 "only me" is counted for its owner alone, so never on a dashboard.
 
-**In the Glass**, the rail's **Dashboards** draws an **Alert monitoring** board itself, first among the
+**In the Glass**, **Reports** (the top bar's view switch) draws an **Alert monitoring** board itself, first among the
 boards, from the same figures counted as the person reading it: raised each week and by rule, closed
 by outcome, time to close, hotlist matches and the team view. A Reports Viewer's *Open the dashboard*
 opens it filtered to an alert's rule and period. It needs
@@ -2787,12 +3113,12 @@ records, the accounts, the audit log), `<project>_arcadedb-databases` and `<proj
 `<project>_objectstore-data`. `<project>` is `osprey-local-lite`, `osprey-small`, or the
 `deployment.name` you gave; `docker volume ls` lists them. They outlive a stopped, recreated or
 removed container, so a restart, `ospreyflow apply`, an update and `uninstall --keep-data` keep them;
-`ospreyflow uninstall` without `--keep-data` removes them. A deployment installed with v0.4.10 or
-earlier kept PostgreSQL and ArcadeDB in unnamed volumes, and Valkey and OpenSearch inside their
-containers; its data is moved into the named volumes once (section 14). A backup reads each store through its own
+`ospreyflow uninstall` without `--keep-data` removes them.  A backup reads each store through its own
 running server, so it is the same wherever the data is kept. **Not in a backup:** Valkey's working
-sets and queues, and OpenSearch, which holds no index of OspreyFlow's yet — so there is nothing of it
-to restore or rebuild, and a restore starts it empty.
+sets and queues, and OpenSearch's search index, which is rebuilt from the graph instead: a restore's
+last step, once the graph and the texts are back, runs `python -m scripts.rebuild_search_index` in the
+Conduit's container, in a deployment that runs an OpenSearch (`components.search: opensearch`, the
+default). With `postgres-fulltext` there is no index to rebuild.
 
 **A backup that fails** removes the set it had started, and says
 so, so no half-written set is left beside the good ones. If it cannot remove all of it, it says what
@@ -2807,19 +3133,9 @@ settings' placeholder, is refused at setup except on Small on your own server. A
 installed by name cannot be called `local-lite`, `small` or `cluster`, or the checkout's own
 `deployment.name`, since the checkout's own deployment keeps its backups under that name. Give two
 checkouts on one machine different backups folders: both deployments are `local-lite`, so they would
-otherwise share a subfolder. An `osprey.yaml` from v0.4.x or earlier names no backups folder (or the
-placeholder `/var/lib/osprey/backups`), so its sets go to `~/OspreyFlow/backups/<deployment>/`,
-and the backup's first line says so. Name a folder as `components.storage.backups` to stop that
-line.
+otherwise share a subfolder. 
 
-Sets taken before this release may still be in the checkout's `backups/`, in a named
-deployment's `~/.ospreyflow/deployments/<name>/backups/`, or directly in a server's backups
-folder. `ospreyflow doctor` names each such folder, with the sets' total size and the one command
-that moves them (`mkdir -p <folder>/<deployment> && mv <sets> <folder>/<deployment>/`). It never
-moves or deletes a set itself. Until they are moved, `ospreyflow restore` with no set lists them
-beside the deployment's own sets, each with its move command, and `ospreyflow restore <set name>`
-still restores one, looking in the deployment's folder first. A set the doctor cannot read all of
-(a server's are the owner's only) is given as "at least" its size, and its move needs `sudo`.
+
 
 **A synced folder.** A set holds the deployment's data and any real-data exception it was given.
 `ospreyflow doctor` warns when the backups folder is under a folder a sync client copies: on
@@ -2838,8 +3154,7 @@ the install.
 `ospreyflow restore` accepts.
 
 **Once the object store holds files** (a demo pack or an upload has put some there), it is copied
-as the account that runs `ospreyflow backup`, so that account can remove its working copy. With
-v0.4.8 and earlier on Linux such a backup failed with "Permission denied" (section 16).
+as the account that runs `ospreyflow backup`, so that account can remove its working copy. 
 
 **Enterprise.** The cloud protects its managed services as for Small. **The graph store and the
 analytics database run in the cluster, and nothing backs them up yet**: `ospreyflow backup` drives
@@ -2854,15 +3169,24 @@ and shares its retention.
 Releases are tagged `vMAJOR.MINOR.PATCH`, with signed images and a signed list of every image by
 digest. Each release's notes are its section of `CHANGELOG.md`.
 
+**v0.6.0 is installed fresh.** No earlier deployment is moved to it: a deployment made by an earlier
+release stays on that release, and v0.6.0 is installed as a new deployment. `ospreyflow update`, an
+install over an existing deployment, and on `cloud-platform` the rendered `INSTALL.md` each refuse an
+earlier one before anything is changed: "v0.6.0 is installed fresh; this deployment is ‹release›, and
+nothing moves it onto v0.6.0. Install v0.6.0 as a new deployment, in a place of its own (a folder, or on
+a cluster a namespace); this one is left on ‹release›, unchanged." What follows is how a v0.6.0
+deployment moves to a later release.
+
 **Which installs `update` moves, and how the others are updated:**
 
 | Your install | How it is updated |
 | --- | --- |
 | Lite, installed from a release tag | `ospreyflow update` (below) |
-| Lite, built from the checkout (`--build`, or a checkout on no release tag) | `git pull`, then `ospreyflow start --build`. `update` refuses this install, saying so |
+| Lite, built from the checkout (`--build`, or a checkout on no release tag) | `git pull`, then `ospreyflow start --build`. `update` refuses this install, saying so. Where the deployment searches with OpenSearch, `start --build` rebuilds the search index from the graph as its last step, as `install` and `update` do. If the rebuild fails it says so: the stack is up, search is limited to exact identifiers, and running `start --build` again rebuilds it |
 | Small | **Not yet by `update`**: its first step, the backup, refuses a deployment on a managed database (section 13). The cloud's own backups protect the data |
 | Small on your own server, installed from a release tag | `ospreyflow update`, as Lite: its backup is written to `<server.backups>/<deployment>/` first |
 | Enterprise | Move the checkout to the release's tag and run the install again: the chart is upgraded in place, every password and account kept |
+| A namespace on a shared platform (`cloud-platform`), the poc shape | As section 6a.1's *Moving to a new release* says: back up first, then run the new release's rendered `INSTALL.md` again, whose `helm upgrade --install` moves the deployment onto the new release. The standard shape's runbooks are *coming* (section 6a.10) |
 
 **Checking for a newer release.** The deployment never calls out to look. Run
 `ospreyflow update --check` on the computer that holds the checkout: it asks the repository's
@@ -2881,8 +3205,8 @@ that can read it first; without one the check cannot answer, and says so.
 - `ospreyflow update` moves to the newest release (`--to vX.Y.Z` for another; `--yes` asks
   nothing). It checks every image's signature first and changes nothing if one fails; refuses if a
   local change to a file would be overwritten ("commit or undo them first"); **backs everything up**;
-  moves the checkout to the tag; starts the release's images and checks each service runs them. If
-  anything fails after the backup it **rolls back** — the previous release and its data restored
+  moves the checkout to the tag; starts the release's images and checks each service runs them; and,
+  where the deployment searches with OpenSearch, rebuilds the search index from the graph. If anything fails after the backup it **rolls back** — the previous release and its data restored
   from the backup just taken — and says so.
 - **Without internet**: on a machine with it, `ospreyflow update --make-bundle <file> --to
   vX.Y.Z` writes the release, verified, to one file; carry it over and run
@@ -2896,67 +3220,9 @@ that can read it first; without one the check cannot answer, and says so.
     anything, and says what to run instead, for example: "this bundle carries the images for
     linux/arm64, and this machine is linux/amd64; nothing was verified or loaded. Make one for it
     on any machine that reaches the release: ospreyflow update --make-bundle FILE --platform
-    linux/amd64". A bundle made before this version names no platform: it carries the platform of
-    the machine that made it, and on another it is refused when its cosign image is checked.
+    linux/amd64". 
 
 An update moves forward only.
-
-**The stores' one-time move to named volumes.** A deployment installed with v0.4.10 or earlier keeps
-its PostgreSQL and ArcadeDB data in unnamed volumes, and Valkey's and OpenSearch's inside their
-containers (section 13). The first `ospreyflow update` after that — after its backup and before anything
-starts — moves the data into the stores' named volumes, once; so does the first `ospreyflow start`,
-`start --build`, `apply` or `install` that brings such a deployment up from a newer checkout. The
-deployment is stopped while it moves: each store is started alone on its old data and asked what it
-holds, its data is copied with its own image keeping every owner and permission (Valkey's from its
-container, through a temporary image of it that is removed afterwards), the copy is checked file by
-file against the original, and the store is started on its named volume in a container of its own,
-apart from the deployment's, and must hold the same as before. Only then does the command start the
-deployment on the named volumes. It says, for example:
-
-```
-The stores' data moves to named volumes, once: postgres, arcadedb, valkey, opensearch. The deployment is stopped while it moves; the old volumes are kept.
-  postgres: the databases keycloak, osprey, postgres, superset.
-  postgres: copying /var/lib/postgresql/data from 3f9c…e1 to osprey-small_postgres-data…
-  postgres: /var/lib/postgresql/data copied and checked (2114 entries, the same owners, modes and contents).
-  …
-  valkey: keys that do not expire db0: 1.
-  valkey: copying /data from valkey's container to osprey-small_valkey-data…
-  …
-  opensearch: holds no index of its own, so nothing is copied; it starts on its named volume empty.
-  postgres: on its named volume it holds the databases keycloak, osprey, postgres, superset, as before.
-  …
-The stores' data is in their named volumes, checked; they start on them next.
-The old volumes are left in place: 3f9c…e1, 7a20…4b, c51d…90, 0be8…7f. Once the deployment works as before, remove them with:
-  docker volume rm 3f9c…e1 7a20…4b c51d…90 0be8…7f
-```
-
-Run again, it does nothing. It needs room for a second copy of the stores' data on the disk where
-Docker keeps its volumes (`ospreyflow doctor` shows that disk). **If the move fails**, it says why and
-removes nothing: the named volumes it filled are removed, each store's data is where it was, no
-container of the deployment's has been replaced, and every file the command wrote is put back as it
-was, so the deployment still runs from the files that name its old data. An update then rolls back
-to the previous release on that data, with nothing restored ("rolled back to … on its own data,
-which was never moved"). `apply`, `install` and `start --build` stop, saying "…, and the
-deployment's files are as they were. The deployment is stopped; ospreyflow start starts it on that
-data." — or "Nothing was stopped." when the move refused before it stopped anything — and
-`ospreyflow start` then brings the deployment up on its old data. If an update fails after a move
-that succeeded, it rolls back as for any other failure (the backup restored) and removes the named
-volumes the move filled; the old volumes are kept either way.
-
-### 14.1 Removing the old store volumes
-
-After the move, each store's old volume is left as it was — a long hexadecimal name — and nothing
-uses it. Check the deployment first: sign in, open a case, and take a backup (`ospreyflow backup`,
-section 13). Then remove the volumes the move named, with the command it printed:
-
-```
-docker volume rm <name> <name> …
-```
-
-Docker refuses to remove a volume a container still uses, so nothing in use can be removed this way.
-If the move's words are lost, `docker volume ls --filter dangling=true` lists the volumes no
-container uses; this deployment's are among them, but so may be other programs', so do not remove
-them all (`docker volume prune` would). Until they are removed they cost only disk.
 
 ## 15. Scheduled and watched pipelines
 
@@ -2966,9 +3232,10 @@ arrives** in its dataset's folder (a filename pattern such as `*.csv`; each new 
 minute after it stops changing). Both are set on the Ingest Studio's Publish screen by someone
 holding `schedule_pipelines`, and run **as that person**, with every check their own run would get.
 A run that is refused or fails tells its owner in their alerts; three refusals in a row pause it.
-Admin → Schedules and runs lists every one.
+Admin → Operations lists every one.
 
-![Admin → Schedules and runs](images/admin/04-schedules.png)
+<!-- needs a new capture: shows the screen under its old name, Schedules and runs -->
+![Admin → Operations](images/admin/04-schedules.png)
 
 ## 16. When something is wrong
 
@@ -2978,9 +3245,9 @@ Admin → Schedules and runs lists every one.
 | A service is not healthy | `ospreyflow status`, then `ospreyflow logs <service>` |
 | The page does not open | `ospreyflow status`; that port 80 (Lite) or the DNS records (Small) are right |
 | Nobody can sign in | `ospreyflow logs keycloak`; that the address in `osprey.yaml` is the one in the browser; then `ospreyflow repair-sign-in` |
-| Rules say "the rule's deployer could not be resolved", a hotlist reads **Stopped**, or a list refresh re-screens 0 customers — typically after the stores were wiped; Admin → System's **Acting for people** says "The Conduit cannot act for people" | The Conduit cannot act for people: the identity provider no longer holds its client secret. Run `ospreyflow repair-sign-in`, then run the rule again. The System line turns green within half a minute |
+| Rules say "the rule's deployer could not be resolved", a hotlist reads **Stopped** with "Its owner's sign-in could not be checked at three loads in a row. It is tried again at the next." beside it, or a list refresh re-screens 0 customers — typically after the stores were wiped; Admin → System's **Acting for people** says "The Conduit cannot act for people" | The Conduit cannot act for people: the identity provider no longer holds its client secret. Run `ospreyflow repair-sign-in`, then run the rule again. The System line turns green within half a minute |
 | Someone signing in through the organisation is told "This email address already belongs to an OspreyFlow account" | An account you made holds their email, and OspreyFlow does not join the two by itself (section 5a.1). Join them in Admin → People and roles' *Refused organisation sign-ins*, or remove that account and they arrive again, or they sign in with that account (section 9.7) |
-| *Refused organisation sign-ins* does not list someone who was refused | It lists the last seven days, from a deployment updated to the release after v0.4.10 and repaired since (`ospreyflow repair-sign-in`, which also makes the identity provider record the refusals). Someone refused before that, or more than seven days ago, is not listed: ask them to sign in through the organisation once more, then look again. Someone already joined to an account is not listed either |
+| *Refused organisation sign-ins* does not list someone who was refused | It lists the last seven days. Someone refused more than seven days ago is not listed: ask them to sign in through the organisation once more, then look again. Someone already joined to an account is not listed either |
 | Admin → People and roles says "the identity provider refused the Conduit — its account needs manage-users, manage-clients and view-events" | Run `ospreyflow repair-sign-in`, which grants the Conduit's account what it needs |
 | Removing someone is refused: "the only enabled person who can manage people" | Give someone else the Admin role (or the `manage_people` right) first, so the deployment is never left with no administrator. Your own account cannot be removed either: another administrator removes it |
 | `doctor`, the install or `repair-sign-in` warns "Sign-in through the organisation joins by email" | `sign_in.organisation.trust_email` is on (section 5a.1). Keep it only with the security officer's written sign-off; otherwise set `trust_email: false` in `osprey.yaml` and run `ospreyflow apply` |
@@ -2993,13 +3260,9 @@ Admin → Schedules and runs lists every one.
 | `doctor`, `install` or `apply` refuses the GPU | Each reason is named, and nothing was changed: install the NVIDIA driver and restart until `nvidia-smi` lists the GPU; install the NVIDIA Container Toolkit and run `sudo nvidia-ctk runtime configure --runtime=docker` and `sudo systemctl restart docker`; on macOS or Windows, set the GPU to `none` (section 5a.4) |
 | `ospreyflow update --from` says "this bundle carries the images for linux/arm64, and this machine is linux/amd64", or "the bundle's cosign image is not the one pinned for linux/amd64" | The bundle was made for another platform: the second words are a bundle made with v0.4.10 or earlier, before `--platform`, which carried the platform of the machine that made it (an Apple-silicon Mac's is arm64). Nothing was verified or loaded. Make it again with `ospreyflow update --make-bundle <file> --platform linux/amd64` (the default) on any machine that reaches the release (section 14) |
 | `ospreyflow demo add` or an upload fails with "Permission denied: '/var/lib/osprey/ingest/uploaded/…'", or `install`, `apply`, `start` or `update` says "the Conduit (uid 10001) cannot write …/uploaded" | Linux only: the Conduit's upload folder in `server.ingest` (Lite: `components.storage.ingest`) is not its own. A deployment installed or updated with v0.4.8 or earlier has it so: run `ospreyflow apply` or `ospreyflow start` once with a later version, which gives the folder over (section 5a). When giving it over fails, the command names Docker's reason; or give it over yourself, `sudo chown 10001:10001 <server.ingest>/uploaded`, and run the command again |
-| `ospreyflow backup` fails with "Permission denied" on a file under `.objects-staging`, or a folder named `….incomplete` is left where backups are written | Linux, v0.4.8 or earlier, once the object store holds files: the object store's copy belonged to the Conduit's user. Update, then back up again. Remove what was left as root (`sudo rm -rf <folder>`); a folder with an `INCOMPLETE` file in it is not a backup, and `restore` refuses it (section 13) |
 | Ask on the local engine fails after the extraction model was changed (the GPU switched on, or `models.extraction`) | `ospreyflow apply` fetches the newly chosen model, and waits for it, before anything that uses it starts again; if the download fails it stops with nothing changed, saying "the model download (ollama-models) did not finish": `ospreyflow logs ollama-models` says why, then run `ospreyflow apply` again. With v0.4.8 or earlier, `apply` never fetched it: `docker compose --env-file <deployment>/deployment.env -f <deployment>/compose.yaml up -d --force-recreate --no-deps ollama-models` fetches it (the 14b is about 9 GB) |
 | A Small server never answered | Its log, `/var/log/ospreyflow-first-boot.log` (Session Manager on AWS) |
 | An update rolled back | Its own words say why, and where its backup is |
-| `start`, `apply`, `install` or `update` says "the stores' data could not be moved to named volumes" | Nothing was removed, and the deployment's files are as they were: `ospreyflow start` runs it on its old data (section 14). "both its current volume … and the named volume … hold data": the named volume is left from an earlier attempt — look at it, and remove it (`docker volume rm <name>`) only if it holds nothing you need; then run the command again. "holds the indexes …": OpenSearch holds an index OspreyFlow did not write, which would not survive the move; snapshot or remove it first. "No space left on device": free room for a second copy of the stores' data where Docker keeps its volumes. "is not the same as the original": the copy did not keep an owner or a permission; say so, with the line it names |
-| Old unnamed volumes after the move | Expected: section 14.1 says how to remove them once the deployment works as before |
-| `restore` fails on 'identity' with "could not authenticate to Keycloak: 500" | The identity provider was running on a database replaced under it, and builds its tables only when it starts. From the release after v0.4.10 the restore starts it again itself before that step. With v0.4.10 or earlier, everything before the accounts is restored: run `ospreyflow stop` then `ospreyflow start`, and ask for the accounts to be brought back from the same set (the restore's identity step on its own); do not run the whole restore again, which refuses a deployment that is no longer empty |
 | The model download stopped with `rename …-partial …: no such file or directory` | A model server restarted mid-download and removed the half-fetched file (fixed from the release after 15 October 2026). Run `ospreyflow start` while the deployment is up: it starts the download again and the server keeps running, so it completes |
 
 ---
@@ -3035,7 +3298,7 @@ Made from the deployment's own schema. Settings marked *section* hold the settin
 | `models.provider.api_base` | str or none | none | The provider's address, where it is not LiteLLM's default (an Azure deployment, a proxy) |
 | `models.provider.privacy_contract` | bool | false | True when the deployment's organisation holds a data-processing agreement with the provider covering this key. A dataset whose egress is `contracted` is sent only to a provider marked so. Default: false. |
 | `models.provider.contract_reference` | str or none | none | The agreement's reference, in words (for example DPA 2026/07); never a secret. Shown beside the mark. |
-| `models.provider.kind` | `provider` \| `gateway` \| `bedrock` | `provider` | ADR-135 Amendments 4 and 7: provider (a hosted provider LiteLLM knows by name), or at profile: cloud-platform only, gateway (the client's own OpenAI-compatible AI gateway, at api_base) or bedrock (Amazon Bedrock in London). Default: provider. |
+| `models.provider.kind` | `provider` \| `gateway` \| `bedrock` | `provider` | ADR-135 Amendments 4 and 7: provider (a hosted provider LiteLLM knows by name), or at profile: cloud-platform only, gateway (your organisation's own OpenAI-compatible AI gateway, at api_base) or bedrock (Amazon Bedrock in London). Default: provider. |
 | `models.provider.auth` | `key` \| `iam_role` or none | none | ADR-135 Amendments 4 and 7: key (entered in Admin › Models, kept by the model gateway alone), or at profile: cloud-platform only, iam_role (the gateway's own IAM role: no key is stored). Default: iam_role for bedrock, else key. |
 | `models.provider.region` | str or none | none | Bedrock's region (profile: cloud-platform): eu-west-2 (London) only, and the default for bedrock. |
 | `models.providers` | list of section | — | The providers (engines) an administrator enables, each reached through the deployment's gateway; each key is OSPREY_MODEL_KEY_<NAME>. |
@@ -3045,7 +3308,7 @@ Made from the deployment's own schema. Settings marked *section* hold the settin
 | `models.providers.api_base` | str or none | none | The provider's address, where it is not LiteLLM's default (an Azure deployment, a proxy) |
 | `models.providers.privacy_contract` | bool | false | True when the deployment's organisation holds a data-processing agreement with the provider covering this key. A dataset whose egress is `contracted` is sent only to a provider marked so. Default: false. |
 | `models.providers.contract_reference` | str or none | none | The agreement's reference, in words (for example DPA 2026/07); never a secret. Shown beside the mark. |
-| `models.providers.kind` | `provider` \| `gateway` \| `bedrock` | `provider` | ADR-135 Amendments 4 and 7: provider (a hosted provider LiteLLM knows by name), or at profile: cloud-platform only, gateway (the client's own OpenAI-compatible AI gateway, at api_base) or bedrock (Amazon Bedrock in London). Default: provider. |
+| `models.providers.kind` | `provider` \| `gateway` \| `bedrock` | `provider` | ADR-135 Amendments 4 and 7: provider (a hosted provider LiteLLM knows by name), or at profile: cloud-platform only, gateway (your organisation's own OpenAI-compatible AI gateway, at api_base) or bedrock (Amazon Bedrock in London). Default: provider. |
 | `models.providers.auth` | `key` \| `iam_role` or none | none | ADR-135 Amendments 4 and 7: key (entered in Admin › Models, kept by the model gateway alone), or at profile: cloud-platform only, iam_role (the gateway's own IAM role: no key is stored). Default: iam_role for bedrock, else key. |
 | `models.providers.region` | str or none | none | Bedrock's region (profile: cloud-platform): eu-west-2 (London) only, and the default for bedrock. |
 | `models.defaults` | mapping | — | Each role's default engine, `local` or an enabled provider's name. A role not named runs on `local` (for the single `provider`, on it). |
@@ -3084,17 +3347,19 @@ Made from the deployment's own schema. Settings marked *section* hold the settin
 | `cloud_platform.egress_nets` | mapping | — | For each host the namespace reaches (a model provider, a proxied map provider, the mail server, a connector host, S3 and STS unless the platform's settings name theirs), the networks (CIDR) its traffic is allowed to; a host with none is refused at render. No network wider than /16 (IPv4) or /48 (IPv6), and never a default route |
 | `cloud_platform.tls_secret` | str or none | none | The platform's own certificate. The Kubernetes Secret holding the certificate for the deployment's name (the Glass's: the profile renders no sign-in or reporting name), where the platform's wildcard does not cover it |
 | `cloud_platform.claims` | section or none | none | How people sign in with Entra ID (ADR-148 Amendment 8): the tenant, the Glass's and the API's app registrations, where each claim comes from and the first administrators. |
-| `cloud_platform.claims.tenant_id` | str | required | The client's Entra tenant id |
+| `cloud_platform.claims.tenant_id` | str | required | Your organisation's Entra tenant id |
 | `cloud_platform.claims.client_id` | str | required | The Glass's own app registration (application id) |
 | `cloud_platform.claims.api_client_id` | str | required | This API's app registration (application id): the token's audience |
+| `cloud_platform.claims.superset_client_id` | str or none | none | Superset's own app registration (application id), when reporting.superset is on: people sign in to Superset with it, and its delegated token reads the Conduit's GET /v1/me and /v1/me/rights alone |
 | `cloud_platform.claims.api_id_uri` | str or none | none | The API's application id URI, which the Glass's scope names |
 | `cloud_platform.claims.token_version` | `2.0` \| `1.0` | `2.0` | The access token version the API's registration is issued (accessTokenAcceptedVersion): the issuer and audience the Conduit checks follow it |
 | `cloud_platform.claims.scope` | str | `access_as_user` | The delegated scope the Glass asks the API for |
-| `cloud_platform.claims.clearance` | mapping | required | Where clearance comes from: {claim: <name>} or {groups: {<group id>: <value>}} |
-| `cloud_platform.claims.org_unit` | mapping | required | Where the organisational unit comes from: {claim: ...} or {groups: {...}} |
-| `cloud_platform.claims.handling_codes` | mapping | required | Where the handling codes come from: {claim: ...} or {groups: {<id>: [codes]}} |
+| `cloud_platform.claims.clearance` | mapping | required | Where clearance comes from: {claim: <name>}, {groups: {<group id>: <value>}}, or {administrator: true}, set in Admin › People and roles |
+| `cloud_platform.claims.org_unit` | mapping | required | Where the organisational unit comes from: {claim: ...}, {groups: {...}}, or {administrator: true} (the poc shape alone) |
+| `cloud_platform.claims.handling_codes` | mapping | required | Where the handling codes come from: {claim: ...}, {groups: {<id>: [codes]}}, or {administrator: true} (the poc shape alone) |
 | `cloud_platform.claims.groups_claim` | str | `groups` | The token claim listing the person's Entra group ids, which a {groups: ...} table above is read from |
 | `cloud_platform.claims.first_administrators` | list of str | required | The people given the Admin role at install, by Entra object id (at least one) |
+| `cloud_platform.claims.first_administrator_access` | mapping or none | none | With {administrator: true} for clearance, org_unit or handling_codes: what the first administrators hold of each such value at install, {clearance: ..., org_unit: ..., handling_codes: [...]}, so they can sign in and set everyone else's; required then |
 | `cloud_platform.claims.claims_mapping_policy` | bool | false | Whether a claims-mapping policy signs the API's tokens with its own key (the keys are then read with ?appid=<api_client_id>) |
 | `cloud_platform.connector_hosts` | list of str | — | The hosts a SQL or API connection may reach, each as host or host:port (a name, not an IPv6 literal), with its networks in egress_nets under the host alone. The namespace's egress allows each host on its ports; the Conduit's own allow-list (OSPREY_CONNECTOR_EGRESS) holds the hosts alone, so a connection to a listed host on a port not listed here passes the Conduit and times out at the egress. A bare host is reached on 443 (an API connection over HTTPS); a SQL connection needs its database's port here (db.example.org:5432). A host given twice with two ports is reached on both |
 | `cloud_platform.connector_sources` | section | — | The S3 buckets and Athena workgroups an S3 or Athena connection may read: each the Conduit's own egress row and the namespace role's read (ADR-140 Amendment 21). |

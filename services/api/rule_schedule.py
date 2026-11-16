@@ -31,7 +31,16 @@ from valkey.asyncio import Valkey
 
 from conduit_common.identity import new_id
 from conduit_common.valkey_compat import reply
-from principal_auth import PrincipalExchangeUnavailable, PrincipalRevoked
+from principal_auth import (
+    PEOPLE_SECTION,
+    OwnerNotHeld,
+    OwnerRecordUnavailable,
+    PrincipalAccessOutOfDate,
+    PrincipalExchangeUnavailable,
+    PrincipalRevoked,
+    out_of_date_next,
+    out_of_date_words,
+)
 from schemas.domain import Principal, TypologyRule
 from schemas.monitoring import ListSchedule, RuleRun, RuleRunOutcome, RuleScheduleView
 from schemas.rights import Right, rights_for
@@ -316,6 +325,22 @@ class RuleScheduleExecutor:
             author = await self.resolve_owner(owner)
         except PrincipalRevoked as error:
             raise _Refused(f"the rule's author, {owner}, can no longer sign in") from error
+        except PrincipalAccessOutOfDate as error:
+            raise _Refused(
+                f"the rule's author, {owner}, {out_of_date_words(error)}: "
+                f"{out_of_date_next(error)}",
+                outcome="failed",
+            ) from error
+        except OwnerNotHeld as error:
+            raise _Refused(
+                f"the rule's author, {owner}, is not held in {PEOPLE_SECTION}"
+            ) from error
+        except OwnerRecordUnavailable as error:
+            raise _Refused(
+                f"the people store behind {PEOPLE_SECTION} could not be read to act as the "
+                "rule's author",
+                outcome="failed",
+            ) from error
         except PrincipalExchangeUnavailable as error:
             raise _Refused(
                 "the identity provider could not be reached to act as the rule's author",

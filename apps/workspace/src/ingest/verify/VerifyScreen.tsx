@@ -52,7 +52,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   source_unreadable: "The source couldn't be read — check it's still at the location Connect recorded.",
   source_handling_incomplete: "This source's handling marking is incomplete — go back to Connect.",
   ontology_violation:
-    "This recipe doesn't match the active ontology — open it in Map and check the affected element's type and properties.",
+    "This pipeline doesn't match the active ontology — open it in Map and check the affected element's type and properties.",
 };
 
 function friendlyError(err: unknown): string {
@@ -151,7 +151,7 @@ export function VerifyScreen({ apiBaseUrl,
     >
       <div style={{ display: "flex", alignItems: "center", gap: "var(--sp-8)" }}>
         {onBack && <Button onClick={onBack}>← Back to the pipeline</Button>}
-        <h1 style={{ fontSize: "1.1em", margin: 0 }}>Test{draft ? ` — ${draft.label}` : ""}</h1>
+        <h1 style={{ fontSize: "var(--fs-14)", lineHeight: "var(--lh-14)", margin: 0 }}>Test{draft ? ` — ${draft.label}` : ""}</h1>
         <div style={{ flex: 1 }} />
         <RightButton right="verify_pipelines" onClick={() => void handleRunVerify()} variant="primary" disabled={running}>
           {running ? "Testing…" : "Run the test"}
@@ -236,11 +236,9 @@ export function VerifyScreen({ apiBaseUrl,
                     row(s) — {group.reason}
                     <ul style={{ margin: "var(--sp-4) 0 0 var(--sp-16)", padding: 0 }}>
                       {group.samples.map((s) => (
-                        <li
-                          key={s.row_index}
-                          style={{ color: "var(--text-tertiary)", fontFamily: "var(--mono)" }}
-                        >
-                          row {rowNumber(s.row_index)}: {s.sample}
+                        <li key={s.row_index} style={{ color: "var(--text-tertiary)" }}>
+                          {/* v0.6.0 #6: the row's words in the page's face, its sample a value in mono */}
+                          row {rowNumber(s.row_index)}: <span className="value">{s.sample}</span>
                         </li>
                       ))}
                     </ul>
@@ -263,7 +261,7 @@ export function VerifyScreen({ apiBaseUrl,
             <WouldRaisePanel report={report} />
           </Panel>
 
-          <Panel title="The graph this recipe would produce">
+          <Panel title="The graph this pipeline would produce">
             <div style={{ height: 480 }}>
               {workingSet && registry ? (
                 <GlassCanvas

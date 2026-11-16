@@ -2,6 +2,13 @@
    Every colour is a `var(--token)` from `spec/design/tokens.css` — no
    colour is introduced that isn't already a token (CLAUDE.md). */
 
+/* Every bare heading and control on the one scale (v0.6.0 #6), first, so that the panels' own rules after it win a
+   tie of `:where()` by coming later. */
+@import "./scale.css";
+/* The Glass page's panels and menus on the page's own type scale, GOV.UK's look included. */
+@import "./panelType.css";
+
+
 .btn {
   font: inherit;
   font-size: var(--fs-13);
@@ -50,6 +57,10 @@
   background: var(--surface-sunken);
   color: var(--text-primary);
 }
+/* A field holding a value to copy (the Studio's SQL and pipeline YAML editors) keeps the value's mono: `.input`'s
+   `font: inherit` comes after tokens.css's `.value` at the same weight, so it is said again here, after it (v0.6.0 #6,
+   case's review of 1b0f225). */
+.input.value, .select.value { font-family: var(--mono); }
 .input::placeholder { color: var(--text-tertiary); }
 .input:disabled { color: var(--text-disabled); }
 
@@ -84,6 +95,12 @@
 .range-slider__handle:focus-visible { background: var(--brass); }
 
 .resolution-threshold-control { display: flex; align-items: center; gap: var(--sp-8); }
+/* Amendment 19 decision 5: the control is a button in the canvas toolbar; the slider is in its panel. */
+.resolution-threshold-control > .radial-menu__item { white-space: nowrap; }
+.resolution-threshold-control__panel {
+  display: flex; align-items: center; gap: var(--sp-8); padding: var(--sp-8);
+  background: var(--surface-raised); border: 1px solid var(--border-subtle);
+}
 .resolution-threshold-control input[type="range"] { width: 120px; }
 .resolution-threshold-control__name { font-size: var(--fs-12); font-weight: 600; color: var(--text-tertiary); white-space: nowrap; }
 .resolution-threshold-control__label {
@@ -147,6 +164,10 @@
   display: flex; flex-direction: column;
 }
 .drawer > .panel__body { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+/* A drawer's stack of sections (the Cases drawer's views and cases): one column, the drawer's width at most, never
+   its content's. With a grid's implicit `auto` column a long view name widened it to 573 px in the 360 px drawer
+   and pushed the view's tag out (ADR-145 Amendment 14 decision 1, `views.spec.ts`). */
+.drawer-stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--sp-8); min-width: 0; }
 .drawer__title { display: flex; justify-content: space-between; align-items: center; gap: var(--sp-8); }
 
 .popover {
@@ -180,6 +201,8 @@
 /* The right-click list (ADR-078): the name at the left, its count quieter at the right edge, and a
    small heading over each group with a hairline between groups. Tokens only. */
 .radial-menu__list { min-width: 240px; }
+/* The canvas's expansion prompts (`LargeExpansionPrompt`, `CapRefusalPrompt`): their words and choices in one column. */
+.expansion-prompt { display: flex; flex-direction: column; gap: var(--sp-6); min-width: 280px; }
 /* Above the canvas's own layers: its labels and nodes were drawn over the menu's top row. */
 .radial-menu, .radial-menu__list { z-index: 40; }
 .radial-menu__list .radial-menu__item {
@@ -397,7 +420,7 @@
 }
 .selection-bar__step:hover:not(:disabled), .selection-bar__step:focus-visible { background: var(--n9); }
 .selection-bar__step:disabled { opacity: 0.35; cursor: default; }
-.selection-bar__reading { min-width: 5.5em; text-align: center; font-family: var(--mono); font-size: var(--fs-11); color: var(--surface-app); }
+.selection-bar__reading { min-width: 5.5em; text-align: center; font-family: var(--ui); /* words ("direct", "within 2"), v0.6.0 #6 */ font-size: var(--fs-11); color: var(--surface-app); }
 
 /* The workspace shell (ADR-097 step 1, design review items 1 and 16). */
 .classification-strip {
@@ -405,15 +428,25 @@
   background: var(--surface-raised); border-bottom: 1px solid var(--border-subtle);
   color: var(--text-primary); font-size: var(--fs-11); line-height: var(--lh-11); font-weight: 600;
 }
+/* ADR-115 decision 2, the owner's ruling of 15 November 2026: the strip is always in view. Under GOV.UK the page
+   scrolls (to the footer, and Admin as a page), so the strip stays pinned at the window's top while GOV.UK's header
+   and the top bar scroll away; under that brand a drawer starts below the top bar, so nothing comes over it. It is
+   App's root's first child, so it sticks for the whole page. `keyboard/admin-frame.spec.ts` and
+   `keyboard/frame-scroll.spec.ts` hold it. */
+[data-brand="govuk"] .classification-strip { position: sticky; top: 0; }
 /* One line at §5a's height while its items fit; when they do not, whole items wrap to a second line
    rather than one line too wide to see (ADR-115 Amendments 2 and 3). Whether they fit depends on the
    case's name and its scope badge as well as the window, so it is not a breakpoint. */
 .top-bar { box-sizing: border-box; min-height: var(--h-top-bar); flex: none; flex-wrap: wrap; padding-top: 0; padding-bottom: 0; }
 .top-bar__search { flex: 1 1 280px; min-width: 280px; max-width: 480px; }
-/* Narrow windows (ADR-115 Amendment 2): the two lines get room above and below. */
-@media (max-width: 1099px) {
-  .top-bar { padding-top: var(--sp-6); padding-bottom: var(--sp-6); }
-}
+/* The owner's *Build a report* beside the view switch (ADR-145 Amendment 15): a link out to Superset, in a new tab,
+   underlined as a link and never drawn as a view; 24 px tall at least (WCAG 2.2, 2.5.8). Under GOV.UK `govuk-link`
+   gives its colour and focus. */
+.top-bar__out { display: inline-flex; align-items: center; min-height: 24px; white-space: nowrap; font-size: var(--fs-13); color: var(--text-primary); text-decoration: underline; text-underline-offset: 2px; }
+.top-bar__out:hover { color: var(--text-primary); text-decoration-thickness: 2px; }
+/* When whole items wrap even with all that folds folded (`TopBar`, `BAR_FOLD_ORDER`; ADR-115 Amendment 2), the two
+   lines get room above and below. A narrow window alone no longer means two lines: the bar folds first. */
+.top-bar--wrapped { padding-top: var(--sp-6); padding-bottom: var(--sp-6); }
 .brand-mark { display: inline-flex; align-items: center; gap: var(--sp-6); flex: none; }
 .brand-mark__name { font-weight: 700; font-size: var(--fs-14); color: var(--text-primary); }
 /* A segmented control: one choice of several, current shown as current (ADR-097, review item 7). */
@@ -437,7 +470,7 @@
   font: inherit; font-size: var(--fs-12); cursor: pointer; text-align: left;
 }
 .left-rail__item:hover, .left-rail__item:focus-visible { background: var(--surface-hover); color: var(--text-primary); }
-.left-rail__item[aria-pressed="true"] { background: var(--surface-raised); color: var(--text-primary); box-shadow: inset 2px 0 0 var(--text-primary); }
+.left-rail__item[aria-pressed="true"], .left-rail__item[data-current="true"] { background: var(--surface-raised); color: var(--text-primary); box-shadow: inset 2px 0 0 var(--text-primary); }
 .left-rail__help { margin-top: auto; }
 .left-rail__help + .left-rail__toggle { margin-top: 0; }
 .left-rail__toggle { margin-top: auto; }
@@ -619,6 +652,15 @@
 .canvas-toolbar__show { border-color: var(--border-subtle); overflow: visible; }
 .canvas-toolbar__show > * + * { border-left: 1px solid var(--border-subtle); }
 .canvas-toolbar__show .radial-menu__item { border-radius: 0; }
+/* The owner's rulings 6 and 7 (v0.6.1 glass-rows): under 1220 px of its own width (measured; the rulings' estimate
+   was 1132) the toolbar's words shorten (`toolbarCompact.ts`) and it draws a little tighter, so it stays one row down
+   to 912 px in its quiet state (the controls drawn on demand may wrap it). */
+/* Amendment 19 decision 6: a hidden toolbar is not drawn at all (the rule above would otherwise draw it). */
+.canvas-toolbar[hidden], .view-toolbar[hidden] { display: none; }
+.view-toolbar .toolbar-toggle { margin-left: auto; }
+.canvas-toolbar--compact { column-gap: var(--sp-8); }
+.canvas-toolbar--compact .radial-menu__item { padding: var(--sp-2) var(--sp-4); }
+.canvas-toolbar--compact select { max-width: 104px; }
 /* A toolbar menu's panel, laid over the canvas under its button: an overlay, so a shadow. */
 .canvas-menu { position: relative; display: flex; }
 .canvas-menu-panel {
@@ -793,6 +835,19 @@
 .view-over-cap__window { display: flex; gap: var(--sp-12); flex-wrap: wrap; }
 .view-over-cap__window label { display: grid; gap: var(--sp-4); font-size: var(--fs-12); color: var(--text-secondary); }
 .view-over-cap__message { margin: var(--sp-12) 0 0; color: var(--text-primary); font-weight: 600; }
+/* An expansion run as a batch job (ADR-151): not modal, so it sits at the canvas's foot while the
+   reader goes on working; shaped as the over-cap dialog is. */
+.batch-expansion {
+  position: fixed; z-index: 20; right: var(--sp-16); bottom: var(--sp-16);
+  width: var(--w-right-panel-max); max-width: calc(100% - var(--sp-32)); box-sizing: border-box;
+  padding: var(--sp-16); background: var(--surface-raised); border-radius: var(--r-3); box-shadow: var(--overlay-shadow);
+  font-size: var(--fs-13); line-height: var(--lh-13); color: var(--text-primary);
+}
+.batch-expansion__title { margin: 0 0 var(--sp-8); font-size: var(--fs-16); line-height: var(--lh-16); font-weight: 700; }
+.batch-expansion__figure, .batch-expansion__trouble { margin: 0 0 var(--sp-8); color: var(--text-secondary); }
+.batch-expansion__status { margin: 0 0 var(--sp-8); font-weight: 600; }
+.batch-expansion__message { margin: 0 0 var(--sp-12); font-weight: 600; }
+.batch-expansion__actions { display: flex; gap: var(--sp-8); flex-wrap: wrap; }
 .view-over-cap__reopen { position: fixed; z-index: 20; left: 50%; top: calc(var(--h-canvas-toolbar) + var(--sp-8)); transform: translateX(-50%); }
 /* The token could not be renewed (ADR-050 Amendment 1): asked over the page, in place, above everything
    else, so the page behind it is kept as it is; shaped as the over-cap dialog is. */
@@ -807,13 +862,17 @@
 .session-prompt__actions { display: flex; gap: var(--sp-8); flex-wrap: wrap; }
 .session-prompt__problem { margin: var(--sp-12) 0 0; color: var(--error); font-weight: 600; }
 /* ADR-115 E6 (DESIGN.md §5a): below 1100px the toolbar's "Last change" note gives its room back. */
-.canvas-toolbar__last-change { flex: 0 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-tertiary); }
+.canvas-toolbar__last-change {
+  flex: 1 1 0; min-width: 0; text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-tertiary);
+}
 @media (max-width: 1099px) { .canvas-toolbar__last-change { display: none; } }
 
 /* The cases, each once, with each case's views beneath it (ADR-144 decision 5), in the case menu and
    the Cases drawer alike. */
-.case-tree__list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--sp-2); }
-.case-tree__row { display: grid; gap: var(--sp-4); }
+/* One column, never wider than the list's box (`minmax(0, 1fr)`): a long view name otherwise widened the Cases drawer's
+   list past its 360 px and out of the window (ADR-145 Amendment 14 decision 1, the views harness's `long=1` scan). */
+.case-tree__list { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--sp-2); }
+.case-tree__row { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--sp-4); }
 .case-tree__row--view { padding-left: var(--sp-16); }
 .case-tree__line { display: flex; align-items: center; gap: var(--sp-8); min-height: var(--h-control-28); }
 .case-tree__name {
@@ -890,3 +949,24 @@
 .severity--high { border-color: var(--error); }
 .severity--medium { border-color: var(--warning); }
 .severity--low { border-color: var(--text-tertiary); }
+
+/* The answer's [G-n] and [S-n] markers (the owner's word, 15 November 2026): inline in the sentence, a link's look
+   and no padding, so a marker sits one space after its words and before any punctuation as text does. */
+.answer-marker {
+  display: inline; margin: 0; padding: 0; border: 0; background: none; font: inherit; line-height: inherit;
+  color: var(--text-primary); text-decoration: underline; text-underline-offset: 2px; cursor: pointer;
+}
+.answer-marker:focus-visible { outline: var(--focus-width) solid var(--focus); outline-offset: var(--focus-offset); }
+.answer-marker:disabled { color: var(--text-secondary); text-decoration: none; cursor: default; }
+
+/* Ask & Chat's history as an accordion (v0.6.0 #3): each question's line is a full-width button, its answer below. */
+.questions__line {
+  display: flex; align-items: baseline; gap: var(--sp-8); width: 100%; min-height: 24px; margin: 0; padding: 0;
+  border: 0; background: none; color: var(--text-primary); font: inherit; font-weight: 600; text-align: left;
+  cursor: pointer;
+}
+.questions__line:focus-visible { outline: var(--focus-width) solid var(--focus); outline-offset: var(--focus-offset); }
+.questions__chevron { flex: none; color: var(--text-secondary); }
+.questions__question { flex: 1 1 auto; min-width: 0; }
+.questions__to-decide { flex: none; font-weight: 400; font-size: var(--fs-12); color: var(--text-secondary); }
+

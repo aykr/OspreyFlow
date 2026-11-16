@@ -23,7 +23,7 @@
 // `family_name`/`given_names`/`date_of_birth` only.
 import { expect, type Page, test } from "@playwright/test";
 
-import { freshWorkspaceUrl, liveOnly } from "./live";
+import { freshWorkspaceUrl, liveOnly, unfoldSidePanel, workingSetCounts } from "./live";
 
 test.beforeEach(liveOnly);
 
@@ -43,11 +43,17 @@ const RING_B = { nino: "QQ435286A", id: "corp-ring0-member1" };
 /** Seeds the working set by typing an identifier into the search box, exactly as
  * `DEMO_GUIDE.md` §6 tells a presenter to.
  *
- * **Clears the box first and waits for the option naming `expectedId`.** A second search issued
- * straight after a first would otherwise be matched against the combobox's still-current option
- * list — `GlobalSearch` keeps `results` until its next response lands — so a generic
- * `/^Person: corp-/` matcher happily clicked the *previous* result again and the working set
- * stayed at one node. Found exactly that way, building this round's two-node selection. */
+ * **Clears the box first and chooses the option for `expectedId` from the box's own answer.** A
+ * second search issued straight after a first would otherwise be matched against the combobox's
+ * still-current option list — `GlobalSearch` keeps `results` until its next response lands — so a
+ * generic `/^Person: corp-/` matcher happily clicked the *previous* result again and the working
+ * set stayed at one node. Found exactly that way, building this round's two-node selection.
+ *
+ * **By position in that answer, not by the option's name** (14 November 2026). An option is named
+ * as the canvas names the record (`searchOptions.ts`'s `displayValue`: "Person: Mikhail Volkov"),
+ * no longer by its id, and this fixture's resolution pairs share their names on purpose: a name
+ * cannot tell `corp-res-identical-1` from `-2`. The box draws the suggestion route's nodes in the
+ * order it returns them, so the option at the record's index in that response is the record. */
 async function seedFromSearch(
   page: Page,
   identifier: string,
@@ -56,7 +62,6 @@ async function seedFromSearch(
   const search = page
     .getByRole("combobox", { name: "Search entities, identifiers, documents" })
     .first();
-  const option = page.getByRole("option", { name: `Person: ${expectedId}` });
 
   // **Retried, deliberately, and bounded.** `GlobalSearch` fires its query on each change and
   // keeps the previous `results` until the next response lands, so a second search issued
@@ -66,7 +71,22 @@ async function seedFromSearch(
   // there, all three fail and the message below is the right one.
   for (let attempt = 0; attempt < 3; attempt++) {
     await search.fill("");
+    const answered = page
+      .waitForResponse(
+        (r) =>
+          r.request().method() === "POST" &&
+          new URL(r.url()).pathname.endsWith("/suggest") &&
+          (r.request().postDataJSON() as { query?: string } | null)?.query === identifier,
+        { timeout: 10_000 },
+      )
+      .catch(() => null);
     await search.pressSequentially(identifier, { delay: 15 });
+    const response = await answered;
+    if (!response?.ok()) continue;
+    const ids = ((await response.json()) as { nodes: { id: string }[] }).nodes.map((n) => n.id);
+    const at = ids.indexOf(expectedId);
+    if (at < 0) continue;
+    const option = page.getByRole("option").nth(at);
     try {
       await option.waitFor({ state: "visible", timeout: 5_000 });
       await option.click();
@@ -77,27 +97,55 @@ async function seedFromSearch(
   }
   throw new Error(
     `no search result for ${identifier} (${expectedId}) after three attempts. The identifier ` +
-      "resolves through POST /v1/search — if it does here too, this is the Glass, not the data; " +
-      "before owner ruling R4 it returned nothing for every Fixture Corp entity, because the " +
+      "resolves through the case's POST /suggest — if it does here too, this is the Glass, not the " +
+      "data; before owner ruling R4 it returned nothing for every Fixture Corp entity, because the " +
       "fixture carried no identifier search could match.",
   );
 }
 
+/** Puts exactly the record `expectedId` on the canvas: its identifier searched with Enter, and *Show on graph*
+ * on the search results page (ADR-145 Amendment 15 Part A), which seeds the result's own records and expands
+ * nothing. A suggestion chosen from the box is drawn three hops out (`search/drawSearchResult.ts`), so a case
+ * that needs only its own records (a pair to explain, two ends of a path) puts them on this way (14 November
+ * 2026: two suggestions chosen left 6 and 7 nodes, not 2). The seed request is held to the record: it carries
+ * `expectedId`, or, when every record of the result is drawn already, there is none and the counts stay. */
+async function showExactly(page: Page, identifier: string, expectedId: string): Promise<void> {
+  const box = page.getByRole("combobox", { name: "Search entities, identifiers, documents" }).first();
+  await box.fill(identifier);
+  await box.press("Enter");
+  const results = page.locator("section.search-results");
+  await expect(results, `no results page for ${identifier}`).toBeVisible({ timeout: 30_000 });
+  const show = results.getByRole("button", { name: /^Show on graph: / });
+  await expect(show, `${identifier} found other than one result`).toHaveCount(1, { timeout: 30_000 });
+  const before = await workingSetCounts(page);
+  const seeded = page
+    .waitForResponse((r) => r.request().method() === "POST" && new URL(r.url()).pathname.endsWith("/seed"), { timeout: 15_000 })
+    .catch(() => null);
+  await show.click();
+  const response = await seeded;
+  if (response) {
+    expect(response.status(), await response.text()).toBeLessThan(300);
+    const sent = (response.request().postDataJSON() as { nodes: { id: string }[] }).nodes.map((n) => n.id);
+    expect(sent, `Show on graph for ${identifier} did not carry ${expectedId}`).toContain(expectedId);
+  } else {
+    expect(await workingSetCounts(page), `Show on graph for ${identifier} sent nothing, and the canvas changed`).toEqual(before);
+  }
+  await expect(results).toBeHidden();
+}
+
 async function edgeCountOf(page: Page): Promise<number> {
-  const text = (await page.getByRole("status").first().textContent()) ?? "";
-  return Number(/(\d+)\s*edges/.exec(text)?.[1] ?? 0);
+  return (await workingSetCounts(page)).edges;
 }
 
 async function nodeCount(page: Page): Promise<number> {
-  const text = (await page.getByRole("status").first().textContent()) ?? "";
-  return Number(/(\d+)\s*nodes/.exec(text)?.[1] ?? 0);
+  return (await workingSetCounts(page)).nodes;
 }
 
 async function selectBothByKeyboard(
   page: Page,
   second: { nino: string; id: string },
 ): Promise<void> {
-  await seedFromSearch(page, second.nino, second.id);
+  await showExactly(page, second.nino, second.id);
   await expect.poll(() => nodeCount(page), { timeout: 30_000 }).toBe(2);
   await pairByKeyboard(page);
 }
@@ -128,7 +176,16 @@ async function pairByKeyboard(page: Page): Promise<void> {
 }
 
 async function addPersonVariable(page: Page): Promise<void> {
+  // The query builder is one of the side panels, folded until shown (`layout/SidePanelStack.tsx`'s
+  // DEFAULT_FOLDED: every panel but the Inspector). Its header's button unfolds it.
+  await unfoldSidePanel(page, "Query builder");
+  // Within the panel, *Add to the pattern* is a section of its own, folded until opened (only
+  // *Pattern* starts open), and a folded section stays in the page, hidden.
+  const add = page.getByRole("button", { name: /^Add to the pattern/ });
+  if ((await add.getAttribute("aria-expanded")) === "false") await add.click();
+  // Its own group's: other controls on the page are named "Entity type" too.
   await page
+    .getByRole("group", { name: "Add a pattern variable" })
     .getByRole("combobox", { name: "Entity type" })
     .selectOption("Person");
   await page.getByRole("button", { name: "Add variable" }).click();
@@ -170,13 +227,14 @@ test("moving the resolution threshold live reports what merged and what split", 
   await slider.focus();
   await slider.press("End"); // Broad — the loosest, so the one most likely to merge something
 
-  // The commit's own summary, in the words `ThresholdControl.tsx` emits. Asserting the three
+  // The commit's own summary, in the words `ThresholdControl.tsx` emits ("Match strictness: …"
+  // since ADR-097 step 3 named the control so; "Resolution threshold: …" before). Asserting the three
   // counts are present rather than asserting particular numbers: the exact merge count is a
   // property of the fixture and of the threshold moved from, so pinning it here would make this
   // fail for a fixture change rather than for a regression in the control.
   await expect(
     page.getByText(
-      /Resolution threshold: .* — \d+ merged, \d+ split, \d+ affected/,
+      /Match strictness: .* — \d+ merged, \d+ split, \d+ affected/,
     ),
   ).toBeVisible();
 
@@ -226,9 +284,27 @@ test("explain on a merged cluster names the pair's real resolution score", async
   // Round 12d read the resulting `merged: 0` as the fixture being wrong and compared the edges'
   // `weight` (§6.1's load-time strength) against §C5's match `score`. Round 12e measured both:
   // every stored `score` matches §C5 exactly. The fixture was never at fault.
+  // What the Glass is sent, said if Explain is not offered: each frame on the case's stream and each seed,
+  // expansion and threshold answer, their ops and cluster ids (ADR-124 Amendment 19, step 3h).
+  const heard: string[] = [];
+  const said = (from: string, body: string) => {
+    try {
+      const b = JSON.parse(body) as Record<string, unknown>;
+      const one = (d: Record<string, unknown> | undefined) =>
+        d ? `${String(d.op)}#${String(d.seq)} ${JSON.stringify(d.affected_cluster_ids ?? (d.nodes as { id: string; resolution?: { cluster_id?: string } }[] | undefined)?.map((n) => [n.id, n.resolution?.cluster_id ?? null]) ?? "")}` : "";
+      heard.push(`${from}: ${one((b.delta as Record<string, unknown>) ?? b)}${b.clusters ? ` + ${one(b.clusters as Record<string, unknown>)}` : ""}`.slice(0, 600));
+    } catch {
+      heard.push(`${from}: ${body.slice(0, 120)}`);
+    }
+  };
+  page.on("websocket", (ws) => ws.on("framereceived", (f) => said("stream", String(f.payload))));
+  page.on("response", async (r) => {
+    const path = new URL(r.url()).pathname;
+    if (r.request().method() !== "GET" && /\/(seed|expand|resolution\/threshold)$/.test(path)) said(path.split("/").slice(-1)[0]!, await r.text().catch(() => ""));
+  });
   await page.goto(await freshWorkspaceUrl(request));
-  await seedFromSearch(page, PAIR_A.nino, PAIR_A.id);
-  await seedFromSearch(page, PAIR_B.nino, PAIR_B.id);
+  await showExactly(page, PAIR_A.nino, PAIR_A.id);
+  await showExactly(page, PAIR_B.nino, PAIR_B.id);
   await expect.poll(() => nodeCount(page), { timeout: 30_000 }).toBe(2);
 
   // Expand SAME_AS from the canvas, by keyboard — the step that was unreachable until 12e.
@@ -237,7 +313,11 @@ test("explain on a merged cluster names the pair's real resolution score", async
   await page.keyboard.press("\\");
   const menu = page.locator(".radial-menu__list[role='menu']");
   await expect(menu).toBeVisible();
-  const sameAs = menu.getByRole("menuitem", { name: /^SAME_AS/ });
+  // Under *Expand by link type*, by its name as people read it ("Same as (1)"), not SAME_AS (ADR-098
+  // Amendment 8).
+  const sameAs = menu
+    .getByRole("group", { name: "Expand by link type" })
+    .getByRole("menuitem", { name: /^Same as \(/ });
   await expect(
     sameAs,
     "the radial menu offers no SAME_AS entry — it is declared from:[\"*\"] to:[\"*\"], so a " +
@@ -268,10 +348,12 @@ test("explain on a merged cluster names the pair's real resolution score", async
   await canvas.focus();
   await page.keyboard.press("\\");
   const explain = menu.getByRole("menuitem", { name: /Explain cluster/ });
-  await expect(explain).toBeVisible();
+  await expect(explain, `Explain cluster not offered. What the Glass was sent:\n${heard.join("\n")}`).toBeVisible();
   await explain.click();
 
-  const dialog = page.getByRole("dialog");
+  // The canvas's popover, picked by its own heading: it has no name, and the keys panel the Glass
+  // shows by itself on a first visit is a dialog too ("Welcome back").
+  const dialog = page.getByRole("dialog").filter({ hasText: "Cluster explanation" });
   await expect(dialog).toBeVisible();
   // The per-comparison evidence `01_DOMAIN_MODEL.md` §4 calls the "full comparison vector" —
   // every gamma level, not a bare verdict.
@@ -302,7 +384,7 @@ test("the pathfinder finds a path between two ring members, and reports its leng
   // other, so a direct path exists and its length is knowable in advance — which is what makes
   // the assertion below a real check rather than "something came back".
   await page.goto(await freshWorkspaceUrl(request));
-  await seedFromSearch(page, RING_A.nino, RING_A.id);
+  await showExactly(page, RING_A.nino, RING_A.id);
   await selectBothByKeyboard(page, RING_B);
 
   const menu = page.locator(".radial-menu__list[role='menu']");
@@ -310,7 +392,10 @@ test("the pathfinder finds a path between two ring members, and reports its leng
   await expect(findPaths).toBeVisible();
   await findPaths.click();
 
-  const dialog = page.getByRole("dialog");
+  // The pathfinder's popover, picked by its own close button, for the reason the explain case gives.
+  const dialog = page
+    .getByRole("dialog")
+    .filter({ has: page.getByRole("button", { name: /^Close pathfinder (result|error)$/ }) });
   await expect(dialog).toBeVisible();
   await expect(dialog).not.toContainText(/no path/i);
   // Two members of one fully-interconnected ring are one hop apart. Asserting the reported

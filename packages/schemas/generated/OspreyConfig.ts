@@ -77,7 +77,7 @@ export type PrivacyContract = boolean;
  */
 export type ContractReference = string | null;
 /**
- * ADR-135 Amendments 4 and 7: provider (a hosted provider LiteLLM knows by name), or at profile: cloud-platform only, gateway (the client's own OpenAI-compatible AI gateway, at api_base) or bedrock (Amazon Bedrock in London). Default: provider.
+ * ADR-135 Amendments 4 and 7: provider (a hosted provider LiteLLM knows by name), or at profile: cloud-platform only, gateway (your organisation's own OpenAI-compatible AI gateway, at api_base) or bedrock (Amazon Bedrock in London). Default: provider.
  */
 export type Kind = "provider" | "gateway" | "bedrock";
 /**
@@ -206,7 +206,7 @@ export type AllowFrom = string[];
  */
 export type TlsSecret = string | null;
 /**
- * The client's Entra tenant id
+ * Your organisation's Entra tenant id
  */
 export type TenantId = string;
 /**
@@ -217,6 +217,10 @@ export type ClientId1 = string;
  * This API's app registration (application id): the token's audience
  */
 export type ApiClientId = string;
+/**
+ * Superset's own app registration (application id), when reporting.superset is on: people sign in to Superset with it, and its delegated token reads the Conduit's GET /v1/me and /v1/me/rights alone (ADR-148 Amendment 9)
+ */
+export type SupersetClientId = string | null;
 /**
  * Default: api://<api_client_id>. The API's application id URI, which the Glass's scope names
  */
@@ -237,6 +241,12 @@ export type GroupsClaim = string;
  * The people given the Admin role at install, by Entra object id (at least one)
  */
 export type FirstAdministrators = string[];
+/**
+ * With {administrator: true} for clearance, org_unit or handling_codes (the poc shape's fallback, ADR-148 Amendment 15): what the first administrators hold of each such value at install, {clearance: ..., org_unit: ..., handling_codes: [...]}, so they can sign in and set everyone else's; required then
+ */
+export type FirstAdministratorAccess = {
+  [k: string]: unknown;
+} | null;
 /**
  * Default: false. Whether a claims-mapping policy signs the API's tokens with its own key (the keys are then read with ?appid=<api_client_id>)
  */
@@ -824,12 +834,14 @@ export interface EgressNets {
  * ADR-148 decision 9 and Amendment 8: how this deployment's people sign in with Entra ID, and
  * where `principal_auth` finds each of clearance, unit and handling codes in their token (a claim,
  * or a table from Entra group to value; `principal_auth.ClaimMapping` checks the shape at render).
- * Roles are not here: they are kept in Admin › People, the first administrators named below.
+ * Roles are not here: they are kept in Admin › People and roles, the first administrators named
+ * below.
  */
 export interface EntraSignInConfig {
   tenant_id: TenantId;
   client_id: ClientId1;
   api_client_id: ApiClientId;
+  superset_client_id?: SupersetClientId;
   api_id_uri?: ApiIdUri;
   token_version?: TokenVersion;
   scope?: Scope;
@@ -838,22 +850,23 @@ export interface EntraSignInConfig {
   handling_codes: HandlingCodes;
   groups_claim?: GroupsClaim;
   first_administrators: FirstAdministrators;
+  first_administrator_access?: FirstAdministratorAccess;
   claims_mapping_policy?: ClaimsMappingPolicy;
 }
 /**
- * Where clearance comes from: {claim: <name>} or {groups: {<group id>: <value>}}
+ * Where clearance comes from: {claim: <name>}, {groups: {<group id>: <value>}}, or {administrator: true}, set in Admin › People and roles (the poc shape alone, ADR-148 Amendment 15)
  */
 export interface Clearance {
   [k: string]: unknown;
 }
 /**
- * Where the organisational unit comes from: {claim: ...} or {groups: {...}}
+ * Where the organisational unit comes from: {claim: ...}, {groups: {...}}, or {administrator: true} (the poc shape alone)
  */
 export interface OrgUnit {
   [k: string]: unknown;
 }
 /**
- * Where the handling codes come from: {claim: ...} or {groups: {<id>: [codes]}}
+ * Where the handling codes come from: {claim: ...}, {groups: {<id>: [codes]}}, or {administrator: true} (the poc shape alone)
  */
 export interface HandlingCodes {
   [k: string]: unknown;

@@ -28,3 +28,45 @@ describe("test_a_stopped_hotlist_is_visibly_stopped_not_only_flagged_in_data", (
     expect(container.textContent).not.toBe("Stopped");
   });
 });
+
+// ADR-044 Amendment 1: a stopped hotlist or watch says why, beside the label, in the Conduit's words.
+describe("a stopped watch says why", () => {
+  const WHY = "Its owner can no longer sign in to OspreyFlow.";
+
+  test("the reason is shown beside Stopped", () => {
+    const { container } = render(<StatusBadge status="stopped" why={WHY} />);
+    expect(container.textContent).toBe(`Stopped${WHY}`);
+  });
+
+  test("an active watch shows no reason, even one left behind", () => {
+    const { container } = render(<StatusBadge status="active" why={WHY} />);
+    expect(container.textContent).toBe("Active");
+  });
+
+  test("a stopped watch with no reason still says Stopped", () => {
+    const { container } = render(<StatusBadge status="stopped" why={null} />);
+    expect(container.textContent).toBe("Stopped");
+  });
+});
+
+// ADR-044 Amendment 2: an active watch whose last loads could not check its owner's sign-in says so beside Active,
+// in the Conduit's words (`status_note`), until the third stops it; a stopped one shows its reason, never the note.
+describe("an active watch with unreachable loads says so", () => {
+  const NOTE = "Its owner's sign-in could not be checked at the last load. It stops if that happens at three loads in a row.";
+
+  test("the note is shown beside Active", () => {
+    const { container } = render(<StatusBadge status="active" note={NOTE} />);
+    expect(container.textContent).toBe(`Active${NOTE}`);
+  });
+
+  test("a stopped watch shows its reason, not a note left behind", () => {
+    const why = "Its owner's sign-in could not be checked at three loads in a row. It is tried again at the next.";
+    const { container } = render(<StatusBadge status="stopped" why={why} note={NOTE} />);
+    expect(container.textContent).toBe(`Stopped${why}`);
+  });
+
+  test("an active watch with no note is Active alone", () => {
+    const { container } = render(<StatusBadge status="active" note={null} />);
+    expect(container.textContent).toBe("Active");
+  });
+});

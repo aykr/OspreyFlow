@@ -36,8 +36,8 @@ ours:
 egress:
   # On every render: the bucket (S3) and IRSA's role (STS). `{region}` is the platform's.
   always: ["s3.{region}.amazonaws.com", "sts.{region}.amazonaws.com"]
-  # Entra ID's sign-in host, whose keys the Conduit reads to verify every token (P10 part 2): the
-  # Conduit's alone.
+  # Entra ID's sign-in host, whose keys the Conduit reads to verify every token (P10 part 2), where
+  # Superset signs people in and the report sync gets its token (ADR-148 Amendments 9 and 10).
   sign_in: ["login.microsoftonline.com"]
   # A model engine that names no `api_base` is reached at its provider's own host.
   engine_hosts:
@@ -60,20 +60,26 @@ egress:
   # No KMS: S3 calls it on the backups' behalf (SSE-KMS), so none of P9's pods reaches it.
   # The pods rendered outside the workloads that have rows by their own pods' names: P9's backup
   # and restore (ADR-148 Amendment 7). A row whose pod is not rendered selects nothing.
-  others: [backup, backup-claims, restore, restore-claims]
+  others: [backup, backup-claims, restore, restore-claims, search-rebuild, search-drift, seed]
   reach:
     identity: [litellm]
-    sign_in: [api]
+    # Superset's sign-in and the report sync's token (ADR-148 Amendments 9 and 10) too.
+    sign_in: [api, superset, report-sync]
     # ClickHouse too: its BACKUP TO S3 runs as its own backup role (ADR-148 Amendment 7, P9), as do
     # P9's backup and restore pods.
-    always: [api, worker, report-sync, clickhouse, backup, backup-claims, restore, restore-claims]
+    # The search index's rebuild and drift check (ADR-150) sign as the namespace's role, so reach STS.
+    # The POC seed (ADR-148 Amendment 14) stages the HMP seed's files in the buckets, as that role.
+    always: [api, worker, report-sync, clickhouse, backup, backup-claims, restore, restore-claims,
+             search-rebuild, search-drift, seed]
     engines: [litellm]
     maps: [api]
     mail: []
     connectors: [api]
     sources: [api]
   # The managed stores' networks (RDS, ElastiCache): the pods that read a store's details.
-  managed: [api, worker, report-sync, superset, litellm]
+  # The search index's rebuild and drift check reach the OpenSearch domain on these networks (3a).
+  # The POC seed path's Job (ADR-148 Amendment 14) writes the case store.
+  managed: [api, worker, report-sync, superset, litellm, search-rebuild, search-drift, seed]
   # Their ports: RDS's PostgreSQL and ElastiCache's (the Terraform's own); the OpenSearch domain's
   # 443 is added when the deployment searches with it.
   managed_ports: [5432, 6379]
@@ -85,6 +91,8 @@ egress:
     api: [arcadedb, clickhouse, litellm, ner, superset, laurium]
     worker: [arcadedb, clickhouse, ner]
     report-sync: [api]
+    # Superset asks the Conduit who signed in (GET /v1/me, ADR-148 Amendment 9).
+    superset: [api]
     arcadedb: [arcadedb]
     clickhouse: [clickhouse, clickhouse-keeper]
     clickhouse-keeper: [clickhouse-keeper]
@@ -98,6 +106,10 @@ egress:
     # the backup's reaches S3 and STS alone (`reach.always`).
     backup: [arcadedb, clickhouse]
     restore: [kube-api, clickhouse]
+    # The search index's rebuild and drift check (ADR-150, v0.5.2 step 3a): the graph, and the domain.
+    search-rebuild: [arcadedb]
+    search-drift: [arcadedb]
+    seed: [arcadedb, clickhouse]
     restore-claims: [kube-api]
 
 # Decision 5 and the platform's quotas: what each container asks for and may use. A namespace on a

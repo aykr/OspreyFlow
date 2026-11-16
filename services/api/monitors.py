@@ -13,9 +13,16 @@ from datetime import UTC, datetime
 import asyncpg
 
 from conduit_common.identity import new_id
-from schemas.domain import Monitor, MonitorScheduleInput, Principal, WatchStatus
+from schemas.domain import (
+    Monitor,
+    MonitorScheduleInput,
+    Principal,
+    StoppedReason,
+    WatchStatus,
+)
 
 from .dataset_scope import made_in, reach_clause
+from .watch_status import active_note, stopped_why
 
 #: `ADD COLUMN IF NOT EXISTS` — `alerts.py`'s own `_BOOTSTRAP_SQL` docstring has the full reasoning.
 _BOOTSTRAP_SQL = """
@@ -28,6 +35,11 @@ CREATE TABLE IF NOT EXISTS monitors (
     UNIQUE (pattern_id, owner_id)
 );
 ALTER TABLE monitors ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
+-- ADR-044 Amendment 1: why it is stopped, NULL while active.
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS status_detail TEXT;
+-- ADR-044 Amendment 2: loads in a row whose owner's sign-in could not be checked; the third stops
+-- it.
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS unreachable_in_a_row INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS monitors_owner_id_idx ON monitors (owner_id);
 ALTER TABLE monitors ADD COLUMN IF NOT EXISTS dataset_id TEXT;
 -- ADR-146 decision 4 (G16): each watched pattern also runs on its own schedule, daily by default.
@@ -43,12 +55,23 @@ class MonitorNotFoundError(Exception):
     the same existence-leak discipline every other store in this codebase already establishes."""
 
 
+def _detail(row: asyncpg.Record) -> StoppedReason | None:
+    """ADR-044 Amendment 1: the stopped reason, only while stopped, and only one this release
+    knows."""
+    detail = row["status_detail"] if row["status"] == "stopped" else None
+    return detail if stopped_why(detail) is not None else None
+
+
 def _row_to_monitor(row: asyncpg.Record) -> Monitor:
     return Monitor(
         id=row["id"],
         pattern_id=row["pattern_id"],
         owner_id=row["owner_id"],
         status=row["status"],
+        status_detail=_detail(row),
+        stopped_why=stopped_why(_detail(row)),
+        unreachable_in_a_row=row["unreachable_in_a_row"],
+        status_note=active_note(row["unreachable_in_a_row"]) if row["status"] == "active" else None,
         created_at=row["created_at"],
         dataset_id=row["dataset_id"],
         every=row["every"],
@@ -58,8 +81,9 @@ def _row_to_monitor(row: asyncpg.Record) -> Monitor:
 
 
 _SELECT = (
-    "SELECT id, pattern_id, owner_id, status, created_at, dataset_id, every, hour, weekday "
-    "FROM monitors"
+    "SELECT id, pattern_id, owner_id, status, status_detail, unreachable_in_a_row, created_at, "
+    "dataset_id, every, hour, "
+    "weekday FROM monitors"
 )
 
 
@@ -111,7 +135,8 @@ class MonitorStore:
         reach, extra = reach_clause(principal, 3)
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT id, pattern_id, owner_id, status, created_at, dataset_id, "
+                "SELECT id, pattern_id, owner_id, status, status_detail, unreachable_in_a_row, "
+                "created_at, dataset_id, "
                 "every, hour, weekday "
                 f"FROM monitors WHERE id = $1 AND owner_id = $2{reach}",
                 monitor_id,
@@ -126,7 +151,8 @@ class MonitorStore:
         reach, extra = reach_clause(principal, 2)
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT id, pattern_id, owner_id, status, created_at, dataset_id, "
+                "SELECT id, pattern_id, owner_id, status, status_detail, unreachable_in_a_row, "
+                "created_at, dataset_id, "
                 "every, hour, weekday "
                 f"FROM monitors WHERE owner_id = $1{reach} ORDER BY created_at DESC",
                 principal.id,
@@ -142,14 +168,30 @@ class MonitorStore:
             rows = await conn.fetch(_SELECT)
         return [_row_to_monitor(row) for row in rows]
 
-    async def set_status(self, monitor_id: str, status: WatchStatus) -> None:
+    async def count_unreachable(self, monitor_id: str) -> int:
+        """`HotlistStore.count_unreachable`'s twin (ADR-044 Amendment 2), identical reasoning."""
+        async with self._pool.acquire() as conn:
+            count = await conn.fetchval(
+                "UPDATE monitors SET unreachable_in_a_row = unreachable_in_a_row + 1 WHERE id = $1 "
+                "RETURNING unreachable_in_a_row",
+                monitor_id,
+            )
+        return int(count or 0)
+
+    async def set_status(
+        self, monitor_id: str, status: WatchStatus, detail: StoppedReason | None = None
+    ) -> None:
         """`HotlistStore.set_status`'s own twin, identical reasoning — called only by the
         evaluator, written on every evaluation attempt so `status` reflects the most recent one."""
         async with self._pool.acquire() as conn:
             await conn.execute(
-                "UPDATE monitors SET status = $2 WHERE id = $1", monitor_id, status
+                # ADR-044 Amendment 2: any status set puts the count of unreachable loads back to 0.
+                "UPDATE monitors SET status = $2, status_detail = CASE WHEN $2 = 'stopped' "
+                "THEN $3 END, unreachable_in_a_row = 0 WHERE id = $1",
+                monitor_id,
+                status,
+                detail,
             )
-
 
     async def set_schedule(
         self, monitor_id: str, principal: Principal, schedule: MonitorScheduleInput
@@ -160,8 +202,9 @@ class MonitorStore:
             row = await conn.fetchrow(
                 "UPDATE monitors SET every = $3, hour = $4, weekday = $5 "
                 f"WHERE id = $1 AND owner_id = $2{reach} "
-                "RETURNING id, pattern_id, owner_id, status, created_at, dataset_id, every, hour, "
-                "weekday",
+                "RETURNING id, pattern_id, owner_id, status, status_detail, "
+                "unreachable_in_a_row, created_at, "
+                "dataset_id, every, hour, weekday",
                 monitor_id,
                 principal.id,
                 schedule.every,

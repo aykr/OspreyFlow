@@ -20,9 +20,11 @@ from __future__ import annotations
 import jwt
 
 from principal_auth import (
+    DASHBOARD_APP_ROLE,
     DEFAULT_CLAIM_MAPPING,
     ENTRA_ALGORITHMS,
     LEEWAY_SECONDS,
+    RUN_APP_ROLE,
     ClaimMapping,
     OidcSettings,
     PrincipalResolutionError,
@@ -50,11 +52,14 @@ def is_deployment_client(client: str) -> bool:
 class ServiceIdentityRefused(Exception):
     """A token that is not a service identity's, said in words that name no claim's value.
     `status`: 401 for a sign-in that could not be verified, 403 for a verified one that is not a
-    service identity's (a person's)."""
+    service identity's (a person's). `client`: the application a verified app-only token names,
+    where the refusal is of that application (ADR-148 Amendment 20's role), so the run API can
+    still tell a dashboard identity registered in Admin › Dashboards that it is one."""
 
-    def __init__(self, words: str, *, status: int) -> None:
+    def __init__(self, words: str, *, status: int, client: str | None = None) -> None:
         super().__init__(words)
         self.status = status
+        self.client = client
 
 
 NOT_A_SERVICE_IDENTITY = (
@@ -63,11 +68,28 @@ NOT_A_SERVICE_IDENTITY = (
 )
 
 
+#: ADR-148 Amendment 10: a dashboard identity reads the report feed and never submits runs.
+DASHBOARD_IS_NO_SERVICE_IDENTITY = (
+    "the sign-in is a dashboard identity's: a dashboard reads the report feed and never "
+    "submits runs"
+)
+
+
+#: ADR-148 Amendment 20: an orchestrator's application must hold this API's own app role.
+RUN_ROLE_NOT_HELD = (
+    f"the orchestrator's application does not hold this API's {RUN_APP_ROLE} app role: in "
+    "Entra ID, add it to the orchestrator's own registration (API permissions, this API, "
+    "Application permissions) and grant admin consent, then ask for a new token"
+)
+
+
 class ServiceIdentityVerifier:
     """**On Entra ID sign-in** (ADR-148 Amendment 8) a service identity's token is an app-only
     token of the pinned tenant: the configured issuer and audience, `tid` the tenant, no delegated
     `scp`, `idtyp` `app` where present, and its client (`azp`, or `appid` in v1.0; the same if both)
-    an application id that is neither the Glass's nor this API's own. Entra issues no
+    an application id that is neither the Glass's nor this API's own, which holds this API's
+    `OspreyFlow.Run` app role in `roles` (ADR-148 Amendment 20) and not the dashboards'
+    (Amendment 10). Entra issues no
     `preferred_username` for an application, so the Keycloak rule below cannot apply. **On
     Keycloak**, a token carrying `tid` (Entra's) is refused, as `principal_auth` refuses one."""
 
@@ -148,10 +170,11 @@ class ServiceIdentityVerifier:
         if "scp" in claims or claims.get("idtyp", "app") != "app":
             # A delegated token is a person's, whichever application asked for it.
             raise ServiceIdentityRefused(NOT_A_SERVICE_IDENTITY, status=403)
-        clients = {claims[c] for c in ("azp", "appid") if c in claims}
-        if len(clients) != 1:
+        # A claim of any other shape than a string is no client: refused, never an error.
+        named = [claims[c] for c in ("azp", "appid") if c in claims]
+        if not named or not all(isinstance(c, str) for c in named) or len(set(named)) != 1:
             raise ServiceIdentityRefused(NOT_A_SERVICE_IDENTITY, status=403)
-        client = clients.pop()
+        client = named[0]
         if not isinstance(client, str) or not is_object_id(client):
             raise ServiceIdentityRefused(NOT_A_SERVICE_IDENTITY, status=403)
         if client in (
@@ -161,4 +184,15 @@ class ServiceIdentityVerifier:
         ):
             # The Glass's own registration, or this API's: the deployment's, never an orchestrator.
             raise ServiceIdentityRefused(DEPLOYMENT_CLIENT_WORDS, status=403)
+        roles = claims.get("roles")
+        if isinstance(roles, list) and DASHBOARD_APP_ROLE in roles:
+            # Amendment 10: a client granted the dashboards' role is a dashboard's, registered or
+            # not.
+            raise ServiceIdentityRefused(DASHBOARD_IS_NO_SERVICE_IDENTITY, status=403)
+        # Amendment 20: any other application of the tenant is no orchestrator until it holds this
+        # API's role. A `roles` of any other shape than a list of strings holds none: refused,
+        # never an error.
+        held = [r for r in roles if isinstance(r, str)] if isinstance(roles, list) else []
+        if RUN_APP_ROLE not in held:
+            raise ServiceIdentityRefused(RUN_ROLE_NOT_HELD, status=403, client=client)
         return client

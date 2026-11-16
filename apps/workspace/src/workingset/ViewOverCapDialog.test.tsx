@@ -227,7 +227,7 @@ describe("saving a smaller view", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: "Person" }));
     fireEvent.click(screen.getByRole("button", { name: "Save and open the view" }));
     expect((await screen.findByRole("alert")).textContent).toBe(
-      'Too many for the canvas: 50,020 nodes against a limit of 50,000. The view "Smaller view of this case" was saved and could not be removed: delete it from Views in this case. Narrow the choice and try again.',
+      'Too many for the canvas: 50,020 nodes against a limit of 50,000. The view "Smaller view of this case" was saved and could not be removed: delete it from Saved views. Narrow the choice and try again.',
     );
     expect(calls.some((c) => c.method === "DELETE")).toBe(true);
   });
@@ -295,5 +295,32 @@ describe("focus that leaves the dialog", () => {
     outside.focus();
     expect(screen.getByRole("dialog").contains(document.activeElement)).toBe(true);
     outside.remove();
+  });
+
+  it("for an expansion the cap refused: its own title and reason, the cap's figure, the save, and no Try again", async () => {
+    // spec/00 §4's cap choices on the canvas's expand (rule 2): the refused expansion is not the case's view
+    // grown past the cap, so the dialog says what was refused and offers no resync.
+    const calls = conduit();
+    render(
+      <ViewOverCapDialog
+        wouldBe={{ ...wouldBe, cap: 5_000, would_be: 6_210 }}
+        entityTypes={ONTOLOGY_TYPES}
+        apiBaseUrl="http://api.invalid"
+        bearerToken="token"
+        investigationId="c1"
+        title="This expansion is too large"
+        why="Expanding Ann Bell would take the canvas past what it can hold. Nothing has been added. You can save a smaller view of the case, private to you, and open that."
+        onViewOpened={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("heading", { name: "This expansion is too large" })).toBeTruthy();
+    expect(screen.getByText("Too many for the canvas: 6,210 nodes against a limit of 5,000.")).toBeTruthy();
+    expect(screen.getByText(/Expanding Ann Bell would take the canvas past what it can hold\. Nothing has been added\./)).toBeTruthy();
+    expect(screen.queryByText(/Work in this case by others/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save as a view" }));
+    expect(screen.getByRole("group", { name: "Entity types" })).toBeTruthy();
+    expect(calls).toEqual([]);
   });
 });

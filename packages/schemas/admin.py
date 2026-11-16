@@ -34,6 +34,9 @@ class PersonAccount(BaseModel):
     #: has not, and counts for nothing a sign-in proves (the lock-out's last manager among them).
     #: Always true on Keycloak, whose accounts are the directory's own.
     signed_in: bool = True
+    #: On Entra ID, a guest (B2B) account, homed in another organisation's tenant, as their last
+    #: sign-in's token said (ADR-148 Amendment 17). Never on Keycloak.
+    guest: bool = False
     #: On Entra ID, when this person's clearance, unit and handling codes were last read from their
     #: token (ADR-148 Amendment 8); older than a day, they are not trusted to receive anything. None
     #: on Keycloak, whose directory attributes are current.
@@ -59,6 +62,24 @@ class AccessInput(BaseModel):
     def _few_codes(cls, codes: list[str]) -> list[str]:
         # A bound, kept out of the field so the generated type stays a plain array.
         if len(codes) > 16:
+            raise ValueError("at most 16 handling codes")
+        return codes
+
+
+class PersonAccessInput(BaseModel):
+    """Access for a person already here (`PUT /v1/admin/people/{id}/access`). On Keycloak, clearance
+    and unit, and the codes (none when not given), as `AccessInput`. On Entra ID with the
+    administrator fallback (ADR-148 Amendment 15), only the values this deployment sets: one not
+    given is left as it is, and a value Entra sends is never given here."""
+
+    clearance: str | None = Field(default=None, min_length=1, max_length=40)
+    org_unit: str | None = Field(default=None, min_length=1, max_length=60)
+    receivable_handling_codes: list[str] | None = None
+
+    @field_validator("receivable_handling_codes")
+    @classmethod
+    def _few_codes(cls, codes: list[str] | None) -> list[str] | None:
+        if codes is not None and len(codes) > 16:
             raise ValueError("at most 16 handling codes")
         return codes
 
@@ -108,6 +129,10 @@ class DashboardIdentity(BaseModel):
     client_id: str
     #: The identity's account id — what a case Author grants Viewer to.
     account_id: str
+    #: Its name, a slug: on Keycloak what follows `osprey-dashboard-` in its client id; on Entra ID
+    #: the name it was registered by, one a tenant (ADR-148 Amendment 10). Superset's embedding
+    #: matches a board on it.
+    name: str | None = None
     clearance: str | None = None
     org_unit: str | None = None
     #: The handling codes the identity may receive — a viewer of its embedded board must hold
@@ -124,8 +149,9 @@ class DashboardIdentity(BaseModel):
 
 class RegisteredDashboard(BaseModel):
     dashboard: DashboardIdentity
-    #: Shown once, at registration; OspreyFlow keeps no copy.
-    secret: str
+    #: Shown once, at registration; OspreyFlow keeps no copy. None on Entra ID (ADR-148 Amendment
+    #: 10), where the identity's own app registration holds its secret.
+    secret: str | None = None
 
 
 class RolesInput(BaseModel):
@@ -135,16 +161,39 @@ class RolesInput(BaseModel):
 
 
 class SignInKind(BaseModel):
-    """`GET /v1/admin/sign-in`: how this deployment's people sign in (ADR-148 Amendment 8), so Admin
-    › People offers what it can do: invite on Keycloak; add by object id on Entra ID, where Entra
-    holds the accounts."""
+    """`GET /v1/admin/sign-in`: how this deployment's people sign in (ADR-148 Amendment 8), so
+    Admin › People and roles offers what it can do: invite on Keycloak; add by object id on Entra
+    ID, where Entra holds the accounts."""
 
     kind: Literal["keycloak", "entra"]
+    #: ADR-148 Amendment 15: on Entra ID, the values Admin › People sets here (the poc shape's
+    #: fallback); none means Entra sends every one, and Access is not offered.
+    administrator_sets: list[Literal["clearance", "org_unit", "handling_codes"]] = Field(
+        default_factory=list
+    )
+
+
+class GuestSignIn(BaseModel):
+    """`GET|PUT /v1/admin/sign-in/guests` (ADR-148 Amendment 17): whether this deployment admits
+    guest (B2B) accounts on Entra ID, off until an administrator of people turns it on; who last
+    changed it, and when (none, never)."""
+
+    admitted: bool
+    changed_by: str | None = None
+    changed_at: datetime | None = None
+
+
+class GuestSignInInput(BaseModel):
+    """`PUT /v1/admin/sign-in/guests`: admit guests, or no longer."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    admitted: bool
 
 
 class AddPersonInput(BaseModel):
-    """A person added to Admin › People by their Entra object id, ahead of their first sign-in
-    (ADR-148 Amendment 8). Only on Entra ID sign-in; Graph gives the object id."""
+    """A person added to Admin › People and roles by their Entra object id, ahead of their first
+    sign-in (ADR-148 Amendment 8). Only on Entra ID sign-in; Graph gives the object id."""
 
     object_id: str = Field(
         pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
@@ -159,6 +208,13 @@ class DashboardInput(BaseModel):
     name: str = Field(min_length=1, max_length=60)
     clearance: str = Field(min_length=1)
     org_unit: str = Field(min_length=1)
+    #: ADR-148 Amendment 10: on Entra ID, the identity's own app registration's application id
+    #: (required there; refused on Keycloak, where OspreyFlow creates the client).
+    application_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        description="On Entra ID: the dashboard's app registration's application id, lower case",
+    )
 
 
 class ComponentHealth(BaseModel):
@@ -804,10 +860,10 @@ class NeedsYou(BaseModel):
 
 ALL_MODELS: list[type[BaseModel]] = [
     PersonAccount, DashboardIdentity, RegisteredDashboard, RolesInput, AddPersonInput,
-    SignInKind, DashboardInput,
+    SignInKind, GuestSignIn, GuestSignInInput, DashboardInput,
     ComponentHealth, UpdateNotice, ConvertedViews, SystemStatus, EmbeddedDashboard,
     DashboardGuestToken,
-    AccessInput, InviteInput, SignInDelivery, DemoPackStatus,
+    AccessInput, PersonAccessInput, InviteInput, SignInDelivery, DemoPackStatus,
     ModelRoleStatus, EngineStatus, ScheduleRunView, AdminSchedule, PauseScheduleInput, DataFeed,
     ChangeScheduleInput, AdminDataset, DatasetEgressInput, OrganisationArrival,
     OrganisationLinkInput, DatasetPromotionPolicyInput, DatasetAuthor, AdminDatasetAuthors,

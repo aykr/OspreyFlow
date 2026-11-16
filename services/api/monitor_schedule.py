@@ -25,8 +25,16 @@ from typing import Any, Protocol
 from valkey.asyncio import Valkey
 
 from conduit_common.valkey_compat import reply
-from principal_auth import PrincipalExchangeUnavailable, PrincipalRevoked
-from schemas.domain import Alert, Monitor, Principal, WatchStatus
+from principal_auth import (
+    PEOPLE_SECTION,
+    OwnerRecordUnavailable,
+    PrincipalAccessOutOfDate,
+    PrincipalExchangeUnavailable,
+    PrincipalRevoked,
+    out_of_date_next,
+    out_of_date_words,
+)
+from schemas.domain import Alert, Monitor, Principal, StoppedReason, WatchStatus
 
 from .scheduler import DEFAULT_TIMEZONE, due_slots
 
@@ -47,7 +55,9 @@ class ScheduledMonitors(Protocol):
     async def list_all_active(self) -> list[Monitor]: ...
     async def last_slot(self, monitor_id: str) -> datetime | None: ...
     async def record_slot(self, monitor_id: str, slot: datetime) -> None: ...
-    async def set_status(self, monitor_id: str, status: WatchStatus) -> None: ...
+    async def set_status(
+        self, monitor_id: str, status: WatchStatus, detail: StoppedReason | None = None
+    ) -> None: ...
 
 
 @dataclass
@@ -87,15 +97,30 @@ class MonitorScheduleExecutor:
             owner = await self.resolve_owner(monitor.owner_id)
         except PrincipalRevoked:
             await self.monitors.record_slot(monitor.id, latest)
-            await self.monitors.set_status(monitor.id, "stopped")
+            await self.monitors.set_status(monitor.id, "stopped", "revoked")
             return
-        except PrincipalExchangeUnavailable:
+        except PrincipalExchangeUnavailable as error:
             # Says nothing about the owner: the claim is given back, so the next tick tries the
-            # same slot again rather than losing it.
-            log.warning("watch %s: the identity provider could not be reached", monitor.id)
+            # same slot again rather than losing it. Each in its own words (ADR-148 Amendment 16).
+            if isinstance(error, PrincipalAccessOutOfDate):
+                log.warning("watch %s: its owner, %s, %s: %s", monitor.id, monitor.owner_id,
+                            out_of_date_words(error), out_of_date_next(error))  # fmt: skip
+            elif isinstance(error, OwnerRecordUnavailable):
+                log.warning(
+                    "watch %s: the people store behind %s could not be read",
+                    monitor.id,
+                    PEOPLE_SECTION,
+                )
+            else:
+                log.warning("watch %s: the identity provider could not be reached", monitor.id)
             await reply(self.valkey.delete(claim))
             return
         await self.monitors.record_slot(monitor.id, latest)
+        # ADR-044 Amendment 2: its owner was acted as, so this run reached them, as a load
+        # that can act as its owner does: active, the count of unreachable loads back to 0,
+        # whether or not it then matches (no dataset, or one its owner no longer reaches,
+        # matches nothing below).
+        await self.monitors.set_status(monitor.id, "active")
         if monitor.dataset_id is None:
             return  # no dataset, nothing to read
         # Narrowed to the watch's dataset only once the owner is shown still to reach it: an owner

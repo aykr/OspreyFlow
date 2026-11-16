@@ -98,8 +98,9 @@ class AnalyticsEngine(StrEnum):
 class SearchBackend(StrEnum):
     """`05_DEPLOYMENT.md` §3's reduced variant, as a declarable component rather than a hidden
     code path: "If Preflight finds less than 16 GB it offers a reduced variant that drops OpenSearch
-    and falls back to PostgreSQL full-text, stating the trade-off on screen: search quality
-    degrades and semantic search is unavailable."
+    (`search: postgres-fulltext`), stating the trade-off on screen: with no search index, search is
+    the graph store's own exact search". The value's name is older than the code: nothing searches
+    PostgreSQL (docs' v0.5.2 sweep, 14 November 2026).
 
     **Offering it is Preflight's job, not this schema's** (ADR-049 amendment 5, ownership confirmed
     by the owner 24 September 2026). Stage 2 §1 only has to be able to *render* the reduced variant
@@ -363,8 +364,9 @@ class ModelProviderConfig(BaseModel):
     kind: EngineKind = Field(
         default="provider",
         description="ADR-135 Amendments 4 and 7: provider (a hosted provider LiteLLM knows by "
-        "name), or at profile: cloud-platform only, gateway (the client's own OpenAI-compatible "
-        "AI gateway, at api_base) or bedrock (Amazon Bedrock in London). Default: provider.",
+        "name), or at profile: cloud-platform only, gateway (your organisation's own "
+        "OpenAI-compatible AI gateway, at api_base) or bedrock (Amazon Bedrock in London). "
+        "Default: provider.",
     )
     auth: EngineAuth | None = Field(
         default=None,
@@ -590,8 +592,8 @@ def engine_refusal(provider: ModelProviderConfig, profile: str) -> str | None:
             if not _BEDROCK_MODEL_ID.fullmatch(model):
                 return (
                     f"Bedrock is used in London only: the {role} model is not a model's own id "
-                    "(such as anthropic.…). A cross-region inference profile's id (eu.…, us.…, "
-                    "apac.…, global.…) or an ARN may send the call outside London"
+                    "(such as amazon.nova-pro-v1:0). A cross-region inference profile's id "
+                    "(eu.…, us.…, apac.…, global.…) or an ARN may send the call outside London"
                 )
         return None
     if provider.name == "bedrock":
@@ -1095,17 +1097,25 @@ class EntraSignInConfig(BaseModel):
     """ADR-148 decision 9 and Amendment 8: how this deployment's people sign in with Entra ID, and
     where `principal_auth` finds each of clearance, unit and handling codes in their token (a claim,
     or a table from Entra group to value; `principal_auth.ClaimMapping` checks the shape at render).
-    Roles are not here: they are kept in Admin › People, the first administrators named below."""
+    Roles are not here: they are kept in Admin › People and roles, the first administrators named
+    below."""
 
     model_config = ConfigDict(extra="forbid")
 
-    tenant_id: str = Field(pattern=_ENTRA_ID, description="The client's Entra tenant id")
+    tenant_id: str = Field(pattern=_ENTRA_ID, description="Your organisation's Entra tenant id")
     client_id: str = Field(
         pattern=_ENTRA_ID, description="The Glass's own app registration (application id)"
     )
     api_client_id: str = Field(
         pattern=_ENTRA_ID,
         description="This API's app registration (application id): the token's audience",
+    )
+    superset_client_id: str | None = Field(
+        default=None,
+        pattern=_ENTRA_ID,
+        description="Superset's own app registration (application id), when reporting.superset is "
+        "on: people sign in to Superset with it, and its delegated token reads the Conduit's "
+        "GET /v1/me and /v1/me/rights alone (ADR-148 Amendment 9)",
     )
     api_id_uri: str | None = Field(
         default=None,
@@ -1124,13 +1134,18 @@ class EntraSignInConfig(BaseModel):
         description="Default: access_as_user. The delegated scope the Glass asks the API for",
     )
     clearance: dict[str, Any] = Field(
-        description="Where clearance comes from: {claim: <name>} or {groups: {<group id>: <value>}}"
+        description="Where clearance comes from: {claim: <name>}, {groups: {<group id>: <value>}}, "
+        "or {administrator: true}, set in Admin › People and roles (the poc shape alone, ADR-148 "
+        "Amendment "
+        "15)"
     )
     org_unit: dict[str, Any] = Field(
-        description="Where the organisational unit comes from: {claim: ...} or {groups: {...}}"
+        description="Where the organisational unit comes from: {claim: ...}, {groups: {...}}, or "
+        "{administrator: true} (the poc shape alone)"
     )
     handling_codes: dict[str, Any] = Field(
-        description="Where the handling codes come from: {claim: ...} or {groups: {<id>: [codes]}}"
+        description="Where the handling codes come from: {claim: ...}, {groups: {<id>: [codes]}}, "
+        "or {administrator: true} (the poc shape alone)"
     )
     groups_claim: str = Field(
         default="groups",
@@ -1140,6 +1155,13 @@ class EntraSignInConfig(BaseModel):
     )
     first_administrators: list[str] = Field(
         description="The people given the Admin role at install, by Entra object id (at least one)"
+    )
+    first_administrator_access: dict[str, Any] | None = Field(
+        default=None,
+        description="With {administrator: true} for clearance, org_unit or handling_codes (the poc "
+        "shape's fallback, ADR-148 Amendment 15): what the first administrators hold of each such "
+        "value at install, {clearance: ..., org_unit: ..., handling_codes: [...]}, so they can "
+        "sign in and set everyone else's; required then",
     )
     claims_mapping_policy: bool = Field(
         default=False,
@@ -1192,6 +1214,8 @@ class EntraSignInConfig(BaseModel):
             "org_unit": self.org_unit,
             "handling_codes": self.handling_codes,
             "groups_claim": self.groups_claim,
+            # ADR-148 Amendment 9: Superset's registration, admitted for its two reads alone.
+            **({"superset_client_id": self.superset_client_id} if self.superset_client_id else {}),
         }
 
 

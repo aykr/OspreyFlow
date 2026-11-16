@@ -25,6 +25,7 @@ verbatim below, because they document decisions rather than location.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -35,6 +36,7 @@ import urllib.request
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import quote
@@ -188,12 +190,16 @@ class _Source(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     claim: str | None = None
+    #: ADR-148 Amendment 15: set by an administrator in Admin › People, never read from the token
+    #: (the client page's fallback where Entra cannot send the value; the poc shape alone, at
+    #: render).
+    administrator: bool = False
 
     @model_validator(mode="after")
     def _exactly_one(self) -> _Source:
         groups = getattr(self, "groups", None)
-        if (self.claim is None) == (groups is None):
-            raise ValueError("name exactly one of `claim` or `groups`")
+        if sum((self.claim is not None, groups is not None, self.administrator)) != 1:
+            raise ValueError("name exactly one of `claim`, `groups` or `administrator: true`")
         if self.claim is not None and not self.claim:
             raise ValueError("`claim` must name a claim")
         if groups is not None:
@@ -210,15 +216,15 @@ class _Source(BaseModel):
 
 
 class ValueSource(_Source):
-    """Where a single-valued claim (clearance, organisational unit) comes from: a token claim, or a
-    table from group id to value."""
+    """Where a single-valued claim (clearance, organisational unit) comes from: a token claim, a
+    table from group id to value, or the administrator (Amendment 15)."""
 
     groups: dict[str, str] | None = None
 
 
 class CodesSource(_Source):
     """Where the receivable handling codes come from: a token claim (a list, or one code as a
-    string), or a table from group id to the codes that group grants."""
+    string), a table from group id to the codes that group grants, or the administrator."""
 
     groups: dict[str, list[str]] | None = None
 
@@ -255,6 +261,9 @@ class ClaimMapping(BaseModel):
     api_client_id: str | None = None
     #: The delegated scope the Glass asks for; an Entra token's `scp` must include it.
     scope: str = DEFAULT_SCOPE
+    #: Superset's own app registration (ADR-148 Amendment 9): a person's delegated token issued to
+    #: it, with this API's scope, is admitted to `SUPERSET_ROUTES` alone (`Principal.routes`).
+    superset_client_id: str | None = None
 
     @model_validator(mode="after")
     def _entra_needs_its_tenant(self) -> ClaimMapping:
@@ -270,6 +279,18 @@ class ClaimMapping(BaseModel):
             raise ValueError("`scope` must name one delegated scope")
         if self.api_client_id is not None and not _GUID.match(self.api_client_id):
             raise ValueError("`api_client_id` must be the API's application id (a GUID)")
+        if self.superset_client_id is not None and (
+            self.tenant_id is None
+            or not _GUID.match(self.superset_client_id)
+            or self.superset_client_id in (self.client_id, self.api_client_id)
+        ):
+            # ADR-148 Amendment 9: its own registration in the Entra tenant, never the Glass's
+            # (whose tokens would then be held to Superset's two routes) nor the API's.
+            raise ValueError(
+                "`superset_client_id` must be Superset's own application id (a GUID) in an Entra "
+                "ID "
+                "mapping, neither the Glass's nor the API's"
+            )
         if self.tenant_id is None and (
             self.client_id is not None
             or self.api_client_id is not None
@@ -356,7 +377,11 @@ def _token_groups(claims: Mapping[str, Any], mapping: ClaimMapping) -> list[str]
 
 def _single_value(
     claims: Mapping[str, Any], source: ValueSource, what: str, groups: list[str]
-) -> str:
+) -> str | None:
+    """The token's value, or None for a value the administrator sets (Amendment 15), which the
+    token is never read for: the stored person's is taken, after every check of the token."""
+    if source.administrator:
+        return None
     if source.claim is not None:
         value = claims.get(source.claim)
         if value is None:
@@ -392,7 +417,11 @@ def _string_list(claims: Mapping[str, Any], claim: str, what: str) -> list[str]:
     return list(dict.fromkeys(names))
 
 
-def _handling_codes(claims: Mapping[str, Any], source: CodesSource, groups: list[str]) -> list[str]:
+def _handling_codes(
+    claims: Mapping[str, Any], source: CodesSource, groups: list[str]
+) -> list[str] | None:
+    if source.administrator:
+        return None
     if source.claim is not None:
         return _string_list(claims, source.claim, "handling codes")
     assert source.groups is not None
@@ -433,6 +462,12 @@ class StoredPerson:
 
     roles: tuple[str, ...]
     disabled: bool
+    #: ADR-148 Amendment 15: what an administrator set in Admin › People for a value the mapping
+    #: sources from the administrator; None where none was set (the person is then refused in
+    #: words).
+    clearance: str | None = None
+    org_unit: str | None = None
+    receivable_handling_codes: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -444,9 +479,13 @@ class SeenPerson:
     name: str | None
     username: str | None
     email: str | None
-    clearance: str
-    org_unit: str
-    receivable_handling_codes: tuple[str, ...]
+    #: None for a value the administrator sets (Amendment 15): the token is not read for it.
+    clearance: str | None
+    org_unit: str | None
+    receivable_handling_codes: tuple[str, ...] | None
+    #: A guest (B2B) account, homed in another tenant (ADR-148 Amendment 17), recorded so a guest is
+    #: refused again, without a token, once the deployment no longer admits guests.
+    guest: bool = False
 
 
 def _text_claim(claims: Mapping[str, Any], name: str) -> str | None:
@@ -454,13 +493,81 @@ def _text_claim(claims: Mapping[str, Any], name: str) -> str | None:
     return value[:200] if isinstance(value, str) and value else None
 
 
+@dataclass(frozen=True)
+class StoredDashboard:
+    """A dashboard identity as the deployment registered it (ADR-148 Amendment 10): Admin ›
+    Dashboards' clearance, unit and handling codes for one Entra app registration."""
+
+    application_id: str
+    clearance: str
+    org_unit: str
+    receivable_handling_codes: tuple[str, ...]
+    #: Its name, the slug Keycloak's `osprey-dashboard-<slug>` carries; Superset's embedding
+    #: matches a board on it. The resolver never reads it.
+    name: str = ""
+
+
+class DashboardSource(Protocol):
+    """Where a dashboard identity is read (ADR-148 Amendment 10): the deployment's own store, keyed
+    by tenant and the registration's application id; `None` when it is not registered. It raises on
+    any failure, which the resolver turns into `PrincipalLookupUnavailable`, never a principal."""
+
+    async def dashboard(self, tenant_id: str, application_id: str) -> StoredDashboard | None: ...
+
+
+#: How long a clearance, unit and handling codes read from an Entra token at sign-in are trusted
+#: for anything done for the person while they are not present: an Entra access token's longest
+#: life, plus a margin (ADR-148 Amendment 8; the orchestrator's ruling, 12 November 2026). A run
+#: acting as its owner is one (Amendment 16): the same rule, this one constant.
+ACCESS_FRESH = timedelta(hours=24)
+
+
+@dataclass(frozen=True)
+class StoredOwner:
+    """An Entra person as the deployment holds them, read without their being present (ADR-148
+    Amendment 16): the roles and disabled flag Admin › People keeps, read live, and the clearance,
+    unit and codes as their last sign-in's token gave them, with when (`access_read_at`). A person
+    added by object id who has never signed in has no clearance, unit or time."""
+
+    roles: tuple[str, ...]
+    disabled: bool
+    clearance: str | None
+    org_unit: str | None
+    receivable_handling_codes: tuple[str, ...]
+    access_read_at: datetime | None
+    #: ADR-148 Amendment 15: the values the administrator sets for this person and has not set yet
+    #: ("clearance", "unit", "handling codes"), which refuse a run in their own words.
+    unset: tuple[str, ...] = ()
+    #: A guest (B2B) account, as their last sign-in's token said (ADR-148 Amendment 17).
+    guest: bool = False
+
+
+#: The Admin section where people's roles, access and guests are set, as the Glass's side list
+#: names it (`apps/workspace/src/admin/sections.json`; `tests/test_people_section_words.py` reads it
+#: there; ADR-148 Amendment 19).
+PEOPLE_SECTION = "Admin › People and roles"
+
+#: ADR-148 Amendment 17: why a guest (B2B) account is refused while the deployment does not admit
+#: guests.
+GUESTS_NOT_ADMITTED_WORDS = (
+    "this is a guest account, homed outside this organisation's Entra ID, and this deployment does "
+    f"not admit guests: an administrator can admit them in {PEOPLE_SECTION}"
+)
+
+
 class RoleSource(Protocol):
     """Where an Entra principal's roles are read (ADR-148 Amendment 8, the orchestrator's ruling of
     11 November 2026): the deployment's own store, keyed by tenant and object id. `person` records
     a person on their first sign-in (with no roles) and answers what is stored; it raises on any
-    failure, which the resolver turns into `PrincipalLookupUnavailable`, never a principal."""
+    failure, which the resolver turns into `PrincipalLookupUnavailable`, never a principal.
+    `owner` reads a person without recording anyone, for a run acting as them (Amendment 16):
+    `None` for a person not held."""
 
     async def person(self, tenant_id: str, oid: str, seen: SeenPerson) -> StoredPerson: ...
+
+    async def owner(self, tenant_id: str, oid: str) -> StoredOwner | None: ...
+
+    async def guests_admitted(self, tenant_id: str) -> bool: ...
 
 
 class PrincipalLookupUnavailable(Exception):
@@ -667,10 +774,39 @@ class _Verified:
     """A verified token's principal parts, before roles: built only by `_verified_parts`."""
 
     id: str
-    clearance: str
-    org_unit: str
-    codes: list[str]
+    #: None where the administrator sets the value (Amendment 15), taken from the stored person.
+    clearance: str | None
+    org_unit: str | None
+    codes: list[str] | None
     token_roles: list[str]
+    #: None for the Glass's token (every route its rights allow); Superset's, `SUPERSET_ROUTES`.
+    routes: list[str] | None = None
+    #: A guest (B2B) account's token (ADR-148 Amendment 17): admitted only by `resolve_principal`,
+    #: which asks the deployment's setting before anything is recorded of them.
+    guest: bool = False
+
+
+def _with_what_the_administrator_set(
+    verified: _Verified, mapping: ClaimMapping, stored: StoredPerson
+) -> _Verified:
+    """ADR-148 Amendment 15: each value the mapping sources from the administrator, from the stored
+    person alone (the token was not read for it, so no claim can raise it); one never set is refused
+    in words, never a default."""
+    taken: dict[str, Any] = {}
+    for field, source, held, what in (
+        ("clearance", mapping.clearance, stored.clearance, "clearance has"),
+        ("org_unit", mapping.org_unit, stored.org_unit, "organisational unit has"),
+        ("codes", mapping.handling_codes, stored.receivable_handling_codes, "handling codes have"),
+    ):
+        if not source.administrator:
+            continue
+        if held is None or (field != "codes" and not held):
+            raise AccessNotSet(
+                f"your {what} not been set in this deployment: ask an administrator to set "
+                f"{'them' if field == 'codes' else 'it'} in {PEOPLE_SECTION}"
+            )
+        taken[field] = list(held) if field == "codes" else held
+    return dataclasses.replace(verified, **taken) if taken else verified
 
 
 def _stored_roles(stored: StoredPerson) -> list[str]:
@@ -681,42 +817,143 @@ def _stored_roles(stored: StoredPerson) -> list[str]:
 
 
 def principal_from_claims(
-    claims: Mapping[str, Any], mapping: ClaimMapping, stored: StoredPerson | None = None
+    claims: Mapping[str, Any],
+    mapping: ClaimMapping,
+    stored: StoredPerson | StoredDashboard | StoredOwner | None = None,
+    *,
+    guest_admitted: bool = False,
 ) -> Principal:
     """The one claims-construction path (ADR-043; ADR-148 decision 9): every `Principal` this
     package builds, from a session's token or an exchanged one, is built here from verified
     claims. An Entra principal's roles are the stored person's (`stored`, read by the resolver
-    from its `RoleSource`), never the token's; one disabled here is refused (401)."""
-    verified = _verified_parts(claims, mapping)
-    if mapping.is_entra:
-        if stored is None:
-            raise PrincipalLookupUnavailable(
-                "an Entra principal's roles are read from the deployment's store, and none was read"
-            )
-        if stored.disabled:
-            raise PrincipalResolutionError(
-                "this account is disabled in this deployment: ask an administrator"
-            )
-        roles = _stored_roles(stored)
+    from its `RoleSource`), never the token's; one disabled here is refused (401). A dashboard
+    identity's (ADR-148 Amendment 10, `stored` its registration) is its registration's clearance,
+    unit and codes, the role `reports_viewer` alone, admitted to `DASHBOARD_ROUTES` alone. A run's
+    owner on Entra (Amendment 16, `stored` the owner as held, `claims` naming only their `oid`)
+    is their stored roles and the access their last sign-in gave, judged fresh by the resolver."""
+    routes: list[str] | None = None
+    if isinstance(stored, StoredOwner):
+        oid = claims.get("oid")
+        if not mapping.is_entra or not isinstance(oid, str) or not oid:
+            raise PrincipalLookupUnavailable("a stored owner is read only for an Entra mapping")
+        if stored.disabled or stored.clearance is None or stored.org_unit is None:
+            raise PrincipalLookupUnavailable("a stored owner is built only once judged current")
+        principal_id, clearance, org_unit = oid, stored.clearance, stored.org_unit
+        codes = list(stored.receivable_handling_codes)
+        roles = _stored_roles(StoredPerson(roles=stored.roles, disabled=False))
+    elif isinstance(stored, StoredDashboard):
+        principal_id = _verified_dashboard(claims, mapping)
+        if principal_id != stored.application_id:
+            raise PrincipalLookupUnavailable("the store answered another dashboard identity")
+        clearance, org_unit = stored.clearance, stored.org_unit
+        codes, roles = list(stored.receivable_handling_codes), ["reports_viewer"]
+        routes = sorted(DASHBOARD_ROUTES)
     else:
-        if stored is not None:
-            raise PrincipalLookupUnavailable("a stored person is read only for an Entra mapping")
-        roles = verified.token_roles
+        verified = _verified_parts(claims, mapping)
+        if verified.guest and not guest_admitted:
+            # ADR-148 Amendment 17: a guest's claims build a principal only once the caller has
+            # asked the deployment's setting (`resolve_principal`); any other caller is refused.
+            raise GuestNotAdmitted(GUESTS_NOT_ADMITTED_WORDS)
+        if mapping.is_entra:
+            if stored is None:
+                raise PrincipalLookupUnavailable(
+                    "an Entra principal's roles are read from the deployment's store, and none "
+                    "was read"
+                )
+            if stored.disabled:
+                raise PrincipalResolutionError(
+                    "this account is disabled in this deployment: ask an administrator"
+                )
+            roles = _stored_roles(stored)
+            verified = _with_what_the_administrator_set(verified, mapping, stored)
+        else:
+            if stored is not None:
+                raise PrincipalLookupUnavailable(
+                    "a stored person is read only for an Entra mapping"
+                )
+            roles = verified.token_roles
+        # Every administrator-sourced value was taken from the stored person above (an Entra mapping
+        # alone may name one, `ClaimMapping`'s validator), or refused there.
+        held_clearance, held_unit = verified.clearance, verified.org_unit
+        held_codes = verified.codes
+        assert held_clearance is not None and held_unit is not None and held_codes is not None
+        principal_id, clearance, org_unit = verified.id, held_clearance, held_unit
+        codes, routes = held_codes, verified.routes
     return Principal(
         # Entra: the object id, one per person in the (pinned) tenant, which Graph also gives, so
         # Admin › People can assign roles before a first sign-in; Entra's `sub` is pairwise per
         # application. Keycloak: `sub`, required and refused unless a string by PyJWT's decode.
-        id=verified.id,
-        clearance=verified.clearance,
-        org_unit=verified.org_unit,
-        receivable_handling_codes=verified.codes,
+        # A dashboard identity: its registration's application id.
+        id=principal_id,
+        clearance=clearance,
+        org_unit=org_unit,
+        receivable_handling_codes=codes,
         roles=roles,
+        routes=routes,
     )
+
+
+#: ADR-148 Amendment 10: the app role a dashboard identity's registration holds on the API's own
+#: (an application permission the client's Entra administrator grants), without which its app-only
+#: token is no dashboard; and the routes alone such a principal is admitted to.
+DASHBOARD_APP_ROLE = "Dashboard.Read"
+
+DASHBOARD_ROUTES = frozenset(
+    {"GET /v1/investigations", "GET /v1/investigations/{investigation_id}/reports/feed"}
+)
+
+#: ADR-148 Amendment 20 (v0.6.0 #18): the app role this API defines for an orchestrator, which
+#: the run API requires of an app-only token on Entra ID. Granted to the orchestrator's own
+#: registration as an application permission with admin consent; Entra then puts it in the
+#: token's `roles`, and leaves `roles` out when no app role is granted.
+RUN_APP_ROLE = "OspreyFlow.Run"
+
+
+#: ADR-148 Amendment 9: what a person's delegated token issued to Superset's own registration is
+#: admitted to: who they are and what they may do, from which Superset gives them its role.
+SUPERSET_ROUTES = frozenset({"GET /v1/me", "GET /v1/me/rights"})
+
+
+def _verified_dashboard(claims: Mapping[str, Any], mapping: ClaimMapping) -> str:
+    """A dashboard identity's app-only token (ADR-148 Amendment 10), checked before its
+    registration is read: the pinned tenant, one client that is an application id and neither the
+    Glass's nor this API's, and the app role. Answers that client's application id."""
+    if not mapping.is_entra or mapping.tenant_id is None:
+        raise PrincipalResolutionError("a dashboard identity is read only for an Entra mapping")
+    if claims.get("tid") != mapping.tenant_id:
+        raise PrincipalResolutionError("token's tid is missing or names another tenant")
+    # v2.0 names the client in `azp`, v1.0 in `appid`: one client, whichever are present.
+    # A claim of any other shape than a string is no client: refused, never an error.
+    named = [claims[c] for c in ("azp", "appid") if c in claims]
+    texts = all(isinstance(c, str) for c in named)
+    client = named[0] if named and texts and len(set(named)) == 1 else None
+    # The audience a verified token names (one, or a list holding the configured one) is the API's.
+    aud = claims.get("aud")
+    audiences = [aud] if isinstance(aud, str) else aud if isinstance(aud, list) else []
+    own = {mapping.client_id, mapping.api_client_id, *(a for a in audiences if isinstance(a, str))}
+    if not isinstance(client, str) or not _GUID.match(client) or client in own:
+        raise PrincipalResolutionError(
+            "token is app-only and its client is no dashboard identity's application"
+        )
+    roles = claims.get("roles")
+    if not isinstance(roles, list) or DASHBOARD_APP_ROLE not in roles:
+        raise PrincipalResolutionError(
+            f"token is app-only without the app role {DASHBOARD_APP_ROLE}: no dashboard identity"
+        )
+    return client
+
+
+def _is_app_only(claims: Mapping[str, Any]) -> bool:
+    """An Entra token with no person behind it: `idtyp: app`, or no delegated `scp`."""
+    scope = claims.get("scp")
+    return claims.get("idtyp") == "app" or not isinstance(scope, str) or not scope
 
 
 def _verified_parts(claims: Mapping[str, Any], mapping: ClaimMapping) -> _Verified:
     """Every refusal a token's claims can earn, before anything is read about the person: a
     refused token never records a person in the store."""
+    routes: list[str] | None = None
+    guest = False
     if mapping.is_entra:
         if claims.get("tid") != mapping.tenant_id:
             raise PrincipalResolutionError("token's tid is missing or names another tenant")
@@ -731,15 +968,21 @@ def _verified_parts(claims: Mapping[str, Any], mapping: ClaimMapping) -> _Verifi
             raise PrincipalResolutionError(
                 f"token's scp does not grant this API's scope ({mapping.scope!r})"
             )
-        # v2.0 names the client in `azp`, v1.0 in `appid`: whichever is present must be the Glass.
-        clients = [claims[c] for c in ("azp", "appid") if c in claims]
-        if not clients or any(c != mapping.client_id for c in clients):
+        # v2.0 names the client in `azp`, v1.0 in `appid`: whichever is present must be the Glass,
+        # or Superset's own registration (ADR-148 Amendment 9), whose person is admitted to
+        # reading who they are alone (`SUPERSET_ROUTES`), so Superset can give them their role.
+        clients = {claims[c] for c in ("azp", "appid") if c in claims}
+        if clients == {mapping.client_id}:
+            pass
+        elif mapping.superset_client_id is not None and clients == {mapping.superset_client_id}:
+            routes = sorted(SUPERSET_ROUTES)
+        else:
             raise PrincipalResolutionError("token was not issued to the Glass's client")
         # A guest (B2B) account is homed in another tenant: `acct` 1, or an `idp` other than the
-        # issuer. Refused until the deployment decides to admit guests (ADR-148 Amendment 6).
+        # issuer. Admitted only while the deployment admits guests (ADR-148 Amendment 17), which
+        # `resolve_principal` asks before anything is read or recorded of the person.
         guest_idp = "idp" in claims and _tenant_of_entra_issuer(claims["idp"]) != mapping.tenant_id
-        if claims.get("acct") in (1, "1") or guest_idp:
-            raise PrincipalResolutionError("token is a guest account's: guests are not admitted")
+        guest = claims.get("acct") in (1, "1") or guest_idp
     elif "tid" in claims:
         # Keycloak never emits `tid`; an Entra token here would skip every check above and have its
         # app roles read as OspreyFlow roles.
@@ -760,6 +1003,8 @@ def _verified_parts(claims: Mapping[str, Any], mapping: ClaimMapping) -> _Verifi
         # Keycloak's `roles` come from Admin › People through its attribute; an Entra token's are
         # app roles an Entra administrator assigns, never read (Amendment 6 point 4).
         token_roles=[] if mapping.is_entra else _string_list(claims, CLAIM_ROLES, "roles"),
+        routes=routes,
+        guest=bool(mapping.is_entra and guest),
     )
 
 
@@ -772,6 +1017,22 @@ class PrincipalResolutionError(Exception):
     never a 500: "no `Principal`" is a different failure from "the Vault
     is unreachable", and the API surface (`app.py`) maps this exception
     type to the former."""
+
+    #: A stable tag for a refusal whose words the person can act on, sent beside them in the 401
+    #: (`error`), so the Glass shows those words and no others; None for the rest.
+    error: str | None = None
+
+
+class AccessNotSet(PrincipalResolutionError):
+    """ADR-148 Amendment 15: a value the administrator sets for this person has not been set."""
+
+    error = "access_not_set"
+
+
+class GuestNotAdmitted(PrincipalResolutionError):
+    """ADR-148 Amendment 17: a guest (B2B) account while the deployment does not admit guests."""
+
+    error = "guest_not_admitted"
 
 
 class PrincipalExchangeError(Exception):
@@ -809,6 +1070,134 @@ class PrincipalExchangeUnavailable(PrincipalExchangeError):
     about the target subject."""
 
 
+class OwnerRecordUnavailable(PrincipalExchangeUnavailable):
+    """On Entra ID (ADR-148 Amendment 16): the deployment's people store could not be read, in
+    time, to act as an owner. Nothing about the owner and nothing about Entra, which was not asked:
+    a caller words it as the store, never as "the identity provider could not be reached"."""
+
+
+#: ADR-148 Amendment 16: why a run is refused when its owner's access is out of date, after the
+#: owner's id in a caller's sentence ("the schedule's owner, <id>, …"), and before what happens
+#: next, which is each caller's own (`NEXT_SLOT_WORDS`, `RUN_AGAIN_WORDS`, the KYC check's). The
+#: 24 hours are `ACCESS_FRESH`'s.
+ACCESS_OUT_OF_DATE_WORDS = (
+    "has not signed in to OspreyFlow within the last 24 hours, so their clearance and unit are out "
+    "of date"
+)
+#: What happens next for a slot of a schedule (a pipeline's, a rule's, a list's) or a watch.
+NEXT_SLOT_WORDS = "it runs at its next slot after they sign in"
+#: What to do next for a run asked for by hand or by a trigger (*Run now*, `ospreyflow run`).
+RUN_AGAIN_WORDS = "run it again once they have signed in"
+
+
+class OwnerNotHeld(PrincipalExchangeRefused):
+    """On Entra ID (ADR-148 Amendment 16): Admin › People holds no such person. A fact about the
+    owner, so it counts as a refusal of their rights does; Entra itself was not asked."""
+
+
+class PrincipalAccessOutOfDate(PrincipalExchangeUnavailable):
+    """On Entra ID (ADR-148 Amendment 16): the owner is held and not disabled, but the clearance,
+    unit and codes their last sign-in gave are older than `ACCESS_FRESH`, or were never read (added
+    by object id, never signed in). Nothing is decided about the owner, so, as an unreachable
+    identity provider is, it never counts toward pausing a schedule; a caller says
+    `ACCESS_OUT_OF_DATE_WORDS`, never that anything could not be reached."""
+
+    def __init__(self, owner_id: str, access_read_at: datetime | None) -> None:
+        when = "never" if access_read_at is None else access_read_at.isoformat()
+        super().__init__(f"owner {owner_id!r}: access last read {when}")
+        self.owner_id = owner_id
+        self.access_read_at = access_read_at
+
+
+class OwnerValueNotSet(PrincipalAccessOutOfDate):
+    """On Entra ID with the administrator fallback (ADR-148 Amendment 15): a value the
+    administrator sets for this person (`unset`) has not been set, so a run cannot act as them.
+    Signing in does not help, so a caller says `out_of_date_words` and `out_of_date_next`, never
+    "sign in". As `PrincipalAccessOutOfDate`, it decides nothing about the owner and never pauses
+    a schedule."""
+
+    def __init__(self, owner_id: str, unset: tuple[str, ...]) -> None:
+        super().__init__(owner_id, None)
+        self.args = (f"owner {owner_id!r}: {', '.join(unset)} not set in {PEOPLE_SECTION}",)
+        self.unset = unset
+
+
+def _listed(words: tuple[str, ...]) -> str:
+    return words[0] if len(words) == 1 else f"{', '.join(words[:-1])} and {words[-1]}"
+
+
+def out_of_date_words(error: PrincipalAccessOutOfDate) -> str:
+    """Why a run cannot act as its owner, in words a person can act on."""
+    if isinstance(error, OwnerValueNotSet):
+        unset = _listed(error.unset)
+        return f"an administrator has not set {unset} for this person in {PEOPLE_SECTION}"
+    return ACCESS_OUT_OF_DATE_WORDS
+
+
+def out_of_date_next(error: PrincipalAccessOutOfDate, *, by_hand: bool = False) -> str:
+    """What happens next: at the next slot, or for a run asked for by hand, what to do."""
+    if isinstance(error, OwnerValueNotSet):
+        return (
+            "run it again once an administrator has set it" if by_hand
+            else "it runs at its next slot once an administrator has set it"
+        )
+    return RUN_AGAIN_WORDS if by_hand else NEXT_SLOT_WORDS
+
+
+#: ADR-148 Amendment 18: how the Conduit's log begins its one line about a token-version mismatch,
+#: which INSTALL step 6's check reads (`harness/cloud_platform/runbooks.py`).
+TOKEN_VERSION_LOG = "token version: "
+
+
+class TokenVersionMismatch(PrincipalResolutionError):
+    """ADR-148 Amendment 18: an Entra access token signed by the tenant, but of the other version
+    than the deployment expects (`cloud_platform.claims.token_version`), so its issuer and audience
+    can never match. Refused in words that name the API registration's
+    `requestedAccessTokenVersion` and the setting, rather than a bare issuer or audience
+    mismatch."""
+
+    error = "token_version"
+
+    def __init__(self, got: str, want: str, issuer: str) -> None:
+        manifest = "2" if want == "2.0" else "1 (or null)"
+        super().__init__(
+            f"the API's app registration issues v{got} access tokens (issuer {issuer}), and this "
+            f"deployment expects v{want} (cloud_platform.claims.token_version: \"{want}\"): set "
+            f"requestedAccessTokenVersion to {manifest} in the API registration's manifest, or set "
+            f"token_version to \"{got}\" in osprey.yaml and render again"
+        )
+        self.got, self.want, self.issuer = got, want, issuer
+
+
+def entra_issuers(tenant_id: str) -> dict[str, str]:
+    """An Entra tenant's two access-token issuers, by token version, as `EntraSignInConfig.issuer`
+    renders them."""
+    return {
+        "1.0": f"https://sts.windows.net/{tenant_id}/",
+        "2.0": f"https://login.microsoftonline.com/{tenant_id}/v2.0",
+    }
+
+
+def token_version_mismatch(
+    claims: Mapping[str, Any], tenant_id: str, expected_issuer: str | None
+) -> TokenVersionMismatch | None:
+    """The mismatch a token signed by the tenant shows, or None. Only this tenant's own issuer in
+    the other version's form, with a `ver` that agrees with it when present, counts: anything
+    else is no version question and keeps the plain refusal. `claims` must already be
+    signature-checked."""
+    issuers = entra_issuers(tenant_id)
+    want = next((v for v, i in issuers.items() if i == expected_issuer), None)
+    issuer = claims.get("iss")
+    got = next((v for v, i in issuers.items() if i == issuer), None)
+    if want is None or got is None or got == want:
+        return None
+    ver = claims.get("ver")
+    if ver is not None and str(ver) != got:
+        return None
+    assert isinstance(issuer, str)
+    return TokenVersionMismatch(got, want, issuer)
+
+
 def _access_token_of(response: httpx.Response, what: str) -> str:
     """The `access_token` of a token endpoint's 200, or `PrincipalExchangeUnavailable`. A body that
     is not JSON, is not an object, or carries no non-empty string token is a malformed answer, not
@@ -844,6 +1233,7 @@ class PrincipalResolver:
         *,
         claim_mapping: ClaimMapping | None = None,
         role_source: RoleSource | None = None,
+        dashboard_source: DashboardSource | None = None,
         role_lookup_timeout_seconds: float = ROLE_LOOKUP_TIMEOUT_SECONDS,
     ) -> None:
         # Validated again from plain data: a copy or a `model_construct` skips the validators,
@@ -868,10 +1258,15 @@ class PrincipalResolver:
                 raise ValueError("an Entra ID claim mapping needs the deployment's people store")
         elif role_source is not None:
             raise ValueError("a people store is read only for an Entra ID claim mapping")
+        elif dashboard_source is not None:
+            raise ValueError("a dashboard store is read only for an Entra ID claim mapping")
         if role_lookup_timeout_seconds <= 0:
             raise ValueError("the role lookup's timeout must be positive")
         self._role_source = role_source
+        self._dashboard_source = dashboard_source
         self._role_lookup_timeout = role_lookup_timeout_seconds
+        #: ADR-148 Amendment 18: the token-version mismatch is logged once per process.
+        self._version_said = False
         self._config = config
         self._claim_mapping = mapping
         self._keys = SigningKeys(config.oidc_jwks_url, config.oidc_jwks_ttl_seconds)
@@ -1041,13 +1436,7 @@ class PrincipalResolver:
         independent exchange against the IdP's own current state, not a lookup against anything
         this process remembers from a previous call."""
         if self._claim_mapping.is_entra:
-            # Entra has no impersonation exchange: a person cannot be signed in as without them
-            # (the orchestrator's ruling, 11 November 2026). ADR-044's unreachable path marks the
-            # run stopped; a later step gives owners a way to resolve (CARRIES).
-            raise PrincipalExchangeUnavailable(
-                "owner resolution is unavailable with Entra ID sign-in: a scheduled run cannot act "
-                "as its owner on this deployment"
-            )
+            return await self._stored_owner(owner_id)
         if not self._config.oidc_token_exchange_url:
             raise PrincipalExchangeUnavailable(
                 "OIDC_TOKEN_EXCHANGE_URL is not set — this deployment has not configured "
@@ -1107,6 +1496,73 @@ class PrincipalResolver:
                 f"exchanged token for owner {owner_id!r} failed verification: {exc}"
             ) from exc
 
+    async def _guests_admitted(
+        self, *, unread: type[Exception] = PrincipalLookupUnavailable
+    ) -> bool:
+        """Whether this deployment admits guests (ADR-148 Amendment 17), read fresh, within the role
+        lookup's bound; a store that cannot answer is `unread`, never "admitted"."""
+        assert self._role_source is not None and self._claim_mapping.tenant_id is not None
+        try:
+            admitted = await asyncio.wait_for(
+                self._role_source.guests_admitted(self._claim_mapping.tenant_id),
+                timeout=self._role_lookup_timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 - every failure of the read is the one refusal
+            raise unread(
+                f"whether guests are admitted could not be read: {type(exc).__name__}"
+            ) from exc
+        return admitted is True
+
+    async def _stored_owner(self, owner_id: str, now: datetime | None = None) -> Principal:
+        """ADR-148 Amendment 16 (the owner's ruling 1, option A): Entra has no impersonation
+        exchange, so a run acts as its owner's stored identity. Roles and the disabled flag are
+        read live from Admin › People's store; clearance, unit and codes are as at the owner's last
+        sign-in, refused when older than `ACCESS_FRESH` (`PrincipalAccessOutOfDate`). A person not
+        held is refused; one disabled here is revoked; the store unread is `OwnerRecordUnavailable`.
+        Read fresh at every call, never cached."""
+        mapping = self._claim_mapping
+        assert self._role_source is not None and mapping.tenant_id is not None
+        try:
+            stored = await asyncio.wait_for(
+                self._role_source.owner(mapping.tenant_id, owner_id),
+                timeout=self._role_lookup_timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 - every failure of the read is the store unread
+            raise OwnerRecordUnavailable(
+                f"the people store could not be read for owner {owner_id!r}: {type(exc).__name__}"
+            ) from exc
+        if stored is None:
+            raise OwnerNotHeld(f"owner {owner_id!r} is not a person of this deployment")
+        if not isinstance(stored, StoredOwner):
+            raise OwnerRecordUnavailable("the people store answered something not a person")
+        if stored.disabled:
+            raise PrincipalRevoked(f"owner {owner_id!r} is disabled in this deployment")
+        if stored.guest and not await self._guests_admitted(unread=OwnerRecordUnavailable):
+            # ADR-148 Amendment 17: a guest can no longer sign in here, so nothing acts as them.
+            raise PrincipalRevoked(
+                f"owner {owner_id!r} is a guest, and guests are no longer admitted"
+            )
+        if stored.unset:
+            raise OwnerValueNotSet(owner_id, stored.unset)
+        read_at = stored.access_read_at
+        if (
+            read_at is None
+            or stored.clearance is None
+            or stored.org_unit is None
+            or (now or datetime.now(UTC)) - read_at > ACCESS_FRESH
+        ):
+            raise PrincipalAccessOutOfDate(owner_id, read_at)
+        try:
+            return principal_from_claims({"oid": owner_id}, mapping, stored)
+        except PrincipalLookupUnavailable as exc:
+            raise OwnerRecordUnavailable(
+                f"the stored owner {owner_id!r} is not a principal's"
+            ) from exc
+        except ValueError as exc:
+            raise OwnerRecordUnavailable(
+                f"the stored access of owner {owner_id!r} is not a principal's"
+            ) from exc
+
     def resolve(self, token: str) -> Principal:
         """A Keycloak session's principal, from its token alone. An Entra principal's roles are
         read from the store, which this synchronous path cannot do: `resolve_principal`."""
@@ -1118,14 +1574,19 @@ class PrincipalResolver:
 
     async def resolve_principal(self, token: str) -> Principal:
         """Every session's principal, as the Conduit asks for it. For an Entra mapping the token is
-        checked in full first (a refused token records nobody), then the person is read from the
-        store, within the timeout: a failure or a slow answer is `PrincipalLookupUnavailable` (a
-        503), never a principal with no roles. Nothing is kept between calls."""
+        checked in full first (a token refused by its own checks records nobody), then the person
+        is read from the store, within the timeout (ADR-148 Amendment 15: a person whose values
+        the administrator sets, not yet set, is recorded at that first sign-in, so People lists
+        them to set, and then refused in words): a failure or a slow answer is
+        `PrincipalLookupUnavailable` (a 503), never a principal with no roles. Nothing is kept
+        between calls."""
         # In a thread, bounded: a slow or unreachable identity provider never holds the event loop,
         # and is a 503 in words, never "token rejected" (ADR-148 Amendment 8).
         claims = await in_keys_thread(self._verified_claims, token)
         if not self._claim_mapping.is_entra:
             return principal_from_claims(claims, self._claim_mapping)
+        if self._dashboard_source is not None and _is_app_only(claims):
+            return await self._dashboard_principal(claims)
         verified = _verified_parts(claims, self._claim_mapping)
         assert self._role_source is not None and self._claim_mapping.tenant_id is not None
         seen = SeenPerson(
@@ -1134,8 +1595,11 @@ class PrincipalResolver:
             email=_text_claim(claims, "email"),
             clearance=verified.clearance,
             org_unit=verified.org_unit,
-            receivable_handling_codes=tuple(verified.codes),
+            receivable_handling_codes=None if verified.codes is None else tuple(verified.codes),
+            guest=verified.guest,
         )
+        if verified.guest and not await self._guests_admitted():
+            raise GuestNotAdmitted(GUESTS_NOT_ADMITTED_WORDS)
         try:
             stored = await asyncio.wait_for(
                 self._role_source.person(self._claim_mapping.tenant_id, verified.id, seen),
@@ -1147,11 +1611,62 @@ class PrincipalResolver:
             ) from exc
         if not isinstance(stored, StoredPerson):
             raise PrincipalLookupUnavailable("the people store answered something not a person")
-        return principal_from_claims(claims, self._claim_mapping, stored)
+        return principal_from_claims(
+            claims, self._claim_mapping, stored, guest_admitted=verified.guest
+        )
+
+    async def _dashboard_principal(self, claims: Mapping[str, Any]) -> Principal:
+        """ADR-148 Amendment 10: a dashboard identity's app-only token, checked in full before the
+        store is read (`_verified_dashboard`); its principal built as every other is."""
+        mapping = self._claim_mapping
+        assert mapping.tenant_id is not None and self._dashboard_source is not None
+        # The API's own audience is refused there: a verified token's `aud` is, or holds, the
+        # configured one.
+        application_id = _verified_dashboard(claims, mapping)
+        try:
+            stored = await asyncio.wait_for(
+                self._dashboard_source.dashboard(mapping.tenant_id, application_id),
+                timeout=self._role_lookup_timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 - every failure of the read is the one 503
+            raise PrincipalLookupUnavailable(
+                f"the dashboard identity could not be read: {type(exc).__name__}"
+            ) from exc
+        if stored is None:
+            raise PrincipalResolutionError(
+                "token is app-only and its client is not a registered dashboard identity"
+            )
+        if not isinstance(stored, StoredDashboard):
+            raise PrincipalLookupUnavailable("the store answered something not a dashboard")
+        return principal_from_claims(claims, mapping, stored)
+
+    def _version_mismatch(self, token: str, signing_key: Any) -> TokenVersionMismatch | None:
+        """ADR-148 Amendment 18: why a refused Entra token was refused, when the reason is its
+        version. Its signature is checked again with the tenant's own key, issuer and audience
+        aside, so only a token the tenant signed reaches the words; the token is never admitted by
+        this. The words are logged once per process, for INSTALL step 6's check to find."""
+        mapping = self._claim_mapping
+        if not mapping.is_entra or mapping.tenant_id is None:
+            return None
+        try:
+            claims = jwt.decode(
+                token, signing_key, algorithms=self._algorithms, leeway=LEEWAY_SECONDS,
+                options={"verify_aud": False, "verify_iss": False},
+            )  # fmt: skip
+        except jwt.PyJWTError:
+            return None
+        mismatch = token_version_mismatch(claims, mapping.tenant_id, self._config.oidc_issuer)
+        if mismatch is not None and not self._version_said:
+            self._version_said = True
+            _log.warning("%s%s", TOKEN_VERSION_LOG, mismatch)
+        return mismatch
 
     def _verified_claims(self, token: str) -> dict[str, Any]:
         try:
             signing_key = self._keys.key_for(token)
+        except jwt.PyJWTError as exc:
+            raise PrincipalResolutionError(f"token rejected: {exc}") from exc
+        try:
             claims = jwt.decode(
                 token,
                 signing_key,
@@ -1166,6 +1681,9 @@ class PrincipalResolver:
                 },
             )
         except jwt.PyJWTError as exc:
+            mismatch = self._version_mismatch(token, signing_key)
+            if mismatch is not None:
+                raise mismatch from exc
             raise PrincipalResolutionError(f"token rejected: {exc}") from exc
 
         # A missing clearance or unit is refused, not defaulted to "": defaulting would still fail

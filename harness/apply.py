@@ -67,6 +67,7 @@ from harness import (
     model_downloads,
     store_volumes,
     tls_check,
+    upgrade_stamp,
 )
 from harness.keycloak_admin import (
     grant_service_account_roles,
@@ -1603,6 +1604,16 @@ def main(
         # place only once preflight passes: a refused run writes nothing to the deployment.
         previous_path = out_dir / SECRETS_FILE
         previous_env = previous_path.read_text(encoding="utf-8") if previous_path.is_file() else ""
+        # v0.6.0 is installed fresh (`harness.fresh_only`): an install over an earlier deployment
+        # stops here, before anything is rendered into place, built or started.
+        if previous_path.is_file():
+            from harness import fresh_only
+            from harness.render import release_version
+
+            installed = fresh_only.installed_version(previous_env)
+            why = fresh_only.refusal(installed, release_version(config))
+            if why is not None:
+                raise ApplyFailed("check the deployment", f"{why} Nothing was changed.")
         stage = out_dir.parent / f".{out_dir.name}.staging"
         staged = stage_deployment(
             config,
@@ -1646,7 +1657,10 @@ def main(
         if args.no_build:
             result.record("build", "skipped (--no-build): using the images already in the daemon")
         else:
-            _run(_compose(compose_file) + ["build", "--pull"], stage="build")
+            _run(
+                _compose(compose_file) + ["build", "--pull", *upgrade_stamp.build_args()],
+                stage="build",
+            )
             result.record("build", "owned images built from this checkout")
 
         # 3b. The Ingest Studio's upload folder, the Conduit's to write before anything starts
@@ -1704,6 +1718,17 @@ def main(
                 password=demo_admin_password,
             )
             result.record("demo-admin", "password set on the disposable admin subject")
+
+        # 4d. The search index made again from the graph where the deployment searches with
+        # OpenSearch (the CARRIES row "an upgrade must rebuild when the mapping changes"; ADR-150
+        # decision 4): an earlier version's index has no mapping fingerprint and a fresh domain's
+        # holds none of the graph, so the indexer would write nothing and search stay on the
+        # fallback. A failed rebuild fails the install, in its own words.
+        from harness import search_rebuild
+
+        if search_rebuild.renders_opensearch(compose_file):
+            _run(search_rebuild.rebuild_argv(_compose(compose_file)), stage="search index")
+            result.record("search index", "rebuilt from the graph")
 
         # 5. Seed, under the ordering guard.
         datasets = [d for d in args.seed.split(",") if d]

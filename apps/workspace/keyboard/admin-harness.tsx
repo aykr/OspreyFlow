@@ -4,11 +4,20 @@ import { createRoot } from "react-dom/client";
 
 import "../src/design/tokens.css";
 import "../src/design/primitives.css";
+import "../src/shell/places.css";
 import { AdminPlace } from "../src/admin/AdminPlace";
+import { BrandFrame } from "../src/brand/BrandFrame";
+import { PLAIN_APPEARANCE } from "../src/brand/brand";
+import { AdminWithoutCase } from "../src/shell/AdminWithoutCase";
 import { applyHarnessBrand } from "./brandHarness";
 
 // `?brand=govuk` (ADR-145 decision 13): the side list as a GOV.UK side navigation, scanned so.
-await applyHarnessBrand();
+const brand = await applyHarnessBrand();
+// `?frame=1` (the owner's screenshot of Admin › System, 15 November 2026): Admin in the page's own frame, as
+// `main.tsx` and the app draw it: the brand frame (GOV.UK's header and footer under that brand) around the real
+// `AdminWithoutCase` (Admin's one path, `shell/startScreen.tsx`): its root at the window's height less what the frame
+// shows above, its start bar and case line, then Admin.
+const framed = new URLSearchParams(location.search).get("frame") === "1";
 
 const tab = new URLSearchParams(location.search).get("rights") ?? "manage_people,manage_dashboards,administer_system";
 const open = new URLSearchParams(location.search).get("open");
@@ -66,6 +75,82 @@ if (serving === "datasets") {
   };
 }
 
+// `?serve=system` (the owner's screenshot): Admin › System as a deployment shows it, each part of the page's
+// fonts present: the health list's store names, a model's id in its table, the version, the marking ceiling and
+// the converted views. Synthetic (rule 9).
+if (serving === "system") {
+  const served: Record<string, unknown> = {
+    "/v1/admin/system": {
+      components: [
+        { name: "Graph store", ok: true, millis: 12 },
+        { name: "Case and rule stores (Postgres)", ok: true, millis: 4 },
+        { name: "Search index", ok: true, millis: 9 },
+        { name: "Valkey", ok: true, millis: 1 },
+        { name: "Identity provider", ok: true, millis: 30 },
+      ],
+      models: [
+        { role: "Extraction", model: "gemini-2.5-flash", runs_at: "the provider", local_model: "llama3.1:8b" },
+        { role: "Ask & Chat", model: "claude-sonnet-5-5", runs_at: "the provider", local_model: null },
+        { role: "Recognition", model: "stanza-en-1.9", runs_at: "this deployment", local_model: null },
+      ],
+      version: "v0.5.2",
+      update: null,
+      highest_marking: "OFFICIAL-SENSITIVE",
+      converted_views: { views: 3, cases: 2 },
+    },
+  };
+  window.fetch = async (input: RequestInfo | URL) => {
+    const path = new URL(String(input)).pathname;
+    return new Response(JSON.stringify(served[path] ?? []), { status: 200 });
+  };
+}
+
+// `?serve=models` and `?serve=maps` (ADR-145 Amendment 16, the GOV.UK pass's headings): for the look spec and
+// the axe scans, the page serves Admin › Models (an engine without its key, the declared local models, no
+// usage yet) or Admin › Maps (the local basemap and a hosted provider needing its key) itself; `open=` then
+// opens the section. The views are the sections' own unit tests'. Synthetic (rule 9).
+if (serving === "models" || serving === "maps") {
+  const GEMINI = { name: "gemini", label: "Gemini", roles: { extraction: "gemini-2.5-flash" }, api_base: null,
+                   privacy_contract: false, contract_reference: null };  // prettier-ignore
+  const NONE = { calls: 0, succeeded: 0, failed: 0, prompt_tokens: 0, completion_tokens: 0, tokens: 0 };
+  const LICENCE = { id: "ODbL-1.0", redistributable: true, client_scope: "open", note: null };
+  const OSM = { id: "osm-local", label: "OpenStreetMap", kind: "vector", source: "file:///data/tiles/gb.pmtiles",
+                proxy: "none", style: "bundled:osprey-dark", attribution: "© OpenStreetMap contributors",
+                licence: LICENCE, variables: {} };  // prettier-ignore
+  const HOSTED = { id: "hosted", label: "Hosted tiles", kind: "raster",
+                   source: "https://tiles.example.test/{z}/{x}/{y}.png?key={credential}", proxy: "required",
+                   cache: { ttl_days: 30, prefetch_areas: [] }, attribution: "Example",
+                   licence: { id: "example", redistributable: false, client_scope: "per-deployment", note: null },
+                   variables: {} };  // prettier-ignore
+  const row = (provider: object, tier: number, extra: object = {}) => ({
+    provider, tier, key_state: "none", needs_key: false, key_set_at: null, key_set_by: null,
+    state: "Ready: a local file on this deployment.", ready: true, ...extra,
+  });  // prettier-ignore
+  const served: Record<string, unknown> = {
+    "/v1/admin/models": {
+      engines: [{ provider: GEMINI, key_state: "none", key_set_at: null, key_set_by: null, default_for: [] }],
+      defaults: {}, local_only: false, sendable_handling_codes: ["O"], source: "models file",
+      local_models: { extraction: "qwen2.5:7b-instruct", vision: null, transcription: null, embedding: "all-minilm" },
+    },
+    "/v1/admin/models/history": { entries: [] },
+    "/v1/admin/models/usage": { start: "2026-11-01", end: "2026-11-08", rows: [], by_engine: {}, by_job: {}, total: NONE },
+    "/v1/admin/maps": {
+      default: "osm-local", changed_in_admin: false, areas: [], schedule: { every_hours: null }, next_run_at: null,
+      providers: [row(OSM, 1), row(HOSTED, 3, { needs_key: true, state: "Needs a key: none is set.", ready: false })],
+      basemap: {
+        basemaps: [{ provider_id: "osm-local", file: "gb.pmtiles", built: false, size_bytes: null, built_at: null }],
+        glyphs_installed: false, glyph_fonts: ["Noto Sans Regular"], builder_ready: true,
+        builder_state: "Ready: Java and the map builder are installed.", regions: ["great-britain", "rutland"],
+      },
+    },
+    "/v1/admin/maps/history": { entries: [] },
+  };  // prettier-ignore
+  window.fetch = async (input: RequestInfo | URL) => {
+    const path = new URL(String(input)).pathname;
+    return new Response(JSON.stringify(served[path] ?? []), { status: 200 });
+  };
+}
+
 // `?serve=people` (L2.5): for the axe scans, the page serves Admin › People and Roles itself: two
 // people, one holding a team's custom role, their case levels, a case with no Author, the roles and a
 // disable plan; `show=` then opens *Disable…* (`disable`), a new role's form (`role-form`) or a team
@@ -78,7 +163,10 @@ if (serving === "people") {
                  members: [{ id: "u1", name: "Ana Analyst" }, { id: "u2", name: "Bea Engineer" }] };  // prettier-ignore
   const served: Record<string, unknown> = {
     "/v1/admin/people": [ANA, { ...ANA, id: "u2", username: "bea", name: "Bea Engineer", roles: ["data_engineer", "role:r1"] }],
-    "/v1/admin/organisation-arrivals": [],
+    // `?arrivals=1` (v0.6.0 #6): one refused organisation sign-in, so its name's face is measured.
+    "/v1/admin/organisation-arrivals": new URLSearchParams(location.search).get("arrivals") === "1"
+      ? [{ subject: "sub-1", provider_username: "pat.example", last_refused: "2026-11-05T09:30:00Z", attempts: 2 }]
+      : [],
     "/v1/admin/people/rows": {
       rows: [{ id: "u1", levels: [{ investigation_id: "c1", name: "Op Kestrel", level: "author", through: null },
                                   { investigation_id: "c2", name: "Op Heron", level: "editor", through: "Intel" }] }],
@@ -144,6 +232,16 @@ if (serving === "audit" || serving === "operations") {
     "/v1/admin/schedules": [{ recipe_id: "feed", label: "Daily custody export", case_id: "case-1", cron: "0 6 * * 1-5",
       timezone: "Europe/London", schedule: "every weekday at 06:00 (Europe/London)", owner: "approver-1",
       next_run: "2026-11-09T06:00:00Z", paused: false, paused_reason: null, flagged: false, last_run: null }],
+    // The section headings step: Operations' figures with every part drawn (the scheduler's health, an external
+    // trigger, a budget alert, a quota), so each of their headings is measured.
+    "/v1/admin/operations/runs": { days: 7, units: ["unit-1"],
+      rows: [{ day: "2026-11-10", pipeline_id: "r-calls", pipeline_label: "Wing phone calls", unit: "unit-1", trigger: "external",
+               runs: 2, succeeded: 1, refused: 1, failed: 0, wall_ms: 4200, rows_read: 120, graph_writes: 30, withheld: false }],
+      scheduler: { skipped: 1, missed: 0, running_now: 0, paused: [], refused: [{ reason: "the dataset's quota of 1 run a day is used", count: 1 }] },
+      external: [{ run_id: "SYN-RUN-1", pipeline_label: "Wing phone calls", service_identity: "syn-airflow", ran_as_name: "Sam Example",
+                   started_at: "2026-11-10T09:00:00Z", outcome: "succeeded", wall_ms: 2100, withheld: false }],
+      alerts: [{ scope: "dataset", key: "harbour-extract", day: "2026-11-10", words: "Harbour extract has used 80% of its 1 run a day." }],
+      quotas: [{ scope: "dataset", key: "harbour-extract", runs_per_day: 1, alert_at_share: 0.8 }] },
   };  // prettier-ignore
   window.fetch = async (input: RequestInfo | URL) => {
     const path = new URL(String(input)).pathname;
@@ -175,8 +273,37 @@ if (serving === "policies" || serving === "connections") {
     return new Response(JSON.stringify(served[path] ?? []), { status: 200 });
   };
 }
+// `?serve=packs` (the section headings step, 14 Nov): Demo packs with one synthetic pack loaded and one not, and
+// Dashboard identities with none registered, so each section's own headings are drawn. Synthetic (rule 9).
+if (serving === "packs") {
+  const PACK = { id: "fixture-a", title: "Fixture pack A (synthetic)", shows: "A small synthetic case.", delivery: "seed",
+                 licence: "CC0-1.0", case_name: "Fixture A", loaded_case_id: "case-a", command: "ospreyflow demo add fixture-a" };  // prettier-ignore
+  const served: Record<string, unknown> = {
+    "/v1/admin/demo-packs": [PACK, { ...PACK, id: "fixture-b", title: "Fixture pack B (synthetic)", loaded_case_id: null,
+                                    command: "ospreyflow demo add fixture-b" }],  // prettier-ignore
+    "/v1/admin/dashboards": [],
+  };
+  window.fetch = async (input: RequestInfo | URL) => {
+    const path = new URL(String(input)).pathname;
+    return new Response(JSON.stringify(served[path] ?? []), { status: 200 });
+  };
+}
+// The page's own frame is the window's: the harness's fixed 1100 by 800 root would bend it.
+if (framed) document.getElementById("root")!.removeAttribute("style");
+const place = <AdminPlace apiBaseUrl="http://keyboard-test.invalid" bearerToken="unused" rights={new Set(tab.split(","))} />;
 createRoot(document.getElementById("root")!).render(
-  <AdminPlace apiBaseUrl="http://keyboard-test.invalid" bearerToken="unused" rights={new Set(tab.split(","))} />,
+  framed ? (
+    <BrandFrame
+      appearance={brand === "govuk"
+        ? { brand: "govuk", serviceName: "Prison Intelligence", organisation: "Ministry of Examples", phase: "beta" }
+        : PLAIN_APPEARANCE}
+    >
+      <AdminWithoutCase apiBaseUrl="http://keyboard-test.invalid" bearerToken="unused" rights={new Set(tab.split(","))}
+        onStart={() => undefined} account={null} marking="OFFICIAL" />
+    </BrandFrame>
+  ) : (
+    place
+  ),
 );
 
 if (open) {

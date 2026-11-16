@@ -15,10 +15,33 @@ engineers, and the [architecture guide](architecture-guide.md), for how it is bu
 <!-- document-control:begin -->
 ## Document control
 
-**Version 1.51** · 2026-11-13 · For OspreyFlow v0.5.0 · Issued
+**Version 1.74** · 2026-11-16 · For OspreyFlow v0.6.0 · Issued
 
 | Version | Date | What changed |
 | --- | --- | --- |
+| 1.74 | 2026-11-16 | v0.6.0 (the owner, 16 Nov; built as v0.6.1's first item), the Glass's rows (ADR-145 Amendment 19, decisions 1 to 4): §3, the case line says what is on the graph, "Whole case" or "Saved view: ‹name›" with its tag, **Details ▾** and **Back to the whole case**, and stays one line on a narrow window; §5.13, no strip over the graph: *Details* holds the count of what could not be shown, that nothing changes the case, where the view came from with **← Back to the alert**, and a merged drawing's notes; focus to the saved view's name. Held by `tests/test_user_guide_navigation.py`, `tests/test_guide_navigation_words.py` and `tests/test_user_guide_saved_views.py`. §5.2, **Match strictness** is a control in the graph's toolbar, and **Hiding the toolbar**: **Hide toolbar** and **Show toolbar**, T with the graph selected, remembered for you in this browser; the Map has the buttons (ADR-145 Amendment 19, decisions 5 and 6). |
+| 1.73 | 2026-11-16 | §9's **Reports**: in the boards' editor a builder sees the figures behind every board, for every case and clearance, so the right to manage dashboards is given only to people cleared for all of them (ADR-148 Amendment 21, the owner's ruling of 16 November). |
+| 1.72 | 2026-11-15 | Ask & Chat (§6) opens as a page over the view, as the search results do, with **Back to** the view; the results page and the Ask page replace each other; the rail's row in §3 says so (ADR-145 Amendment 18, v0.6.0); *Show all on graph*'s words past the limit say *Save as a view* is under the answer in Ask & Chat, since the page has gone. Held by `tests/test_user_guide_ask_chat.py` and `tests/test_user_guide_ask_items.py`. Version set at merge. PDF made by the orchestrator at merge. |
+| 1.71 | 2026-11-15 | §6, *An answer's items* (v0.6.0 item 5, the owner's closed list): **Show all on graph** puts an answer's items on the case's graph, selected, a saved view closed first, what it cannot show a count and past the limit nothing; **Save as a view** names the view from the question and saves it as a saved view of the case. Held by `tests/test_user_guide_ask_items.py`. Version set at merge. PDF made by the orchestrator at merge. |
+| 1.70 | 2026-11-15 | §7.5: **What raises alerts** says why a hotlist or watch stopped, in the same words under *Stopped*; a stopped rule says nothing more (v0.6.0 #14, ADR-044 Amendment 1). Held by `tests/test_user_guide_alert_sources_stopped_why.py`. PDF made by the orchestrator at merge. |
+| 1.69 | 2026-11-15 | The header names v0.6.0, the one release v0.5.2's work ships in (the owner's plan of 15 November); v0.5.2 is not published. Held by `tests/test_guides_release_header.py`. Version set at merge. PDF made by the orchestrator at merge. |
+| 1.68 | 2026-11-15 | Ask & Chat (§6), "Earlier questions": each earlier question collapses to its line, the newest answer open, a closed line counting its proposals to decide (v0.6.0 item 3, the owner, 15 Nov). Version set at merge. PDF made by the orchestrator at merge. |
+| 1.67 | 2026-11-15 | Ask & Chat (§6): a marker sits after its words and is named "Show on the graph:" and what it shows; the line under an answer with markers; the engine named in lower case after "Answered by" (the owner, 15 Nov; ADR-129 Amendment 6). Version set at merge. PDF made by the orchestrator at merge. |
+| 1.66 | 2026-11-15 | The header names v0.5.2, the release this guide describes (step 5's sweep, §2, at the cut). Held by `tests/test_guides_release_header.py`. Version set at merge. PDF made by the orchestrator at merge. |
+| 1.65 | 2026-11-14 | "View" means a saved view alone (ADR-145 Amendment 17, ADR-144 Amendment 6). §3: the case line's **Saved views (n)** (*Saved views* while unread), and "› Saved view: ‹name›" while one is open. §4 and §5: the Cases panel's saved views, **More** in place of More views with its name for a screen reader, the case line's parts in their order; §5.2, **Clear the graph**. §5.13, *Saved views*: the strip's **Back to the whole case** first and its words, the list's **The whole case** row and *Open now*, a view saved under the Glass's default name told apart by its first item and when it was saved, focus to the strip and back, the canvas's notice in a saved view, and the graph toolbar's Views menu gone. §5.12, the client's words gone (studio's V3): the composition is **Rarity plus adds**, its scale the raw-sum scale, the measure the **share of pair links**, and the influencers' "to be confirmed" note struck. Held by `tests/test_user_guide_navigation.py`, `tests/test_guide_navigation_words.py`, `tests/test_user_guide_saved_views.py` and `tests/test_guides_no_client_words.py`. Version set at merge. PDF made by the orchestrator at merge. |
+| 1.64 | 2026-11-14 | §5.2: a batch result, and a view, up to the view's limit saved and opened with its links, and *Show links among all* on a large canvas, since the links among a set are found a thousand records at a time (ADR-124 Amendment 20). Held by `tests/test_user_guide_am20.py`. PDF made by the orchestrator at merge. |
+| 1.63 | 2026-11-14 | A watch whose owner is not held in *People and roles* quotes the stopped reason's new words ("Its owner is not held in Admin › People and roles.", ADR-148 Amendment 19). Version set at merge. PDF made by the orchestrator at merge. |
+| 1.62 | 2026-11-14 | §7.5: a watch stays active through two unreachable evaluations in a row, with a note saying so, and stops at the third (ADR-044 Amendment 2). |
+| 1.61 | 2026-11-14 | Step 5's wording sweep. §5.2: records arrive shown as one where they match, worked out for you alone (ADR-124 Amendment 19); *Mark for suppression (hides nothing yet)* as built, a mark that hides nothing, kept for the session that made it, the suppression itself not built; the batch job's limits (the Editor level, the expand right, ten minutes). §5.5: the limited line's reason, a 50-character search refused in the Conduit's words, and each group counting its own records. Then the early part. §2: a refresh keeps you signed in and where you were, for the tab alone, forgotten at sign-out (ADR-050 Amendment 3). §3: under GOV.UK, the slim header and phase banner and the one-row context banner on every screen but Home and sign-in (ADR-132 Amendment 8). §5.5: the box's filters as it labels them (Ignore case, Match, Entity types, Only nodes on screen, Reset filters), its more line, its limited line (a *Starts with* search alone), one character with *Only nodes on screen*, and a *Starts with* search of at most 50 characters where there is an index. §6: Ask & Chat for Ask the case. Held by `tests/test_guides_v051_gaps.py`, `test_user_guide_search_results.py` and `test_guide_navigation_words.py`. PDF made by the orchestrator at merge. |
+| 1.60 | 2026-11-14 | §5.2: an expansion past the working set's limit may be **run as a batch job** (ADR-151): run on the server as you, saved as a private view of the case, or refused with its figures past a view's own limit of 50,000 nodes and 250,000 links; its result opens as your private view when it is done, and the job carries on with the panel closed. Held by `tests/test_user_guide_batch_expansion.py`. PDF made by the orchestrator at merge. |
+| 1.59 | 2026-11-14 | §5.5: the fallback's depth line as studio's fix words it, "Only the first 100 matches are listed, and the filters apply to those alone.", shown only where the search found more than 100: the fallback asks one past its depth, so exactly 100 matches is a whole list. Held by `tests/test_user_guide_search_results.py`. PDF made by the orchestrator at merge. |
+| 1.58 | 2026-11-14 | §5.5: the fallback's paging as studio's fix built it: *Next page* offered only while a further page holds records, and where the search reached the fallback's 100, the last page's line adds, even with a dataset or a group chosen, "Only the first 100 matches are listed: narrow the search to see others." in the Conduit's words. Held by `tests/test_user_guide_search_results.py`. PDF made by the orchestrator at merge. |
+| 1.57 | 2026-11-14 | §5.5: the search results page as v0.5.2's step 3e′ built it (ADR-145 Amendment 15 Part A, spec 02 §2.0c): Enter on the typed words opens it over the view, a suggestion moved to still chosen; the heading and the Conduit's count, a group's own once chosen; the groups, the datasets and dates, *Clear filters*; 20 a page; each result's *Show on graph* (the records it stands for, one that could not be read said) and, for a document, *Open* (the results set aside while it is read over the view); *Back to ‹view›*; the empty line; the Ask line; a search over 200 characters refused with its limit named, never cut, and the Conduit's other refusals in its words; the fallback's one line, its first 100 exact matches, counts always marked incomplete, datasets without counts and no dates. §12: Enter in the top bar's search box. Held by `tests/test_user_guide_search_results.py`. PDF made by the orchestrator at merge. |
+| 1.56 | 2026-11-14 | §7.5: a *Stopped* hotlist or watch says why beside the word, each reason in the Conduit's words (ADR-044 Amendment 1). PDF made by the orchestrator at merge. |
+| 1.55 | 2026-11-14 | §6, Ask & Chat: **Whole case** as v0.5.2's Part D(iii) built it (ADR-098 Amendment 9, ADR-129 Amendment 5, rules-b's wording): the case searched with the question's own words, as you, by names and words, not meaning; a question past 200 characters refused with what to do; a document on the canvas read whole, one elsewhere by its passage; each other record a source, `[S-n]`, selecting its records. Held by `tests/test_user_guide_ask_chat.py`. PDF made by the orchestrator at merge. |
+| 1.54 | 2026-11-14 | The Glass's navigation as the owner decided it on 13 November (ADR-145 Amendment 15) and the selection's actions as Part C built them (ADR-078 Amendment 1). §3: the banner is the case line, "Case ‹name› ▾ · Views in this case · reads ‹dataset›", *All cases* opening the Cases panel, the cross-link *Open this case's data in the Ingest Studio ↗*; no mode lines. §4: the case switcher and the Cases panel in place of the rail's Cases drawer; *Roles, teams and Authors* from Admin and the Studio. §5's table: the rail Explore, Ask & Chat and History; the view switch Graph, Map, Drawing board and Reports, with Matrix, Figures, Ownership and Connection strength under More views; *Build a report*. §5.2: the selection bar's words and order, the menu's *Expand by link type*, the fold of types with no links, the selection's actions first, the menu key and Shift+F10. §5.12, §5.13, §5.14, §7.1, §8, §9 and §12 follow. Five screenshots marked for a new capture. Held by `tests/test_user_guide_navigation.py`. PDF made by the orchestrator at merge. |
+| 1.53 | 2026-11-14 | §7.5 and §7.11: where people sign in with Entra ID, your watches, hotlists and rules run as you, and a scheduled rule's run acts as you, while you have signed in within the last 24 hours (administration guide §6a.7; ADR-148 Amendment 16). PDF made by the orchestrator at merge. |
+| 1.52 | 2026-11-14 | §6, Ask & Chat, as v0.5.2's Part D built it (ADR-098 Amendment 7, rules-b's wording): **Read from** (*Selected items*, *Everything on the graph*, *Whole case* not available yet), the *About* and *Will read* lines and the engine before anything is sent, an answer from links and events when there is no document; *Ask the model about these…* on any selection saves a private view and asks there; asking needs Editor, no longer a document. Held by `tests/test_user_guide_ask_chat.py`. PDF made by the orchestrator at merge. |
 | 1.51 | 2026-11-13 | §7.5 and §7.11: where people sign in with Entra ID (a shared platform), a load judges only its starter's rules, hotlists and watches, a watch's own runs do not happen, and a scheduled rule is refused (administration guide §6a.7; docs' v0.5.2 sweep, part one). PDF made by the orchestrator at merge. |
 | 1.50 | 2026-11-13 | §3, §4, §5 and §5.13–5.14: the Glass's mode toggle is **Graph · Drawing board** (it was *Case · Boards*), with a line saying what each mode is (ADR-145 Amendment 13); **Views ▾** by the graph lists the case's saved views and opens one, the Cases drawer keeping its list (ADR-144 Amendment 3). PDF reprinted alone. |
 | 1.49 | 2026-11-13 | §5 and §6: the rail as the owner ruled (ADR-145 Amendment 12): Cases, Explore, *Ask & Chat* (Questions renamed) and Dashboards on the rail; *⋯ More* is *⋯ Explore Details*, holding History, Ownership and Connection strength; Help (and **?**) opens the keys, with the user guide's link, over any view, and closes again. PDF reprinted alone. |
@@ -135,6 +158,11 @@ your session has ended (you have been away, or your administrator has ended it),
 the selection, the map and anything you have typed, stays as it is. If the sign-in service cannot be
 reached, it says so and offers **Try again**.
 
+**Refreshing the page** keeps you signed in and where you were. It asks the sign-in service's own session
+first, without showing you anything, and shows the sign-in page only when that session has ended. Home stays Home, a case stays that case (on the view it had, where that is the graph, the map, the Matrix
+or Figures; on any other view, the Glass's first), and Admin, the Ingest Studio and Rules and Monitoring stay
+themselves; a place your roles do not open is shown as Home. This is kept for the tab alone, and **Sign out** forgets it, so the next person to sign in there does not start where you were.
+
 **Signing out**: the account button at the top right (your name and clearance) has **Sign out**.
 
 ## 3. Home
@@ -174,14 +202,24 @@ It is hidden when nothing waits.
 The OspreyFlow mark at the top left always brings you back.
 
 **Moving between places.** The **place switcher** in the top bar lists the same places; under the
-GOV.UK theme it sits inside the GOV.UK header. Under it, a **context banner** says where you are: in
-the Glass, "You are in the Glass · Graph · Drawing board", with the case you are in and the dataset it
-reads, and a line saying which you are in: "Graph: the case's data. Saved views are under Views or
-Cases." or "Drawing board: your sketch; it does not change the case's data." (on a narrow screen
-that line sits under the banner's row); elsewhere "You are in the Ingest Studio", "You are in Rules and Monitoring" or "You are in
-Admin". If you can open both the Glass and the Ingest Studio, the banner offers **Open ‹dataset› in
-the Ingest Studio ↗**, and from there **← Back to case ‹name› in the Glass**, which brings you back
-to the same case and view.
+GOV.UK theme it sits inside the GOV.UK header. Under it, a **context banner** says where you are. In
+the Glass it is the **case line**: "You are in the Glass · Case ‹name› ▾ · Saved views (n) · reads
+‹dataset›". The case switcher lists your cases, and its last entry, **All cases**, opens the **Cases**
+panel; **Saved views (n)**, n being how many saved views you may see (**Saved views** alone while they are still
+being read), opens the **Saved views** panel
+(section 5.13); then what is on the graph: "Whole case", or, while a saved view is open, "Saved view: ‹name›"
+with its tag, **Details ▾** and **Back to the whole case** (section 5.13); and the line names the dataset the case
+reads, or says "reads no dataset". On a narrow window the line stays one line: "reads …" and then the saved view's
+and the case's names are shortened (their whole words show when you point at them), and "You are in the Glass" is
+left out, before anything moves to a second line. Graph, Map, Drawing board and Reports are
+in the top bar's view switch, not here (section 5). Elsewhere it says "You are in the Ingest Studio",
+"You are in Rules and Monitoring" or "You are in Admin". If you can open both the Glass and the Ingest
+Studio, the banner offers **Open this case's data in the Ingest Studio ↗**, and from there **← Back to
+case ‹name› in the Glass**, which brings you back to the same case.
+
+**Under the GOV.UK theme**, on every screen but Home and the sign-in page, the GOV.UK header and the
+phase banner are slim, and the context banner, a GOV.UK notification banner, is folded into one row,
+"You are in …" at its start, so the canvas has more of the window.
 
 ## 4. Cases
 
@@ -207,8 +245,8 @@ What you may do in a case is your level and your **roles** together:
 
 Your administrator may also have given you a role of the deployment's own, or the **Super user**
 preset (Analyst, Data Engineer and Rule author together, still never the second person on your own
-work). The rail's **?** opens *Roles, teams and Authors*, which says the same in full: each place,
-role, right and level.
+work). *Roles, teams and Authors*, opened from Admin and from the Ingest Studio, says the same in full:
+each place, role, right and level.
 
 **Starting a case.** **Create case** asks you to name the case and choose what it reads: **Use an
 existing dataset…**, or **Make a new dataset — empty, loaded in the Ingest Studio**. You may tick the
@@ -231,11 +269,11 @@ members, and the Authors of the dataset's home case, read them, and its lead, or
 each to a member (**Give to**) or sets it aside with **Suppress until…**. *Coming:* a case level
 given to a team.
 
-The case menu at the top left lists your cases. The rail's **Cases** drawer lists them too, with
-**Who can open this case**, which the Author manages, and the case's **views** (section 5.13). A link
-to a case opens it directly.
+The case switcher on the case line (section 3) lists your cases. Its last entry, **All cases**, opens
+the **Cases** panel, which lists them too, with the case's **saved views** (section 5.13), **Browse all
+cases**, and **Who can open this case**, which the Author manages. A link to a case opens it directly.
 
-**The case brief.** The **Cases** drawer also holds the case's **Brief**: what the case is for.
+**The case brief.** The **Cases** panel also holds the case's **Brief**: what the case is for.
 
 - **Priority information requirement** is one statement of the question that matters most.
 - **Information requirements** are up to twenty, each of up to 2,000 characters, each marked **Open** or
@@ -275,13 +313,14 @@ added from outside, such as a VAST Challenge dataset, is a case of its own named
 
 ## 5. The Glass
 
+<!-- needs a new capture: shows the rail and banner before ADR-145 Amendment 15 -->
 ![A case with nothing drawn yet: Where to start](images/user/04-case-where-to-start.png)
 
 | Part | What it is |
 | --- | --- |
-| **Top bar** | The place switcher, the case menu, search, the view switch (Graph and Map, with Matrix and Figures under **More views**), Export, and your account |
-| **Context banner** | Where you are: the Glass's **Graph** and **Drawing board**, with a line saying which is open, the case and the dataset it reads |
-| **Left rail** | Cases, Explore, **Ask & Chat** and Dashboards, then **⋯ Explore Details** with History, Ownership and Connection strength, those your rights allow; and **Help** (**?**), which opens the keys and the user guide over any view and closes again with a second press or Esc |
+| **Top bar** | The place switcher, search, the view switch (**Graph**, **Map**, **Drawing board** and **Reports**, with **Matrix**, **Figures**, **Ownership** and **Connection strength** under **More**, those your rights allow; for a screen reader **More** is *More ways to show the case*, and while one of its own is open it shows that one's name), **Build a report (opens in new tab)** (section 9), Export, and your account |
+| **Context banner** | The case line: the case switcher, **Saved views (n)**, what is on the graph ("Whole case", or the open saved view with **Details ▾** and **Back to the whole case**), and the dataset the case reads (section 3) |
+| **Left rail** | **Explore**, **Ask & Chat** and **History**, those your rights allow: Explore and History each open their panel beside the view, and Ask & Chat opens as a page over it (§6); a second press closes each again; **Help** (**?**), which opens the keys and the user guide over any view and closes again with a second press or Esc; and **Show names** |
 | **Canvas** | The graph, the map, the Matrix or the case's figures |
 | **Right column** | The Inspector, Metrics, the query builder and Find connections, stacked; **Full width** and **Hide** |
 | **Timeline** | Folded at the bottom until opened |
@@ -297,21 +336,53 @@ list** (section 5.5) is a fold here too.
 
 ### 5.2 The graph
 
+<!-- needs a new capture: shows the rail and banner before ADR-145 Amendment 15 -->
 ![The graph, with its groups shown](images/user/05-canvas.png)
 
 **Selecting.** Click a node; Shift-, Ctrl- or Cmd-click adds or removes one; or draw a lasso. The
-selection bar then offers **Expand**, **Show links among these**, **Save as a view** (section 5.13),
-**Remove from view** and **Clear** (Esc). Past one degree, **Show links among these** draws the routes
-between the selected nodes, says which pairs are not connected, and says when the routes are already
-drawn. **Remove from view** and **Clear view** take nodes off the canvas; a node you put back brings
+selection bar then offers **Expand**, **Show links** (for two or more, with how far to look, "direct"
+or "within 2" to "within 6", stepped by − and +), **Ask the model about these…** (section 6), **Save as
+a view** (section 5.13), **Remove from view** and **Clear** (Esc), and **Undo select what is lit**
+after a selection made by what is lit. Past one degree, **Show links** draws the routes between the
+selected nodes, says which pairs are not connected, and says when the routes are already drawn. **Remove from view** and **Clear the graph** take nodes off the canvas; a node you put back brings
 its links in the view back with it.
 
-**Expanding.** Double-click, or press Enter, to draw a node's links. Right-click (or `\`) opens its
-menu: **Show links** lists each kind of relationship with how many there are, so you can draw just
-one; **Actions** holds Link to…, Split from…, Find paths to…, Explain cluster, View messages, Expand
-group, Read full screen and Add files held by this…. An expansion that would add more than
+**Hiding the toolbar.** **Hide toolbar**, at the right-hand end of the graph's toolbar, hides it and
+gives its room to the graph. The case line then becomes one short line, with **Show toolbar** at its
+right-hand end to bring it back. With the graph selected (click it, or Tab to it), press T to hide or
+show the toolbar. The map's toolbar hides in the same way, with its buttons, under the same setting; the
+drawing board has no toolbar to hide. OspreyFlow
+remembers your choice in this browser, so the Glass opens as you left it. On a narrow window the
+toolbar's words are shorter (**Strictness** and **Hide**), so it stays on one row.
+
+**Expanding.** Double-click, or press Enter, to draw a node's links. Right-click (or `\`, the menu
+key, or Shift+F10) opens its menu, on the selection: a right-click on something not selected selects
+it first. The selection's own actions come first, in the bar's words. **Expand by link type** lists
+each kind of relationship with how many links it has, so you can draw just one; the kinds with none
+fold into one line ("7 types with no links") that opens in place. **Actions** holds what the item
+offers, as its type allows: Explain cluster, View messages, Expand group, Read full screen, Add files
+held by this…, Set picture… and Mark for suppression (hides nothing yet); with two selected, only the pair's own: Link
+to…, Split from… and Find paths to…. In a saved view, the menu offers only what changes nothing in the case. An expansion that would add more than
 **500** nodes asks first, offering one relationship at a time, all of them, or nothing. An expansion
-past the working set's own limit is refused; reduce what is drawn, or save a smaller view, and try again.
+past the working set's own limit is refused; reduce what is drawn, save a smaller view, or **Run as a
+batch job**. A batch job runs the same expansion on the server as you, reading only what you may see,
+and saves what it finds as a private view of the case; nothing is added to the case's own graph. When
+it is done, its result opens as your private view; if it cannot be opened, it stays in
+**Saved views**. A result too large for a view to show, more than **50,000** nodes or **250,000** links, is
+refused with its figures and saves nothing: narrow it by link type, depth or dates. The links among
+the records are found a thousand records at a time, so a result up to that limit is saved with its links and its
+view opens with them, and **Show links among all** on a large canvas keeps working as it grows. A batch job needs the Editor level on the case, since its result is saved as a view of it, and the right to
+expand; without either the panel says why and starts nothing. While it runs the panel says "The batch job is under
+way."; one that would take longer than ten minutes is stopped and saves nothing. One batch job of yours runs in a
+case at a time, and its panel says so: "Closing this does not stop the job. While it
+runs, asking for a batch expansion in this case again follows it."
+
+**Mark for suppression (hides nothing yet)** proposes a record for suppression, in the open. It asks first
+"Why should it be suppressed?", which is required and kept with the mark; then the node is marked, and the Explore
+panel lists it, with who marked it, when, and why. A mark hides nothing and changes no record: the node is still
+shown, cited and exported as before, to everyone who may see it. The marks are read back from the case, so on a
+marked node the menu offers **Remove suppression mark** in its place, which asks nothing. A suppression that takes
+effect, once its evidence is loaded through the Ingest Studio, is not built yet.
 
 **Reading a link.** A link's stroke says where it came from: **solid** from a record, **dashed**
 inferred by a model, **dotted** unresolved. Hovering names its type and how many such links join the
@@ -346,8 +417,11 @@ are dots.
 **Same-as links.** Records OspreyFlow thinks are one are joined by a same-as link. Its menu offers
 **Collapse into one node** (for this view only), **Confirm as the same**, **Mark as not the same**
 and **Explain this link**. Confirming or marking needs a reason, kept in the audit with your name.
-**Match strictness** at the top of the graph sets how sure a match must be to show records as one —
-Strict, Balanced (the default) or Broad — and says how many merged and split.
+**Match strictness** in the graph's toolbar, after Layout, sets how sure a match must be to show records as
+one. Press it to open its slider: Strict, Balanced (the default) or Broad. It says how many merged and split.
+Records drawn into the graph, by a search, an expansion or a list, arrive already shown as one where they
+match at the case's strictness, with **Explain cluster** on them. What is shown as one is worked out for you
+alone, from the records you may see: a record hidden from you joins nothing. When someone else on the case changes the strictness, your graph shows it in full when the case is loaded again; an expansion brings it only for the records it adds.
 
 **Groups.** **Communities** boxes groups of closely linked entities; fold a group from its box, or
 press `G` on a node in it. **Layout** offers Organic, Force-directed tree, and Clustered bubbles;
@@ -358,6 +432,7 @@ press `G` on a node in it. **Layout** offers Organic, Force-directed tree, and C
 
 ### 5.3 The map
 
+<!-- needs a new capture: shows the rail and banner before ADR-145 Amendment 15 -->
 ![The map, with sites, boundaries and hotspot cells](images/user/06-map.png)
 
 The map shows the same working set and selection as the graph. A location is drawn at its point,
@@ -414,14 +489,56 @@ it.
 
 ### 5.5 Search
 
+<!-- needs a new capture: shows the rail and banner before ADR-145 Amendment 15 -->
 ![Search: suggestions after two characters](images/user/16-search.png)
 
-Press `/` anywhere (outside a text box) to search. Suggestions start at two characters, across names,
-identifiers and titles; choosing one puts it in the case and draws it with what is near it (three
-links out), counting first and asking if it is a lot. Cancelling a large draw leaves the chosen node in
-the case on its own. **Filters** narrow by entity type, how the text matches, and whether to look only at what
-is already drawn. A phone number or account reference is read the same way however you type it, so
-`07700 900640` finds the number held as `+447700900640`.
+Press `/` anywhere (outside a text box) to search. Suggestions start at two characters (one, with **Only nodes on screen**), across names, identifiers and titles; choosing one puts it in the case and draws it with what is near it (three links
+out), counting first and asking if it is a lot. Cancelling a large draw leaves the chosen node in the case
+on its own. **Filters** narrow them: **Ignore case**; **Match**, *Starts with*, *Contains* or *Exact*;
+**Entity types** (none ticked searches every type); and **Only nodes on screen**. **Reset filters** puts
+them back. When more match than are shown, the box says "Showing the first …; more match. Keep typing to
+narrow." Where the search index cannot answer a *Starts with* search, the box says why: "Suggestions match only the exact
+start of a name or identifier: this deployment has no search index.", or, while the index cannot be reached or
+catches up with recent changes, that suggestions are limited just now. A *Starts with* search is at most 50
+characters where there is an index; a longer one is refused in the Conduit's words, "a suggestion is at most 50
+characters". A phone number or account reference is read the same way
+however you type it, so `07700 900640` finds the number held as `+447700900640`.
+
+**The results page.** Press Enter on the words you typed, with no suggestion moved to, and the results
+fill the main area over the view you were on, which waits beneath them as it was and cannot be reached
+until you leave them; a suggestion moved to with the arrow keys is still chosen by Enter. The page is
+headed "Search results for '…'", with the number of records under it as the Conduit counts them: the
+total, or a group's own count once you choose one, and "(counts may be incomplete)" when the Conduit
+cannot be sure. **All**, then each group with its count, narrows the list. Each group counts its own records, and a record can
+be in more than one (a document is both a Document and *Mentioned in documents*), so **All** need not be the groups
+added up; the page says so where there is more than one group. Beside it, under the page's
+own filters, **Datasets** and **Dates** narrow it again to what the search offers, and **Clear filters**
+undoes them. The search box's **Filters** shape its suggestions alone: the page starts at **All** with
+no filter. Results come 20 a page, with **Next page** and **Previous page**. Each gives its name as the
+canvas names it, its type, why it matched and its date, and for a document the passage with the
+matched words marked. **Show on graph** puts the records the result stands for on the graph, selects
+the first and takes you there; a record the result names that could not be read is said, as in "1 of
+its 2 records could not be read.", never left out in silence. **Open**, for a document, sets the
+results aside and reads it over the view; they come back when you close it. **Back to ‹view›** returns
+to the view as you left it. With nothing found the page says "No records match '…'.", or "No records
+match '…' in this group." once a group is chosen, with **Clear filters** where a filter is on. Where
+Ask & Chat is offered to you, a last line, "Ask a question about '…' instead", opens it with your words
+in the question box, sending nothing until you press **Ask**.
+
+A search can be at most 200 characters. A longer one is refused, saying the limit and how many
+characters yours has, and is never cut short: shorten it and press Enter again. Other refusals come in
+the Conduit's words, as when a date filter's end is before its start ("the date filter ends before it
+starts") or a page is asked for past the deepest the search lists ("results are listed 1000 deep at
+most; narrow the search to see further").
+
+Where the search index cannot answer, the page says so in one line, such as "Search is limited to
+exact identifiers: this deployment has no search index.", and looks no further than the first 100
+exact matches. Its counts are of those, and always marked incomplete; the datasets are offered without
+counts, and there are no dates to filter by. A date filter already set is not applied, and the line
+then adds "The date filter is not applied." **Next page** is offered only while a further
+page holds records, and where the search found more than 100, the last page's line adds "Only the
+first 100 matches are listed, and the filters apply to those alone.", even when a dataset or a group
+has narrowed the list.
 
 **Add many from a list.** The list button beside the search box (**Add many from a list**), and the fold
 of that name in **Where to start**, take a list of identifiers and draw what is found. Adding needs
@@ -610,7 +727,7 @@ OspreyFlow ships two. **Direct link**: calls, money transfers, visits and cell s
 stronger than links that are only inferred or shared. **Evidenced by an assault, disorder or find**:
 a role in such an incident, and a conflict, association or cell share between people in one, are drawn
 stronger. Their sizes are calibrated so that a boost moves an ordinary link about as far as doubling
-its count would, and are marked "to be confirmed with the client". Boosts add up.
+its count would. Boosts add up.
 
 **An influencer applies only if you may see the record that evidences the link,** or, for a dataset,
 only if your case reads that dataset. An assault report above your clearance never thickens a line
@@ -620,8 +737,7 @@ weight never changes: influencers are applied as the link is read, so a change t
 
 **3. Shared-attribute rarity.** Two people who share something few others share are more interesting
 than two who share what everyone does. A thing two people of one kind share (a cell, a phone number, a
-visitor, a report, a group) is a **shared value**. By default rarity is worked out as the client works
-it out: a value held by *k* people links *k × (k − 1) / 2* pairs, and its rarity is one less its share
+visitor, a report, a group) is a **shared value**. By default rarity is worked out as the **share of pair links**: a value held by *k* people links *k × (k − 1) / 2* pairs, and its rarity is one less its share
 of all the pairs linked through values of its kind. A phone two people share, among phones that link
 few pairs, scores near 1; the prison everyone is held in scores near 0. Two people take the rarity of
 the rarest value they share. Your installation may choose the earlier measure instead, **inverse
@@ -629,7 +745,7 @@ frequency**, which adds, for each thing two people share, the logarithm of how m
 over how many share it; the legend says which is in force. It is worked out per dataset unless you
 choose across the case's datasets, and **only over what you may see**: if two analysts have different
 access, they can see different rarity for the same pair, and both are right for what each may see.
-Rarity is its own measure, never folded into the strength, except under client parity (below).
+Rarity is its own measure, never folded into the strength, except under rarity plus adds (below).
 
 **Two compositions.** How the three ideas make a strength is the installation's choice, shown in the
 legend:
@@ -637,14 +753,13 @@ legend:
 | Composition | Strength is | Drawn on |
 | --- | --- | --- |
 | **Standard** (shipped) | the link's stored weight, from its own count and recency, with the influencers applied | 0 to 1 |
-| **Client parity** | rarity plus the influencers' added boosts, with no count and no recency: the client's own sum | 0 to 1, through a curve that keeps the sums' order; the Inspector also shows the **raw sum on the client's scale** |
+| **Rarity plus adds** | rarity plus the influencers' added boosts, with no count and no recency: a raw sum | 0 to 1, through a curve that keeps the sums' order; the Inspector also shows the **raw sum on the raw-sum scale** |
 
-Under client parity, a stored link's rarity is that of the link itself among the links of its type you
+Under rarity plus adds, a stored link's rarity is that of the link itself among the links of its type you
 can see in its dataset (one less one over how many there are), and a pair linked through a shared
 value takes that value's rarity. Only added boosts count in the sum: a multiplier, floor or exclusion
-is left out, and the legend says so. Because rarity is worked out over what you may see, so is a
-client-parity strength. An installation chooses its composition in the same way as its influencers (a
-proposal and a second person's approval); a case's Author may switch one case to client parity, to
+is left out, and the legend says so. Because rarity is worked out over what you may see, so is a strength under rarity plus adds. An installation chooses its composition in the same way as its influencers (a
+proposal and a second person's approval); a case's Author may switch one case to rarity plus adds, to
 compare the two on the same case, and back.
 
 **Where you see it:**
@@ -667,12 +782,11 @@ compare the two on the same case, and back.
 - **The Inspector** explains a selected link under **Connection strength**: its count against what is
   heavy for its type, when it was last seen, the rule and weights version it was worked out under,
   each influencer that changed it and the kind of record (or the dataset) that evidenced it, and what
-  its two ends share, rarest first, with the measure named. Under client parity it shows instead the
-  link's rarity term, each boost added, and the **raw sum on the client's scale**, beside the strength
+  its two ends share, rarest first, with the measure named. Under rarity plus adds it shows instead the link's rarity term, each boost added, and the **raw sum on the raw-sum scale**, beside the strength
   it is drawn at. With two people selected, **What these two share** does the same for them.
 
 **Who changes influencers.** An installation-wide set is proposed in the Glass's **Connection
-strength** (on the rail) by someone holding the right to manage influencers, and takes effect only when **another**
+strength** (under **More**) by someone holding the right to manage influencers, and takes effect only when **another**
 person with that right approves it; the proposer can withdraw it but never approve it, and every
 version is kept; a version may also choose the composition and the rarity measure. A case's **Author**
 may add influencers for that case, switch off installation-wide ones in it, or choose its composition
@@ -681,28 +795,40 @@ that case, and the legend marks it. Both are recorded in the audit.
 
 **Rules on strength.** A rule written as a sentence (§7.6) may say "and the connection strength
 between it and … reaches X", or "… the shared-attribute rarity between it and another … reaches X". A
-strength figure is on the drawn scale (0 to 1) or **on the client's scale** (the raw sum, which only
-client parity has: under the standard composition such a rule raises nothing). It is previewed like
+strength figure is on the drawn scale (0 to 1) or **on the raw-sum scale** (the raw sum, which only rarity plus adds has: under the standard composition such a rule raises nothing). It is previewed like
 any other, and judged as its author, on what its author may see: it never raises an alert on evidence
 its author could not read.
 
-### 5.13 Case views
+### 5.13 Saved views
 
-A **view** is a saved lens on the case: what was drawn, its filters and its period. It is never a
-copy: there are no branches, and nothing in a view changes the case.
+A **saved view** is a saved lens on the case: what was drawn, its filters and its period. It is never a
+copy: there are no branches, and nothing in a saved view changes the case.
 
 - **Saving.** Select what matters and choose **Save as a view** in the selection bar; name it under
-  **View name** and **Save view**. A new view is yours alone.
-- **Finding them.** **Views ▾**, in the graph's toolbar beside *Clear view*, lists the views you may
-  see, each marked *Private* or *Shared*, the one open now marked too; choose one to open it. Before
-  you have any it says "No saved views yet. Select nodes and choose Save as a view." The rail's
-  **Cases** drawer also lists them, under **Views in this case**, each with
-  **Open**, **Share with the case** and **Delete** ("Delete this view? Nothing on the case is deleted
-  with it."). Only the person who saved a view shares or deletes it. Before you have any it says "No
-  views yet. Select nodes on the canvas and choose *Save as a view*."
-- **Opening one** reads the case through it, read-only. A banner says "View: ‹name›", whether it is
-  shared or private, and "Nothing in a view changes the case.", with **Back to the case**. A view
-  opened from an alert also says "Opened from an alert" and offers **← Back to the alert**.
+  **View name** and **Save view**. A new saved view is yours alone.
+- **Finding them.** **Saved views (n)**, on the case line, opens the **Saved views** panel: on the case's
+  own screen it is the one route to them, and the **Cases** panel, from **All cases**, still lists each
+  case's saved views. The list starts with **The whole case**,
+  marked *Open now* when no saved view is open, and offering **Open** (*Open the whole case*, to a screen
+  reader) while one is, which does what **Back to the whole case** does. Then each saved view you may see,
+  with its *Private* or *Shared* tag. One saved under the name the Glass gives a selection ("Selection of
+  3 nodes") is told apart by a second line: its first item, as you may see it, and when it was saved
+  ("‹first item› · saved 14 Nov 2026, 12:01"), or when it was saved alone ("Saved 14 Nov 2026, 12:01").
+  The one open now is marked *Open now* and offers no **Open**; the others offer **Open**, and to the
+  person who saved them **Share with the case** and **Delete** ("Delete this view? Nothing on the case is
+  deleted with it."). Before you have any it says "No views yet. Select nodes on the canvas and choose
+  *Save as a view*."
+- **Opening one** reads the case through it, read-only. The case line says so: "Saved view: ‹name›", its
+  *Private* or *Shared* tag, **Details ▾** and **Back to the whole case** (the GOV.UK back link in that
+  look). Nothing is drawn over the graph, so it does not move when a saved view opens or closes.
+  **Details** opens over the graph and says how many of its items could not be shown when any could not,
+  "Nothing in a saved view changes the case.", and, for a saved view opened from an alert, "From alert
+  ‹title›" with **← Back to the alert**; for a merged drawing it offers **Notes from the drawing (n)**. Esc
+  closes it. A saved view opened from an alert also offers **← Back to the alert** on the case line itself.
+  Focus moves to the saved view's name on the case line; **Details** is the next Tab, then **Back to the
+  whole case**, which returns focus to **Saved views (n)**. An action that would change the case says
+  instead "This is a saved view: nothing in it changes the case. Go back to the whole case to change it."
+  With no saved view open the case line ends "Whole case".
 
 ### 5.14 Drawing boards
 
@@ -711,9 +837,9 @@ declare a person, an account or a place, and draw the links between them. What y
 the case's own **analyst layer**: it is read with the case's dataset but never written into it, and
 no other case can see it or infer it. The analysis canvas never draws.
 
-**Opening a board.** Choose **Drawing board** in the context banner: "Drawing boards in case ‹name›".
-The banner then says "Drawing board: your sketch; it does not change the case's data."; **Graph**
-takes you back to the case's data.
+**Opening a board.** Choose **Drawing board** in the top bar's view switch: "Drawing boards in case
+‹name›", and above the board, "Drawing board: your sketch; it does not change the case's data.";
+**Graph**, in the same switch, takes you back to the case's data.
 **New board** asks for a **Board name** and where to **Start from**: blank, **From a view of this
 case**, or **From the selection** (its items as live references); then **Make the board**. A new board
 is yours alone until you **Share with the case**; on a board someone else drew you read it, "Read
@@ -783,13 +909,51 @@ the case's analyst layer.
 
 ## 6. Ask & Chat: questions to the model
 
+<!-- needs a new capture: shows the rail and banner before ADR-145 Amendment 15, and Ask & Chat as a drawer before Amendment 18 -->
 ![Ask & Chat (named Questions in this picture): ask about the documents in this case](images/user/12-questions.png)
 
-**Ask & Chat** (on the rail; it was named *Questions*) asks the deployment's model about the documents in this case that you can see, and about
-**graph facts**. It answers from those only, citing each — **Draws on** opens a document. What it
+**Ask & Chat** (on the rail; it was named *Questions*) asks the deployment's model about what you choose
+under **Read from**: **Selected items** (what you have selected, everything one link from it, and the
+documents among them; the choice when something is selected), **Everything on the graph** (every item,
+link and document you can see), or **Whole case** (the case searched with your question's own words, as
+you, so it finds things by their names and words, not by what they mean; a question of more than 200
+characters is refused, with what to do instead). Above the question it says what that is about ("About:
+Tarbuck, Kyle and 1 other"), what will be read ("Will read: 1 document, 3 items and 2 links") and which
+engine will answer, before anything is sent. It answers from the documents and **graph facts** only,
+citing each — **Draws on** opens a document. Under *Whole case*, a document on the canvas is read whole
+and one elsewhere in the case by the passage the search found; each other record found is a source,
+cited as `[S-n]`, which selects its records on the canvas. With no document to read it answers from the
+links and events, and says so under the answer. What it
 proposes, you **Accept** or **Reject**; an accepted proposal enters the graph as *inferred*.
-**Ask the model about these…** on a selection of documents starts a case of its own for them. Asking
-needs Editor, and at least one document you can see in the case.
+**Ask the model about these…** on any selection saves it as a private view and asks there. Asking
+needs Editor.
+
+**An answer's items.** Under an answer whose markers stand for items, **Show all on graph** puts every
+item they stand for on the case's graph and selects them together, the view moved to the first; a saved
+view that is open is closed first, since the items go on the case. What it cannot show, a record you may
+not see or no longer held, or a link whose two ends you cannot both see, is told only as a count ("3 of
+this answer's items could not be shown."), never which. Past the graph's limit it adds nothing and says
+so ("Too many for the canvas: … Nothing was added; Save as a view, under the answer in Ask & Chat, keeps them all.").
+**Save as a view**
+opens the *Save as a view* form under the answer, named "Answer: " and the question (cut at a word after
+72 characters), or "Answer from Ask & Chat" when there is no question; saving says "Saved as a view:
+‹name›. Open it from Saved views." It is a saved view of the case, private to you until shared, and
+**Saved views (n)** counts it (section 5.13). An answer whose markers stand for links alone offers only
+**Show all on graph**.
+
+**Earlier questions.** The questions asked in the case (or in a view) are listed in the order asked, the
+newest open with its answer and each earlier one closed to its question's line. Choose a line, or press
+Enter on it, to open that answer, and again to close it; opening one closes no other. Asking a new question
+closes every earlier one. A closed answer's markers and buttons are not reached by Tab until it is open; if
+it holds proposals you have not yet accepted or rejected, its line says so: "2 proposals to decide".
+
+**A page of its own.** Ask & Chat opens as a page filling the main area, as the search results do,
+with the view you left kept beneath it, unchanged. **Back to** the view (*Back to Map*, say) is its
+first link and puts that view back, as does pressing Ask & Chat on the rail again; focus returns to
+Ask & Chat on the rail. A search from the page shows the results in its place, and the results' *Ask a
+question about '…' instead* opens it in theirs; Back from either goes to the view, not to the other.
+Choosing a view, a saved view or another place leaves it too. Selecting a marker in an answer, or
+**Show all on graph** under it, leaves the page and shows the graph with those items in view.
 
 **Graph facts.** Along with the documents, the model is given a numbered, plain account of the graph
 around what you have selected and one link beyond it (the whole view when nothing is selected). A
@@ -799,8 +963,14 @@ and last date, how often it occurred, its dataset's label and whether it is dire
 events for each month. It holds only what you may see, and never an identifier of the system. It has no
 path facts: a question about a connection is answered from the links it holds.
 
-In an answer, each `[G-n]` is a button, "Select [G-1] on the canvas". It selects what the fact stands
-for and brings it into view: the link if one drawn link is meant, otherwise its nodes. A fact the model
+In an answer, each `[G-n]` and `[S-n]` is a short marker, one space after the words it follows. Its name,
+read aloud and shown when you point at it, says what choosing it shows: "Show on the graph: SHAH, Rohan –
+associated with – MERCER, Dana" for a fact, its two ends as the canvas names them, or "Show on the graph:
+KESTREL, Ann" for a source. A line under the answer says "Select a marker to show that item on the graph."
+Choosing a fact's marker selects what the fact stands for and brings it into view: the link if one drawn
+link is meant, otherwise its nodes. An answer kept from before facts were described names a fact by its
+number, "Show on the graph: graph fact 1". Read aloud, each name ends with the marker itself, "…, [G-1]", so
+you can say the marker you see to choose it. A fact the model
 cites that was not in the account it was given is dropped and counted among the items left out.
 
 The documents and the graph facts share one limit. Over it, the question is refused, saying how many
@@ -830,11 +1000,11 @@ deployment's own model is chosen instead. Every dataset starts at "never", so un
 changes yours, every question is answered by the deployment's own model.
 
 **"Answered by …".** Under each answer, a small line says which engine and model produced it, for
-example "Answered by Gemini (gemini/gemini-2.5-flash)" or "Answered by This deployment's own model
+example "Answered by Gemini (gemini/gemini-2.5-flash)" or "Answered by this deployment's own model
 (qwen2.5:7b-instruct)". It is what the deployment says it used, not what you chose. An answer kept
 before engines were named has no such line. **Ask to search** shows the same choice and line, and the
 choice applies there too: your question is about the case, so it goes under the case's handling and
-from the case's datasets, through the same two checks as Ask the case. It reaches the engine you chose
+from the case's datasets, through the same two checks as Ask & Chat. It reaches the engine you chose
 only when the case's material, as you see it, may leave the deployment and every dataset of the case
 allows that engine; otherwise the deployment's own model answers, and its line says so.
 
@@ -868,7 +1038,7 @@ none open, it says "Open a case to see its alerts and what raises them." Its tab
 - **Held rows**: the rows a rule held before they loaded. You see it as an Editor or Author of the case;
 - **Changes**: the rule audit. You see it as an Author of the case, or as an administrator.
 
-**Connection strength** is not here: it is in the Glass's rail (section 5).
+**Connection strength** is not here: it is in the Glass, under **More** (section 5).
 
 **One queue holds every alert you may see.** **Kind** names its five kinds:
 
@@ -1036,6 +1206,33 @@ queue on **Alerts**. There is no Watches tab and no separate inbox.
   monitor**. Each runs as data loads, and on its own as you choose: "Daily at 06:00, and as data
   loads", "Weekly, and as data loads" or "Only as data loads".
 
+**A watch that is *Stopped* says why**, beside the word, in these words (ADR-044 Amendment 1):
+
+- its owner was disabled, or, as a guest, is no longer admitted: "Its owner can no longer sign in to
+  OspreyFlow."
+- on a deployment signing in with Entra ID, its owner's access is out of date: "Its owner has not
+  signed in to OspreyFlow within the last 24 hours, so their clearance and unit are out of date. It
+  is active again at the first load after they sign in."
+- on Entra ID, its owner is not in *People and roles*: "Its owner is not held in
+  Admin › People and roles."
+- the identity provider refused: "The identity provider refused to act as its owner."
+- its owner's sign-in could not be checked at three loads in a row: "Its owner's sign-in could not be
+  checked at three loads in a row. It is tried again at the next." One or two such loads leave it
+  *Active*, matching nothing, and say so beside the word: "Its owner's sign-in could not be checked at
+  the last load. It stops if that happens at three loads in a row." or "Its owner's sign-in could not
+  be checked at the last two loads. It stops if the next is the third in a row." (ADR-044 Amendment 2)
+- its owner could not be acted as, for no reason given: "Its owner could not be acted as at the last
+  load."
+- a watched pattern whose saved pattern is no longer its owner's: "Its saved pattern is no longer
+  its owner's."
+
+A hotlist or watch stopped because its owner could not be acted as is active again at the first load
+that can act as them. One whose saved pattern is no longer its owner's stays stopped until it is.
+
+**What raises alerts** says the same words under *Stopped* beside each of your stopped hotlists and
+watched patterns. A rule there that is *Stopped* says nothing more, as a rule's retirement records no
+reason.
+
 **From the Glass.** In the Query builder, **Save as a watch** on a saved pattern makes a watched
 pattern of the case's dataset: "Saved as a watch: it runs as data loads and daily, and is kept in
 Rules and Monitoring › What raises alerts." In the Inspector, **Watch for this** on an entity that
@@ -1078,8 +1275,10 @@ An alert on another analyst's hotlist is listed to you only when its owner share
 and says "read from data this case does not read", with no file and no row (section 5.6): a file name
 is as much a source as a row.
 
-**Where people sign in with Entra ID** (a deployment on a shared platform), a load judges only the
-rules, hotlists and watches of the person who started it, and a watch's own runs do not happen: the
+**Where people sign in with Entra ID** (a deployment on a shared platform), your rules, hotlists and
+watches are judged at another person's load, and your watch's own runs happen, only while you have
+used OspreyFlow within the last 24 hours. Otherwise, at a load your hotlists and watches are marked
+*Stopped*, with that reason beside it, until the first load after you sign in again: the
 administration guide, §6a.7, says why.
 
 ### 7.6 The rule editor: a rule written as a sentence
@@ -1111,8 +1310,7 @@ understood.
 - **How often.** Optionally, a number of times, a total amount or a first time, within some days
   (§7.7).
 - **How strongly connected.** Optionally: *the connection strength* between the subject and something
-  it is linked to (by a link type, or any; to a type, or anything) *reaches* a figure up to 1, or *on
-  the client's scale* a raw sum up to 10 (met only under client parity); or *the
+  it is linked to (by a link type, or any; to a type, or anything) *reaches* a figure up to 1, or *on the raw-sum scale* a raw sum up to 10 (met only under rarity plus adds); or *the
   shared-attribute rarity* between it and another of its type *reaches* a figure, per dataset or across
   the case's datasets (§5.12). Both are read from the stored graph, so the rule runs after commit or on
   a schedule, and both are worked out as you, the rule's author, may see them.
@@ -1284,8 +1482,10 @@ as you see it, and raises an alert for each new finding, once.
   says why. Changing the rule starts it again.
 - A rule for the whole deployment does not run on a schedule: it is judged within each case as that
   case's data loads.
-- **Where people sign in with Entra ID** (a deployment on a shared platform), a rule cannot act as
-  you while you are away, so its scheduled runs are refused (the administration guide, §6a.7).
+- **Where people sign in with Entra ID** (a deployment on a shared platform), a rule's scheduled run
+  acts as you only while you have used OspreyFlow within the last 24 hours. Otherwise it is recorded
+  as not run, in those words, and runs at its next slot after you sign in; this never stops the
+  schedule (the administration guide, §6a.7).
 
 ### 7.12 A second person's approval
 
@@ -1316,7 +1516,7 @@ audit.
 
 ![Ownership: who stands behind an organisation, and its due diligence](images/user/10-ownership-due-diligence.png)
 
-The rail's **Ownership** traces who stands behind an organisation or account: every beneficial owner
+**Ownership**, under **More** in the Glass, traces who stands behind an organisation or account: every beneficial owner
 at or above the threshold (25% by default), their cumulative share through each chain, and anyone
 holding control whatever their share. A circle of cross-holdings is traced once, and said so. **Due
 diligence** gives the verification status, risk band and score with each factor's weight, and the
@@ -1327,7 +1527,7 @@ verifying documents. All of it is worked out as you read, from what you can see,
 
 ![The case's Figures](images/user/07-reports-figures.png)
 
-**Figures** (under **More views** in the view switch; a Reports Viewer has it in the switch itself)
+**Figures** (under **More** in the view switch)
 shows the case's own counts over a **Period** of the last 4, 12, 26 or 52 weeks: an **Alerts** panel
 (open alerts by source and age, and the newest), alerts raised each week, open alerts by age,
 outcomes (open, claimed, each closing reason, and closed with no outcome), customers by KYC status, a
@@ -1342,8 +1542,12 @@ Beside Figures, as your rights allow: **Trends**, **Packs** (report packs, expor
 
 ![Dashboards: a board drawn inside the Glass](images/user/08-reports-dashboard.png)
 
-**Dashboards**, on the rail, is the one door to the deployment's boards, drawn inside the Glass and
-showing only those you may open. The same boards are at `bi.` in front of the deployment's address,
+**Reports**, in the view switch (it was named *Dashboards*), is the one door to the deployment's
+boards, drawn inside the Glass and showing only those you may open. Where the deployment has its
+reporting, **Build a report (opens in new tab)**, beside the switch, opens the boards' own editor at
+`bi.`, for whoever may manage dashboards. There a builder sees the figures behind every board, for
+every case and clearance: a board's rows are kept to its own cases only when it is shown in the Glass,
+so this right is given only to people cleared for all of them. The same boards are at `bi.` in front of the deployment's address,
 signed in the same way. The first is **Alert monitoring**: alerts raised each week and by rule,
 closed by outcome, time to close, hotlist matches, and the team view.
 
@@ -1427,13 +1631,14 @@ recorded. Report packs export to PDF from the Packs and Published tabs.
 | --- | --- | --- |
 | Home | `G`, `I`, `R`, `A` | Open the Glass, the Ingest Studio, Rules and Monitoring or Admin, as your roles allow |
 | Anywhere | `/` | Search |
+| The top bar's search box | Enter | The search results page for the words typed; with a suggestion moved to by the arrows, that suggestion |
 | Anywhere in the Glass | `?` | Opens or closes the welcome panel, with keys worth knowing and the user guide, over any view (as the rail's **Help** does) |
 | Canvas | Tab, Shift+Tab | Move into and out of the canvas |
 | Canvas | Arrows | Step to the next or previous neighbour; a screen reader hears its name, type and links |
 | Canvas | Ctrl/Cmd+Arrows | Step within the selection; with Shift, through every node |
 | Canvas | Space | Add or remove the focused node from the selection |
 | Canvas | Enter | Expand the focused node, or read a document |
-| Canvas | `\` | The focused node's or the selected link's menu |
+| Canvas | `\`, the menu key, Shift+F10 | The focused node's or the selected link's menu |
 | Canvas | `L`, Shift+`L` | The next or previous link of the focused node |
 | Canvas | `G` | Fold or unfold the focused node's group |
 | Canvas | `F` | Fit the graph to the view |
