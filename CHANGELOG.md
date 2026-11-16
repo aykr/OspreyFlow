@@ -6,6 +6,26 @@ update. Work not yet in a release is listed under *Unreleased*.
 
 ## Unreleased
 
+## v0.6.1 — 2026-11-16
+
+A patch to v0.6.0: Ask & Chat opens as a drawer again, and search on Small and Lite keeps up with new data.
+
+**The Glass (ADR-145 Amendment 20).**
+- **Ask & Chat opens as a drawer again**, beside the view, which stays in reach. **Expand**, at the drawer's top,
+  makes it v0.6.0's full page over the view, keeping the question you were typing, the engine you chose and your
+  place in the conversation; **Show as a drawer**, beside the page's heading, turns it back. Esc closes the drawer,
+  as it closes other drawers, and so do **Close** and a second press of the rail. Each opening is the drawer; the
+  search results' *Ask a question about '…' instead* opens the page, in the results' place. The drawer stays beside a
+  view or a search you choose, and beside the graph when you choose a marker or *Show all on graph*; it closes when
+  you go to another place. The search results and the batch job's panel make room for it.
+
+**Search (ADR-150 Amendment 4).**
+- **Search on Small and Lite is fed by the Conduit.** Where no worker runs (`local-lite`, `small`), the
+  Conduit now sends every graph change to the search index itself, so demo packs and loads added after
+  the install are searchable as they are written. In v0.6.0 nothing fed the index on those shapes, and
+  once more than 10,000 changes were waiting, case search answered only exact identifiers. A deployment
+  already in that state catches up by itself once it runs v0.6.1, with no rebuild (ADR-150 Amendment 4).
+
 ## v0.6.0 — 2026-11-18
 
 **v0.6.0 is installed fresh: there is no upgrade to it from any earlier version.**
